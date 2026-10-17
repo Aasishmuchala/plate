@@ -25,7 +25,7 @@ One column, top to bottom: the daemon status line (health and version handshake,
 
 - **Send Packet** and **Batch Cameras** run the same flow: handshake, then lint on every selected camera, then the send. A daemon that is down or the wrong release stops the flow before anything is rendered; any lint problem on any selected camera stops it too and lists the codes (`UNLABELLED_SHARE`, `SCALED_CAMERA`, `SHIFTED_CAMERA`, `NO_VRAY`, `HIDDEN_CAMERA`, `BAD_NAME_CHARS`, ...).
 - **Receive** asks for a result file and loads it into the VFB history or as the viewport background.
-- **Send Motion**, **Light** and **Scout** are disabled, with a tooltip, until their actions are wired (a later task). The dock decides by asking the controller for its capabilities, so the buttons light up by themselves when the action modules arrive.
+- **Send Motion**, **Light** and **Scout** run through their action modules (T77). Light stays disabled, with a `MAXGAFFER_MISSING` tooltip, when MaxGaffer is not installed. A canvas Light or Scout job reaches Max through the dock's job poller (`plate_max.jobs`).
 - Threading contract (copied from MaxGaffer): every pymxs call runs on Max's main thread; the daemon health call runs on a `QThread` while the main thread spins a local event loop, so Max stays responsive and no widget is touched off-thread. Renders block Max by nature, so the log narrates and keeps the event loop alive.
 
 The send, batch and receive actions live in `plate_max/actions/`, written by the Send/Batch/Receive task. The controller calls them through a fixed contract (documented at the top of `plate_max/ui/controller.py`) and only when the module exists.

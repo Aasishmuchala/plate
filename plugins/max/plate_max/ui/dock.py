@@ -1,11 +1,22 @@
 """PLATE dock: PySide6, instrument-grade dark (the MaxGaffer/MaxDirector house style).
 
-One column: daemon status line, camera list, per-camera recipe editor, the action buttons, the
-lint panel, progress and log. Threading contract (copied from MaxGaffer's dock):
+One column: daemon status line, the scene's project (with its custody), camera list, per-camera
+recipe editor, the action buttons, the lint panel, progress and log. Threading contract (copied from
+MaxGaffer's dock):
   * every pymxs touch happens on Max's MAIN thread, always;
-  * slow pure I/O (the daemon health call) runs on a QThread while the main thread spins a local
-    QEventLoop, so Max stays responsive and no widget is touched off-thread;
+  * slow pure I/O (the daemon health and projects calls, the job poller's daemon calls) runs on a
+    QThread while the main thread spins a local QEventLoop, so Max stays responsive and no widget is
+    touched off-thread;
   * renders block Max by nature, so the log narrates and processes events to never feel dead.
+
+The job poller (plate_max.jobs, made by the controller) runs on this dock's QTimer: it starts with
+the dock and stops when the dock closes, so a Light or Scout node on the canvas reaches Max only while
+the dock is open. A job marks the dock busy while it runs; a tick waits while the artist is in the
+middle of an action.
+
+show_dock() (what bootstrap.launch() calls) opens PLATE as a tab of the shared dock
+(plate_max.shared.launch_plate, plugins/max/SHARED_BRIDGE.md) parented to max_main_window();
+PLATE_STANDALONE_DOCK=1 keeps the old floating window for side-by-side checks on the box.
 
 Qt is allowed only in this package (tests/test_stdlib_only.py). bootstrap.launch() imports this
 module lazily; a missing PySide6 is reported there, never at plate_max import.
@@ -14,6 +25,7 @@ module lazily; a missing PySide6 is reported there, never at plate_max import.
 from __future__ import annotations
 
 import html as _html
+import os
 from typing import Any
 
 from PySide6 import QtCore, QtWidgets  # type: ignore
@@ -33,6 +45,7 @@ TEXT = "#f2f2f7"
 DIM = "#98989d"  # secondary text and captions
 FAINT = "#636366"  # disabled and placeholders
 ERR = "#ff453a"  # systemRed (dark): error emphasis only
+WARN = "#ff9f0a"  # systemOrange (dark): one warning only, an unset custody after a send
 OK = "#f2f2f7"
 
 STYLE = (
@@ -83,8 +96,13 @@ STYLE = (
 
 RECEIVE_LABELS = {"vfb_history": "VFB history", "viewport_background": "Viewport background"}
 PENDING_TIP = "Not wired in this build yet."
+HINT_TIP = (
+    "A hint for you only: it is not sent with the packet. The canvas's Make bar picks the engine "
+    "and the preset when the plate is edited."
+)
 NO_OVERSCAN = "none"
 FRAME_MAX = 20000
+STANDALONE_ENV = "PLATE_STANDALONE_DOCK"
 
 
 def _cap(text: str) -> QtWidgets.QLabel:
@@ -126,12 +144,22 @@ class PlateDock(QtWidgets.QWidget):
         self._workers: list[_Worker] = []
         self._busy = False
         self._loading = False
+        self._loading_project = False
+        self._io_depth = 0  # local event loops spinning (a daemon wait): the poller holds off
+        self._job: dict[str, Any] | None = None  # the canvas job running now
+        self._container: Any = None  # the QDockWidget around this page, watched for close/show
+        self.poller: Any = None  # made below, once the widgets exist
         self._relay = _ProgressRelay(self)
         self._relay.progress.connect(self._on_progress)
         self.class_checks: dict[str, QtWidgets.QCheckBox] = {}
         self._build()
         self.refresh_cameras()
         self.refresh_status()
+        self.refresh_projects()
+        self._poll_timer = QtCore.QTimer(self)
+        self._poll_timer.setObjectName("plateJobPoller")
+        self.poller = self._make_poller()
+        self._start_poller()
 
     # ================================================================= layout
     def _card(self, parent_layout) -> QtWidgets.QVBoxLayout:
@@ -174,6 +202,35 @@ class PlateDock(QtWidgets.QWidget):
         head.addWidget(self.btn_status)
         col.addLayout(head)
 
+        # ---- project: what the scene sends into, and its custody
+        proj = self._card(col)
+        proj_head = QtWidgets.QHBoxLayout()
+        proj_head.addWidget(_cap("PROJECT"))
+        proj_head.addStretch(1)
+        self.btn_projects = QtWidgets.QPushButton("Refresh")
+        self.btn_projects.setObjectName("ghost")
+        self.btn_projects.clicked.connect(self.refresh_projects)
+        proj_head.addWidget(self.btn_projects)
+        proj.addLayout(proj_head)
+        proj_row = QtWidgets.QHBoxLayout()
+        proj_row.setSpacing(12)
+        self.cb_project = QtWidgets.QComboBox()
+        self.cb_project.setEditable(True)
+        self.cb_project.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.cb_project.setMinimumWidth(220)
+        self.cb_project.setToolTip(
+            "The project this scene sends into (the daemon's projects; type a new id to start one). "
+            "Kept in <scene>.plate.json next to the .max file."
+        )
+        self.cb_project.currentIndexChanged.connect(self._on_project_changed)
+        self.cb_project.lineEdit().editingFinished.connect(self._on_project_changed)
+        proj_row.addWidget(self.cb_project, 1)
+        self.lbl_custody = QtWidgets.QLabel("custody unset")
+        self.lbl_custody.setObjectName("dim")
+        self.lbl_custody.setToolTip("The project's custody: which engine grades its plates may reach.")
+        proj_row.addWidget(self.lbl_custody)
+        proj.addLayout(proj_row)
+
         # ---- cameras
         cams = self._card(col)
         cap_row = QtWidgets.QHBoxLayout()
@@ -201,12 +258,14 @@ class PlateDock(QtWidgets.QWidget):
         form.setVerticalSpacing(8)
         self.cb_engine = QtWidgets.QComboBox()
         self.cb_engine.addItems(self.ctrl.engines())
-        form.addRow("Engine", self.cb_engine)
+        self.cb_engine.setToolTip(HINT_TIP)
+        form.addRow("Engine hint (not sent)", self.cb_engine)
         self.cb_preset = QtWidgets.QComboBox()
         self.cb_preset.setEditable(True)
         self.cb_preset.addItem("")
         self.cb_preset.addItems(self.ctrl.presets())
-        form.addRow("Preset", self.cb_preset)
+        self.cb_preset.setToolTip(HINT_TIP)
+        form.addRow("Preset hint (not sent)", self.cb_preset)
         self.chk_safe = QtWidgets.QCheckBox("Safe frame (the deliverable crop inside the render)")
         form.addRow("", self.chk_safe)
         frame_row = QtWidgets.QHBoxLayout()
@@ -253,6 +312,13 @@ class PlateDock(QtWidgets.QWidget):
         self.btn_batch = self._button("Batch Cameras", self._on_batch)
         for b in (self.btn_send, self.btn_batch):
             row1.addWidget(b)
+        self.chk_supersedes = QtWidgets.QCheckBox("supersedes last")
+        self.chk_supersedes.setToolTip(
+            "The new packet replaces the camera's last packet sent from this dock: approved layers carry "
+            "over where the IDs are unchanged."
+        )
+        self.chk_supersedes.toggled.connect(self._on_supersedes_toggled)
+        row1.addWidget(self.chk_supersedes)
         row1.addStretch(1)
         act.addLayout(row1)
         row2 = QtWidgets.QHBoxLayout()
@@ -262,6 +328,9 @@ class PlateDock(QtWidgets.QWidget):
         self.btn_scout = self._button("Scout", self._on_scout)
         for b in (self.btn_motion, self.btn_light, self.btn_scout):
             row2.addWidget(b)
+        self.chk_scout_keep = QtWidgets.QCheckBox("keep scout cameras")
+        self.chk_scout_keep.setToolTip("Leave the __PLATE_scout_N cameras in the scene after the previews.")
+        row2.addWidget(self.chk_scout_keep)
         row2.addStretch(1)
         act.addLayout(row2)
         row3 = QtWidgets.QHBoxLayout()
@@ -297,7 +366,16 @@ class PlateDock(QtWidgets.QWidget):
 
         # ---- progress and log
         prog = self._card(col)
-        prog.addWidget(_cap("PROGRESS"))
+        prog_head = QtWidgets.QHBoxLayout()
+        prog_head.addWidget(_cap("PROGRESS"))
+        prog_head.addStretch(1)
+        self.lbl_jobs = QtWidgets.QLabel("canvas jobs: off")
+        self.lbl_jobs.setObjectName("dim")
+        self.lbl_jobs.setToolTip(
+            "Light and Scout nodes on the canvas reach this Max through the dock while it is open."
+        )
+        prog_head.addWidget(self.lbl_jobs)
+        prog.addLayout(prog_head)
         self.bar = QtWidgets.QProgressBar()
         self.bar.setRange(0, 1)
         self.bar.setValue(0)
@@ -334,9 +412,13 @@ class PlateDock(QtWidgets.QWidget):
         self._workers.append(worker)
         worker.done.connect(lambda r: (box.__setitem__("r", r), loop.quit()))
         worker.failed.connect(lambda e: (box.__setitem__("e", e), loop.quit()))
-        worker.start()
-        loop.exec()
-        worker.wait()
+        self._io_depth += 1
+        try:
+            worker.start()
+            loop.exec()
+            worker.wait()
+        finally:
+            self._io_depth -= 1
         self._workers.remove(worker)
         if "e" in box:
             raise RuntimeError(box["e"])
@@ -366,6 +448,7 @@ class PlateDock(QtWidgets.QWidget):
 
     def _refresh_buttons(self) -> None:
         caps = self.ctrl.capabilities()
+        why_not = self._unavailable()
         has_cams = bool(self.selected_cameras())
         table = (
             (self.btn_send, ctl.CAP_SEND_PACKET, True),
@@ -378,10 +461,29 @@ class PlateDock(QtWidgets.QWidget):
         for btn, cap, needs_camera in table:
             available = cap in caps
             btn.setEnabled(available and not self._busy and (has_cams or not needs_camera))
-            btn.setToolTip("" if available else PENDING_TIP)
+            btn.setToolTip("" if available else why_not.get(cap) or PENDING_TIP)
         self.cb_receive.setEnabled(ctl.CAP_RECEIVE in caps and not self._busy)
-        for w in (self.btn_refresh, self.btn_status, self.btn_lint, self.cam_list):
+        self.chk_scout_keep.setEnabled(ctl.CAP_SCOUT in caps and not self._busy)
+        for w in (
+            self.btn_refresh,
+            self.btn_status,
+            self.btn_lint,
+            self.cam_list,
+            self.cb_project,
+            self.btn_projects,
+            self.chk_supersedes,
+        ):
             w.setEnabled(not self._busy)
+
+    def _unavailable(self) -> dict[str, str]:
+        """Why each disabled action is disabled (MAXGAFFER_MISSING for Light without MaxGaffer)."""
+        reasons = getattr(self.ctrl, "unavailable", None)
+        if not callable(reasons):
+            return {}
+        try:
+            return dict(reasons() or {})
+        except Exception:  # noqa: BLE001 a tooltip must never raise into Max
+            return {}
 
     # ================================================================= daemon status
     def refresh_status(self) -> dict[str, Any]:
@@ -410,6 +512,95 @@ class PlateDock(QtWidgets.QWidget):
             self._log(f"Not sending: {self.lbl_status.text()}", err=True)
             return False
         return True
+
+    # ================================================================= project binding
+    def refresh_projects(self) -> list[dict[str, Any]]:
+        """Fill the Project combo from the daemon's projects (off the main thread) and select the
+        scene's binding. A daemon that does not answer leaves the binding as it is."""
+        heads: list[dict[str, Any]] = []
+        try:
+            heads = list(self.ctrl.io(self.ctrl.projects) or [])
+        except Exception as e:  # noqa: BLE001 the combo must never raise into Max
+            self.cb_project.setToolTip(f"projects not loaded: {e}")
+        ids = [str(h.get("project_id")) for h in heads if h.get("project_id")]
+        self._fill_projects(ids)
+        return heads
+
+    def _fill_projects(self, ids: list[str]) -> None:
+        current = self._project_id()
+        self._loading_project = True
+        try:
+            self.cb_project.clear()
+            for pid in [*ids, *([current] if current and current not in ids else [])]:
+                self.cb_project.addItem(pid, pid)
+            index = self.cb_project.findData(current)
+            if index >= 0:
+                self.cb_project.setCurrentIndex(index)
+            else:
+                self.cb_project.setEditText(current)
+        finally:
+            self._loading_project = False
+        self._show_custody()
+
+    def _project_id(self) -> str:
+        try:
+            return str(self.ctrl.project_id() or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def sync_project(self) -> None:
+        """Show the open scene's binding (another scene may be open now) without asking the daemon."""
+        current = self._project_id()
+        if current and self.cb_project.currentText().strip() != current:
+            self._loading_project = True
+            try:
+                index = self.cb_project.findData(current)
+                if index < 0:
+                    self.cb_project.addItem(current, current)
+                    index = self.cb_project.findData(current)
+                self.cb_project.setCurrentIndex(index)
+            finally:
+                self._loading_project = False
+        self._show_custody()
+
+    def _on_project_changed(self, *_args) -> None:
+        if self._loading_project:
+            return
+        self.choose_project(self.cb_project.currentText())
+
+    def choose_project(self, project_id: str) -> bool:
+        """Bind the scene to project_id (the combo's pick or typed text) and keep it in
+        <scene>.plate.json. False (and the old binding shown again) for text that is no project id."""
+        text = str(project_id or "").strip()
+        if not text or text == self._project_id():
+            return False
+        try:
+            saved = self.ctrl.set_project(text)
+        except Exception as e:  # noqa: BLE001 a bad id is shown, never raised into Max
+            self._log(f"Project: {e}", err=True)
+            self.sync_project()
+            return False
+        pid = self._project_id()
+        where = f"saved in {saved}" if saved else "this scene is unsaved: kept until another scene opens"
+        self._log(f"Project: {pid} ({where})")
+        self.sync_project()
+        return True
+
+    def _custody(self) -> dict[str, Any] | None:
+        try:
+            return self.ctrl.project_custody()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _show_custody(self, after_send: bool = False) -> None:
+        custody = self._custody()
+        unset = not custody or bool(custody.get("unset"))
+        if unset and after_send:
+            self.lbl_custody.setText(ctl.CUSTODY_UNSET)
+            self.lbl_custody.setStyleSheet(f"color:{WARN};")
+            return
+        self.lbl_custody.setText(ctl.custody_text(custody))
+        self.lbl_custody.setStyleSheet(f"color:{DIM};")
 
     # ================================================================= cameras and recipe
     def selected_cameras(self) -> list[str]:
@@ -442,6 +633,8 @@ class PlateDock(QtWidgets.QWidget):
         if self.cam_list.currentItem() is None and self.cam_list.count():
             self.cam_list.setCurrentRow(0)  # signals are live again: loads the recipe and the buttons
         self._on_current_changed()
+        if hasattr(self, "cb_project"):  # a new scene (filePostOpen) may be bound to another project
+            self.sync_project()
         self._refresh_buttons()
 
     def _on_selection_changed(self) -> None:
@@ -548,6 +741,18 @@ class PlateDock(QtWidgets.QWidget):
         return all_ok
 
     # ================================================================= actions
+    def _poller_active(self) -> bool:
+        return bool(self.poller is not None and getattr(self.poller, "active", False))
+
+    def _can_start(self, name: str) -> bool:
+        """False (said in the log) while a canvas job holds Max; a busy dock ignores the click."""
+        if self._busy:
+            return False
+        if self._poller_active():
+            self._log(f"{name}: a canvas job is talking to the daemon; try again in a moment.", err=True)
+            return False
+        return True
+
     def _guarded(self, name: str, work) -> None:
         """Run work() with the busy lifecycle; an exception is logged, never raised into Max."""
         if self._busy:
@@ -560,20 +765,31 @@ class PlateDock(QtWidgets.QWidget):
         finally:
             self._set_busy(False)
 
-    def _show_results(self, name: str, results: list[dict[str, Any]]) -> None:
+    def _show_results(self, name: str, results: list[dict[str, Any]], sends: bool = True) -> None:
+        """One log line per result (Sent, ingesting / Already sent / Ingest failed: ...). After a send
+        to a project whose custody is unset, the custody label says so in amber."""
         if not results:
             self._log(f"{name}: nothing was sent")
         for r in results:
-            if r.get("ok"):
-                self._log(f"{name}: {r.get('camera')} sent (packet {r.get('packet_id') or '?'})")
-            else:
-                why = "; ".join(r.get("errors") or []) or "no reason given"
-                self._log(f"{name}: {r.get('camera')} FAILED: {why}", err=True)
+            line, err = ctl.result_message(name, r)
+            self._log(line, err=err)
+            for warning in r.get("warnings") or []:
+                self._log(f"{name}: {r.get('camera')}: {warning}")
+        if sends and any(r.get("ok") and r.get("packet_id") for r in results):
+            self.refresh_projects()  # the first packet may have just created the project, custody unset
+            self._show_custody(after_send=True)
+            if self.lbl_custody.text() == ctl.CUSTODY_UNSET:
+                self._log(
+                    f"{name}: project {self._project_id()} has its custody unset: only C0 (local) engines "
+                    "run until it is set in the canvas's Project panel"
+                )
 
     def _send_flow(self, name: str, runner) -> None:
         cams = self.selected_cameras()
         if not cams:
             self._log("Select at least one camera.", err=True)
+            return
+        if not self._can_start(name):
             return
         if not self._daemon_ready():
             return
@@ -594,6 +810,8 @@ class PlateDock(QtWidgets.QWidget):
         self._send_flow("Batch Cameras", self.ctrl.batch_cameras)
 
     def _on_receive(self) -> None:
+        if not self._can_start("Receive"):
+            return
         path = self._pick_receive_path()
         if not path:
             return
@@ -611,10 +829,15 @@ class PlateDock(QtWidgets.QWidget):
         )
         return path
 
-    def _camera_action(self, name: str, runner) -> None:
-        camera = self.current_camera() or (self.selected_cameras() or [""])[0]
+    def _focused_camera(self) -> str:
+        return self.current_camera() or (self.selected_cameras() or [""])[0]
+
+    def _camera_action(self, name: str, runner, camera: str | None = None) -> None:
+        camera = camera or self._focused_camera()
         if not camera:
             self._log("Select a camera first.", err=True)
+            return
+        if not self._can_start(name):
             return
         if not self._daemon_ready():
             return
@@ -625,48 +848,243 @@ class PlateDock(QtWidgets.QWidget):
         self._guarded(name, work)
 
     def _on_motion(self) -> None:
-        self._camera_action("Send Motion", self.ctrl.send_motion)
+        """Send Motion of the focused camera, from its hero still: the last packet this dock sent of
+        it, else the one the artist picks from the camera's stills in the packets folder."""
+        camera = self._focused_camera()
+        if not camera:
+            self._log("Select a camera first.", err=True)
+            return
+        if not self._can_start("Send Motion"):
+            return
+        hero = self.ctrl.last_packet(camera) or self._pick_hero_packet(camera)
+        if not hero:
+            return
+        self._log(f"Send Motion: {camera} from hero still {hero}")
+        self._camera_action(
+            "Send Motion", lambda cam, prog: self.ctrl.send_motion(cam, prog, hero_packet_id=hero), camera
+        )
+
+    def _pick_hero_packet(self, camera: str) -> str:
+        """The hero still for Send Motion when this dock has sent none of camera: the artist picks one
+        of the camera's stills (newest first) or pastes a packet id. "" when cancelled or none exists."""
+        choices = list(self.ctrl.hero_candidates(camera) or [])
+        if not choices:
+            self._log(f"Send Motion needs a hero still of {camera}: Send Packet first.", err=True)
+            return ""
+        text, ok = QtWidgets.QInputDialog.getItem(
+            self, "Hero still", f"Hero still packet for {camera}", choices, 0, True
+        )
+        return str(text).strip() if ok else ""
 
     def _on_light(self) -> None:
-        self._camera_action("Light", self.ctrl.light)
+        """MaxGaffer's light match of the focused camera to a reference picture, then a re-rendered
+        packet that supersedes the old one."""
+        camera = self._focused_camera()
+        if not camera:
+            self._log("Select a camera first.", err=True)
+            return
+        if not self._can_start("Light"):
+            return
+        reference = self._pick_reference_path()
+        if not reference:
+            return
+        self._camera_action(
+            "Light", lambda cam, prog: self.ctrl.light(cam, prog, reference_path=reference), camera
+        )
+
+    def _pick_reference_path(self) -> str:
+        path, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Reference picture for the light match",
+            "",
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.exr);;All files (*)",
+        )
+        return path
 
     def _on_scout(self) -> None:
+        if not self._can_start("Scout"):
+            return
         if not self._daemon_ready():
             return
+        keep = self.chk_scout_keep.isChecked()
 
         def work():
-            self._show_results("Scout", self.ctrl.scout(self._progress))
+            self._show_results("Scout", self.ctrl.scout(self._progress, keep=keep), sends=False)
 
         self._guarded("Scout", work)
+        if keep:
+            self.refresh_cameras()
 
-    def closeEvent(self, event) -> None:  # noqa: N802 Qt naming
+    def _on_supersedes_toggled(self, on: bool) -> None:
+        setter = getattr(self.ctrl, "set_supersede_last", None)
+        if callable(setter):
+            setter(bool(on))
+
+    # ================================================================= canvas jobs
+    def _make_poller(self) -> Any:
+        maker = getattr(self.ctrl, "make_poller", None)
+        if not callable(maker):
+            return None
+        try:
+            return maker(
+                log=self._log,
+                busy=self._poller_should_wait,
+                on_start=self._on_job_start,
+                on_finish=self._on_job_finish,
+            )
+        except Exception as e:  # noqa: BLE001 no poller is a dock without canvas jobs, not a crash
+            self._log(f"canvas jobs off: {type(e).__name__}: {e}", err=True)
+            return None
+
+    def _start_poller(self) -> None:
+        if self.poller is None:
+            self.lbl_jobs.setText("canvas jobs: off")
+            return
+        try:
+            if not self.poller.running:
+                self.poller.start(self._poll_timer)
+        except RuntimeError:  # the timer went with a closing dock
+            return
+        except Exception as e:  # noqa: BLE001 a poller that cannot start is a dock without canvas jobs
+            self._log(f"canvas jobs off: {type(e).__name__}: {e}", err=True)
+            return
+        self.lbl_jobs.setText("canvas jobs: on")
+
+    def _stop_poller(self) -> None:
+        if self.poller is None:
+            return
+        try:
+            self.poller.stop()
+            self.lbl_jobs.setText("canvas jobs: off (dock closed)")
+        except RuntimeError:
+            pass
+
+    def _poller_should_wait(self) -> bool:
+        """A tick waits while the artist is in an action, a daemon wait spins events, or a dialog is up."""
+        if self._busy or self._io_depth > 0:
+            return True
+        return QtWidgets.QApplication.activeModalWidget() is not None
+
+    def _on_job_start(self, job: dict[str, Any]) -> None:
+        self._job = dict(job)
+        self._set_busy(True)
+        what = job.get("camera") or job.get("packet_id") or ""
+        self._log(f"Canvas job {job.get('action')} {what}".rstrip())
+
+    def _on_job_finish(self, job: dict[str, Any], body: dict[str, Any]) -> None:
+        self._job = None
+        self._set_busy(False)
+        action = job.get("action")
+        if body.get("ok"):
+            tail = f" (packet {body['packet_id']})" if body.get("packet_id") else ""
+            self._log(f"Canvas job {action}: done{tail}")
+        else:
+            self._log(f"Canvas job {action} FAILED: {body.get('detail') or 'no reason given'}", err=True)
+        if action == "scout" and job.get("keep"):
+            self.refresh_cameras()
+
+    def shutdown(self) -> None:
+        """Stop the job poller and let the daemon workers finish (closing, or close_dock())."""
+        self._stop_poller()
         for worker in list(self._workers):
             worker.wait(2000)
+
+    def _watch_container(self) -> None:
+        """Follow the QDockWidget around this page (the shared dock, or the standalone one): the
+        poller stops when it closes and starts again when it shows."""
+        if self._container is not None:
+            return
+        widget = self.parentWidget()
+        while widget is not None and not isinstance(widget, QtWidgets.QDockWidget):
+            widget = widget.parentWidget()
+        if widget is None:
+            return
+        self._container = widget
+        widget.visibilityChanged.connect(self._on_container_visible)
+
+    def _on_container_visible(self, visible: bool) -> None:
+        if visible:
+            self._start_poller()
+        else:
+            self._stop_poller()
+
+    def showEvent(self, event) -> None:  # noqa: N802 Qt naming
+        super().showEvent(event)
+        self._watch_container()
+        self._start_poller()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 Qt naming
+        self.shutdown()
         super().closeEvent(event)
 
 
 _dock_instance: PlateDock | None = None
 _dock_container: Any = None
+_dock_shared = False  # _dock_instance is the PLATE tab of the shared dock
 
 
-def show_dock(controller: Any = None) -> PlateDock:
-    """Create (or raise) the dock: a floating QDockWidget parented to 3ds Max's main window when
-    qtmax is available, else a plain top-level window (dev and tests). One instance per session."""
-    global _dock_instance, _dock_container
-    if _dock_instance is not None:
-        try:
+def max_main_window() -> Any:
+    """3ds Max's main window (qtmax.GetQMaxMainWindow()), None off-Max. plate_max.shared.host asks
+    this first when an adapter passes no parent (SHARED_BRIDGE.md, PLATE adoption step 1)."""
+    try:
+        import qtmax  # Max 2021+; absent off-Max
+
+        return qtmax.GetQMaxMainWindow()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _alive(widget: Any) -> bool:
+    if widget is None:
+        return False
+    try:
+        widget.objectName()  # raises RuntimeError once the C++ widget is deleted
+        return True
+    except RuntimeError:
+        return False
+
+
+def show_dock(controller: Any = None, standalone: bool | None = None) -> PlateDock | None:
+    """Open (or raise) the dock: what bootstrap.launch() calls. By default PLATE is a tab of the
+    shared dock (shared.launch_plate(controller, parent=max_main_window()): one QDockWidget and one
+    set of Max callbacks for PLATE, MaxDirector and MaxGaffer) and the PlateDock page is returned, or
+    None when the shared dock could not open (the reason is in a message box and the Listener).
+    standalone=True, or PLATE_STANDALONE_DOCK=1, opens the old floating dock instead (a QDockWidget
+    on Max's main window, a top-level window off-Max). One instance per session either way."""
+    global _dock_instance, _dock_container, _dock_shared
+    if standalone is None:
+        standalone = os.environ.get(STANDALONE_ENV, "").strip() not in ("", "0")
+    if _dock_instance is not None and not _alive(_dock_instance):
+        _dock_instance = _dock_container = None
+        _dock_shared = False
+    if _dock_instance is not None and (standalone or not _dock_shared):
+        try:  # one PLATE dock: a standalone one already open is raised, never twinned
             (_dock_container or _dock_instance).show()
             (_dock_container or _dock_instance).raise_()
             return _dock_instance
         except RuntimeError:  # the C++ object is gone (dock closed and deleted)
             _dock_instance = _dock_container = None
-    parent = None
-    try:
-        import qtmax  # Max 2021+; absent off-Max
+            _dock_shared = False
+    if not standalone:
+        return _show_shared(controller)
+    return _show_standalone(controller)
 
-        parent = qtmax.GetQMaxMainWindow()
-    except Exception:  # noqa: BLE001
-        parent = None
+
+def _show_shared(controller: Any) -> PlateDock | None:
+    global _dock_instance, _dock_container, _dock_shared
+    from .. import shared
+
+    dock = shared.launch_plate(controller, parent=max_main_window())
+    page = shared.get_host().widget("plate") if dock is not None else None
+    if page is None:  # the dock failed to open, or PLATE's tab is a placeholder saying why
+        return None
+    _dock_instance, _dock_container, _dock_shared = page, dock, True
+    return page
+
+
+def _show_standalone(controller: Any) -> PlateDock:
+    global _dock_instance, _dock_container, _dock_shared
+    parent = max_main_window()
     ctrl = controller if controller is not None else ctl.LiveController()
     if parent is not None:
         dock = QtWidgets.QDockWidget("PLATE", parent)
@@ -683,16 +1101,35 @@ def show_dock(controller: Any = None) -> PlateDock:
         widget.resize(580, 1000)
         widget.show()
         _dock_container = None
-    _dock_instance = widget
+    _dock_instance, _dock_shared = widget, False
     return widget
 
 
 def close_dock() -> None:
-    """Drop the singleton (tests, and a clean re-launch after an update)."""
-    global _dock_instance, _dock_container
-    target = _dock_container or _dock_instance
+    """Drop the singleton (tests, and a clean re-launch after an update): the poller stops, and the
+    PLATE tab leaves the shared dock (the dock itself closes when no other tool's tab is left)."""
+    global _dock_instance, _dock_container, _dock_shared
+    page, container, was_shared = _dock_instance, _dock_container, _dock_shared
     _dock_instance = _dock_container = None
-    if target is not None:
+    _dock_shared = False
+    if _alive(page):
+        try:
+            page.shutdown()
+        except RuntimeError:
+            pass
+    if was_shared:
+        from .. import shared
+
+        host = shared.get_host()
+        if host.widget("plate") is page:
+            host.remove_panel("plate")
+            if not host.panels():
+                host.close()
+            return
+        target = container  # a host that was reset underneath us: close what we opened
+    else:
+        target = container or page
+    if _alive(target):
         try:
             target.close()
             target.deleteLater()

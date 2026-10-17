@@ -108,7 +108,7 @@ from .quotes import (
 from .recipes import ProjectSheet, RecipeError, RunnableRecipe
 from .review_bundle import DEFAULT_WATERMARK, MAX_WIDTH_LIMIT
 from .states import RunState
-from .timeutil import iso, utcnow
+from .timeutil import iso, parse_iso, utcnow
 from .worker import FanOutError, fan_out
 
 __all__ = [
@@ -1728,8 +1728,8 @@ def daemon_call(
         reason = getattr(e, "reason", e)
         raise CliExit(
             EXIT_USAGE,
-            f"no daemon answered at {base} ({reason}): start it with scripts/start-daemon.sh "
-            "(scripts\\start-daemon.ps1 on Windows), or name it with PLATE_DAEMON_URL / PLATE_PORT",
+            f"no daemon answered at {base} ({reason}): start it with the start-daemon script in scripts/, "
+            "or name it with PLATE_DAEMON_URL / PLATE_PORT",
         ) from e
     try:
         doc = json.loads(raw.decode("utf-8"))
@@ -1795,10 +1795,12 @@ def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
 def cmd_spend(session: Session, args: argparse.Namespace) -> int:
     root = resolve_project(session, args.project)
     project = Project.load(root)
+    ledger = Ledger(root)
     try:
-        summary = Ledger(root).summarize(args.since)
+        summary = ledger.summarize(args.since)
     except ValueError as e:  # a --since that is not an ISO date or time
         raise CliExit(EXIT_USAGE, f"--since {args.since!r}: {e}") from e
+    records = ledger.records()
     rows = [
         [
             engine,
@@ -1821,6 +1823,19 @@ def cmd_spend(session: Session, args: argparse.Namespace) -> int:
     session.say(f"spend for {project.project_id}" + (f" since {args.since}" if args.since else ""))
     for text in _table(["engine", "runs", "quoted USD", "billed USD", "accepted"], rows):
         session.say(text)
+    # An imported take never reaches `submitted`, so `summarize` does not count it; what was declared is shown.
+    since = parse_iso(args.since)
+    declared = [
+        r
+        for r in records
+        if r.get("kind") == "quoted"
+        and isinstance(r.get("data"), Mapping)
+        and r["data"].get("imported") is True
+        and (since is None or ((at := parse_iso(r.get("at"))) is not None and at >= since))
+    ]
+    if declared:
+        total = sum(float(r.get("cost_usd_quoted") or 0) for r in declared)
+        session.say(f"not in the table: {len(declared)} imported take(s), {usd(total)} declared")
     return EXIT_OK
 
 
@@ -1917,7 +1932,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     i = sub.add_parser("import", help="file a take made outside PLATE as a gated, ledgered run")
     i.add_argument("file")
-    i.add_argument("--project", required=True, help="the project folder or id")
+    i.add_argument(
+        "--project", required=True, help="an existing project (folder or id), e.g. made by `plate run`"
+    )
     i.add_argument(
         "--packet", required=True, help="the id of an ingested packet, or a packet folder to ingest"
     )

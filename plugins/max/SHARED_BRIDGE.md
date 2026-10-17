@@ -68,7 +68,7 @@ each one opens its own floating dock, keeps its own `show_dock()` singleton, and
    `from . import shared; _state["dock"] = shared.launch_plate(controller)`. `PLATE_ON` refreshes the
    camera list on `#filePostOpen`.
 
-Until the box check below passes, the standalone dock stays the default. A second macro (`PLATE_SharedDock`)
+Since T77, PLATE opens as a tab of the shared dock by default; `PLATE_STANDALONE_DOCK=1` (or `show_dock(standalone=True)`) still opens the old floating dock until the box check below passes. A second macro (`PLATE_SharedDock`)
 can run `python.Execute "import plate_max.shared as _s; _s.launch_plate()"` for side-by-side testing.
 
 ## MaxGaffer adapter (about 20 lines, in its repo; not implemented here)

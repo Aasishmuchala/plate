@@ -1,12 +1,15 @@
 """The PLATE dock driven for real, offscreen, against a FakeController.
 
-Two halves. The controller half (LiveController, the recipe defaults, the FakeController itself) needs
-no Qt and always runs. The dock half builds the real PySide6 widgets with QT_QPA_PLATFORM=offscreen and
-clicks through every user journey (send, batch, receive, lint block, recovery from a failing action);
-it skips cleanly when the PySide6 wheel is not installed (the `qt` fixture). What this proves that an
-import smoke cannot: the buttons reach the controller with the right arguments, the busy lifecycle
-restores the buttons, daemon I/O leaves the main thread while pymxs-facing calls stay on it, and the
-dock paints a non-trivial image. What it cannot prove: how it looks inside 3ds Max's Qt (verify-on-box).
+Two halves. The controller half (LiveController, the recipe defaults, the project binding, the
+FakeController itself) needs no Qt and always runs. The dock half builds the real PySide6 widgets with
+QT_QPA_PLATFORM=offscreen and clicks through every user journey (send, batch, receive, lint block,
+recovery from a failing action, Send Motion / Light / Scout, the Project combo, the canvas-job poller's
+lifecycle, the shared-dock launch); it skips cleanly when the PySide6 wheel is not installed (the `qt`
+fixture). The daemon is a loopback http.server (health and projects). What this proves that an import
+smoke cannot: the buttons reach the controller and the actions with the right arguments, the busy
+lifecycle restores the buttons, daemon I/O leaves the main thread while pymxs-facing calls stay on it,
+and the dock paints a non-trivial image. What it cannot prove: how it looks inside 3ds Max's Qt, and a
+real Send Motion or Light run (verify-on-box).
 """
 
 from __future__ import annotations
@@ -26,7 +29,11 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # before anything imports Qt
 
 from plate_max import PACKET_VERSION, PLUGIN_VERSION, bootstrap, policy  # noqa: E402
+from plate_max import config as plate_config  # noqa: E402
+from plate_max.packet_id import new_packet_id  # noqa: E402
 from plate_max.ui import controller as ctl  # noqa: E402
+
+TOKEN = "c0ffeec0ffeec0ffeec0ffeec0ffeec0"
 
 PLUGIN = Path(ctl.__file__).resolve().parent.parent.parent
 ALL_CAPS = (
@@ -37,6 +44,26 @@ ALL_CAPS = (
     ctl.CAP_LIGHT,
     ctl.CAP_SCOUT,
 )
+
+
+@pytest.fixture
+def no_gaffer(monkeypatch):
+    """No MaxGaffer in this Max: import maxgaffer raises ImportError."""
+    monkeypatch.setitem(sys.modules, "maxgaffer", None)
+    monkeypatch.setitem(sys.modules, "maxgaffer.api", None)
+
+
+@pytest.fixture
+def gaffer_api(monkeypatch):
+    """A maxgaffer.api with the two calls actions.light needs (never called by these tests)."""
+    pkg = types.ModuleType("maxgaffer")
+    api = types.ModuleType("maxgaffer.api")
+    api.match_camera = lambda *a, **k: {"score": 1.0}
+    api.apply_camera_state = lambda camera: []
+    pkg.api = api
+    monkeypatch.setitem(sys.modules, "maxgaffer", pkg)
+    monkeypatch.setitem(sys.modules, "maxgaffer.api", api)
+    return api
 
 
 # ===================================================================== controller half (no Qt)
@@ -99,6 +126,131 @@ def test_result_dict_reads_dicts_and_objects_and_a_bare_error_string():
     assert ctl.result_dict({}) == {"camera": "", "ok": False, "packet_id": None, "errors": []}
 
 
+def test_result_dict_passes_the_send_answer_through():
+    from plate_max.actions import light, send_packet
+
+    sent = send_packet.SendResult(
+        camera="A",
+        ok=True,
+        packet_id="pkt_9",
+        status_code=202,
+        events_url="/api/v0/packets/pkt_9/events",
+        ingest="ingesting",
+        warnings=["dome swapped"],
+    )
+    out = ctl.result_dict(sent)
+    assert (
+        out["status_code"] == 202 and out["events_url"].endswith("/events") and out["ingest"] == "ingesting"
+    )
+    assert out["warnings"] == ["dome swapped"] and "preview" not in out and "code" not in out
+    relit = light.LightResult(
+        camera="A", ok=True, packet_id="pkt_10", send={"status_code": 200, "ingest": None}
+    )
+    assert ctl.result_dict(relit)["status_code"] == 200  # Light: read from its re-render
+
+
+@pytest.mark.parametrize(
+    ("result", "line", "err"),
+    [
+        (
+            {"camera": "A", "ok": True, "packet_id": "p1", "status_code": 202},
+            "S: A: Sent, ingesting (packet p1)",
+            False,
+        ),
+        (
+            {"camera": "A", "ok": True, "packet_id": "p1", "status_code": 202, "ingest": "ingested"},
+            "S: A: Sent, ingested (packet p1)",
+            False,
+        ),
+        (
+            {"camera": "A", "ok": True, "packet_id": "p1", "status_code": 200},
+            "S: A: Already sent (packet p1)",
+            False,
+        ),
+        (
+            {
+                "camera": "A",
+                "ok": False,
+                "packet_id": "p1",
+                "status_code": 202,
+                "ingest": "failed: bad EXR; no Z",
+            },
+            "S: A: Ingest failed: bad EXR; no Z",
+            True,
+        ),
+        ({"camera": "A", "ok": True, "packet_id": "p1"}, "S: A sent (packet p1)", False),
+        ({"camera": "A", "ok": False, "errors": ["x", "y"]}, "S: A FAILED: x; y", True),
+        (
+            {"camera": "__PLATE_scout_0", "ok": True, "preview": "/s/0.png"},
+            "S: __PLATE_scout_0 preview /s/0.png",
+            False,
+        ),
+    ],
+)
+def test_result_message_says_what_the_daemon_answered(result, line, err):
+    assert ctl.result_message("S", result) == (line, err)
+
+
+def test_custody_words_and_the_packet_floor():
+    assert ctl.custody_text(None) == "custody unset"
+    assert ctl.custody_text({"nda": False, "allowed_grades": ["C0"], "unset": True}) == "custody unset"
+    assert ctl.custody_text({"nda": True, "allowed_grades": ["C0", "C1"]}) == "NDA · C0, C1"
+    assert ctl.custody_text({"nda": False, "allowed_grades": ["C0", "C1", "C2", "D"]}) == "C0, C1, C2, D"
+    assert ctl.packet_custody({"nda": True, "allowed_grades": ["C0"], "root": "x"}) == {
+        "nda": True,
+        "allowed_grades": ["C0"],
+    }
+    assert ctl.packet_custody({"nda": False, "allowed_grades": ["C0"], "unset": True}) is None
+    assert ctl.packet_custody(None) is None
+
+
+# ---- the project binding: <scene>.plate.json, then config.json's project_id, then the stem
+def _save_scene(runtime, folder: Path, name: str = "Club House_v2.max") -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    runtime.maxFilePath, runtime.maxFileName = str(folder), name
+    return folder / name
+
+
+def _write_config(**keys) -> Path:
+    path = Path(os.environ["PLATE_CONFIG"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(keys), encoding="utf-8", newline="\n")
+    return path
+
+
+def test_project_binding_order_is_sidecar_then_config_then_stem(scene, tmp_path):
+    live = ctl.LiveController()
+    assert live.project_id() == "untitled"  # an unsaved scene with no config key
+    max_file = _save_scene(scene, tmp_path / "jobs")
+    live = ctl.LiveController()
+    assert live.project_id() == "club-house-v2"  # send_packet's own default: the stem slug
+    _write_config(project_id="tula_wot")
+    assert ctl.LiveController().project_id() == "tula_wot"  # a schema slug keeps its underscore
+    sidecar = max_file.with_name("Club House_v2.plate.json")
+    sidecar.write_text(json.dumps({"project_id": "abhigna", "cameras": {}}), encoding="utf-8", newline="\n")
+    assert ctl.LiveController().project_id() == "abhigna"
+    assert plate_config.project_id() == "tula_wot" and plate_config.CONFIG_KEYS[-1] == "packets_dir"
+
+
+def test_set_project_persists_in_the_scene_sidecar_and_keeps_the_recipes(scene, tmp_path):
+    from plate_max import recipes
+
+    max_file = _save_scene(scene, tmp_path / "jobs", "lobby.max")
+    recipes.set_recipe(recipes.CameraRecipe(camera="CAM_a", preset="night-relight"), max_file)
+    live = ctl.LiveController()
+    saved = live.set_project("Tula WoT")
+    assert saved == max_file.with_name("lobby.plate.json")
+    data = json.loads(saved.read_text(encoding="utf-8"))
+    assert data["project_id"] == "tula-wot" and data["cameras"]["CAM_a"]["preset"] == "night-relight"
+    assert live.project_id() == "tula-wot" and ctl.LiveController().project_id() == "tula-wot"
+    recipes.set_recipe(recipes.CameraRecipe(camera="CAM_b"), max_file)  # a recipe save keeps the binding
+    assert json.loads(saved.read_text(encoding="utf-8"))["project_id"] == "tula-wot"
+    with pytest.raises(ValueError):
+        live.set_project("  !!  ")
+    scene.maxFileName = ""  # another, unsaved scene: nowhere to write, the binding is the stem default
+    assert ctl.LiveController().set_project("adhoc") is None
+
+
 def test_fake_controller_recipes_merge_and_stay_per_camera():
     fake = ctl.FakeController()
     fake.set_recipe("CAM_main", {"engine_id": "gpt-image-2.5", "preset": "night-relight"})
@@ -144,19 +296,28 @@ class TestLiveController:
         assert report["problems"][0]["code"] == "LINT_ERROR"
         assert report["problems"][0]["node"] == "CAM_nope"
 
-    def test_capabilities_list_only_the_action_modules_that_exist(self, monkeypatch):
+    def test_capabilities_list_only_the_action_modules_that_exist(self, monkeypatch, no_gaffer):
         live = ctl.LiveController()
         monkeypatch.setattr(ctl.LiveController, "_module_exists", staticmethod(lambda name: False))
         assert live.capabilities() == set()
+        assert set(live.unavailable()) == set(ALL_CAPS)
         monkeypatch.setattr(
             ctl.LiveController, "_module_exists", staticmethod(lambda name: name.endswith("send_packet"))
         )
         assert live.capabilities() == {ctl.CAP_SEND_PACKET}
-        # Motion, Light and Scout are never reported until their actions are wired (T37/T38)
-        monkeypatch.setattr(ctl.LiveController, "_module_exists", staticmethod(lambda name: True))
+
+    def test_motion_and_scout_enable_when_their_modules_import_and_light_needs_maxgaffer(self, no_gaffer):
+        live = ctl.LiveController()  # the real plate_max.actions modules
         caps = live.capabilities()
-        assert caps == {ctl.CAP_SEND_PACKET, ctl.CAP_BATCH, ctl.CAP_RECEIVE}
-        assert not caps & {ctl.CAP_MOTION, ctl.CAP_LIGHT, ctl.CAP_SCOUT}
+        assert caps == set(ALL_CAPS) - {ctl.CAP_LIGHT}
+        why = live.unavailable()
+        assert list(why) == [ctl.CAP_LIGHT] and why[ctl.CAP_LIGHT].startswith("MAXGAFFER_MISSING")
+        [refused] = live.light("CAM_x", lambda *a: None, reference_path="ref.png")
+        assert refused["ok"] is False and refused["code"] == "MAXGAFFER_MISSING"
+
+    def test_light_enables_with_maxgaffer_installed(self, gaffer_api):
+        live = ctl.LiveController()
+        assert live.capabilities() == set(ALL_CAPS) and live.unavailable() == {}
 
     def test_an_unavailable_action_returns_a_failed_result_instead_of_raising(self, monkeypatch):
         monkeypatch.setattr(ctl.LiveController, "_module_exists", staticmethod(lambda name: False))
@@ -268,24 +429,196 @@ class TestLiveController:
         rec = ctl.LiveController()._recipe_object("CAM_a")
         assert isinstance(rec, dict) and rec["camera"] == "CAM_a"
 
-    @pytest.mark.parametrize("method", ["send_motion", "light"])
-    def test_unwired_camera_actions_refuse_loudly(self, method):
-        with pytest.raises(NotImplementedError):
-            getattr(ctl.LiveController(), method)("CAM_x", lambda *a: None)
+    def test_send_motion_reaches_the_action_with_the_hero_the_range_and_the_project(
+        self, clubhouse, monkeypatch, tmp_path
+    ):
+        packets = tmp_path / "packets"
+        _write_config(token=TOKEN, daemon_url="http://127.0.0.1:4999", packets_dir=str(packets))
+        clubhouse.animationRange = types.SimpleNamespace(
+            start=types.SimpleNamespace(frame=10), end=types.SimpleNamespace(frame=34)
+        )
+        seen = {}
 
-    def test_unwired_scout_refuses_loudly(self):
-        with pytest.raises(NotImplementedError):
-            ctl.LiveController().scout(lambda *a: None)
+        def motion_run(
+            camera, hero_packet_id, f0, f1, out_root, daemon_base=None, crossings=(), options=None
+        ):
+            seen.update(camera=camera, hero=hero_packet_id, f0=f0, f1=f1, out_root=out_root, base=daemon_base)
+            seen.update(crossings=crossings, options=options)
+            return types.SimpleNamespace(
+                camera=camera, ok=True, packet_id="pkt_motion", errors=[], status_code=202
+            )
+
+        modules = {ctl.CAP_MOTION: types.SimpleNamespace(run=motion_run)}
+        monkeypatch.setattr(ctl.LiveController, "_action", lambda self, cap: modules[cap])
+        live = ctl.LiveController()
+        [no_hero] = live.send_motion("CAM_front", lambda *a: None)
+        assert no_hero["ok"] is False and "Send Packet first" in no_hero["errors"][0] and seen == {}
+        live.note_packet("CAM_front", "pkt_hero")
+        live.set_project("tula-wot")
+        live._projects = {
+            "tula-wot": {"project_id": "tula-wot", "custody": {"nda": True, "allowed_grades": ["C0"]}}
+        }
+        [sent] = live.send_motion("CAM_front", lambda *a: None)
+        assert sent == {
+            "camera": "CAM_front",
+            "ok": True,
+            "packet_id": "pkt_motion",
+            "errors": [],
+            "status_code": 202,
+        }
+        assert (seen["camera"], seen["hero"], seen["f0"], seen["f1"]) == ("CAM_front", "pkt_hero", 10, 34)
+        assert (
+            seen["out_root"] == packets
+            and seen["base"] == "http://127.0.0.1:4999"
+            and seen["crossings"] == []
+        )
+        opts = seen["options"]
+        assert opts.project_id == "tula-wot" and opts.custody == {"nda": True, "allowed_grades": ["C0"]}
+        assert "supersedes" not in opts  # "supersedes last" is not ticked
+        live.set_supersede_last(True)
+        live.send_motion("CAM_front", lambda *a: None, hero_packet_id="pkt_other")
+        assert (
+            seen["hero"] == "pkt_other" and seen["options"]["supersedes"] == "pkt_motion"
+        )  # one id for a move
+
+    def test_light_runs_match_apply_and_rerender_through_the_light_action(self, gaffer_api, monkeypatch):
+        seen = {}
+
+        def light_run(cameras, out_root, daemon_base=None, options=None):
+            seen.update(cameras=cameras, options=options)
+            return [
+                types.SimpleNamespace(camera=cameras[0], ok=True, packet_id="pkt_relit", errors=[], send=None)
+            ]
+
+        real = ctl.LiveController._action
+        monkeypatch.setattr(
+            ctl.LiveController,
+            "_action",
+            lambda self, cap: (
+                types.SimpleNamespace(run=light_run, available=lambda: (True, ""))
+                if cap == ctl.CAP_LIGHT
+                else real(self, cap)
+            ),
+        )
+        live = ctl.LiveController()
+        [no_ref] = live.light("CAM_a", lambda *a: None)
+        assert no_ref["ok"] is False and no_ref["code"] == "NO_REFERENCE"
+        live.note_packet("CAM_a", "pkt_old")
+        [relit] = live.light(
+            "CAM_a", lambda *a: None, reference_path="/refs/dusk.jpg", locks=["sun"], deep=True
+        )
+        assert relit["ok"] and live.last_packet("CAM_a") == "pkt_relit"
+        opts = seen["options"]
+        assert seen["cameras"] == ["CAM_a"] and opts.reference_path == "/refs/dusk.jpg"
+        assert opts.locks == ["sun"] and opts.deep is True and opts.supersedes == {"CAM_a": "pkt_old"}
+
+    def test_scout_runs_the_scout_action_with_keep(self, monkeypatch):
+        seen = {}
+
+        def scout_run(out_root, daemon_base=None, options=None):
+            seen.update(out_root=out_root, options=options)
+            return [
+                types.SimpleNamespace(
+                    camera="__PLATE_scout_0", ok=True, packet_id=None, errors=[], preview="/s.png"
+                )
+            ]
+
+        monkeypatch.setattr(
+            ctl.LiveController, "_action", lambda self, cap: types.SimpleNamespace(run=scout_run)
+        )
+        monkeypatch.setattr(ctl.LiveController, "capabilities", lambda self: {ctl.CAP_SCOUT})
+        [view] = ctl.LiveController().scout(lambda *a: None, keep=True)
+        assert (
+            view["preview"] == "/s.png" and seen["options"].keep is True and "packets" not in seen["options"]
+        )
+
+    def test_options_carry_the_project_its_custody_and_supersedes_last(self, monkeypatch, scene):
+        live = ctl.LiveController()
+        live.set_project("abhigna")
+        opts = live._options(["CAM_a", "CAM_b"], lambda *a: None)
+        assert (
+            opts.project_id == "abhigna" and opts.custody is None and opts.supersedes is None
+        )  # unknown project
+        live._projects = {
+            "abhigna": {
+                "project_id": "abhigna",
+                "custody": {"nda": False, "allowed_grades": ["C0"], "unset": True},
+            }
+        }
+        assert live._options(["CAM_a"], lambda *a: None).custody is None  # unset: no floor in the packet
+        live._projects["abhigna"]["custody"] = {"nda": False, "allowed_grades": ["C0", "C1", "C2"]}
+        live.note_packet("CAM_a", "pkt_a")
+        live.set_supersede_last(True)
+        opts = live._options(["CAM_a", "CAM_b"], lambda *a: None)
+        assert opts.custody == {"nda": False, "allowed_grades": ["C0", "C1", "C2"]}
+        assert opts.supersedes == {"CAM_a": "pkt_a"}  # only the camera whose last packet is known
+
+    def test_job_options_carry_the_jobs_project_and_only_the_edited_recipes(self, scene):
+        live = ctl.LiveController()
+        live.set_recipe("CAM_a", {"preset": "night-relight"})
+        opts = live.job_options(["CAM_a", "CAM_b"], "tula-wot")
+        assert opts.project_id == "tula-wot" and set(opts.recipes) == {"CAM_a"}
+
+    def test_hero_candidates_are_the_cameras_stills_in_the_project_newest_first(self, scene, tmp_path):
+        packets = tmp_path / "packets"
+        _write_config(packets_dir=str(packets))
+        ids = sorted(new_packet_id() for _ in range(4))
+
+        def write(pid, camera="CAM_a", kind="still", project="untitled"):
+            (packets / pid).mkdir(parents=True)
+            manifest = {"packet_id": pid, "kind": kind, "project_id": project, "camera": {"name": camera}}
+            (packets / pid / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8", newline="\n")
+
+        write(ids[0])
+        write(ids[1], camera="CAM_b")
+        write(ids[2], kind="motion")
+        write(ids[3], project="elsewhere")
+        live = ctl.LiveController()
+        assert live.hero_candidates("CAM_a") == [ids[0]]
+        live.note_packet("CAM_a", "pkt_session")
+        assert live.hero_candidates("CAM_a") == ["pkt_session", ids[0]]
+
+    def test_projects_come_from_get_projects_with_the_bearer(self, stub_daemon):
+        live = ctl.LiveController()
+        heads = live.projects()
+        assert [h["project_id"] for h in heads] == ["clubhouse", "tula-wot"]
+        assert stub_daemon["auth"] == [f"Bearer {TOKEN}"]
+        assert live.project_custody("tula-wot") == {"nda": True, "allowed_grades": ["C0", "C1"]}
+        assert live.project_custody("nobody") is None
+
+    def test_make_poller_builds_the_job_poller_over_this_controller(self):
+        from plate_max import jobs
+
+        live = ctl.LiveController()
+        poller = live.make_poller(log=print)
+        assert isinstance(poller, jobs.Poller) and poller.controller is live and poller.interval_s == 5.0
+        assert ctl.FakeController().make_poller() is None  # a dock under test never polls a real daemon
 
 
 @pytest.fixture
 def stub_daemon(tmp_path):
     """A loopback http.server that answers /api/v0/health with whatever health holds; the config.json
     that conftest points PLATE_CONFIG at is told to use it."""
-    state = {"health": {"ok": True, "daemon_version": PLUGIN_VERSION, "packet_versions": ["0.1"]}}
+    state = {
+        "health": {"ok": True, "daemon_version": PLUGIN_VERSION, "packet_versions": ["0.1"]},
+        "projects": [
+            {"project_id": "clubhouse", "custody": {"nda": False, "allowed_grades": ["C0", "C1", "C2", "D"]}},
+            {"project_id": "tula-wot", "custody": {"nda": True, "allowed_grades": ["C0", "C1"]}},
+        ],
+        "auth": [],
+    }
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
+            if self.path == "/api/v0/projects":
+                state["auth"].append(self.headers.get("Authorization"))
+                raw = json.dumps(state["projects"]).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
             raw = json.dumps(state["health"]).encode("utf-8")
             self.send_response(200 if self.path == "/api/v0/health" else 404)
             self.send_header("Content-Type", "application/json")
@@ -302,7 +635,7 @@ def stub_daemon(tmp_path):
     url = f"http://127.0.0.1:{server.server_address[1]}"
     config = Path(os.environ["PLATE_CONFIG"])
     config.parent.mkdir(parents=True, exist_ok=True)
-    config.write_text(json.dumps({"daemon_url": url}), encoding="utf-8", newline="\n")
+    config.write_text(json.dumps({"daemon_url": url, "token": TOKEN}), encoding="utf-8", newline="\n")
     state["url"] = url
     try:
         yield state
@@ -709,18 +1042,324 @@ def test_receive_cancelled_does_nothing_and_a_refusal_is_shown(make_dock, monkey
     assert "Receive: not a PNG/EXR the VFB can load" in dock.log.toPlainText()
 
 
-def test_motion_light_and_scout_call_the_controller_when_wired(make_dock):
+def test_motion_light_and_scout_call_the_controller_when_wired(make_dock, monkeypatch):
     dock, fake = make_dock(capabilities=ALL_CAPS)
     select(dock, "CAM_lobby")
+    fake.last_packets["CAM_lobby"] = "pkt_hero"  # the dock sent this camera's still earlier
+    monkeypatch.setattr(dock, "_pick_reference_path", lambda: "/refs/golden_hour.jpg")
     fake.calls.clear()
     dock.btn_motion.click()
     dock.btn_light.click()
     dock.btn_scout.click()
+    dock.chk_scout_keep.setChecked(True)
+    dock.btn_scout.click()
     assert [c for c in fake.calls if c[0] in {"send_motion", "light", "scout"}] == [
-        ("send_motion", "CAM_lobby"),
-        ("light", "CAM_lobby"),
-        ("scout",),
+        ("send_motion", "CAM_lobby", "pkt_hero"),
+        ("light", "CAM_lobby", "/refs/golden_hour.jpg"),
+        ("scout", False),
+        ("scout", True),
     ]
+    assert "Send Motion: CAM_lobby from hero still pkt_hero" in dock.log.toPlainText()
+
+
+def test_light_cancelled_at_the_reference_picker_does_nothing(make_dock, monkeypatch):
+    dock, fake = make_dock(capabilities=ALL_CAPS)
+    select(dock, "CAM_main")
+    monkeypatch.setattr(dock, "_pick_reference_path", lambda: "")
+    fake.calls.clear()
+    dock.btn_light.click()
+    assert calls(fake, "light") == [] and calls(fake, "daemon_status") == []
+
+
+def test_send_motion_asks_for_the_hero_when_the_dock_has_sent_none(make_dock, monkeypatch, qt):
+    dock, fake = make_dock(capabilities=ALL_CAPS)
+    select(dock, "CAM_main")
+    dock.btn_motion.click()  # no hero anywhere: said, nothing sent
+    assert calls(fake, "send_motion") == []
+    assert "needs a hero still of CAM_main: Send Packet first" in dock.log.toPlainText()
+    fake.heroes["CAM_main"] = ["pkt_new", "pkt_old"]
+    asked = []
+
+    def get_item(parent, title, label, items, current, editable):
+        asked.append((title, list(items), editable))
+        return "pkt_old", True
+
+    monkeypatch.setattr(qt.QtWidgets.QInputDialog, "getItem", staticmethod(get_item))
+    dock.btn_motion.click()
+    assert asked == [("Hero still", ["pkt_new", "pkt_old"], True)]
+    assert calls(fake, "send_motion") == [("send_motion", "CAM_main", "pkt_old")]
+
+
+def test_the_three_camera_actions_enable_in_a_live_dock_when_their_modules_import(
+    qt, dockmod, stub_daemon, clubhouse, gaffer_api, monkeypatch
+):
+    monkeypatch.setattr(ctl.LiveController, "make_poller", lambda self, **hooks: None)
+    dock = dockmod.PlateDock(ctl.LiveController())  # the real plate_max.actions, a fake MaxGaffer
+    try:
+        select(dock, "CAM_front")
+        assert dock.btn_motion.isEnabled() and dock.btn_light.isEnabled() and dock.btn_scout.isEnabled()
+        assert dock.btn_light.toolTip() == "" and dock.chk_scout_keep.isEnabled()
+    finally:
+        dock.close()
+        dock.deleteLater()
+
+
+def test_light_without_maxgaffer_is_disabled_with_the_reason(make_dock):
+    fake = ctl.FakeController(capabilities=set(ALL_CAPS) - {ctl.CAP_LIGHT})
+    fake.unavailable_reasons = {
+        ctl.CAP_LIGHT: "MAXGAFFER_MISSING: MaxGaffer is not installed in this 3ds Max"
+    }
+    dock, _ = make_dock(fake)
+    select(dock, "CAM_main")
+    dock._refresh_buttons()
+    assert dock.btn_motion.isEnabled() and dock.btn_scout.isEnabled()
+    assert not dock.btn_light.isEnabled() and dock.btn_light.toolTip().startswith("MAXGAFFER_MISSING")
+
+
+def test_engine_and_preset_are_labelled_hints_that_are_not_sent(make_dock, qt):
+    dock, _ = make_dock()
+    form = dock.cb_engine.parentWidget().layout()
+    labels = [
+        w.text()
+        for w in dock.findChildren(qt.QtWidgets.QLabel)
+        if w.buddy() in (dock.cb_engine, dock.cb_preset) or w.text().endswith("(not sent)")
+    ]
+    assert "Engine hint (not sent)" in labels and "Preset hint (not sent)" in labels, (form, labels)
+    assert "not sent" in dock.cb_engine.toolTip() and "Make bar" in dock.cb_preset.toolTip()
+
+
+# ---- the Project combo
+def test_the_project_combo_lists_the_daemon_projects_and_binds_the_scene(make_dock):
+    dock, fake = make_dock()
+    items = [dock.cb_project.itemText(i) for i in range(dock.cb_project.count())]
+    assert items == ["clubhouse", "tula-wot"] and dock.cb_project.currentText() == "clubhouse"
+    assert dock.lbl_custody.text() == "C0, C1, C2"
+    fake.calls.clear()
+    dock.cb_project.setCurrentIndex(dock.cb_project.findData("tula-wot"))
+    assert calls(fake, "set_project") == [("set_project", "tula-wot")] and fake.bound_project == "tula-wot"
+    assert dock.lbl_custody.text() == "NDA · C0, C1"
+    assert "Project: tula-wot (this scene is unsaved" in dock.log.toPlainText()
+    dock.cb_project.setEditText("Night Shoot 2")  # a new project typed in: slugged, then bound
+    dock.cb_project.lineEdit().editingFinished.emit()
+    assert fake.bound_project == "night-shoot-2" and dock.cb_project.currentText() == "night-shoot-2"
+    dock.cb_project.setEditText("!!!")
+    dock.cb_project.lineEdit().editingFinished.emit()
+    assert fake.bound_project == "night-shoot-2" and "not a project id" in dock.log.toPlainText()
+    assert dock.cb_project.currentText() == "night-shoot-2"
+
+
+def test_an_unreachable_daemon_leaves_the_binding_shown(make_dock):
+    fake = ctl.FakeController()
+    fake.projects_error = OSError("connection refused")
+    dock, _ = make_dock(fake)
+    assert dock.cb_project.currentText() == "clubhouse" and "connection refused" in dock.cb_project.toolTip()
+
+
+def test_the_project_combo_persists_to_the_scene_sidecar(
+    qt, dockmod, stub_daemon, clubhouse, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ctl.LiveController, "make_poller", lambda self, **hooks: None)
+    max_file = _save_scene(clubhouse, tmp_path / "jobs", "clubhouse.max")
+    dock = dockmod.PlateDock(ctl.LiveController())
+    try:
+        assert [dock.cb_project.itemText(i) for i in range(dock.cb_project.count())] == [
+            "clubhouse",
+            "tula-wot",
+        ]
+        dock.cb_project.setCurrentIndex(dock.cb_project.findData("tula-wot"))
+        sidecar = max_file.with_name("clubhouse.plate.json")
+        assert json.loads(sidecar.read_text(encoding="utf-8"))["project_id"] == "tula-wot"
+        assert dock.lbl_custody.text() == "NDA · C0, C1"
+        again = dockmod.PlateDock(ctl.LiveController())  # the next session reads the binding back
+        assert again.cb_project.currentText() == "tula-wot"
+        again.close()
+        again.deleteLater()
+    finally:
+        dock.close()
+        dock.deleteLater()
+
+
+def test_send_motion_from_the_dock_reaches_the_action_with_the_project_from_the_combo(
+    qt, dockmod, stub_daemon, clubhouse, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ctl.LiveController, "make_poller", lambda self, **hooks: None)
+    _save_scene(clubhouse, tmp_path / "jobs", "clubhouse.max")
+    seen = {}
+
+    def motion_run(camera, hero_packet_id, f0, f1, out_root, daemon_base=None, crossings=(), options=None):
+        seen.update(camera=camera, hero=hero_packet_id, options=options, base=daemon_base)
+        return {"camera": camera, "ok": True, "packet_id": "pkt_move", "errors": [], "status_code": 202}
+
+    real_action = ctl.LiveController._action
+    monkeypatch.setattr(
+        ctl.LiveController,
+        "_action",
+        lambda self, cap: (
+            types.SimpleNamespace(run=motion_run) if cap == ctl.CAP_MOTION else real_action(self, cap)
+        ),
+    )
+    live = ctl.LiveController()
+    dock = dockmod.PlateDock(live)
+    try:
+        select(dock, "CAM_front")
+        assert dock.btn_motion.isEnabled()  # the real send_motion module imports
+        dock.cb_project.setCurrentIndex(dock.cb_project.findData("tula-wot"))
+        live.note_packet("CAM_front", "pkt_hero")
+        dock.btn_motion.click()
+        assert seen["camera"] == "CAM_front" and seen["hero"] == "pkt_hero"
+        assert seen["options"].project_id == "tula-wot"
+        assert seen["options"].custody == {"nda": True, "allowed_grades": ["C0", "C1"]}
+        assert seen["base"] == stub_daemon["url"]
+        assert "Send Motion: CAM_front: Sent, ingesting (packet pkt_move)" in dock.log.toPlainText()
+    finally:
+        dock.close()
+        dock.deleteLater()
+
+
+# ---- what a send says
+def test_send_answers_say_sent_ingesting_already_sent_or_ingest_failed(make_dock):
+    dock, fake = make_dock()
+    fake.results = [
+        {
+            "camera": "CAM_main",
+            "ok": True,
+            "packet_id": "p1",
+            "errors": [],
+            "status_code": 202,
+            "ingest": "ingesting",
+        },
+        {"camera": "CAM_lobby", "ok": True, "packet_id": "p2", "errors": [], "status_code": 200},
+        {
+            "camera": "CAM_terrace",
+            "ok": False,
+            "packet_id": "p3",
+            "errors": ["ingest: failed: Z missing"],
+            "status_code": 202,
+            "ingest": "failed: Z missing",
+            "warnings": ["the VFB had a LUT"],
+        },
+    ]
+    select(dock, "CAM_main")
+    dock._on_send()
+    text = dock.log.toPlainText()
+    assert "Send Packet: CAM_main: Sent, ingesting (packet p1)" in text
+    assert "Send Packet: CAM_lobby: Already sent (packet p2)" in text
+    assert "Send Packet: CAM_terrace: Ingest failed: Z missing" in text
+    assert "Send Packet: CAM_terrace: the VFB had a LUT" in text
+
+
+def test_an_unset_custody_shows_in_amber_after_a_send(make_dock, dockmod):
+    fake = ctl.FakeController()
+    fake.bound_project = "new-job"  # not on the daemon yet: the first packet creates it, custody unset
+    dock, _ = make_dock(fake)
+    assert dock.lbl_custody.text() == "custody unset"
+    select(dock, "CAM_main")
+    dock._on_send()
+    assert dock.lbl_custody.text() == "custody unset (C0 only)"
+    assert dockmod.WARN in dock.lbl_custody.styleSheet()
+    assert "only C0 (local) engines run" in dock.log.toPlainText()
+    fake.bound_project = "clubhouse"
+    dock.sync_project()
+    dock._on_send()
+    assert dock.lbl_custody.text() == "C0, C1, C2" and dockmod.WARN not in dock.lbl_custody.styleSheet()
+
+
+def test_supersedes_last_reaches_the_controller(make_dock):
+    dock, fake = make_dock()
+    dock.chk_supersedes.setChecked(True)
+    dock.chk_supersedes.setChecked(False)
+    assert calls(fake, "set_supersede_last") == [("set_supersede_last", True), ("set_supersede_last", False)]
+
+
+# ---- the canvas-job poller's lifecycle
+class FakePoller:
+    def __init__(self):
+        self.starts: list = []
+        self.stops = 0
+        self.active = False
+        self._running = False
+
+    def start(self, timer):
+        self.starts.append(timer)
+        self._running = True
+        return True
+
+    def stop(self):
+        self.stops += 1
+        self._running = False
+
+    @property
+    def running(self):
+        return self._running
+
+
+def test_the_poller_starts_with_the_dock_and_stops_when_it_closes(make_dock, qt):
+    fake = ctl.FakeController()
+    fake.poller = FakePoller()
+    dock, _ = make_dock(fake)
+    assert set(fake.poller_hooks) == {"log", "busy", "on_start", "on_finish"}
+    assert len(fake.poller.starts) == 1 and isinstance(fake.poller.starts[0], qt.QtCore.QTimer)
+    assert fake.poller.starts[0].parent() is dock and dock.lbl_jobs.text() == "canvas jobs: on"
+    dock.close()
+    assert fake.poller.stops == 1 and not fake.poller.running
+    assert dock.lbl_jobs.text() == "canvas jobs: off (dock closed)"
+
+
+def test_the_poller_follows_the_dock_widget_around_the_page(qt, dockmod):
+    fake = ctl.FakeController()
+    fake.poller = FakePoller()
+    holder = qt.QtWidgets.QDockWidget("PLATE")
+    page = dockmod.PlateDock(fake, holder)
+    holder.setWidget(page)
+    try:
+        holder.show()
+        qt.app.processEvents()
+        assert fake.poller.running
+        holder.close()  # the artist closes the dock: no more canvas jobs
+        qt.app.processEvents()
+        assert not fake.poller.running and fake.poller.stops >= 1
+        holder.show()
+        qt.app.processEvents()
+        assert fake.poller.running
+    finally:
+        holder.close()
+        holder.deleteLater()
+
+
+def test_a_canvas_job_holds_the_dock_busy_and_a_click_meanwhile_is_refused(make_dock):
+    fake = ctl.FakeController()
+    fake.poller = FakePoller()
+    dock, _ = make_dock(fake)
+    hooks = fake.poller_hooks
+    assert hooks["busy"]() is False
+    job = {"id": "job_1", "action": "light.match", "camera": "CAM_main", "packet_id": "pkt_1"}
+    hooks["on_start"](job)
+    assert dock._busy and not dock.btn_send.isEnabled() and hooks["busy"]() is True
+    select(dock, "CAM_main")
+    fake.calls.clear()
+    dock._on_send()  # the dock is busy with the job: ignored
+    assert calls(fake, "send_packet") == []
+    hooks["on_finish"](job, {"ok": True, "packet_id": "pkt_2"})
+    assert not dock._busy and dock.btn_send.isEnabled()
+    assert "Canvas job light.match CAM_main" in dock.log.toPlainText()
+    assert "Canvas job light.match: done (packet pkt_2)" in dock.log.toPlainText()
+    fake.poller.active = True  # a tick is talking to the daemon right now
+    dock._on_send()
+    assert (
+        calls(fake, "send_packet") == [] and "a canvas job is talking to the daemon" in dock.log.toPlainText()
+    )
+    fake.poller.active = False
+    hooks["on_finish"](job, {"ok": False, "detail": "MAXGAFFER_MISSING: no MaxGaffer"})
+    assert "Canvas job light.match FAILED: MAXGAFFER_MISSING: no MaxGaffer" in dock.log.toPlainText()
+
+
+def test_the_poller_waits_while_a_daemon_call_spins_events(make_dock):
+    fake = ctl.FakeController()
+    fake.poller = FakePoller()
+    dock, _ = make_dock(fake)
+    seen = []
+    dock._run_blocking_io(lambda: seen.append(fake.poller_hooks["busy"]()))
+    assert seen == [True] and fake.poller_hooks["busy"]() is False
 
 
 def test_run_lint_with_no_selection_returns_false(make_dock):
@@ -786,6 +1425,56 @@ def test_progress_callback_drives_the_bar_and_the_log(make_dock):
     assert "two of four" in dock.log.toPlainText()
     dock._progress(0, 0, "")  # unknown total: busy indicator
     assert dock.bar.maximum() == 0
+
+
+def test_max_main_window_is_none_off_max(dockmod, monkeypatch):
+    monkeypatch.setitem(sys.modules, "qtmax", None)
+    assert dockmod.max_main_window() is None
+    marker = object()
+    monkeypatch.setitem(sys.modules, "qtmax", types.SimpleNamespace(GetQMaxMainWindow=lambda: marker))
+    assert dockmod.max_main_window() is marker
+
+
+def test_show_dock_opens_plate_as_a_tab_of_the_shared_dock(dockmod, qt):
+    from plate_max import shared
+
+    fake = ctl.FakeController()
+    page = dockmod.show_dock(fake)
+    try:
+        host = shared.get_host()
+        assert isinstance(page, dockmod.PlateDock) and host.widget("plate") is page
+        assert host.dock.objectName() == shared.DOCK_OBJECT_NAME and host.tab_titles() == ["PLATE"]
+        assert shared.get_mux().subscribers("filePostOpen") == ["plate"]  # PLATE_ON: refresh the cameras
+        assert dockmod.show_dock(fake) is page and host.builds == {"plate": 1}
+        assert dockmod.show_dock(fake, standalone=True) is page  # never a twin PLATE window
+    finally:
+        dockmod.close_dock()
+    assert shared.get_host().dock is None and shared.get_host().panels() == []
+
+
+def test_bootstrap_launch_goes_through_the_shared_dock(dockmod, qt):
+    from plate_max import shared
+
+    bootstrap.reset()
+    fake = ctl.FakeController()
+    try:
+        page = bootstrap.launch(fake)
+        assert page is shared.get_host().widget("plate") and isinstance(page, dockmod.PlateDock)
+    finally:
+        bootstrap.reset()
+        dockmod.close_dock()
+
+
+def test_the_standalone_dock_stays_behind_the_env_switch(dockmod, qt, monkeypatch):
+    from plate_max import shared
+
+    monkeypatch.setenv(dockmod.STANDALONE_ENV, "1")
+    page = dockmod.show_dock(ctl.FakeController())
+    try:
+        assert isinstance(page, dockmod.PlateDock) and page.isVisible()
+        assert shared.get_host().widget("plate") is None
+    finally:
+        dockmod.close_dock()
 
 
 def test_show_dock_is_a_singleton_and_close_dock_resets_it(dockmod, qt):

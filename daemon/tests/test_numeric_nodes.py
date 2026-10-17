@@ -293,11 +293,15 @@ def test_set_on_room_a_and_room_b_is_consistent(env):
     cross = _check(report, "set.cross_view_de00_p90")
     assert cross["status"] == "pass" and cross["value"] <= 3.0
     assert report["metrics"]["cross_view_p90"] <= 3.0 and report["metrics"]["n_corr"] >= 500
-    assert _check(report, "set.outside_corrected_px") == {
-        "metric_id": "set.outside_corrected_px",
-        "value": 0.0,
-        "status": "pass",
-    }
+    # T60 added threshold/op/unit to every check (null for ids outside the threshold set).
+    assert (
+        _check(report, "set.outside_corrected_px").items()
+        >= {
+            "metric_id": "set.outside_corrected_px",
+            "value": 0.0,
+            "status": "pass",
+        }.items()
+    )
     assert (
         report["report_path"].startswith("gates/")
         and (env.pipeline.project_dir(PROJECT) / report["report_path"]).is_file()

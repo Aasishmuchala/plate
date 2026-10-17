@@ -6,6 +6,8 @@ with the bearer (the token check, and the packets folders the daemon reads); pos
 answer (packet version and daemon version). hash_files() / hash_payloads() are POST /api/v0/hash:
 Max's Python has no BLAKE3, so the loopback daemon hashes for the plugin (BUILD_PLAN decision 5b).
 follow_ingest() reads a packet's events_url after a 202 until the ingest ends or a few seconds pass.
+get_json() / post_json() / get_bytes() are the bearer calls the dock and its job poller make to the
+rest of the API (GET /api/v0/projects, GET and POST /api/v0/plugin/jobs..., GET /api/v0/assets/{hash}).
 Standard library urllib only, with proxies switched off: the daemon is 127.0.0.1 and a system proxy
 must never see the token. Status handling: 200/202/409/422/426 are returned for the dock to show; 401
 raises Unauthorized; a dead daemon raises DaemonUnreachable and a silent one DaemonTimeout (a kind of
@@ -45,6 +47,11 @@ FOLLOW_INTERVAL_S = 1.0
 FOLLOW_REQUEST_TIMEOUT_S = 3.0
 INGEST_DONE = "ingest.done"
 INGEST_FAILED = "ingest.failed"
+API_PREFIX = "/api/v0"
+JSON_TIMEOUT_S = 5.0
+JSON_OK_STATUS = (200, 201)
+BYTES_TIMEOUT_S = 120.0
+BYTES_MAX = 512 * 1024 * 1024  # a reference picture; anything larger is not one
 
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -406,3 +413,115 @@ def follow_ingest(
         if clock() + interval_s > deadline:
             return {"ingest": "ingesting", "problem": None}
         sleep(interval_s)
+
+
+# --------------------------------------------------------------------------- the rest of the API
+
+
+def api_path(path: str) -> str:
+    """A daemon route as an absolute path: "/api/v0/projects" stays as it is, "projects" and
+    "/projects" get the /api/v0 prefix."""
+    text = "/" + str(path).lstrip("/")
+    return text if text.startswith("/api/") else API_PREFIX + text
+
+
+def _query_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value)
+
+
+def _with_query(path: str, params: Mapping[str, Any] | None) -> str:
+    if not params:
+        return path
+    pairs = [(str(k), _query_value(v)) for k, v in params.items() if v is not None]
+    if not pairs:
+        return path
+    return path + ("&" if "?" in path else "?") + urllib.parse.urlencode(pairs)
+
+
+def _json_answer(status: int, body: Any) -> Any:
+    if status == 401:
+        raise Unauthorized(f"daemon rejected the token ({body})")
+    if status not in JSON_OK_STATUS:
+        raise UnexpectedStatus(status, body)
+    return body
+
+
+def get_json(
+    path: str,
+    config: Mapping[str, Any],
+    timeout_s: float = JSON_TIMEOUT_S,
+    params: Mapping[str, Any] | None = None,
+) -> Any:
+    """GET <daemon><path>[?params] with the bearer: the decoded JSON of a 200. No token or 401
+    raises Unauthorized (no token never touches the network), any other status UnexpectedStatus,
+    a dead daemon DaemonUnreachable (DaemonTimeout for a silent one). params: None values are left
+    out, True/False are sent as 1/0."""
+    req = urllib.request.Request(
+        _url(_daemon_url(config), _with_query(api_path(path), params)),
+        headers={"Authorization": f"Bearer {_token(config)}", "Accept": "application/json"},
+    )
+    status, body = _request(req, timeout_s)
+    return _json_answer(status, body)
+
+
+def post_json(path: str, body: Any, config: Mapping[str, Any], timeout_s: float = JSON_TIMEOUT_S) -> Any:
+    """POST body as JSON to <daemon><path> with the bearer: the decoded answer of a 200 or 201,
+    with the errors get_json raises. A body holding NaN or infinity raises ValueError before
+    anything is sent (the daemon would refuse it)."""
+    data = json.dumps(body, allow_nan=False).encode("utf-8")
+    req = urllib.request.Request(
+        _url(_daemon_url(config), api_path(path)),
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {_token(config)}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    status, answer = _request(req, timeout_s)
+    return _json_answer(status, answer)
+
+
+def get_bytes(
+    path: str,
+    config: Mapping[str, Any],
+    timeout_s: float = BYTES_TIMEOUT_S,
+    params: Mapping[str, Any] | None = None,
+    max_bytes: int = BYTES_MAX,
+) -> tuple[bytes, str]:
+    """GET a binary route (GET /api/v0/assets/{hash}) with the bearer: (bytes, Content-Type) of a
+    200. 401 raises Unauthorized, any other status UnexpectedStatus (with the JSON error body), an
+    answer longer than max_bytes TransportError, a dead daemon DaemonUnreachable."""
+    req = urllib.request.Request(
+        _url(_daemon_url(config), _with_query(api_path(path), params)),
+        headers={"Authorization": f"Bearer {_token(config)}"},
+    )
+    try:
+        with _opener.open(req, timeout=timeout_s) as resp:
+            status = resp.status
+            content_type = str(resp.headers.get("Content-Type") or "")
+            data = resp.read(int(max_bytes) + 1)
+    except urllib.error.HTTPError as exc:
+        try:
+            status, body = exc.code, _decode(exc.read())
+        finally:
+            exc.close()
+        if status == 401:
+            raise Unauthorized(f"daemon rejected the token ({body})") from None
+        raise UnexpectedStatus(status, body) from None
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise DaemonTimeout(f"{req.full_url}: timed out after {timeout_s:g} s") from exc
+        raise DaemonUnreachable(f"{req.full_url}: {exc}") from exc
+    except TimeoutError as exc:
+        raise DaemonTimeout(f"{req.full_url}: timed out after {timeout_s:g} s") from exc
+    except OSError as exc:
+        raise DaemonUnreachable(f"{req.full_url}: {exc}") from exc
+    if status != 200:
+        raise UnexpectedStatus(status, {"raw": data[:300].decode("utf-8", errors="replace")})
+    if len(data) > max_bytes:
+        raise TransportError(f"{req.full_url}: the answer is over {max_bytes} bytes")
+    return data, content_type

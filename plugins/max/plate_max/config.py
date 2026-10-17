@@ -6,8 +6,10 @@ Resolves the same folder the daemon does: PLATE_HOME if set, else %LOCALAPPDATA%
 file and PLATE_TOKEN_FILE names a file holding only the token, which wins over config.json's token.
 There is one config.json for the daemon and the plugin, keys token, daemon_url, repo_path (the clone
 the startup script puts on sys.path) and packets_dir (a drive or UNC path); the file is created by
-the daemon (or the installer), the plugin reads it and may add its own keys. Seed: MaxGaffer's
-maxbridge/config.py (stdlib settings under %LOCALAPPDATA%).
+the daemon (or the installer), the plugin reads it and may add its own keys. The plugin also reads
+an optional project_id: the project a scene sends into when its <scene>.plate.json names none (the
+dock's binding order is the scene sidecar, then this key, then the .max file's stem). Seed:
+MaxGaffer's maxbridge/config.py (stdlib settings under %LOCALAPPDATA%).
 """
 
 from __future__ import annotations
@@ -24,6 +26,9 @@ DEFAULT_DAEMON_URL = "http://127.0.0.1:4610"
 TOKEN_FILE_ENV = "PLATE_TOKEN_FILE"
 # The keys config.json is documented to hold; any other key a caller saves is kept as it is.
 CONFIG_KEYS = ("token", "daemon_url", "repo_path", "packets_dir")
+PROJECT_KEY = "project_id"
+# Keys the plugin reads when they are there; nothing requires them and the daemon never writes them.
+OPTIONAL_KEYS = (PROJECT_KEY,)
 
 
 def app_data_dir() -> Path:
@@ -102,3 +107,13 @@ def packets_dir(cfg: dict[str, Any] | None = None) -> Path:
     cfg = load_config() if cfg is None else cfg
     configured = cfg.get("packets_dir")
     return Path(configured) if configured else app_data_dir() / "packets"
+
+
+def project_id(cfg: dict[str, Any] | None = None) -> str | None:
+    """config.json's optional project_id, stripped; None when it is absent, empty or not a string
+    (the dock then falls back to the .max file's stem)."""
+    cfg = load_config() if cfg is None else cfg
+    value = cfg.get(PROJECT_KEY)
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None

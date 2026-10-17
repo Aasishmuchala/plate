@@ -8,7 +8,7 @@
 |---|---|
 | `__init__.py` | `PLUGIN_VERSION`, `PACKET_VERSION` (`0.1.1`, the `X-Plate-Packet-Version` header and `manifest.packet_version`), `SENDER` |
 | `rt.py` | `runtime()` (lazy pymxs, or the injected fake), `set_runtime()` |
-| `config.py` | app-data folder, `config.json` load/save, `packets_dir()` |
+| `config.py` | app-data folder, `config.json` load/save, `packets_dir()`, the optional `project_id()` |
 | `fsutil.py` | temp-then-`os.replace` writes with retry, the JSON byte form, canonical JSON for hashing |
 | `digest.py` | `camera_digest`, `scene_digest`, `scene_hash`, `scene_nodes`, `scene_globals`, the Max-matrix conversion |
 | `legend.py` | murmur3 and the Cryptomatte hash, `build_id_legend` |
@@ -18,13 +18,15 @@
 | `packet_id.py` | `new_packet_id()` (`pkt_` + ULID) |
 | `packet.py` | `build_camera_block`, `build_manifest`, `write_packet`, the hash-payload helpers |
 | `exr_header.py` | reads V-Ray's multilayer EXR header, Cryptomatte manifests and rank-0 coverage (the legend's `pixel_share`) with the standard library only |
-| `transport.py` | `handshake`, `post_packet` |
+| `transport.py` | `handshake`, `session`, `post_packet`, `follow_ingest`, `hash_files` / `hash_payloads`, and the bearer calls `get_json`, `post_json`, `get_bytes` |
+| `jobs.py` | the dock's job poller: claims the canvas's plugin jobs (`light.match`, `light.vantage_preview`, `scout`), runs them in the open scene and answers |
 | `kit_ingest.py` | turns the client packet kit's folder plus the client's plate into a Tier A packet |
 | `scout_poses.py` | pure geometry for the Scout action's temporary cameras |
-| `bootstrap.py` | `register_macro` (the `PLATE_Dock` macro) and `launch()`; Qt is imported lazily |
+| `bootstrap.py` | `register_macro` (the `PLATE_Dock` macro) and `launch()`, which opens PLATE's tab of the shared dock through `ui/dock.show_dock()`; Qt is imported lazily |
+| `shared/` | the shared Max bridge: one dock with a tab per tool, one set of Max callbacks, the PySide6 collision guard (`plugins/max/SHARED_BRIDGE.md`) |
 | `bridge/` | every pymxs touch: `scene`, `colour`, `elements`, `render`, `motion`, `safety` (backup, one undo record, journal), `hashing` (BLAKE3 from the daemon), `vantage` |
 | `actions/` | Send Packet, Batch Cameras, Send Motion, Light (MaxGaffer), Scout, Receive |
-| `ui/` | the PySide6 dock (`dock.py`) over a controller (`controller.py`) that a fake replaces in tests; Qt is allowed only here |
+| `ui/` | the PySide6 dock (`dock.py`, plus `max_main_window()`) over a controller (`controller.py`: actions, project binding, the poller's factory) that a fake replaces in tests; Qt is allowed only here |
 
 ## Camera convention (`plate-cam-v0`)
 
@@ -50,7 +52,7 @@ Locked by default. A node is editable only when **all** of these hold: its layer
 
 The schema wants BLAKE3 for every file, for `scene_hash`, for `view_hash` and for every legend `digest`, and BLAKE3 is not in the standard library or in Max's Python. The plugin therefore never computes one: it asks the loopback daemon (`POST /api/v0/hash`, token-authenticated, paths confined to the packets folder, payload bytes accepted for the small JSON documents; `bridge/hashing.py`) and the daemon **rehashes everything again on ingest**, so a wrong hash can only get a packet refused, never accepted. `file_ref(...)`, `build_manifest(scene_hash=, view_hash=)` and `build_id_legend(digest_fn=)` take values (or the hash function) from the caller, and the tests supply them with the dev venv's `blake3`. The helpers give the caller the exact bytes to hash: `legend_bytes`, `camera_frames_bytes`, `scene_hash_payload`, `view_hash_payload`. Rejected alternatives: a `sha256` option in the schema (two algorithms forever) and a pure-Python BLAKE3 inside Max (minutes per 400 MB EXR).
 
-Digest formats are interim (`digest_version` `0`): `scene_hash` covers the `.max` file's name, size and mtime (`file-meta-v0`); a node's `digest` covers its name, layer, material, tags and `objecttransform`; a material's covers its name; `view_hash` covers the camera block, the colour block, the pixel-affecting render settings (sampler, noise threshold, max subdivs, denoiser; not timings), `scene_globals()` (light names, classes, transforms, on/multiplier; environment map; renderer) and the node digests. Mesh topology, shader parameters and full light parameters join in digest version 1 (P0). Until then an edited material parameter or mesh does not change a digest.
+Digest formats: `scene_hash` is `content-v1` (`digest_version` `1`): one canonical text line per geometry node, light, the environment, the units and the render setup, sorted, written into the packet as `scene_digest.txt` and hashed by path; a scene with no digest lines falls back to `file-meta-v0` (the `.max` file's name, size and mtime, `digest_version` `0`). The rest is still the interim `digest_version` `0`: a node's `digest` covers its name, layer, material, tags and `objecttransform`; a material's covers its name; `view_hash` covers the camera block, the colour block, the pixel-affecting render settings (sampler, noise threshold, max subdivs, denoiser; not timings), `scene_globals()` (light names, classes, transforms, on/multiplier; environment map; renderer) and the node digests. Shader parameters and full light parameters are not in those yet, so an edited material parameter does not change a legend digest or the `view_hash`.
 
 ## Writing a packet
 
@@ -76,7 +78,7 @@ transport.post_packet(that_folder, config.load_config())
 
 | daemon answer | `post_packet` | the dock shows |
 |---|---|---|
-| 202 `{packet_id, status: ingesting, events_url}` | returns `status_code 202` | "Sent, ingesting" with a link to the events stream |
+| 202 `{packet_id, status: ingesting, events_url}` | returns `status_code 202`; Send follows `events_url` for up to 5 s | "Sent, ingesting", "Sent, ingested", or "Ingest failed: <errors>" |
 | 200 `{status: known}` | returns 200 | "Already sent" (idempotent re-send) |
 | 409 | returns 409 | "This packet id exists with different content: rebuild the packet" |
 | 422 `{errors: [...]}` | returns 422 | the error list from `validate_packet_dir` |
@@ -87,7 +89,32 @@ transport.post_packet(that_folder, config.load_config())
 
 ## `config.json`
 
-`%LOCALAPPDATA%\Plate\config.json` on Windows, `~/Library/Application Support/Plate/config.json` on macOS (`~/.local/share/Plate` elsewhere). `PLATE_HOME` moves the folder, `PLATE_CONFIG` names the file. Keys: `token`, `daemon_url` (default `http://127.0.0.1:4610`), optional `project_id`, `packets_dir` (a drive or UNC path; default `<app-data>\packets`), `repo_path` (written by the installer), and `plate_max_installed_keys` (the installer's record for uninstall). The daemon creates the file when it is missing; the installer writes it BOM-less so Python's `json` reads it.
+`%LOCALAPPDATA%\Plate\config.json` on Windows, `~/Library/Application Support/Plate/config.json` on macOS (`~/.local/share/Plate` elsewhere). `PLATE_HOME` moves the folder, `PLATE_CONFIG` names the file. Keys: `token`, `daemon_url` (default `http://127.0.0.1:4610`), optional `project_id` (the fallback project of a scene whose `<scene>.plate.json` names none), `packets_dir` (a drive or UNC path; default `<app-data>\packets`), `repo_path` (written by the installer), and `plate_max_installed_keys` (the installer's record for uninstall). The daemon creates the file when it is missing; the installer writes it BOM-less so Python's `json` reads it. The poller caches reference pictures under `<app-data>\cache\references\<hash>.<ext>`.
+
+## The dock
+
+`PLATE_Dock` (the macro) calls `bootstrap.launch()`, which calls `ui/dock.show_dock()`: PLATE opens as the `PLATE` tab of the shared dock (`shared.launch_plate(controller, parent=max_main_window())`, one `PlateSharedDock` for PLATE, MaxDirector and MaxGaffer; see `plugins/max/SHARED_BRIDGE.md`). A second click raises the same dock and tab. `PLATE_STANDALONE_DOCK=1` opens the old floating `PlateDock` instead, for side-by-side checks on the box; only one PLATE dock is ever open.
+
+- **Project.** The combo lists the daemon's projects (`GET /api/v0/projects`). Pick one, or type a new id (it is slugged; a first packet creates the project on the daemon with custody unset). The choice is kept in `<scene>.plate.json` next to the `.max` file under `project_id`, next to the recipes. Without one, the binding is `config.json`'s `project_id`, then the `.max` file's stem as a slug. An unsaved scene keeps the choice until another scene opens. Every send carries `project_id`, and `custody` (`{nda, allowed_grades}`) once the project's custody is set. The label beside the combo shows the custody. After a send to a project whose custody is unset it turns amber: `custody unset (C0 only)`, because only local C0 engines run until someone sets it in the canvas's Project panel.
+- **Recipe.** Engine and Preset are labelled `hint (not sent)`: they never leave Max, and the canvas's Make bar picks the engine.
+- **Send Packet / Batch Cameras.** Health and version check, lint, then the send. The log says `Sent, ingesting`, `Sent, ingested`, `Already sent` or `Ingest failed: …` per camera. Tick `supersedes last` to make each new packet supersede the camera's last packet sent from this dock (approved layers carry over where the IDs are unchanged).
+- **Send Motion.** The focused camera's move over the scene's animation range, as a motion packet of its hero still: the last still this dock sent of the camera, else one the artist picks from the camera's stills of this project in the packets folder (newest first; a packet id can be pasted).
+- **Light.** Asks for a reference picture, then MaxGaffer's match for the focused camera, the best state applied, and a re-rendered packet that supersedes the camera's last one (`actions.light.run`: `light.match`, `apply`, `rerender_packet`). Without MaxGaffer in this Max the button is disabled and its tooltip starts with `MAXGAFFER_MISSING`.
+- **Scout.** The scout poses as temporary `__PLATE_scout_N` cameras with low-resolution V-Ray previews; tick `keep scout cameras` to leave them in the scene. No packet is made from the dock's Scout: a scout pose becomes a plate only when it is sent.
+
+## Canvas jobs (`jobs.py`)
+
+A Light or Scout node on the canvas cannot run in the daemon: it queues a plugin job, and the dock's poller picks it up. The poller runs on the dock's `QTimer` every 5 s. It starts with the dock and stops when the dock closes, so canvas jobs reach Max only while the dock is open (`canvas jobs: on` in the progress card).
+
+| step | what happens |
+|---|---|
+| claim | `GET /api/v0/plugin/jobs?claim=1&since=<cursor>&limit=1`: one job at a time; the others stay queued |
+| `light.match` | the reference picture `GET /api/v0/assets/{reference_hash}` into the cache (once per hash), then `light.match` with the job's `locks` and `deep`, `apply`, and `rerender_packet` with `supersedes` = the job's packet, sent into the job's project |
+| `light.vantage_preview` | `light.vantage_preview(camera)`: the camera into the viewport, the Vantage live link toggled |
+| `scout` | `actions.scout.run` with views `0..count-1` and `keep`; kept cameras are also sent as full packets |
+| answer | `POST /api/v0/plugin/jobs/{id}/result {ok, detail?, packet_id?, metrics?, poses?, packets?}` |
+
+A failing or raising action answers `ok: false` with the text, and nothing reaches Max as an exception. A Light or Scout job whose packet came from a different `.max` than the open one fails with that reason, so the wrong scene is never relit. A job also fails when MaxGaffer is missing, the camera is not in the scene, or the reference cannot be fetched. While a job runs the dock is busy, and a tick waits while the artist is in an action, a daemon call is in flight, or a dialog is open. An answer the daemon missed is posted again first on the next tick. A daemon that does not answer is asked less and less often, down to once a minute, and the error is logged once.
 
 ## Install and uninstall (PowerShell, Windows)
 
@@ -109,7 +136,8 @@ powershell -ExecutionPolicy Bypass -File plugins\max\scripts\uninstall.ps1
 ## What is not done
 
 - Everything under "Unverified on a Max box" and `plugins/max/ONBOX.md`: candidate property names for V-Ray and Vantage, the colour manager API, `vfbControl` commands for Receive, the live-link entry points.
+- On the box: a Light match queued from the canvas reaches Max through the poller, re-renders and supersedes the old packet; Send Motion from the dock on a 25-frame move; the poller's `QTimer` keeps ticking while the dock is a background tab of the shared dock.
 - `ENT_` entourage classes beyond the single `furniture` class.
 - Digest version 1 (mesh topology, shader parameters, full light parameters in `scene_hash`/`view_hash`): until then an edited material parameter or mesh does not change a digest.
-- The shared dock host that lets PLATE, MaxDirector and MaxGaffer share one dock and one set of callbacks (`plugins/max/SHARED_BRIDGE.md`), adopted in the other two repos by a small adapter each.
+- MaxDirector and MaxGaffer joining the shared dock: PLATE opens through it, the other two need the small adapter in their own repos (`plugins/max/SHARED_BRIDGE.md`).
 - A Max 2027 or Blender sender (a later phase).

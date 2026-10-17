@@ -591,10 +591,18 @@ def _renderer_class() -> str:
         return ""
 
 
+_PROJECT_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+
+
 def _project_id(options: Any) -> str:
     given = option(options, "project_id")
     if given:
-        return packet.slugify(str(given))
+        given = str(given)
+        # Keep an id the daemon already accepts (underscores included, e.g. "tula_wot"); slugify only
+        # free text. slugify maps "_" to "-", which would send the packet to a different project.
+        if _PROJECT_ID_RE.fullmatch(given):
+            return given
+        return packet.slugify(given)
     name = str(rt_attr("maxFileName") or "")
     stem = Path(name).stem if name else ""
     try:
