@@ -1,27 +1,38 @@
 # flux-3-image -- Black Forest Labs image edit, direct (D).
 # PLACEHOLDERS (BUILD_PLAN decisions 9 and 13): version is unpinned until the P0 smoke test; price.usd is
-# NOT a vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
+# NOT a confirmed vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
 # endpoints are the vendors' public base URLs as understood on 2026-10-17 and stay unverified until the
 # adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
+# T7: params are the vendor FULL schema (advanced: true only hides a field in the UI drawer). price.usd is the
+# default-tier figure the router ranks on; price.by holds the tiers we know. Nothing is billed-price-verified yet.
 id: flux-3-image
 name: FLUX 3 Image
 version: unpinned
 pinned: false
 kind: image_edit
+# The BFL route path (POST /v1/flux-3-image) is the model id; unverified until the adapter smoke test.
+model_id: flux-3-image
+flags: [unverified_p0]
 inputs:
   - {name: image, type: image, required: true}
   - {name: prompt, type: text, required: true}
   - {name: mask, type: mask, required: false}
   - {name: reference_images, type: images, required: false}
+  - {name: box, type: json, required: false}
 outputs:
   - {name: image, type: image, required: true}
 params:
-  - {name: seed, type: int, default: null, range: null, enum: null}
+  - {name: seed, type: int, range: [0, 4294967295], advanced: true}
+  - {name: output_format, type: enum, default: "png", enum: ["jpeg", "png"]}
+  - {name: safety_tolerance, type: int, range: [0, 6], advanced: true}
+  - {name: prompt_upsampling, type: bool, default: false, advanced: true}
 price:
   model: per_image
-  usd: 0.0
+  usd: 0.12
   status: unconfirmed
-  notes: "UNCONFIRMED placeholder: usd is not a vendor price; refresh from the vendor catalogue at P0. Pricing unit (per image) is also assumed."
+  source: "VIZMAKER.md section 4: Flux 2 Pro was 1 credit (USD 0.12 at the Professional rate) in the January 2026 tutorial. FLUX 3 is not priced anywhere we hold."
+  as_of: 2026-10-17
+  notes: "UNCONFIRMED placeholder from the older Flux 2 Pro reading; refresh from the BFL catalogue at P0. Pricing unit (per image) is assumed."
 determinism: nondeterministic
 licence:
   vendor_terms_url: unknown
@@ -36,4 +47,5 @@ routes:
     terms_hash: unknown
     upload_visibility: unknown
     same_model_fallback_of: null
+    allowed_hosts: [.bfl.ai]
     note: "EU terms take a training licence, so grade D for NDA work."

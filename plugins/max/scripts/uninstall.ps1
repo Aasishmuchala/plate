@@ -5,7 +5,8 @@
   Deletes plate_startup.py from %LOCALAPPDATA%\Autodesk\3dsMax\2026 - 64bit\ENU\scripts\startup,
   then removes from config.json only the keys listed in "plate_max_installed_keys" (keys that were
   already there before the install, such as a token the daemon created, stay). If nothing is left,
-  config.json is deleted. The PLATE clone and the app-data folder are never touched.
+  config.json is deleted. The backups install.ps1 made (plate_startup.py.bak, config.json.bak) are
+  left where they are, and so are the PLATE clone and the app-data folder.
   Works in Windows PowerShell 5.1 and pwsh 7.
 .PARAMETER MaxVersion
   Default 2026. Only used to build the default startup folder.
@@ -21,6 +22,7 @@ param(
     [string]$StartupDir = '',
     [string]$ConfigPath = ''
 )
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 if (-not $StartupDir) {
@@ -40,6 +42,7 @@ if (Test-Path -LiteralPath $target) {
     Write-Host "removed $target"
 }
 else { Write-Host "no startup script at $target" }
+if (Test-Path -LiteralPath ($target + '.bak')) { Write-Host "left the backup $target.bak in place" }
 
 if (Test-Path -LiteralPath $ConfigPath) {
     $cfg = [ordered]@{}
@@ -67,5 +70,6 @@ if (Test-Path -LiteralPath $ConfigPath) {
     else { Write-Host "$ConfigPath has no installer record; left as it is" }
 }
 else { Write-Host "no config.json at $ConfigPath" }
+if (Test-Path -LiteralPath ($ConfigPath + '.bak')) { Write-Host "left the backup $ConfigPath.bak in place" }
 Write-Host 'PLATE Max plugin uninstalled. Restart 3ds Max.'
 exit 0

@@ -1,0 +1,23 @@
+{
+  "note": "synthetic: authored from the vendor's documented shapes, not captured",
+  "request": {
+    "method": "POST",
+    "url": "https://api.atlascloud.ai/api/v1/model/generateImage",
+    "body": {
+      "model": "bytedance/seedream-5-pro/edit",
+      "prompt": "relight to late golden hour, keep every edge and every material",
+      "images": [
+        "https://atlas-media.oss-ap-southeast-1.aliyuncs.com/up/refused.png"
+      ],
+      "aspect_ratio": "16:9",
+      "resolution": "1K"
+    }
+  },
+  "response": {
+    "status": 400,
+    "json": {
+      "code": 400,
+      "message": "request blocked by content moderation"
+    }
+  }
+}

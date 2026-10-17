@@ -1,0 +1,28 @@
+{
+  "note": "synthetic: WaveSpeed v3 task API: model path in the URL, inline data URL image, ratio adaptive left out",
+  "request": {
+    "method": "POST",
+    "url": "https://api.wavespeed.ai/api/v3/bytedance/seedance-v2.5/image-to-video",
+    "body": {
+      "prompt": "Camera holds still; late sun moves across the oak floor.",
+      "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAJCAIAAAC0SDtlAAABxElEQVR4AQG5AUb+AMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoDHGdgUPQSDsAAAAASUVORK5CYII=",
+      "duration": 5,
+      "resolution": "480p",
+      "camera_fixed": true,
+      "generate_audio": false,
+      "return_last_frame": false,
+      "seed": 7
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "code": 200,
+      "message": "success",
+      "data": {
+        "id": "ws-fixture-a",
+        "status": "created"
+      }
+    }
+  }
+}

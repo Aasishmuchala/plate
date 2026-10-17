@@ -4,7 +4,7 @@
 takes the write lock up front (`BEGIN IMMEDIATE`) and nests with savepoints; a `SimulatedCrash` (a
 BaseException) inside `tx` rolls back exactly as a dead process would. Connections are opened per
 request or per worker step, never shared across threads concurrently. The file must be on a local disk
-(`paths.ensure_local`): WAL is unsafe on SMB.
+(`config.ensure_local`): WAL is unsafe on SMB.
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from .config import ensure_local
 from .migrations import MIGRATIONS
-from .paths import ensure_local
 from .timeutil import iso, utcnow
 
 

@@ -1,0 +1,35 @@
+{
+  "note": "synthetic: a safety rejection at submit",
+  "request": {
+    "method": "POST",
+    "url": "https://asia-south1-aiplatform.googleapis.com/v1/projects/plate-test/locations/asia-south1/publishers/google/models/veo-3.1-generate-001:predictLongRunning",
+    "body": {
+      "instances": [
+        {
+          "prompt": "Camera holds; steam rises from the cup.",
+          "image": {
+            "bytesBase64Encoded": "iVBORw0KGgoAAAANSUhEUgAAAAkAAAAQCAIAAABLKsIUAAABy0lEQVR4AQHAAT/+ACjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKAAoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgAKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoACjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKAAoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgAKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoACjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKAAoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgAKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoACjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKAAoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgAKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoACjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKAAoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgAKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoACjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKNnHnYEbKAtjAAAAAElFTkSuQmCC",
+            "mimeType": "image/png"
+          }
+        }
+      ],
+      "parameters": {
+        "durationSeconds": 8,
+        "aspectRatio": "16:9",
+        "resolution": "1080p",
+        "generateAudio": false,
+        "sampleCount": 1
+      }
+    }
+  },
+  "response": {
+    "status": 400,
+    "json": {
+      "error": {
+        "code": 400,
+        "message": "Image rejected by the safety filter",
+        "status": "INVALID_ARGUMENT"
+      }
+    }
+  }
+}

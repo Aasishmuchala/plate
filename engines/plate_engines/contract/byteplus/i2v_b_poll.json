@@ -1,0 +1,19 @@
+{
+  "note": "synthetic: succeeded",
+  "request": {
+    "method": "GET",
+    "url": "https://ark.ap-southeast.bytepluses.com/api/v3/contents/generations/tasks/cgt-fixture-b"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "id": "cgt-fixture-b",
+      "status": "succeeded",
+      "resolution": "480p",
+      "framespersecond": 24,
+      "content": {
+        "video_url": "https://ark-content-generation-ap-southeast-1.tos-ap-southeast-1.bytepluses.com/seedance/b.mp4"
+      }
+    }
+  }
+}

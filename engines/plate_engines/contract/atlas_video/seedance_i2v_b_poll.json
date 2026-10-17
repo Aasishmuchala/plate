@@ -1,0 +1,32 @@
+{
+  "note": "synthetic: processing, then completed with outputs[0] an OSS https URL",
+  "request": {
+    "method": "GET",
+    "url": "https://api.atlascloud.ai/api/v1/model/prediction/pred_vid_b1"
+  },
+  "responses": [
+    {
+      "status": 200,
+      "json": {
+        "code": 200,
+        "data": {
+          "id": "pred_vid_b1",
+          "status": "processing"
+        }
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "code": 200,
+        "data": {
+          "id": "pred_vid_b1",
+          "status": "completed",
+          "outputs": [
+            "https://atlas-media.oss-ap-southeast-1.aliyuncs.com/vid/b1.mp4"
+          ]
+        }
+      }
+    }
+  ]
+}

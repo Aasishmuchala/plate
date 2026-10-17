@@ -12,8 +12,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from . import thresholds
 from .color import ciede2000, hex_to_rgb8, srgb_to_lab
 from .compare import compare, maskdiff, views, write_png
+from .composite import composite_masked
+from .croppair import box_for
+from .masks import feather_inside, rect
 
 # CIEDE2000 reference pairs from Sharma, Wu, Dalal (2005) Table 1 (a selection of rows)
 _SHARMA = [
@@ -94,6 +98,25 @@ def run_selftest(verbose: bool = True) -> bool:
         f"inside identical={md['inside']['frac_identical']:.3f}"
     )
     ok &= md["outside"]["frac_identical"] == 1.0 and md["inside"]["frac_identical"] < 0.05
+
+    # compositor: feather lives inside the mask, so the output outside it IS the plate
+    plate16 = (rng.random((90, 120, 3)) * 65535).astype(np.uint16)
+    ai16 = (rng.random((90, 120, 3)) * 65535).astype(np.uint16)
+    cm = rect((90, 120), (30, 20, 90, 70))
+    alpha = feather_inside(cm, 8)
+    comp = composite_masked(plate16, ai16, cm, feather_px=8)
+    say(f"composite: alpha outside max={alpha[~cm].max():.1f} deep inside={alpha[45, 60]:.1f}")
+    ok &= alpha[~cm].max() == 0.0 and alpha[45, 60] == 1.0 and bool(np.array_equal(comp[~cm], plate16[~cm]))
+
+    # push-in crop geometry: the amphi N2b numbers from cut_crops.py (5504x3072, (3633, 2174), 1.5x -> 2.3x)
+    b0, b1 = box_for(5504, 3072, 3633, 2174, 1.5), box_for(5504, 3072, 3633, 2174, 2.3)
+    say(f"crop boxes: {b0} {b1}")
+    ok &= b0 == (1799, 1024, 3668, 2048) and b1 == (2437, 1507, 2392, 1334)
+
+    # thresholds: the committed set loads and its lapvar band is hard
+    st, _ = thresholds.check("texture.lapvar", 1500.0)
+    say(f"thresholds {thresholds.load().id}: lapvar 1500 -> {st}")
+    ok &= st == "fail"
 
     # views: 3 synthetic cameras, material colour drifting 0 / ~3 / ~12 dE between views
     with tempfile.TemporaryDirectory(prefix="fb_selftest_") as tmp:

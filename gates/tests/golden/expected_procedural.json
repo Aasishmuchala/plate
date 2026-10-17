@@ -1,0 +1,210 @@
+{
+ "_tolerances": {
+  "*de00* / *tone_shift*": "abs 0.05",
+  "*mean_abs*": "abs 0.1",
+  "*recall* / *precision* / *frac*": "abs 0.01",
+  "anything else": "rel 0.001",
+  "first / last / last_vs_start / *luma_delta* / *p95*": "abs 0.1",
+  "int / bool / str leaves (shifts, verdicts, flags)": "exact",
+  "lapvar / fine_ratio / luma_mean / luma_std / sat_mean": "rel 0.02",
+  "ssim*": "abs 0.005"
+ },
+ "camera_lock": {
+  "pan_after_half": {
+   "region0_dx": 5,
+   "region0_dy": 0,
+   "region1_dx": 5,
+   "region1_dy": 0,
+   "region2_dx": 5,
+   "region2_dy": 0,
+   "verdict": "moved"
+  }
+ },
+ "compare": {
+  "blur2": {
+   "best_shift_dx": 0,
+   "best_shift_dy": 0,
+   "best_shift_recall_r2": 0.42155041378145586,
+   "de00_blur_median": 0.0,
+   "de00_blur_p90": 0.8043500011760635,
+   "de00_flat_median": 0.0,
+   "flat_frac_of_ref": 0.46513020833333335,
+   "long_precision_r0": 0.567319716548562,
+   "long_precision_r2": 1.0,
+   "long_precision_r4": 1.0,
+   "long_recall_r0": 0.22985982097618646,
+   "long_recall_r2": 0.42155041378145586,
+   "long_recall_r4": 0.4342171930417159,
+   "ssim_gray": 0.9203424281070401,
+   "ssim_gray_blur8": 0.9984521185162041
+  },
+  "cross_scene": {
+   "best_shift_dx": 1,
+   "best_shift_dy": -2,
+   "best_shift_recall_r2": 0.9898665765917919,
+   "de00_blur_median": 0.7028110852862225,
+   "de00_blur_p90": 4.040058926634224,
+   "de00_flat_median": 0.44201917934938056,
+   "flat_frac_of_ref": 0.46513020833333335,
+   "long_precision_r0": 0.5156040268456376,
+   "long_precision_r2": 0.8491610738255033,
+   "long_precision_r4": 0.9958053691275168,
+   "long_recall_r0": 0.5190001688903901,
+   "long_recall_r2": 0.8535720317513934,
+   "long_recall_r4": 0.9996622192197264,
+   "ssim_gray": 0.9161172057967721,
+   "ssim_gray_blur8": 0.9894503635986175
+  },
+  "identity": {
+   "best_shift_dx": 0,
+   "best_shift_dy": -2,
+   "best_shift_recall_r2": 1.0,
+   "de00_blur_median": 0.0,
+   "de00_blur_p90": 0.0,
+   "de00_flat_median": 0.0,
+   "flat_frac_of_ref": 0.46513020833333335,
+   "long_precision_r0": 1.0,
+   "long_precision_r2": 1.0,
+   "long_precision_r4": 1.0,
+   "long_recall_r0": 1.0,
+   "long_recall_r2": 1.0,
+   "long_recall_r4": 1.0,
+   "ssim_gray": 1.0,
+   "ssim_gray_blur8": 1.0
+  },
+  "shift3": {
+   "best_shift_dx": -1,
+   "best_shift_dy": -1,
+   "best_shift_recall_r2": 0.9996622192197264,
+   "de00_blur_median": 0.4429951211891896,
+   "de00_blur_p90": 2.3105885372490436,
+   "de00_flat_median": 0.0,
+   "flat_frac_of_ref": 0.46513020833333335,
+   "long_precision_r0": 0.50016880486158,
+   "long_precision_r2": 0.6546252532072924,
+   "long_precision_r4": 0.99949358541526,
+   "long_recall_r0": 0.500422225975342,
+   "long_recall_r2": 0.6549569329505152,
+   "long_recall_r4": 1.0,
+   "ssim_gray": 0.888788343632039,
+   "ssim_gray_blur8": 0.992897198045134
+  },
+  "shift3_scaled_long_edges": {
+   "best_shift_dx": -1,
+   "best_shift_dy": -1,
+   "best_shift_recall_r2": 0.9996675531914894,
+   "de00_blur_median": 0.4429951211891896,
+   "de00_blur_p90": 2.3105885372490436,
+   "de00_flat_median": 0.0,
+   "flat_frac_of_ref": 0.46513020833333335,
+   "long_precision_r0": 0.5012460541618209,
+   "long_precision_r2": 0.6648945007476325,
+   "long_precision_r4": 0.9995015783352716,
+   "long_recall_r0": 0.5014960106382979,
+   "long_recall_r2": 0.6650598404255319,
+   "long_recall_r4": 1.0,
+   "ssim_gray": 0.888788343632039,
+   "ssim_gray_blur8": 0.992897198045134
+  },
+  "tint": {
+   "best_shift_dx": 0,
+   "best_shift_dy": -1,
+   "best_shift_recall_r2": 1.0,
+   "de00_blur_median": 5.854876759265996,
+   "de00_blur_p90": 6.406384950035838,
+   "de00_flat_median": 5.849909695262752,
+   "flat_frac_of_ref": 0.46513020833333335,
+   "long_precision_r0": 0.9967910825874008,
+   "long_precision_r2": 1.0,
+   "long_precision_r4": 1.0,
+   "long_recall_r0": 0.9967910825874008,
+   "long_recall_r2": 1.0,
+   "long_recall_r4": 1.0,
+   "ssim_gray": 0.9990720760682458,
+   "ssim_gray_blur8": 0.9989566799220013
+  },
+  "window_added": {
+   "best_shift_dx": 0,
+   "best_shift_dy": -1,
+   "best_shift_recall_r2": 0.9591285255868941,
+   "de00_blur_median": 0.0,
+   "de00_blur_p90": 0.0,
+   "de00_flat_median": 0.0,
+   "flat_frac_of_ref": 0.46513020833333335,
+   "long_precision_r0": 0.8912525797745674,
+   "long_precision_r2": 0.9060168280679473,
+   "long_precision_r4": 0.9103032227337673,
+   "long_recall_r0": 0.948150650228002,
+   "long_recall_r2": 0.9591285255868941,
+   "long_recall_r4": 0.9619996622192197,
+   "ssim_gray": 0.9755959931447857,
+   "ssim_gray_blur8": 0.9865785946393592
+  }
+ },
+ "composite_masked": {
+  "brighter_ai_with_edit": {
+   "de00_ring_matched_mean": 0.00717543186073964,
+   "de00_ring_raw_mean": 3.6543285736882756,
+   "deep_mean_abs_tone_shift_8bit": 6.318399998977776,
+   "inside_mean_abs_diff_vs_plate_8bit": 167.17049937984712,
+   "outside_identical": true,
+   "outside_max_abs_diff": 0.0
+  }
+ },
+ "flicker": {
+  "steady_vs_pumping": {
+   "duration_ok": true,
+   "duration_s": 1.0,
+   "duration_short_ok": false,
+   "pumping_mean_abs_luma_delta": 8.002677469135818,
+   "pumping_p95": 8.002677469135818,
+   "steady_mean_abs_luma_delta": 0.0
+  }
+ },
+ "labmatch": {
+  "scene_to_tinted_scene": {
+   "de00_mean_to_ref_s0.5": 2.818727759613175,
+   "de00_mean_to_ref_s1.0": 0.11388888197222545,
+   "flat_grey_result_mean": 180.0
+  }
+ },
+ "landing": {
+  "aspect_correct_43_in_169": {
+   "first": 4.394010543823242,
+   "last": 6.172725677490234,
+   "last_vs_start": 12.480775833129883
+  }
+ },
+ "maskdiff": {
+  "edit_inside_mask": {
+   "inside_de00_mean": 66.22364000389308,
+   "inside_frac_identical": 0.0,
+   "mask_frac": 0.135,
+   "outside_de00_p99": 0.0,
+   "outside_frac_identical": 1.0
+  }
+ },
+ "texture": {
+  "crunch": {
+   "fine_ratio": 0.7208535671234131,
+   "lapvar": 3594.92529296875,
+   "luma_mean": 145.30543518066406,
+   "luma_std": 60.23332977294922,
+   "sat_mean": 37.52398342556424
+  },
+  "other_scene": {
+   "fine_ratio": 0.4291895925998688,
+   "lapvar": 415.967041015625,
+   "luma_mean": 145.41549682617188,
+   "luma_std": 55.3394889831543,
+   "sat_mean": 37.861172146267364
+  },
+  "soft": {
+   "fine_ratio": 0.4303992688655853,
+   "lapvar": 418.89898681640625,
+   "luma_mean": 145.18597412109375,
+   "luma_std": 55.4465217590332,
+   "sat_mean": 37.940255059136284
+  }
+ }
+}

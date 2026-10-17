@@ -77,11 +77,50 @@ def test_camera_lock_reports_moved_when_every_region_shifts(clip_whole_frame_tra
         assert abs(r["dy"]) <= 1
 
 
-def test_one_still_region_keeps_the_verdict_locked(clip_static_bg_moving_square):
-    # clip_gate rule: "moved" needs every region to move. Region 2 sits in the traveling-square band, whose
-    # content changes; region 1 is static background, so the camera held.
-    res = camera_lock(clip_static_bg_moving_square, [(10, 4, 130, 60), (0, 60, 320, 50)], tol_px=2)
+def test_two_still_regions_keep_the_verdict_locked(clip_static_bg_moving_square):
+    res = camera_lock(clip_static_bg_moving_square, [(10, 4, 130, 60), (180, 120, 130, 56)], tol_px=2)
     assert res["verdict"] == "locked"
+    assert not any(r["moved"] for r in res["regions"])
+
+
+@pytest.fixture(scope="module")
+def clip_left_half_slides(tmp_path_factory):
+    """Right half of the frame is a static texture; the left half slides 8 px: only one region moves."""
+    left = _texture(W + 8, H, seed=21)
+    right = _texture(W, H, seed=22)
+    frames = []
+    for i in range(N):
+        s = int(round(8 * i / (N - 1)))
+        f = right.copy()
+        f[:, : W // 2] = left[:, 8 - s : 8 - s + W // 2]
+        frames.append(f)
+    return write_test_clip(tmp_path_factory.mktemp("motionC") / "c.mp4", frames, fps=FPS)
+
+
+def test_any_moving_region_makes_the_verdict_moved(clip_left_half_slides):
+    # clip_gate.py demanded ALL regions move; one sliding region means the camera (or the content) moved
+    regions = [(180, 10, 130, 60), (10, 10, 130, 60)]  # first static, second sliding
+    res = camera_lock(clip_left_half_slides, regions)
+    assert res["verdict"] == "moved"
+    assert [r["moved"] for r in res["regions"]] == [False, True]
+
+
+def test_camera_lock_phasecorr_samples_and_reports_max_shift(clip_left_half_slides):
+    from plate_gates.video import camera_lock_phasecorr
+
+    res = camera_lock_phasecorr(clip_left_half_slides, [(180, 10, 130, 60), (10, 10, 130, 60)], samples=6)
+    assert res["verdict"] == "moved" and res["samples"] == 6 and res["backend"] == "phasecorr"
+    still, sliding = res["regions"]
+    assert still["max_shift_px"] <= 1 and 6 <= sliding["max_shift_px"] <= 9
+    with pytest.raises(ValueError):
+        camera_lock_phasecorr(clip_left_half_slides, [(0, 0, 50, 50)], samples=1)
+
+
+def test_flat_regions_are_unknown_not_locked(tmp_path):
+    flat = [np.full((H, W, 3), 128, np.uint8) for _ in range(12)]
+    clip = write_test_clip(tmp_path / "flat.mp4", flat, fps=FPS)
+    res = camera_lock(clip, [(10, 10, 100, 60)])
+    assert res["verdict"] == "unknown" and res["regions"][0]["textured"] is False
 
 
 def test_camera_lock_validates_regions(clip_static_bg_moving_square):

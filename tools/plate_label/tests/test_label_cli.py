@@ -1,135 +1,127 @@
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-from blake3 import blake3
+import pytest
 
-from plate_label.cli import main, print_stats, run_interactive, split_codes
+from plate_label import cli
+from plate_label.cli import main, print_stats, split_codes
 from plate_label.store import read_labels
 
-REPO = Path(__file__).resolve().parents[3]
+TOOLS_DIR = Path(__file__).resolve().parents[2]
 
 
-def run_cli(*args: str, out: Path | None = None):
-    env = {**os.environ, "PYTHONPATH": str(REPO / "tools")}
-    cmd = [sys.executable, "-m", "plate_label", *args]
-    if out is not None:
-        cmd += ["--out", str(out)]
-    return subprocess.run(
-        cmd, cwd=REPO, env=env, capture_output=True, text=True, encoding="utf-8", timeout=60
-    )
-
-
-def test_help_lists_headless():
-    r = run_cli("--help")
-    assert r.returncode == 0 and "--headless" in r.stdout
-
-
-def test_headless_writes_one_record_with_matching_hash(images, tmp_path):
-    out = tmp_path / "labels.jsonl"
-    img = images / "A_first.jpg"
-    r = run_cli(
-        "--headless", str(img), "--verdict", "fix", "--reasons", "g01,C01",
-        "--note", "edge shift", "--rater", "tester", "--take-id", "t1", out=out,
-    )  # fmt: skip
-    assert r.returncode == 0, r.stderr
-    lines = out.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 1
-    rec = json.loads(lines[0])
-    assert rec["image_blake3"] == blake3(img.read_bytes()).hexdigest()
-    assert rec["image"] == "A_first.jpg" and rec["verdict"] == "fix"
-    assert rec["reasons"] == ["G01", "C01"] and rec["rater"] == "tester" and rec["take_id"] == "t1"
-
-
-def test_headless_folder_relative_image_and_subdir(images, tmp_path):
-    out = tmp_path / "labels.jsonl"
-    r = run_cli("--headless", "sub/c_third.webp", str(images), "--verdict", "ship", out=out)
-    assert r.returncode == 0, r.stderr
-    assert read_labels(out)[0]["image"] == "sub/c_third.webp"
-
-
-def test_headless_validation_errors_exit_2(images, tmp_path):
-    out = tmp_path / "labels.jsonl"
-    img = str(images / "A_first.jpg")
-    for extra, needle in [
-        (["--verdict", "fix"], "at least one"),
-        (["--verdict", "fix", "--reasons", "Z99"], "Z99"),
-        (["--verdict", "fix", "--reasons", "O99"], "O99"),
-        ([], "--verdict"),
-    ]:
-        r = run_cli("--headless", img, *extra, out=out)
-        assert r.returncode == 2 and needle in r.stderr, (extra, r.stderr)
-    assert run_cli("--headless", str(images / "nope.png"), "--verdict", "ship", out=out).returncode == 2
-    assert not out.exists()
-
-
-def test_serve_alias_needs_a_folder(tmp_path):
-    r = run_cli("serve", out=tmp_path / "labels.jsonl")
-    assert r.returncode == 2 and "FOLDER" in r.stderr
-
-
-def test_stats(images, tmp_path, capsys):
-    out = tmp_path / "labels.jsonl"
-    run_cli("--headless", str(images / "A_first.jpg"), "--verdict", "ship", out=out)
-    run_cli("--headless", str(images / "b_second.PNG"), "--verdict", "fix", "--reasons", "G01,T02", out=out)
-    run_cli(
-        "--headless", str(images / "sub" / "c_third.webp"), "--verdict", "fix", "--reasons", "G01", out=out
-    )
-    assert main(["stats", "--out", str(out)]) == 0
+def test_help_exits_zero(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
     text = capsys.readouterr().out
-    assert "3 label(s)" in text
-    assert any(line.split()[:2] == ["fix", "2"] for line in text.splitlines())
-    assert any(line.split()[:2] == ["G01", "2"] for line in text.splitlines())
-    assert any(line.split()[:2] == ["T02", "1"] for line in text.splitlines())
-    assert print_stats(tmp_path / "missing.jsonl", print_fn=lambda *a, **k: None) == 0
+    assert "--pairs" in text and "--rater" in text and "Ship" in text
+
+
+def test_python_dash_m_help_exits_zero():
+    env = {**os.environ, "PYTHONPATH": str(TOOLS_DIR)}
+    proc = subprocess.run(
+        [sys.executable, "-m", "plate_label", "--help"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--pairs" in proc.stdout
 
 
 def test_split_codes():
-    assert split_codes("g01, C01  x01") == ["G01", "C01", "X01"]
+    assert split_codes("a2, p4  f11") == ["A2", "P4", "F11"]
     assert split_codes("") == []
 
 
-def scripted(lines):
-    it = iter(lines)
-
-    def input_fn(prompt=""):
-        try:
-            return next(it)
-        except StopIteration:
-            raise EOFError from None
-
-    return input_fn
+@pytest.fixture
+def captured(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli, "serve", lambda *a, **k: calls.append((a, k)) or 0)
+    return calls
 
 
-def test_interactive_loop(images, tmp_path):
-    out = tmp_path / "labels.jsonl"
-    shown: list[str] = []
-    say = lambda *a, **k: shown.append(" ".join(str(x) for x in a))  # noqa: E731
-    # image 1: ship; image 2: fix without a reason (rejected), then fix with reasons plus a note; image 3: quit
-    code = run_interactive(
-        images, out, "tester", "take-1",
-        input_fn=scripted(["s", "f", "n", "ledge is soft", "f G01,t02", "q"]), print_fn=say,
-    )  # fmt: skip
-    assert code == 0
-    rows = read_labels(out)
-    assert [(r["image"], r["verdict"]) for r in rows] == [("A_first.jpg", "ship"), ("b_second.PNG", "fix")]
-    assert rows[1]["reasons"] == ["G01", "T02"] and rows[1]["note"] == "ledge is soft"
-    assert rows[1]["rater"] == "tester" and rows[1]["take_id"] == "take-1"
-    assert any(s.startswith("1/3 A_first.jpg") for s in shown) and any(
-        s.startswith("3/3 sub/c_third.webp") for s in shown
+def test_folder_and_serve_alias_start_the_server(shots, tmp_path, captured):
+    out = tmp_path / "l.jsonl"
+    assert main([str(shots), "--out", str(out), "--rater", "r1", "--port", "0", "--no-open"]) == 0
+    assert main(["serve", str(shots), "--out", str(out), "--rater", "r1"]) == 0
+    (args1, kw1), (args2, _) = captured
+    pairs, got_out, rater, port = args1
+    assert (
+        len(pairs) == 3 and got_out == out and rater == "r1" and port == 0 and kw1 == {"open_browser": False}
     )
-    assert any("at least one" in s for s in shown)
+    assert len(args2[0]) == 3 and args2[3] == 4612
 
-    # a second session resumes at the unlabelled image only
-    shown.clear()
-    run_interactive(images, out, "tester", None, input_fn=scripted(["r G03"]), print_fn=say)
-    assert [r["verdict"] for r in read_labels(out)] == ["ship", "fix", "render_it"]
-    assert any("2 already labelled" in s for s in shown) and not any(s.startswith("1/3") for s in shown)
 
-    shown.clear()
-    assert run_interactive(images, out, "tester", None, input_fn=scripted([]), print_fn=say) == 0
-    assert any("nothing left" in s for s in shown)
+def test_pairs_manifest_starts_the_server(manifest, tmp_path, captured):
+    assert main(["--pairs", str(manifest), "--out", str(tmp_path / "l.jsonl")]) == 0
+    assert [p.take_id for p in captured[0][0][0]] == ["S3", "S4"]
+
+
+def test_bad_invocations_exit_2(shots, manifest, tmp_path, captured, capsys):
+    assert main([]) == 2
+    assert main([str(shots), "--pairs", str(manifest)]) == 2
+    assert main([str(tmp_path / "missing-folder")]) == 2
+    assert main(["--pairs", str(tmp_path / "none.json")]) == 2
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert main([str(empty)]) == 2
+    err = capsys.readouterr().err
+    assert "FOLDER" in err and "not both" in err and "not a folder" in err and "no images" in err
+    assert captured == []  # the server never started
+
+
+def test_headless_writes_one_record(tmp_path, make_image, capsys):
+    img = make_image(tmp_path / "cand.png")
+    plate = make_image(tmp_path / "plate.png")
+    out = tmp_path / "labels.jsonl"
+    argv = ["--headless", "--out", str(out), "--rater", "r1", "--take-id", "S3", "--candidate", str(img),
+            "--plate", str(plate), "--verdict", "fix", "--reasons", "p1, a2", "--seconds", "4.5",
+            "--run-id", "r9", "--gate-report", "gates/r9.1.json"]  # fmt: skip
+    assert main(argv) == 0
+    (rec,) = read_labels(out)
+    assert rec["reasons"] == ["P1", "A2"] and rec["seconds"] == 4.5 and rec["run_id"] == "r9"
+    assert rec["gate_report"] == "gates/r9.1.json" and rec["take_id"] == "S3" and rec["rater"] == "r1"
+    assert "labelled S3" in capsys.readouterr().out
+
+
+def test_headless_errors_write_nothing(tmp_path, make_image, capsys):
+    img = make_image(tmp_path / "cand.png")
+    out = tmp_path / "labels.jsonl"
+    base = ["--headless", "--out", str(out), "--take-id", "S3", "--candidate", str(img)]
+    assert main(base) == 2  # no verdict
+    assert main(["--headless", "--out", str(out), "--verdict", "ship"]) == 2  # no take / candidate
+    assert main([*base, "--verdict", "fix", "--reasons", "Z9"]) == 2
+    assert main([*base, "--verdict", "ship", "--reasons", "P1"]) == 2
+    assert main([*base[:-1], str(tmp_path / "nope.png"), "--verdict", "ship"]) == 2
+    err = capsys.readouterr().err
+    assert "--headless needs" in err and "Z9" in err and "does not exist" in err
+    assert not out.exists()
+
+
+def test_stats(tmp_path, make_image, capsys):
+    img = make_image(tmp_path / "cand.png")
+    out = tmp_path / "labels.jsonl"
+    for verdict, reasons in [("ship", ""), ("fix", "P1,A2"), ("fix", "P1"), ("render_it", "F6")]:
+        argv = ["--headless", "--out", str(out), "--rater", "r1", "--take-id", "S3", "--candidate", str(img),
+                "--verdict", verdict, "--reasons", reasons, "--seconds", "3"]  # fmt: skip
+        assert main(argv) == 0
+    capsys.readouterr()
+    assert main(["stats", "--out", str(out)]) == 0
+    text = capsys.readouterr().out
+    assert "4 label(s)" in text and "r1  4" in text
+    lines = {
+        ln.split()[0]: ln.split()[1]
+        for ln in text.splitlines()
+        if ln.strip() and ln.split()[0] in {"ship", "fix", "render_it", "P1", "A2", "F6", "A1"}
+    }
+    assert lines == {"ship": "1", "fix": "2", "render_it": "1", "P1": "2", "A2": "1", "F6": "1", "A1": "0"}
+    assert "median time per label" in text
+    assert print_stats(tmp_path / "none.jsonl", print_fn=lambda *a: None) == 0

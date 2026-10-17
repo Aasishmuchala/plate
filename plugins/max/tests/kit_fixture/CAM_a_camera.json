@@ -1,0 +1,84 @@
+{
+  "kit": "plate_client_kit",
+  "kit_version": "0.1.0",
+  "camera": "CAM_a",
+  "camera_class": "VRayPhysicalCamera",
+  "transform": [
+    [
+      0.90134,
+      -0.433112,
+      0.0
+    ],
+    [
+      0.026315,
+      0.054763,
+      0.998152
+    ],
+    [
+      -0.432311,
+      -0.899675,
+      0.060757
+    ],
+    [
+      -1.3,
+      -1.85,
+      1.5
+    ]
+  ],
+  "fov": 54.43222311,
+  "focal_length_mm": 35.0,
+  "film_width": 36.0,
+  "zoom_factor": 1.0,
+  "render_width": 640,
+  "render_height": 360,
+  "pixel_aspect": 1.0,
+  "frame": 0,
+  "fps": 25.0,
+  "units": {
+    "system_type": "meters",
+    "system_scale": 1.0
+  },
+  "renderer": "V_Ray_7_hotfix_3",
+  "max_version": [
+    28000,
+    54,
+    0,
+    28,
+    0,
+    0,
+    0
+  ],
+  "colour_mode": "legacy_gamma",
+  "colour_mode_raw": "gamma",
+  "gamma": 2.2,
+  "f_number": 2.8,
+  "focus_distance": 2.5,
+  "dof_enabled": true,
+  "iso": null,
+  "shutter_speed": null,
+  "lens_shift": {
+    "horizontal": 0,
+    "vertical": 0
+  },
+  "tilt": {
+    "vertical": 0,
+    "horizontal": 0,
+    "auto": false
+  },
+  "distortion": 0,
+  "render_time_s": 12.5,
+  "exr": "CAM_a_packet.exr",
+  "legend": "CAM_a_legend.txt",
+  "elements": {
+    "beauty": "RGBA",
+    "zdepth": "VRayZDepth",
+    "normals": "VRayNormals",
+    "cryptomatte_object": "CryptoObject",
+    "cryptomatte_material": "CryptoMaterial",
+    "wire_colour": "VRayWireColor",
+    "diffuse_filter": "VRayDiffuseFilter"
+  },
+  "warnings": [
+    "CryptoMaterial id type (unverified): none of #(#id_type, #idType, #cryptomatte_type, #type, #mode) exists"
+  ]
+}

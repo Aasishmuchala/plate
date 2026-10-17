@@ -1,0 +1,18 @@
+{
+  "note": "synthetic: a plain failure must stay failed, never refused",
+  "request": {
+    "method": "GET",
+    "url": "https://api.atlascloud.ai/api/v1/model/prediction/pred_vid_fail"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "code": 200,
+      "data": {
+        "id": "pred_vid_fail",
+        "status": "failed",
+        "error": "internal error: worker out of memory"
+      }
+    }
+  }
+}

@@ -1,9 +1,13 @@
 <#
 .SYNOPSIS
-  Set up PLATE on a Windows 10/11 x64 machine (the render box): uv, Node LTS, the Python 3.12 venv, npm ci.
+  Set up PLATE on a Windows 10/11 x64 machine (the render box): uv, Node LTS, the Python 3.12 venv, npm ci,
+  and config.json with the daemon token.
 .DESCRIPTION
-  Installs uv and Node LTS with winget when they are missing (pass -NoInstall to only check), then
-  runs `uv sync --python 3.12` and `npm ci` in the repo. Never installs the pixels CUDA extra.
+  Installs uv (winget, else the official astral.sh installer) and Node LTS (winget) when they are missing
+  (pass -NoInstall to only check), then runs `uv sync --python 3.12` and `npm ci` in the repo (the ui is an
+  npm workspace of the root package.json, so one `npm ci` installs it). Never installs the pixels CUDA extra.
+  Finally it creates config.json in the app-data folder when it is missing (PLATE_HOME and PLATE_CONFIG are
+  honoured) with a fresh token and prints the launch URL.
   Run from the repo root:  powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 #>
 param([switch]$NoInstall)
@@ -48,7 +52,7 @@ if (-not $nodeOk) {
 }
 
 Invoke-Step 'uv sync (Python 3.12 venv)' { uv sync --python 3.12 }
-Invoke-Step 'npm ci' { npm ci }
+Invoke-Step 'npm ci (root workspace, includes ui)' { npm ci }
 
 if (-not (Test-Command 'ffmpeg')) {
     Write-Warning 'ffmpeg not on PATH: video-gate tests will be skipped. Install with: winget install --id Gyan.FFmpeg -e (or set PLATE_FFMPEG)'
@@ -56,4 +60,11 @@ if (-not (Test-Command 'ffmpeg')) {
 $homeDir = Get-PlateHome
 New-Item -ItemType Directory -Force -Path $homeDir | Out-Null
 Write-Host "PLATE app-data folder: $homeDir"
+
+$port = 4610
+if ($env:PLATE_PORT) { $port = [int]$env:PLATE_PORT }
+$token = Get-PlateToken -Port $port
+Write-Host "PLATE config: $(Get-PlateConfigPath)"
 Write-Host 'Bootstrap done. Next: powershell -ExecutionPolicy Bypass -File scripts\test.ps1' -ForegroundColor Green
+Write-Host 'Then start the daemon (scripts\start-daemon.ps1) and open this URL; the UI keeps the token and sends it as a Bearer header:'
+Write-Host "  http://127.0.0.1:$port/#token=$token"

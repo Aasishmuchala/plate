@@ -1,0 +1,36 @@
+{
+  "note": "synthetic: authored from the behaviour pinned in atlas.py / atlas.ts, not captured from the vendor",
+  "request": {
+    "method": "GET",
+    "url": "https://api.atlascloud.ai/api/v1/model/prediction/pred-vid-1"
+  },
+  "responses": [
+    {
+      "status": 200,
+      "json": {
+        "data": {
+          "status": "created"
+        }
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "data": {
+          "status": "processing"
+        }
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "data": {
+          "status": "succeeded",
+          "outputs": [
+            "https://cdn.atlascloud.ai/out/clip.mp4"
+          ]
+        }
+      }
+    }
+  ]
+}

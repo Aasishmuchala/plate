@@ -1,0 +1,448 @@
+{
+  "packet_version": "0.1.1",
+  "packet_id": "pkt_6RK9WQACT6Y8B2NA51FYVYDGAJ",
+  "kind": "still",
+  "tier": "A",
+  "project_id": "plate-fixture",
+  "shot_id": "room-b",
+  "created_utc": "2026-10-17T00:00:00Z",
+  "supersedes": null,
+  "host": {
+    "app": "none",
+    "version": "blender-5.1.1",
+    "plugin": {
+      "name": "plate_fixture",
+      "version": "0.1.0"
+    }
+  },
+  "renderer": {
+    "name": "vray",
+    "version": "fixture-cycles-5.1"
+  },
+  "scene_hash": {
+    "algo": "blake3",
+    "hex": "d8a4e0da1ff3c5204377ca7a7c736a13473609bb2e352a3984183a58b6ab8c08",
+    "digest_version": "1"
+  },
+  "view_hash": {
+    "algo": "blake3",
+    "hex": "f2773a93fe004981112756b360e6106ba3bd1d68c8b41f055cb04a783561c1b6"
+  },
+  "units": {
+    "system_unit": "meters",
+    "meters_per_unit": 1.0,
+    "up_axis": "Z"
+  },
+  "camera": {
+    "name": "CAM_b",
+    "source": "scene",
+    "node_type": "BlenderCamera",
+    "projection": "perspective",
+    "convention": {
+      "id": "plate-cam-v0",
+      "handedness": "right",
+      "world_up": "+Z",
+      "camera_forward": "-Z",
+      "camera_up": "+Y",
+      "camera_right": "+X",
+      "matrix": "world_from_camera",
+      "layout": "row_major",
+      "vectors": "column",
+      "length_unit": "scene",
+      "pixel_origin": "top_left_corner",
+      "pixel_center": 0.5
+    },
+    "world_from_camera": [
+      [
+        0.852438,
+        -0.035572,
+        0.521617,
+        1.9
+      ],
+      [
+        0.522829,
+        0.057997,
+        -0.850463,
+        -1.75
+      ],
+      [
+        -0.0,
+        0.997683,
+        0.068037,
+        1.5
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "focal_length_mm": 24.0,
+    "film_width_mm": 36.0,
+    "zoom_factor": 1.0,
+    "fov_deg": {
+      "horizontal": 73.7398,
+      "vertical": 45.7473
+    },
+    "lens_shift": {
+      "horizontal": 0,
+      "vertical": 0,
+      "raw_unit": "none",
+      "vertical_tilt_correction": false
+    },
+    "distortion": "none",
+    "intrinsics_px": {
+      "fx": 426.6666666666667,
+      "fy": 426.6666666666667,
+      "principal_point": [
+        320.0,
+        180.0
+      ],
+      "K": [
+        [
+          426.6666666666667,
+          0.0,
+          320.0
+        ],
+        [
+          0.0,
+          426.6666666666667,
+          180.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ]
+    },
+    "resolution": {
+      "width": 640,
+      "height": 360,
+      "pixel_aspect": 1.0
+    },
+    "safe_frame": {
+      "x": 0,
+      "y": 0,
+      "width": 640,
+      "height": 360
+    },
+    "f_number": 8.0,
+    "focus_distance": 4.0,
+    "dof_enabled": false,
+    "exposure": {
+      "mode": "none"
+    },
+    "white_balance": {
+      "mode": "neutral"
+    },
+    "frames": {
+      "hero": 0,
+      "start": 0,
+      "end": 0,
+      "fps": 25
+    }
+  },
+  "colour": {
+    "max_colour_mode": "legacy_gamma",
+    "legacy_gamma": 2.2,
+    "working_space": "lin_rec709",
+    "master": "display_tiff16",
+    "vfb_corrections_baked": false,
+    "display_encoding": {
+      "primaries": "rec709",
+      "transfer": "srgb",
+      "icc": "none"
+    }
+  },
+  "files": {
+    "beauty_exr": {
+      "kind": "file",
+      "path": "beauty.exr",
+      "bytes": 1726490,
+      "hash": {
+        "algo": "blake3",
+        "hex": "3140834041770d62c6bc623a58594de450cbc840aa727cb8bdf61625baa9c7e6"
+      },
+      "format": "exr",
+      "width": 640,
+      "height": 360,
+      "compression": "zip",
+      "parts": "single",
+      "elements": [
+        {
+          "element": "beauty",
+          "layer": "RGBA",
+          "channels": [
+            "R",
+            "G",
+            "B",
+            "A"
+          ],
+          "dtype": "half",
+          "filtered": true,
+          "denoised": false
+        },
+        {
+          "element": "zdepth",
+          "layer": "VRayZDepth",
+          "channels": [
+            "Z"
+          ],
+          "dtype": "float",
+          "filtered": false,
+          "denoised": false,
+          "depth_kind": "planar",
+          "normalized": false,
+          "clamped": false,
+          "background_value": 10000000000.0
+        },
+        {
+          "element": "normals",
+          "layer": "VRayNormals",
+          "channels": [
+            "X",
+            "Y",
+            "Z"
+          ],
+          "dtype": "half",
+          "filtered": true,
+          "denoised": false,
+          "space": "camera",
+          "encoding": "signed"
+        },
+        {
+          "element": "cryptomatte_object",
+          "layer": "CryptoObject",
+          "channels": [
+            "CryptoObject00.R",
+            "CryptoObject00.G",
+            "CryptoObject00.B",
+            "CryptoObject00.A",
+            "CryptoObject01.R",
+            "CryptoObject01.G",
+            "CryptoObject01.B",
+            "CryptoObject01.A",
+            "CryptoObject02.R",
+            "CryptoObject02.G",
+            "CryptoObject02.B",
+            "CryptoObject02.A"
+          ],
+          "dtype": "float",
+          "filtered": true,
+          "denoised": false,
+          "rank_levels": 6
+        },
+        {
+          "element": "cryptomatte_material",
+          "layer": "CryptoMaterial",
+          "channels": [
+            "CryptoMaterial00.R",
+            "CryptoMaterial00.G",
+            "CryptoMaterial00.B",
+            "CryptoMaterial00.A",
+            "CryptoMaterial01.R",
+            "CryptoMaterial01.G",
+            "CryptoMaterial01.B",
+            "CryptoMaterial01.A",
+            "CryptoMaterial02.R",
+            "CryptoMaterial02.G",
+            "CryptoMaterial02.B",
+            "CryptoMaterial02.A"
+          ],
+          "dtype": "float",
+          "filtered": true,
+          "denoised": false,
+          "rank_levels": 6
+        },
+        {
+          "element": "wire_colour",
+          "layer": "VRayWireColor",
+          "channels": [
+            "R",
+            "G",
+            "B"
+          ],
+          "dtype": "half",
+          "filtered": false,
+          "denoised": false
+        },
+        {
+          "element": "diffuse_filter",
+          "layer": "VRayDiffuseFilter",
+          "channels": [
+            "R",
+            "G",
+            "B"
+          ],
+          "dtype": "half",
+          "filtered": true,
+          "denoised": false
+        }
+      ]
+    },
+    "display_tiff16": {
+      "kind": "file",
+      "path": "display.tif",
+      "bytes": 940492,
+      "hash": {
+        "algo": "blake3",
+        "hex": "2c831c6f5663d46ff704fb1317012f4011da9723045cc12822119f6e0b0a5b2a"
+      },
+      "format": "tiff",
+      "width": 640,
+      "height": 360,
+      "bit_depth": 16,
+      "channels": "RGB"
+    },
+    "id_legend": {
+      "kind": "file",
+      "path": "id_legend.json",
+      "bytes": 10757,
+      "hash": {
+        "algo": "blake3",
+        "hex": "9fa8ee584bcb5a6d8eb7e951e7aebc34baab440d2df99f18ba4f8a3cbfedf655"
+      },
+      "format": "json"
+    }
+  },
+  "id_legend": {
+    "file": "id_legend",
+    "source": "cryptomatte",
+    "cryptomatte": {
+      "object": {
+        "layer": "CryptoObject",
+        "hash": "murmur3_32",
+        "id_type": "node_name",
+        "rank_levels": 6,
+        "manifest": "exr_metadata"
+      },
+      "material": {
+        "layer": "CryptoMaterial",
+        "hash": "murmur3_32",
+        "id_type": "material_name",
+        "rank_levels": 6,
+        "manifest": "exr_metadata"
+      }
+    },
+    "entry_count": 33,
+    "coverage": {
+      "labelled_share": 0.9774,
+      "unlabelled_share": 0.0,
+      "uncovered_share": 0.0226
+    }
+  },
+  "policy": {
+    "rules_version": "1",
+    "class_rules": [
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "ARCH_",
+        "class": "architecture"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "GLZ_",
+        "class": "glazing"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "SIGN_",
+        "class": "signage"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "HARD_",
+        "class": "ground"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "VEG_",
+        "class": "vegetation"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "SKY",
+        "class": "sky"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "PEOPLE",
+        "class": "people"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "WATER",
+        "class": "water"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "VEH_",
+        "class": "vehicle"
+      }
+    ],
+    "lock_by_default": true,
+    "locked_ids": [
+      "o:0b411b0a",
+      "o:455f88bc",
+      "o:d33e97bd",
+      "o:57b3d007",
+      "o:b42836e4",
+      "o:d5cf2e02",
+      "o:735a8655",
+      "o:ca5b90f3",
+      "o:0fb79ada",
+      "o:9013efbe",
+      "o:e68e9665",
+      "o:80da502f",
+      "o:5d710960",
+      "o:8bc8ab09",
+      "o:2ff3b239",
+      "o:c42ac1e2",
+      "m:0b411b0a",
+      "m:455f88bc",
+      "m:d33e97bd",
+      "m:57b3d007",
+      "m:b42836e4",
+      "m:e73d1390",
+      "m:735a8655",
+      "m:ca5b90f3",
+      "m:955b3500"
+    ],
+    "editable_ids": [
+      "o:929c9e95",
+      "o:55cbe981",
+      "o:ebb52806",
+      "o:c8a9bf52",
+      "m:929c9e95",
+      "m:b844e457",
+      "m:ebb52806",
+      "m:c8a9bf52"
+    ],
+    "text_lock": true,
+    "lint": {
+      "max_unlabelled_share": 0.05,
+      "unlabelled_share": 0.0,
+      "passed": true
+    }
+  },
+  "render": {
+    "session": "fixture",
+    "sampler": "progressive",
+    "time_s": null,
+    "denoiser": {
+      "beauty": "none",
+      "denoised_elements": []
+    }
+  }
+}

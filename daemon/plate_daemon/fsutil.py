@@ -52,11 +52,18 @@ def write_bytes_atomic(path: Path, data: bytes) -> None:
             tmp.unlink(missing_ok=True)
 
 
-def write_json_atomic(path: Path, obj: Any, indent: int | None = 1) -> None:
+def write_json_atomic(path: Path, obj: Any, indent: int | None = 1, *, mode: int | None = None) -> None:
+    """`mode` (e.g. 0o600 for a secret) is set when the temp file is created, so the final file never
+    exists with looser permissions; on Windows only the read-only bit follows it."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = temp_sibling(path)
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        if mode is None:
+            fh = open(tmp, "w", encoding="utf-8", newline="\n")
+        else:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), mode)
+            fh = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        with fh:
             json.dump(obj, fh, indent=indent, ensure_ascii=False, sort_keys=False)
             fh.write("\n")
             fh.flush()

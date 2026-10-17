@@ -100,10 +100,11 @@ def maskdiff(ref_bgr: np.ndarray, test_bgr: np.ndarray, mask: np.ndarray) -> dic
     return res
 
 
-def compare(ref_bgr, test_bgr, mask=None, ral_lab=None, sig=6.0) -> dict:
+def compare(ref_bgr, test_bgr, mask=None, ral_lab=None, sig=6.0, long_edge_width: int | None = None) -> dict:
     """Geometry + colour drift between a reference and a test image (BGR uint8).
 
-    Test is resized to the reference size. Keys: size, aspect_ref, aspect_test, ssim_gray, ssim_gray_blur8,
+    Test is resized to the reference size. long_edge_width=None keeps the fixed 30 px long-edge cut-off (the
+    recorded goldens); pass the evaluation width to scale it as round(30 * width / 1500). Keys: size, aspect_ref, aspect_test, ssim_gray, ssim_gray_blur8,
     edge_px, canny_all_r{0,2,4,8}, canny_long_r{0,2,4,8}, best_shift_long, de00_blur, and when applicable
     flat_frac_of_ref + de00_flat (flat regions) and de00_mask_vs_ral (mask + target Lab given).
     """
@@ -119,8 +120,8 @@ def compare(ref_bgr, test_bgr, mask=None, ral_lab=None, sig=6.0) -> dict:
     out["ssim_gray_blur8"] = ssim_gray(cv2.GaussianBlur(gr, (0, 0), 8), cv2.GaussianBlur(gt, (0, 0), 8))
     er_all = canny(gr)
     et_all = canny(gt)
-    er = long_edges(er_all)
-    et = long_edges(et_all)
+    er = long_edges(er_all, width=long_edge_width)
+    et = long_edges(et_all, width=long_edge_width)
     out["edge_px"] = dict(
         ref_all=int(er_all.sum()), test_all=int(et_all.sum()), ref_long=int(er.sum()), test_long=int(et.sum())
     )

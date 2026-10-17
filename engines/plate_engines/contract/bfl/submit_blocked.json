@@ -1,0 +1,14 @@
+{
+  "note": "synthetic: authored from the vendor's documented shapes, not captured",
+  "request": {
+    "method": "POST",
+    "url": "https://api.bfl.ai/v1/flux-3-image",
+    "body_hash": "d3b49d51"
+  },
+  "response": {
+    "status": 422,
+    "json": {
+      "detail": "Your input was blocked by our moderation filter"
+    }
+  }
+}

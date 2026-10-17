@@ -20,9 +20,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import plate_spec
+
 from .cas import CAS, hash_bytes, hash_file
 from .db import dumps, loads, tx
-from .specbridge import plate_spec
 from .timeutil import iso, utcnow
 
 

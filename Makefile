@@ -1,4 +1,4 @@
-.PHONY: help setup selftest test test-py test-ui lint fmt check spec daemon pixels label
+.PHONY: help setup selftest hazard test test-py test-ui lint fmt check spec daemon pixels label
 
 PYPATH := spec:daemon:pixels:engines:gates:plugins/max:tools
 PY := PYTHONPATH=$(PYPATH) .venv/bin/python
@@ -8,7 +8,8 @@ RUFF := .venv/bin/ruff
 help:
 	@echo "make setup     uv sync (Python 3.12) + npm install"
 	@echo "make selftest  fidelity_bench selftest (first CI job)"
-	@echo "make test      selftest, then pytest and npm test"
+	@echo "make hazard    Windows-hazard scan (fcntl, os.rename, open() without encoding, ...)"
+	@echo "make test      selftest, hazard scan, then pytest and npm test"
 	@echo "make lint      ruff check + format check"
 	@echo "make spec      validate the three example packets"
 	@echo "make daemon    run the daemon on 127.0.0.1:4610 (fake engine)"
@@ -28,7 +29,10 @@ test-py:
 test-ui:
 	npm test
 
-test: selftest test-py test-ui
+hazard:
+	$(PY) scripts/hazard_scan.py
+
+test: selftest hazard test-py test-ui
 
 lint:
 	$(RUFF) check .

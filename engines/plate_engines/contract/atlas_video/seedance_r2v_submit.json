@@ -1,0 +1,41 @@
+{
+  "note": "synthetic: Seedance 2.5 r2v: reference_images [{url, role}], reference_videos [url], integer-second timing hints in the prompt",
+  "request": {
+    "method": "POST",
+    "url": "https://api.atlascloud.ai/api/v1/model/generateVideo",
+    "body": {
+      "model": "bytedance/seedance-2.5/reference-to-video",
+      "prompt": "Wide establishing view of the lobby.\n0s: the lift doors open\n6s: a visitor crosses to the desk",
+      "duration": 8,
+      "resolution": "720P",
+      "ratio": "16:9",
+      "camera_fixed": true,
+      "generate_audio": false,
+      "return_last_frame": false,
+      "reference_images": [
+        {
+          "url": "https://static.atlascloud.ai/media/plate/ref_lobby.png",
+          "role": "first_frame"
+        },
+        {
+          "url": "https://static.atlascloud.ai/media/plate/ref_desk.png",
+          "role": "reference_image"
+        }
+      ],
+      "reference_videos": [
+        "https://static.atlascloud.ai/media/plate/ref_walk.mp4"
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "code": 200,
+      "message": "success",
+      "data": {
+        "id": "pred_r2v_1",
+        "status": "created"
+      }
+    }
+  }
+}

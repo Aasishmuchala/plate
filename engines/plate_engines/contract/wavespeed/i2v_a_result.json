@@ -1,0 +1,11 @@
+{
+  "note": "synthetic: the finished clip (placeholder bytes)",
+  "request": {
+    "method": "GET",
+    "url": "https://cdn.wavespeed.ai/outputs/a.mp4"
+  },
+  "response": {
+    "status": 200,
+    "bytes_b64": "AAAAGGZ0eXBtcDQyAAAAAG1wNDJpc29tUExBVEUtRklYVFVSRS1DTElQLUFQTEFURS1GSVhUVVJFLUNMSVAtQVBMQVRFLUZJWFRVUkUtQ0xJUC1BUExBVEUtRklYVFVSRS1DTElQLUE="
+  }
+}

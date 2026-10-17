@@ -1,0 +1,7 @@
+{
+ "extends": "clubhouse",
+ "active_camera": "CAM_shifted",
+ "cameras": [
+  {"name": "CAM_shifted", "rows": [[0.5, 0.866025404, 0.0], [0.0, 0.0, 1.0], [0.866025404, -0.5, 0.0], [12000.0, -8500.0, 1600.0]], "props": {"focal_length": 24.0, "horizontal_shift": 0.12}}
+ ]
+}

@@ -1,0 +1,18 @@
+{
+  "note": "synthetic: failed prediction whose reason is a real-face rejection: reads as refused",
+  "request": {
+    "method": "GET",
+    "url": "https://api.atlascloud.ai/api/v1/model/prediction/pred_vid_face"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "code": 200,
+      "data": {
+        "id": "pred_vid_face",
+        "status": "failed",
+        "error": "real person face detected in the first frame"
+      }
+    }
+  }
+}

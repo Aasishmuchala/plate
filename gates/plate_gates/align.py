@@ -4,6 +4,9 @@ Consolidates amphi-plaza/align_check.py and the edge-agreement block of car-entr
 (historical project folders). The plate path and the 1920 px evaluation width are parameters now. The score
 is the share of the test image's edge pixels that land on the plate's edges (dilated by 1 px so a one-pixel
 shift still counts); 1.0 means identical edges.
+
+This is image-only agreement: ADVISORY (thresholds.yaml image_edge_agreement >= 0.88, triage only). The hard
+edge-recall gate (gbuffer_edge_recall_r2 >= 0.90) exists only against G-buffer edges of a Tier A packet.
 """
 
 from __future__ import annotations

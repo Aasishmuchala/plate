@@ -5,10 +5,13 @@ manifest; write_packet writes manifest.json, id_legend.json and (motion) camera_
 temp-then-replace, the manifest last so a half-written folder is never ingestible.
 
 BLAKE3 is not in the standard library and Max ships no blake3 module, so this module never
-computes the hashes the schema demands (files[*].hash, scene_hash, view_hash). The render step, or
-a helper with blake3 installed, supplies them; hash_file_sha256, legend_bytes, camera_frames_bytes,
-scene_hash_payload (digest.py) and view_hash_payload give it the exact bytes. Validation of the
-result against the schema is plate_spec's job and runs in the tests, not here.
+computes the hashes the schema demands (files[*].hash, scene_hash, view_hash). The loopback daemon
+does (BUILD_PLAN decision 5b): bridge.hashing.hash_packet_files hashes the files in the folder,
+hash_payloads the in-memory bytes that legend_bytes, camera_frames_bytes, scene_hash_payload
+(digest.py) and view_hash_payload produce; file_ref_from_hashes turns an answer into a files{} entry
+and write_packet(hashes=) checks the manifest against it before anything is written. The schema's
+hash.algo stays "blake3". Validation of the result against the schema is plate_spec's job and runs
+in the tests, not here.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ from typing import Any
 
 from . import CONVENTION_ID, PACKET_VERSION, SENDER
 from . import policy as policy_mod
-from .digest import DIGEST_VERSION, rotation_error
+from .digest import DIGEST_VERSION, SCENE_DIGEST_VERSION, intrinsics, rotation_error
 from .fsutil import atomic_write_bytes, canonical_json_bytes, dump_json_bytes
 from .packet_id import PACKET_ID_RE
 
@@ -90,6 +93,14 @@ def file_ref(rel_path: str, size: int, blake3_hex: str, fmt: str, **extra: Any) 
         "format": fmt,
         **extra,
     }
+
+
+def file_ref_from_hashes(rel_path: str, hashes: dict[str, Any], fmt: str, **extra: Any) -> dict[str, Any]:
+    """file_ref for rel_path from a bridge.hashing.hash_packet_files answer ({rel: {hex, bytes}})."""
+    entry = hashes.get(rel_path)
+    if not isinstance(entry, dict) or not entry.get("hex"):
+        raise ManifestError(f"no daemon hash for {rel_path!r}: hash the folder first (bridge.hashing)")
+    return file_ref(rel_path, int(entry["bytes"]), str(entry["hex"]), fmt, **extra)
 
 
 def legend_bytes(legend: dict[str, Any]) -> bytes:
@@ -222,17 +233,22 @@ def build_camera_block(cam: dict[str, Any], kind: str = "still") -> dict[str, An
         raise ManifestError("camera focal length, film gate and zoom must be positive")
 
     # full float precision: the spec checks fx to 0.01% and the FOV to 0.005 degrees
-    hfov = math.degrees(2 * math.atan(film / (2 * focal * zoom)))
-    vfov = math.degrees(2 * math.atan(math.tan(math.radians(hfov) / 2) * height / (width * pa)))
-    fx = focal * zoom * width / film
-    fy = fx * pa
-    cx, cy = width / 2, height / 2
+    derived = intrinsics(focal, film, zoom, width, height, pa)
+    hfov, vfov = derived["fov_deg"]["horizontal"], derived["fov_deg"]["vertical"]
+    k = derived["intrinsics_px"]
+    fx, fy, (cx, cy) = k["fx"], k["fy"], k["principal_point"]
 
-    iso, shutter = (cam.get("exposure") or {}).get("iso"), (cam.get("exposure") or {}).get("shutter_s")
+    exp = cam.get("exposure") or {}
+    iso, shutter = exp.get("iso"), exp.get("shutter_s")
     f_number = float(cam["f_number"])
-    if iso and shutter:
+    exposure: dict[str, Any]
+    if exp.get("enabled") is False:
+        exposure = {"mode": "none"}  # the camera's exposure switch is off: ISO and shutter do nothing
+    elif exp.get("ev") is not None:
+        exposure = {"mode": "ev", "ev100": round(float(exp["ev"]), 4)}
+    elif iso and shutter:
         ev100 = math.log2(f_number**2 / shutter) - math.log2(iso / 100.0)
-        exposure: dict[str, Any] = {
+        exposure = {
             "mode": "physical",
             "iso": iso,
             "shutter_s": shutter,
@@ -491,8 +507,15 @@ def build_manifest(
         policy_block["custody"] = copy.deepcopy(custody)
 
     sh: dict[str, Any] = dict(_hash_block(scene_hash, "scene_hash"))
+    # the format scene_hash_payload hashed: content-v1 ("1") when the digest has lines, else file-meta ("0")
+    default_version = str(
+        scene.get("digest_version")
+        or (SCENE_DIGEST_VERSION if scene.get("lines") is not None else DIGEST_VERSION)
+    )
     sh["digest_version"] = (
-        scene_hash.get("digest_version", DIGEST_VERSION) if isinstance(scene_hash, dict) else DIGEST_VERSION
+        str(scene_hash.get("digest_version") or default_version)
+        if isinstance(scene_hash, dict)
+        else default_version
     )
     if scene.get("max_file"):
         max_file: dict[str, Any] = {"name": scene["max_file"]}
@@ -549,17 +572,43 @@ def _write_sidecar(root: Path, manifest: dict[str, Any], role: str, data: bytes)
     atomic_write_bytes(root.joinpath(*rel.split("/")), data)
 
 
+SIDECAR_ROLES = ("id_legend", "camera_frames")  # the files write_packet itself writes
+
+
+def check_hashes(manifest: dict[str, Any], hashes: dict[str, Any]) -> None:
+    """Every file the manifest references (except the sidecars write_packet writes) must carry the
+    size and BLAKE3 the daemon reported for it (bridge.hashing.hash_packet_files). Sequence frames are
+    checked through their hashes listing by plate_spec, not here. Raises ManifestError."""
+    for role, ref in manifest["files"].items():
+        if ref.get("kind") != "file" or role in SIDECAR_ROLES:
+            continue
+        rel = _safe_rel(ref["path"])
+        entry = hashes.get(rel)
+        if not isinstance(entry, dict):
+            raise ManifestError(f"files.{role}: {rel} was not hashed by the daemon (hash the folder again)")
+        if entry.get("hex") != ref["hash"]["hex"] or int(entry.get("bytes", -1)) != ref["bytes"]:
+            raise ManifestError(
+                f"files.{role}: {rel} has changed since it was hashed (manifest {ref['bytes']} bytes "
+                f"{ref['hash']['hex'][:12]}..., daemon {entry.get('bytes')} bytes {str(entry.get('hex'))[:12]}...)"
+            )
+
+
 def write_packet(
     out_dir: Path | str,
     manifest: dict[str, Any],
     legend: dict[str, Any] | None = None,
     camera_frames: list[dict[str, Any]] | None = None,
+    hashes: dict[str, Any] | None = None,
 ) -> Path:
     """Write the JSON files of a packet into out_dir (the beauty, display and sequence files are
     written by the render step). legend / camera_frames are optional: leave one out to keep the file
-    already in the folder. manifest.json goes last."""
+    already in the folder. hashes is the daemon's answer for the folder (bridge.hashing
+    .hash_packet_files): when given, the manifest is checked against it first (check_hashes), so a
+    file that changed after hashing never gets a manifest. manifest.json goes last."""
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
+    if hashes is not None:
+        check_hashes(manifest, hashes)
     if (
         manifest["kind"] == "motion"
         and camera_frames is None

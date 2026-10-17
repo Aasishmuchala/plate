@@ -96,8 +96,9 @@ def test_synthetic_image_inside_the_band_passes():
 
 def test_band_reasons_cover_all_four_codes():
     assert texture_band({"lapvar": 100.0, "fine_ratio": 0.2})["reasons"] == ["lapvar_low", "fine_low"]
-    assert texture_band({"lapvar": 900.0, "fine_ratio": 0.6})["reasons"] == ["lapvar_high", "fine_high"]
+    assert texture_band({"lapvar": 900.0, "fine_ratio": 0.7})["reasons"] == ["lapvar_high", "fine_high"]
     assert texture_band({"lapvar": 450.0, "fine_ratio": 0.40})["pass"] is True
+    assert texture_band({"lapvar": 450.0, "fine_ratio": 0.60})["pass"] is True  # corrected band: 0.40-0.60
 
 
 def test_resize_to_width_changes_the_measurement():

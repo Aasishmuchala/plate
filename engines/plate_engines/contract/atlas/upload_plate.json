@@ -1,0 +1,16 @@
+{
+  "note": "synthetic: authored from the behaviour pinned in atlas.py / atlas.ts, not captured from the vendor",
+  "request": {
+    "method": "POST",
+    "url": "https://api.atlascloud.ai/api/v1/model/uploadMedia",
+    "body_hash": "ec7e8d11"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "data": {
+        "download_url": "https://img.atlascloud.ai/in/plate.png"
+      }
+    }
+  }
+}

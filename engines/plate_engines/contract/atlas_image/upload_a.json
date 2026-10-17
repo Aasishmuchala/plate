@@ -1,0 +1,17 @@
+{
+  "note": "synthetic: authored from the vendor's documented shapes, not captured",
+  "request": {
+    "method": "POST",
+    "url": "https://api.atlascloud.ai/api/v1/model/uploadMedia",
+    "body_hash": "898571c3"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "code": 200,
+      "data": {
+        "download_url": "https://atlas-media.oss-ap-southeast-1.aliyuncs.com/up/a.png"
+      }
+    }
+  }
+}

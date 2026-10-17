@@ -1,0 +1,16 @@
+{
+  "note": "synthetic: authored from the vendor's documented shapes, not captured",
+  "request": {
+    "method": "GET",
+    "url": "https://api.bfl.ai/v1/get_result?id=bfl-err"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "status": "Error",
+      "details": {
+        "msg": "worker crashed"
+      }
+    }
+  }
+}

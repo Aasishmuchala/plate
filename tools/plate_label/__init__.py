@@ -1,7 +1,7 @@
-"""PLATE labelling tool: three-key verdict (Ship / Fix / Render-it) with reason codes on a folder of
-images, written one JSON line per verdict to calib/labels.jsonl. The labels feed the P1 calibration
-(AUC of the gate ensemble against Aasish's verdicts). New code for PLATE, no seed script; the code
-table is fixed by the build plan (T8) so the file is stable from the first label.
+"""PLATE labelling tool: three-key verdict (1 Ship / 2 Fix / 3 Render-it) with reason codes on
+plate-vs-candidate pairs, written one JSON line per verdict to calib/labels.jsonl. The labels feed
+the P1 calibration (gates/plate_gates/calibration.py: AUC of the gate ensemble against these
+verdicts). New code for PLATE, no seed script; the reason-code table is calib/reason_codes.yaml.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

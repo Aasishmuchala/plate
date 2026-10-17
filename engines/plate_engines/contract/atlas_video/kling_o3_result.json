@@ -1,0 +1,11 @@
+{
+  "note": "synthetic: the finished clip (placeholder bytes)",
+  "request": {
+    "method": "GET",
+    "url": "https://atlas-media.oss-ap-southeast-1.aliyuncs.com/vid/kling_o3.mp4"
+  },
+  "response": {
+    "status": 200,
+    "bytes_b64": "AAAAGGZ0eXBtcDQyAAAAAG1wNDJpc29tUExBVEUtRklYVFVSRS1DTElQLUFQTEFURS1GSVhUVVJFLUNMSVAtQVBMQVRFLUZJWFRVUkUtQ0xJUC1BUExBVEUtRklYVFVSRS1DTElQLUE="
+  }
+}

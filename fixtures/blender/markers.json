@@ -1,0 +1,15 @@
+{
+  "description": "Conformance markers for the PLATE fixture room. Metres, world Z up, room x -2.5..2.5, y -2..2, z 0..3. The Blender fixture builds r=2 cm spheres here; the 3ds Max conformance scene on the box is built from this same file so the two agree.",
+  "units": "meters",
+  "radius_m": 0.02,
+  "markers": [
+    {"name": "ARCH_marker_01", "position": [1.75, 1.09, 2.18]},
+    {"name": "ARCH_marker_02", "position": [-1.19, 0.71, 1.43]},
+    {"name": "ARCH_marker_03", "position": [1.49, 0.71, 0.51]},
+    {"name": "ARCH_marker_04", "position": [0.49, 1.4, 1.51]},
+    {"name": "ARCH_marker_05", "position": [1.67, 0.81, 1.31]},
+    {"name": "ARCH_marker_06", "position": [-0.35, 1.1, 2.09]},
+    {"name": "ARCH_marker_07", "position": [0.9, 1.68, 2.3]},
+    {"name": "ARCH_marker_08", "position": [0.26, 1.47, 2.12]}
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "note": "synthetic: authored from the vendor's documented shapes, not captured",
+  "request": {
+    "method": "POST",
+    "url": "https://api.bfl.ai/v1/flux-3-image",
+    "body_hash": "8dd336d0"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "id": "bfl-mod",
+      "polling_url": "https://api.elsewhere.example/v1/get_result?id=bfl-mod",
+      "cost": 4.0,
+      "input_mp": 0.0,
+      "output_mp": 0.0
+    }
+  }
+}

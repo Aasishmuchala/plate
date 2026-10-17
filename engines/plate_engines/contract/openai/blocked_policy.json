@@ -1,0 +1,18 @@
+{
+  "note": "synthetic: authored from the vendor's documented shapes, not captured",
+  "request": {
+    "method": "POST",
+    "url": "https://api.openai.com/v1/images/edits",
+    "body_hash": "e5fbd0d7"
+  },
+  "response": {
+    "status": 400,
+    "json": {
+      "error": {
+        "code": "content_policy_violation",
+        "message": "The prompt violates the content policy.",
+        "type": "image_generation_user_error"
+      }
+    }
+  }
+}

@@ -1,1 +1,1 @@
-# daemon/tests: empty on purpose until router plan T5 and T12; the seed daemon in plate_daemon is untested (docs/P0_AUDIT.md).
+# daemon/tests: router plan T5's suites (config, auth, /hash, CAS, project folder + lock, index rebuild, SSE bus, app + `python -m plate_daemon`); T12 adds the state-machine suites. Every test runs with PLATE_HOME=tmp_path (conftest.py).

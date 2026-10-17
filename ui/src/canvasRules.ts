@@ -1,37 +1,57 @@
 // Canvas rules enforced in code (CLAUDE.md doctrine rules 1, 2 and 7; BUILD_PLAN section 4). Pure functions over
-// nodes and edges so the same checks can run in the store, in tests and later in the daemon. Every refusal returns a
-// reason string that the UI shows verbatim.
+// nodes and edges so the same checks can run in the store, in tests and later in the daemon (T25 mirrors the codes
+// in Python; the server is the enforcement point, these rules are the UX). Every refusal carries a stable `code` and
+// a `message` that the UI shows verbatim.
 
 import type { Edge, Node } from "@xyflow/react";
-import type { NodeType, PlateNodeData } from "./nodeTypes";
+import { type NodeKind, type PlateNodeData, UNSEEN_GEOMETRY_LABEL } from "./nodeTypes";
 
 export type GraphNode = Node<PlateNodeData>;
+/** The part of an edge the rules read. xyflow's `Edge` and the wire `GraphEdge` both satisfy it. */
+export type EdgeLike = Pick<Edge, "id" | "source" | "target">;
+export interface GraphLike {
+  nodes: GraphNode[];
+  edges: EdgeLike[];
+}
+
+export type RuleCode =
+  | "CONCEPT_TO_DELIVERY"
+  | "DEPTH_EXCEEDED"
+  | "VIDEO_LOCKED"
+  | "HIGH_RISK_MOVE"
+  | "NO_PLATE_ANCHOR"
+  | "INVENTED_ANGLE"
+  | "CYCLE"
+  | "UNKNOWN_NODE"
+  | "SCRUB_REQUIRED";
+
+export type RuleResult = { ok: true } | { ok: false; code: RuleCode; message: string };
 export type ConnectResult = { ok: true } | { ok: false; reason: string };
 
-/** Nodes that make new pixels. Each one costs a generation of depth. */
-export const GENERATING_TYPES: ReadonlySet<NodeType> = new Set<NodeType>([
-  "Edit",
-  "People",
-  "Motion",
-  "CropPair",
-  "Recolour",
-]);
+/** Nodes that make new pixels. Each one costs a generation of depth. Mask/Comp/Colour/Gate/Compare and the numeric
+ * nodes (LightMix, Recolour, Set, Light) do not. */
+export const GENERATING_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>(["Edit", "Motion", "People", "CropPair"]);
 
 /** Rule 7: generation depth is at most 2 from the original plate. */
 export const MAX_GENERATION_DEPTH = 2;
 
-/** Rule 1: the concept tier may not reach any of these. (There is no separate Delivery node yet.) */
-const DELIVERY_TYPES: ReadonlySet<NodeType> = new Set<NodeType>(["Export", "Review"]);
+/** Rule 1: the concept tier may not reach any of these. (There is no separate Delivery node today.) */
+const DELIVERY_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>(["Export", "Review"]);
+
+/** Rule 7: video nodes stay locked until the upstream still passed gates and a human approved it. */
+const VIDEO_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>(["Motion", "CropPair"]);
+
+const refuse = (code: RuleCode, message: string): RuleResult => ({ ok: false, code, message });
 
 const byId = (nodes: GraphNode[]): Map<string, GraphNode> => new Map(nodes.map((n) => [n.id, n]));
 
-function upstreamMap(edges: Edge[]): Map<string, string[]> {
+function upstreamMap(edges: EdgeLike[]): Map<string, string[]> {
   const m = new Map<string, string[]>();
   for (const e of edges) m.set(e.target, [...(m.get(e.target) ?? []), e.source]);
   return m;
 }
 
-function downstreamMap(edges: Edge[]): Map<string, string[]> {
+function downstreamMap(edges: EdgeLike[]): Map<string, string[]> {
   const m = new Map<string, string[]>();
   for (const e of edges) m.set(e.source, [...(m.get(e.source) ?? []), e.target]);
   return m;
@@ -51,12 +71,12 @@ function reach(start: string, next: Map<string, string[]>): Set<string> {
 }
 
 /**
- * Number of generating nodes (Edit, People, Motion, CropPair, Recolour) on the longest upstream path from a Plate
- * node to `nodeId`, counting `nodeId` itself when it generates. A node with no Plate upstream has depth 0 (it is not
- * anchored to a packet camera; `canConnect` refuses to feed such a node into a generator). Back edges of a cycle are
- * ignored so this always terminates.
+ * Number of generating nodes (Edit, Motion, People, CropPair) on the longest upstream path from a Plate node to
+ * `nodeId`, counting `nodeId` itself when it generates. A node with no Plate upstream has depth 0 (it is not
+ * anchored to a packet camera; `validateEdge` refuses to feed such a node into a generator). Back edges of a cycle
+ * are ignored so this always terminates.
  */
-export function generationDepth(nodes: GraphNode[], edges: Edge[], nodeId: string): number {
+export function generationDepth(nodes: GraphNode[], edges: EdgeLike[], nodeId: string): number {
   const nodeMap = byId(nodes);
   const up = upstreamMap(edges);
   const done = new Map<string, number>(); // -1 = no Plate upstream
@@ -67,8 +87,8 @@ export function generationDepth(nodes: GraphNode[], edges: Edge[], nodeId: strin
     const node = nodeMap.get(id);
     if (!node) return -1;
     active.add(id);
-    const own = GENERATING_TYPES.has(node.data.type) ? 1 : 0;
-    let best = node.data.type === "Plate" ? 0 : -1;
+    const own = GENERATING_KINDS.has(node.data.kind) ? 1 : 0;
+    let best = node.data.kind === "Plate" ? 0 : -1;
     for (const src of up.get(id) ?? []) {
       if (active.has(src)) continue;
       const d = walk(src);
@@ -81,58 +101,152 @@ export function generationDepth(nodes: GraphNode[], edges: Edge[], nodeId: strin
   return Math.max(walk(nodeId), 0);
 }
 
+/** The same nodes with `data.generationDepth` refreshed from the edges; unchanged nodes keep their identity. */
+export function recomputeDepths(nodes: GraphNode[], edges: EdgeLike[]): GraphNode[] {
+  return nodes.map((n) => {
+    const depth = generationDepth(nodes, edges, n.id);
+    return n.data.generationDepth === depth ? n : { ...n, data: { ...n.data, generationDepth: depth } };
+  });
+}
+
 /** True when `id` has a Plate node among its ancestors (or is one): the generation is anchored to a packet camera. */
 function anchoredToPlate(nodeMap: Map<string, GraphNode>, up: Map<string, string[]>, id: string): boolean {
-  if (nodeMap.get(id)?.data.type === "Plate") return true;
-  return [...reach(id, up)].some((a) => nodeMap.get(a)?.data.type === "Plate");
+  if (nodeMap.get(id)?.data.kind === "Plate") return true;
+  return [...reach(id, up)].some((a) => nodeMap.get(a)?.data.kind === "Plate");
 }
 
 /** Concept tier is sticky: a node is unmeasured if it, or anything feeding it, is a Concept node. */
 function isConceptTier(nodeMap: Map<string, GraphNode>, up: Map<string, string[]>, id: string): boolean {
-  const isConcept = (n?: GraphNode) => n?.data.type === "Concept" || n?.data.tier === "concept";
+  const isConcept = (n?: GraphNode) => n?.data.kind === "Concept" || n?.data.outputTier === "concept_unmeasured";
   if (isConcept(nodeMap.get(id))) return true;
   return [...reach(id, up)].some((a) => isConcept(nodeMap.get(a)));
 }
 
+const hasCameraOverride = (data: PlateNodeData): boolean => {
+  const v = data.params?.["cameraOverride"];
+  return v !== undefined && v !== null && v !== false;
+};
+
+const isHighRisk = (data: PlateNodeData): boolean => data.riskLabel === "high" || data.riskLabel === "highest";
+
+/** Where an override must also carry the `unseen geometry guessed` label (doctrine 2): an invented camera angle on
+ * an Edit, or a Motion whose risk label says it guesses unseen sides. */
+const needsUnseenLabel = (data: PlateNodeData): boolean =>
+  (data.kind === "Edit" && hasCameraOverride(data)) || (data.kind === "Motion" && isHighRisk(data));
+
 /**
- * Would adding `sourceId -> targetId` be allowed? Checks, in order: cycle, concept tier into delivery
- * (doctrine 1), generation anchored to a plate camera (doctrine 2, source-view-only), generation depth
- * (doctrine 7), and the video lock (doctrine 7).
+ * Would `edge` be allowed in `graph`? The edge may or may not already be in `graph.edges` (it is ignored there), so
+ * the same call vets a new connection and re-checks a loaded one. Checks, in order: unknown node, cycle,
+ * CONCEPT_TO_DELIVERY (doctrine 1), NO_PLATE_ANCHOR (doctrine 2, source-view-only), DEPTH_EXCEEDED (doctrine 7),
+ * VIDEO_LOCKED (doctrine 7: the source must be gateStatus pass and approved), HIGH_RISK_MOVE, INVENTED_ANGLE.
  */
-export function canConnect(nodes: GraphNode[], edges: Edge[], sourceId: string, targetId: string): ConnectResult {
-  const nodeMap = byId(nodes);
-  const source = nodeMap.get(sourceId);
-  const target = nodeMap.get(targetId);
-  if (!source || !target) return { ok: false, reason: "unknown node" };
+export function validateEdge(graph: GraphLike, edge: EdgeLike): RuleResult {
+  const nodeMap = byId(graph.nodes);
+  const source = nodeMap.get(edge.source);
+  const target = nodeMap.get(edge.target);
+  if (!source || !target) return refuse("UNKNOWN_NODE", "unknown node");
 
-  const down = downstreamMap(edges);
+  const others = graph.edges.filter((e) => e.id !== edge.id);
 
-  // (4) no cycles, self-loops included: the target must not already lead back to the source.
-  if (sourceId === targetId || reach(targetId, down).has(sourceId)) return { ok: false, reason: "cycle" };
+  // No cycles, self-loops included: the target must not already lead back to the source.
+  if (edge.source === edge.target || reach(edge.target, downstreamMap(others)).has(edge.source)) {
+    return refuse("CYCLE", "cycle");
+  }
 
-  const next: Edge[] = [...edges, { id: `${sourceId}->${targetId}`, source: sourceId, target: targetId }];
+  const next: EdgeLike[] = [...others, edge];
   const nextUp = upstreamMap(next);
+  const tk = target.data.kind;
 
-  // (2) concept tier never reaches Export (or Review), directly or through other nodes.
-  if (DELIVERY_TYPES.has(target.data.type) && isConceptTier(nodeMap, nextUp, targetId)) {
-    return { ok: false, reason: `concept tier cannot reach ${target.data.type}` };
+  // The concept tier never reaches Export (or Review), directly or through other nodes.
+  if (DELIVERY_KINDS.has(tk) && isConceptTier(nodeMap, nextUp, edge.target)) {
+    return refuse("CONCEPT_TO_DELIVERY", `concept tier cannot reach ${tk}`);
   }
 
-  // source-view-only: a generator must hang off a Plate, so every generation is anchored to a packet camera.
-  if (GENERATING_TYPES.has(target.data.type) && !anchoredToPlate(nodeMap, nextUp, sourceId)) {
-    return { ok: false, reason: "generation must be anchored to a plate camera (source-view-only)" };
+  // Source-view-only: a generator must hang off a Plate, so every generation is anchored to a packet camera.
+  if (GENERATING_KINDS.has(tk) && !anchoredToPlate(nodeMap, nextUp, edge.source)) {
+    return refuse("NO_PLATE_ANCHOR", "generation must be anchored to a plate camera (source-view-only)");
   }
 
-  // (1) depth: the target and everything downstream of it must stay within MAX_GENERATION_DEPTH.
-  const affected = [targetId, ...reach(targetId, downstreamMap(next))];
-  if (affected.some((id) => generationDepth(nodes, next, id) > MAX_GENERATION_DEPTH)) {
-    return { ok: false, reason: "generation depth > 2 from the plate" };
+  // Depth: the target and everything downstream of it must stay within MAX_GENERATION_DEPTH.
+  const affected = [edge.target, ...reach(edge.target, downstreamMap(next))];
+  if (affected.some((id) => generationDepth(graph.nodes, next, id) > MAX_GENERATION_DEPTH)) {
+    return refuse("DEPTH_EXCEEDED", "generation depth > 2 from the plate");
   }
 
-  // (3) video stays locked until the upstream still passed gates and a human approved it.
-  if (target.data.type === "Motion" && !(source.data.gatePassed === true && source.data.humanApproved === true)) {
-    return { ok: false, reason: "motion is locked until the upstream still passes gates and is approved" };
+  // Video stays locked until the upstream still passed gates and a human approved it.
+  if (VIDEO_KINDS.has(tk) && !(source.data.gateStatus === "pass" && source.data.approved === true)) {
+    return refuse("VIDEO_LOCKED", `${tk === "Motion" ? "motion" : "crop pair"} is locked until the upstream still passes gates and is approved`);
+  }
+
+  // High-risk moves are blocked unless overridden (and then labelled, see applyOverride).
+  if (tk === "Motion" && isHighRisk(target.data) && target.data.overrides.length === 0) {
+    return refuse("HIGH_RISK_MOVE", `${target.data.riskLabel} risk move is blocked until it is overridden with a reason`);
+  }
+
+  // An invented camera angle needs an explicit override and the "unseen geometry guessed" label.
+  if (
+    tk === "Edit" &&
+    hasCameraOverride(target.data) &&
+    !(target.data.overrides.length > 0 && target.data.labels.includes(UNSEEN_GEOMETRY_LABEL))
+  ) {
+    return refuse("INVENTED_ANGLE", "a camera override needs an explicit override and the label 'unseen geometry guessed'");
   }
 
   return { ok: true };
+}
+
+/** Seed entry point: `validateEdge` for the edge `sourceId -> targetId`, with the failure as a `reason` string. */
+export function canConnect(nodes: GraphNode[], edges: EdgeLike[], sourceId: string, targetId: string): ConnectResult {
+  const verdict = validateEdge({ nodes, edges }, { id: `${sourceId}->${targetId}`, source: sourceId, target: targetId });
+  return verdict.ok ? { ok: true } : { ok: false, reason: verdict.message };
+}
+
+export interface RuleViolation {
+  edge: EdgeLike;
+  code: RuleCode;
+  message: string;
+}
+
+/** Re-check every edge of a loaded graph; an empty list means the graph obeys the canvas rules. */
+export function validateGraph(graph: GraphLike): RuleViolation[] {
+  const out: RuleViolation[] = [];
+  for (const edge of graph.edges) {
+    const verdict = validateEdge(graph, edge);
+    if (!verdict.ok) out.push({ edge, code: verdict.code, message: verdict.message });
+  }
+  return out;
+}
+
+/** The logged scrub that allows a take to be accepted (doctrine 7). */
+export interface ScrubLog {
+  id?: string;
+  fullScrub: boolean;
+}
+
+/** A take is accepted only after a logged full scrub. */
+export function canAccept(node: GraphNode, scrubLog: ScrubLog | null | undefined): RuleResult {
+  if (scrubLog?.fullScrub === true) return { ok: true };
+  return refuse("SCRUB_REQUIRED", `'${node.data.label}' cannot be accepted without a logged full scrub`);
+}
+
+/** Record an override (reason required) and add the `unseen geometry guessed` label where it applies. Pure. */
+export function applyOverride(node: GraphNode, reason: string, by: string, at: string = new Date().toISOString()): GraphNode {
+  if (reason.trim() === "") throw new Error("an override needs a reason");
+  const data = node.data;
+  const labels =
+    needsUnseenLabel(data) && !data.labels.includes(UNSEEN_GEOMETRY_LABEL)
+      ? [...data.labels, UNSEEN_GEOMETRY_LABEL]
+      : data.labels;
+  return { ...node, data: { ...data, overrides: [...data.overrides, { reason, by, at }], labels } };
+}
+
+/** Labels a node carries: its own plus those of every ancestor, so `unseen geometry guessed` follows the pixels. */
+export function effectiveLabels(graph: GraphLike, nodeId: string): string[] {
+  const nodeMap = byId(graph.nodes);
+  const ids = [nodeId, ...reach(nodeId, upstreamMap(graph.edges))];
+  const out: string[] = [];
+  for (const id of ids) {
+    for (const label of nodeMap.get(id)?.data.labels ?? []) if (!out.includes(label)) out.push(label);
+  }
+  return out;
 }

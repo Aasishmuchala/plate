@@ -1,0 +1,17 @@
+{
+  "note": "synthetic: a prediction that never finishes (wait() timeout test)",
+  "request": {
+    "method": "GET",
+    "url": "https://api.atlascloud.ai/api/v1/model/prediction/pred_vid_never_done"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "code": 200,
+      "data": {
+        "id": "pred_vid_never_done",
+        "status": "processing"
+      }
+    }
+  }
+}

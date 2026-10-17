@@ -1,0 +1,165 @@
+# PLATE gate thresholds, one entry per metric. Threshold-set id: ts-2026.10.17-draft.
+#
+# Changing a number means adding a NEW set id; a shipped report keeps pointing at the set it was scored
+# against. Fields per entry:
+#   id             metric id (what a gate reports under)
+#   value | range  the bound, or [low, high] inclusive; with `value`, `op` is le | ge | eq
+#   resolution_px  image width the number is only valid at (null = resolution independent)
+#   status         hard (blocks) | advisory (reported, never blocks) | calibration_needed (advisory until the
+#                  three-key labelling AUC fixes it; see calib/)
+#   provenance     where the number came from
+# Optional: unit, tier (the gate only applies to that packet tier), tol (eq tolerance), variants
+# (named alternative bounds, e.g. preview), status_by_backend (status depends on the flow backend), param
+# (the bound is supplied at check time, e.g. the shot duration).
+set_id: ts-2026.10.17-draft
+metrics:
+  - id: registration.residual_px
+    op: le
+    value: 1.0
+    unit: px
+    resolution_px: null
+    status: hard
+    provenance: BUILD_PLAN section 3 decision 14 (plate-vs-output registration residual after ECC)
+  - id: registration.shift_px
+    op: le
+    value: 8
+    unit: px
+    resolution_px: null
+    status: hard
+    provenance: BUILD_PLAN decision 14; best_shift search window of fidelity_bench (+-8 px)
+  - id: outside_mask.de00
+    op: eq
+    value: 0
+    tol: 0.0
+    unit: dE00
+    resolution_px: null
+    status: hard
+    provenance: Plan decision 4; outside-mask pixels are copied from the plate by slicing, so this holds by construction
+  - id: feather_band.de00_p99
+    op: le
+    value: 1.0
+    unit: dE00
+    resolution_px: null
+    status: hard
+    provenance: BUILD_PLAN decision 14; feather lives inside the mask (4-12 px)
+  - id: gbuffer_edge_recall_r2
+    op: ge
+    value: 0.90
+    variants:
+      delivery: 0.90
+      preview: 0.85
+    tier: A
+    resolution_px: 2048
+    status: hard
+    provenance: BUILD_PLAN decision 14; computable only against G-buffer edges (Tier A), never against image-only Canny
+  - id: invention_flags
+    op: eq
+    value: 0
+    tol: 0.0
+    unit: count
+    resolution_px: null
+    status: hard
+    provenance: BUILD_PLAN decision 14 (architecture invention flags)
+  - id: material.de00_median
+    op: le
+    value: 2
+    unit: dE00
+    resolution_px: null
+    status: hard
+    provenance: BUILD_PLAN decision 14 (per-material dE00 by Cryptomatte id)
+  - id: material.de00_p90
+    op: le
+    value: 5
+    unit: dE00
+    resolution_px: null
+    status: hard
+    provenance: BUILD_PLAN decision 14
+  - id: ral.de00
+    op: le
+    value: 1
+    unit: dE00
+    resolution_px: null
+    status: hard
+    provenance: BUILD_PLAN decision 14 (RAL swatch against the mean Lab of the masked material)
+  - id: texture.lapvar
+    range: [300, 600]
+    resolution_px: 3840
+    status: hard
+    provenance: car-entry lesson, movie-grade refs measured 377-539 at 3840 wide (>1500 synthetic crunch, <250 soft); valid for native 4K frames only
+  - id: texture.fine_ratio
+    range: [0.40, 0.60]
+    resolution_px: 3840
+    status: calibration_needed
+    provenance: Aparna refs 0.53 / 0.45 under the current formula (scout 03); BUILD_PLAN's 0.35-0.45 band is wrong for it
+  - id: tone.luma
+    range: [100, 120]
+    resolution_px: 3840
+    status: advisory
+    provenance: Aparna gate/street interpolation (scout 03)
+  - id: tone.contrast
+    range: [52, 60]
+    resolution_px: 3840
+    status: advisory
+    provenance: Aparna gate/street interpolation (scout 03)
+  - id: tone.sat
+    range: [55, 65]
+    resolution_px: 3840
+    status: advisory
+    provenance: Aparna gate/street interpolation (scout 03)
+  - id: video.first_frame
+    op: le
+    value: 12
+    unit: levels/255
+    resolution_px: null
+    status: calibration_needed
+    provenance: accepted clips measure first-frame MAE 3.8-10.0 on an aspect-mismatched resize (amphi S3 3.8, couple AER_A 7.4, AER_B 7.6, car S1_take1 10.0); the plan's 8 failed shipped work
+  - id: video.last_frame
+    op: le
+    value: 16
+    unit: levels/255
+    resolution_px: null
+    status: calibration_needed
+    provenance: accepted clips measure last-frame MAE 5.8-14.2 (amphi S3 5.8, couple AER_A 14.2, AER_B 12.4, car S1_take1 9.9); the plan's 14 failed shipped work
+  - id: video.camera_lock_median_flow_px
+    op: le
+    value: 1.0
+    unit: px
+    resolution_px: 960
+    status: advisory
+    status_by_backend:
+      raft: hard
+      dis: advisory
+    provenance: BUILD_PLAN decision 11; RAFT is the box path (hard), cv2 DIS flow is the Mac fallback (advisory) and the report states the backend
+  - id: video.phase_corr_px
+    op: le
+    value: 2
+    unit: px
+    resolution_px: null
+    status: advisory
+    provenance: clip_gate.py phase-correlation camera lock (2 px); triage only
+  - id: video.reproj_edge_recall
+    op: ge
+    value: 0.8
+    resolution_px: 960
+    status: hard
+    provenance: BUILD_PLAN decision 14 (reprojection drift against packet G-buffer edges)
+  - id: video.duration_s
+    op: ge
+    param: shot_duration_s
+    unit: s
+    resolution_px: null
+    status: hard
+    provenance: the delivered clip must cover the shot (bound supplied at check time)
+  - id: image_edge_agreement
+    op: ge
+    value: 0.88
+    resolution_px: 1920
+    status: advisory
+    provenance: car-entry README (>= 0.88 locked, 0.76-0.78 acceptable); image-only Canny agreement is triage only
+  - id: long_edge_min_px
+    op: param
+    value: 30
+    unit: px
+    resolution_px: 1500
+    status: hard
+    provenance: fidelity_bench LONG = 30 px at 1500 wide; scaled as round(30 * width / 1500)

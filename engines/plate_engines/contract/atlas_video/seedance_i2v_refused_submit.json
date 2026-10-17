@@ -1,0 +1,26 @@
+{
+  "note": "synthetic: a moderated submit: HTTP 400 whose message reads like moderation",
+  "request": {
+    "method": "POST",
+    "url": "https://api.atlascloud.ai/api/v1/model/generateVideo",
+    "body": {
+      "model": "bytedance/seedance-2.5/image-to-video",
+      "image": "https://static.atlascloud.ai/media/plate/person_moderated.png",
+      "prompt": "Camera holds still; late sun moves across the oak floor.",
+      "duration": 5,
+      "resolution": "480P",
+      "ratio": "adaptive",
+      "camera_fixed": true,
+      "generate_audio": false,
+      "return_last_frame": false,
+      "seed": 7
+    }
+  },
+  "response": {
+    "status": 400,
+    "json": {
+      "code": 400,
+      "message": "request blocked by content moderation"
+    }
+  }
+}

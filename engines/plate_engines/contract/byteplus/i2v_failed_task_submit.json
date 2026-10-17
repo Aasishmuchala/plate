@@ -1,0 +1,36 @@
+{
+  "note": "synthetic: accepted; the task later fails on output moderation",
+  "request": {
+    "method": "POST",
+    "url": "https://ark.ap-southeast.bytepluses.com/api/v3/contents/generations/tasks",
+    "body": {
+      "model": "dreamina-seedance-2-5-260628",
+      "content": [
+        {
+          "type": "text",
+          "text": "Camera holds still; late sun moves across the oak floor."
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAJCAIAAAC0SDtlAAABxElEQVR4AQG5AUb+APDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8ADw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PAA8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDwAPDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8ADw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PAA8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDwAPDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8ADw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PAA8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw7J2VEJ+AM30AAAAASUVORK5CYII="
+          },
+          "role": "first_frame"
+        }
+      ],
+      "resolution": "480p",
+      "ratio": "adaptive",
+      "duration": 5,
+      "camera_fixed": true,
+      "generate_audio": false,
+      "return_last_frame": false,
+      "seed": 7
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "id": "cgt-fixture-c"
+    }
+  }
+}

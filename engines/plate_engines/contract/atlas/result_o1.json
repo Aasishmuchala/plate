@@ -1,0 +1,14 @@
+{
+  "note": "synthetic: authored from the behaviour pinned in atlas.py / atlas.ts, not captured from the vendor",
+  "request": {
+    "method": "GET",
+    "url": "https://img.atlascloud.ai/out/o1.png"
+  },
+  "response": {
+    "status": 200,
+    "bytes_b64": "UkVTVUxULUlNQUdFLUJZVEVT",
+    "headers": {
+      "content-type": "image/png"
+    }
+  }
+}

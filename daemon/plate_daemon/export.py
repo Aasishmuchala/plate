@@ -15,7 +15,6 @@ from pathlib import Path
 from .cas import CAS
 from .fsutil import write_bytes_atomic
 from .machine import append_note, get_run
-from .paths import cas_root
 from .states import RunState
 
 MIN_OVERRIDE_REASON = 10
@@ -34,7 +33,8 @@ def export_run(
     reason: str | None = None,
     cas: CAS | None = None,
 ) -> Path:
-    cas = cas or CAS(cas_root())
+    if cas is None:  # no global CAS (router plan T5): the caller passes the run's project CAS
+        raise TypeError("pass the project's CAS (CAS(project_dir / 'assets')); there is no global CAS")
     dest = Path(dest)
     run = get_run(conn, run_id)
     if run.state is RunState.GATE_FAIL:

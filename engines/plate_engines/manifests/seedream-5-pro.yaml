@@ -1,13 +1,18 @@
 # seedream-5-pro -- ByteDance image edit via Atlas (D).
 # PLACEHOLDERS (BUILD_PLAN decisions 9 and 13): version is unpinned until the P0 smoke test; price.usd is
-# NOT a vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
+# NOT a confirmed vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
 # endpoints are the vendors' public base URLs as understood on 2026-10-17 and stay unverified until the
 # adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
+# T7: params are the vendor FULL schema (advanced: true only hides a field in the UI drawer). price.usd is the
+# default-tier figure the router ranks on; price.by holds the tiers we know. Nothing is billed-price-verified yet.
 id: seedream-5-pro
 name: Seedream 5 Pro
 version: unpinned
 pinned: false
 kind: image_edit
+# Atlas slug for Seedream 5 Pro is not in any source we hold; null until the P0 smoke test reads the catalogue.
+model_id: null
+flags: [unverified_p0]
 inputs:
   - {name: image, type: image, required: true}
   - {name: prompt, type: text, required: true}
@@ -16,12 +21,23 @@ inputs:
 outputs:
   - {name: image, type: image, required: true}
 params:
-  - {name: seed, type: int, default: null, range: null, enum: null}
+  - {name: aspect_ratio, type: enum, enum: ["1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]}
+  - {name: resolution, type: enum, default: "2K", enum: ["1K", "2K", "4K"]}
+  - {name: seed, type: int, range: [-1, 2147483647], advanced: true}
+sizes:
+  legal:
+    - {w: 1024, h: 1024, label: "1K"}
+    - {w: 2048, h: 2048, label: "2K"}
+    - {w: 4096, h: 4096, label: "4K"}
+  aspects: ["1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
 price:
   model: per_image
-  usd: 0.0
+  usd: 0.12
+  by: {"1K": 0.12, "2K": 0.23}
   status: unconfirmed
-  notes: "UNCONFIRMED placeholder: usd is not a vendor price; refresh from the vendor catalogue at P0. Pricing unit (per image) is also assumed."
+  source: "VIZMAKER.md section 4: in-app 1K 0.96 credits and 2K 1.92 credits at USD 0.12 per credit (reseller price, not Atlas list)."
+  as_of: 2026-10-17
+  notes: "UNCONFIRMED: Atlas list price for Seedream 5 Pro is not established; 4K is not priced."
 determinism: nondeterministic
 licence:
   vendor_terms_url: unknown
@@ -36,4 +52,5 @@ routes:
     terms_hash: unknown
     upload_visibility: public
     same_model_fallback_of: null
+    allowed_hosts: [.atlascloud.ai, .aliyuncs.com]
     note: "Atlas uploadMedia returns public OSS URLs: grade D, refused for NDA projects."

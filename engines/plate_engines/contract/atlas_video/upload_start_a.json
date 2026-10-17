@@ -1,0 +1,17 @@
+{
+  "note": "synthetic: uploadMedia of start_a.png (16x9 deterministic PNG, see test_adapters_video.png_bytes); body_hash covers field, file name and bytes",
+  "request": {
+    "method": "POST",
+    "url": "https://api.atlascloud.ai/api/v1/model/uploadMedia",
+    "body_hash": "79423d28"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "code": 200,
+      "data": {
+        "download_url": "https://static.atlascloud.ai/media/plate/uploaded_start_a.png"
+      }
+    }
+  }
+}

@@ -29,10 +29,15 @@ def _one_line(exc: ValidationError) -> str:
 
 
 def load_manifests(dir: Path = DEFAULT_MANIFEST_DIR) -> dict[str, EngineManifest]:
-    """Return {engine_id: EngineManifest} for every *.yaml in dir, sorted by file name."""
+    """Return {engine_id: EngineManifest} for every *.yaml in dir, sorted by file name.
+
+    A file whose name starts with "_" is an overlay (prices.refresh writes _prices.yaml), not a manifest: skipped.
+    """
     out: dict[str, EngineManifest] = {}
     origin: dict[str, str] = {}
     for path in sorted(Path(dir).glob("*.yaml")):
+        if path.name.startswith("_"):
+            continue
         try:
             raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         except (yaml.YAMLError, UnicodeDecodeError) as exc:

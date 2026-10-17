@@ -1,0 +1,504 @@
+{
+  "packet_version": "0.1.1",
+  "packet_id": "pkt_4D1K9JP85JP87VS0389YFQAWJ4",
+  "kind": "motion",
+  "tier": "A",
+  "project_id": "plate-fixture",
+  "shot_id": "dolly-12f",
+  "created_utc": "2026-10-17T00:00:00Z",
+  "supersedes": null,
+  "host": {
+    "app": "none",
+    "version": "blender-5.1.1",
+    "plugin": {
+      "name": "plate_fixture",
+      "version": "0.1.0"
+    }
+  },
+  "renderer": {
+    "name": "vray",
+    "version": "fixture-cycles-5.1"
+  },
+  "scene_hash": {
+    "algo": "blake3",
+    "hex": "d8a4e0da1ff3c5204377ca7a7c736a13473609bb2e352a3984183a58b6ab8c08",
+    "digest_version": "1"
+  },
+  "view_hash": {
+    "algo": "blake3",
+    "hex": "2a2da3c33819ab43774efd4c693a218074c531f4e7542af97ac972fb22329cb7"
+  },
+  "units": {
+    "system_unit": "meters",
+    "meters_per_unit": 1.0,
+    "up_axis": "Z"
+  },
+  "camera": {
+    "name": "CAM_dolly",
+    "source": "scene",
+    "node_type": "BlenderCamera",
+    "projection": "perspective",
+    "convention": {
+      "id": "plate-cam-v0",
+      "handedness": "right",
+      "world_up": "+Z",
+      "camera_forward": "-Z",
+      "camera_up": "+Y",
+      "camera_right": "+X",
+      "matrix": "world_from_camera",
+      "layout": "row_major",
+      "vectors": "column",
+      "length_unit": "scene",
+      "pixel_origin": "top_left_corner",
+      "pixel_center": 0.5
+    },
+    "world_from_camera": [
+      [
+        1.0,
+        0.0,
+        0.0,
+        0.1
+      ],
+      [
+        0.0,
+        0.038433,
+        -0.999261,
+        -1.9
+      ],
+      [
+        0.0,
+        0.999261,
+        0.038433,
+        1.45
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "focal_length_mm": 28.0,
+    "film_width_mm": 36.0,
+    "zoom_factor": 1.0,
+    "fov_deg": {
+      "horizontal": 65.4705,
+      "vertical": 39.7607
+    },
+    "lens_shift": {
+      "horizontal": 0,
+      "vertical": 0,
+      "raw_unit": "none",
+      "vertical_tilt_correction": false
+    },
+    "distortion": "none",
+    "intrinsics_px": {
+      "fx": 248.88888888888889,
+      "fy": 248.88888888888889,
+      "principal_point": [
+        160.0,
+        90.0
+      ],
+      "K": [
+        [
+          248.88888888888889,
+          0.0,
+          160.0
+        ],
+        [
+          0.0,
+          248.88888888888889,
+          90.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ]
+    },
+    "resolution": {
+      "width": 320,
+      "height": 180,
+      "pixel_aspect": 1.0
+    },
+    "safe_frame": {
+      "x": 0,
+      "y": 0,
+      "width": 320,
+      "height": 180
+    },
+    "f_number": 8.0,
+    "focus_distance": 4.0,
+    "dof_enabled": false,
+    "exposure": {
+      "mode": "none"
+    },
+    "white_balance": {
+      "mode": "neutral"
+    },
+    "frames": {
+      "hero": 0,
+      "start": 0,
+      "end": 11,
+      "fps": 25
+    },
+    "frames_file": "camera_frames"
+  },
+  "colour": {
+    "max_colour_mode": "legacy_gamma",
+    "legacy_gamma": 2.2,
+    "working_space": "lin_rec709",
+    "master": "display_tiff16",
+    "vfb_corrections_baked": false,
+    "display_encoding": {
+      "primaries": "rec709",
+      "transfer": "srgb",
+      "icc": "none"
+    }
+  },
+  "files": {
+    "beauty_exr": {
+      "kind": "file",
+      "path": "beauty.exr",
+      "bytes": 347128,
+      "hash": {
+        "algo": "blake3",
+        "hex": "7225684bcbd8d2110f73451f586cc5aabe8c7e9d98041d4858880a31d1143481"
+      },
+      "format": "exr",
+      "width": 320,
+      "height": 180,
+      "compression": "zip",
+      "parts": "single",
+      "elements": [
+        {
+          "element": "beauty",
+          "layer": "RGBA",
+          "channels": [
+            "R",
+            "G",
+            "B",
+            "A"
+          ],
+          "dtype": "half",
+          "filtered": true,
+          "denoised": false
+        },
+        {
+          "element": "zdepth",
+          "layer": "VRayZDepth",
+          "channels": [
+            "Z"
+          ],
+          "dtype": "float",
+          "filtered": false,
+          "denoised": false,
+          "depth_kind": "planar",
+          "normalized": false,
+          "clamped": false,
+          "background_value": 10000000000.0
+        },
+        {
+          "element": "normals",
+          "layer": "VRayNormals",
+          "channels": [
+            "X",
+            "Y",
+            "Z"
+          ],
+          "dtype": "half",
+          "filtered": true,
+          "denoised": false,
+          "space": "camera",
+          "encoding": "signed"
+        },
+        {
+          "element": "cryptomatte_object",
+          "layer": "CryptoObject",
+          "channels": [
+            "CryptoObject00.R",
+            "CryptoObject00.G",
+            "CryptoObject00.B",
+            "CryptoObject00.A",
+            "CryptoObject01.R",
+            "CryptoObject01.G",
+            "CryptoObject01.B",
+            "CryptoObject01.A",
+            "CryptoObject02.R",
+            "CryptoObject02.G",
+            "CryptoObject02.B",
+            "CryptoObject02.A"
+          ],
+          "dtype": "float",
+          "filtered": true,
+          "denoised": false,
+          "rank_levels": 6
+        },
+        {
+          "element": "cryptomatte_material",
+          "layer": "CryptoMaterial",
+          "channels": [
+            "CryptoMaterial00.R",
+            "CryptoMaterial00.G",
+            "CryptoMaterial00.B",
+            "CryptoMaterial00.A",
+            "CryptoMaterial01.R",
+            "CryptoMaterial01.G",
+            "CryptoMaterial01.B",
+            "CryptoMaterial01.A",
+            "CryptoMaterial02.R",
+            "CryptoMaterial02.G",
+            "CryptoMaterial02.B",
+            "CryptoMaterial02.A"
+          ],
+          "dtype": "float",
+          "filtered": true,
+          "denoised": false,
+          "rank_levels": 6
+        },
+        {
+          "element": "wire_colour",
+          "layer": "VRayWireColor",
+          "channels": [
+            "R",
+            "G",
+            "B"
+          ],
+          "dtype": "half",
+          "filtered": false,
+          "denoised": false
+        },
+        {
+          "element": "diffuse_filter",
+          "layer": "VRayDiffuseFilter",
+          "channels": [
+            "R",
+            "G",
+            "B"
+          ],
+          "dtype": "half",
+          "filtered": true,
+          "denoised": false
+        }
+      ]
+    },
+    "display_tiff16": {
+      "kind": "file",
+      "path": "display.tif",
+      "bytes": 233950,
+      "hash": {
+        "algo": "blake3",
+        "hex": "03e5b6526d3f8091158ba1018abf4425c01619730b799060c329263a9e2c213d"
+      },
+      "format": "tiff",
+      "width": 320,
+      "height": 180,
+      "bit_depth": 16,
+      "channels": "RGB"
+    },
+    "id_legend": {
+      "kind": "file",
+      "path": "id_legend.json",
+      "bytes": 10106,
+      "hash": {
+        "algo": "blake3",
+        "hex": "34bd2fc9b0b0b78055aea7caad70ec2d531522e32cfd07b429813bdd4c7da233"
+      },
+      "format": "json"
+    },
+    "camera_frames": {
+      "kind": "file",
+      "path": "camera_frames.json",
+      "bytes": 5134,
+      "hash": {
+        "algo": "blake3",
+        "hex": "9c57c1a0cdd45748ff3f652dcd72698ff97a087dcd6f93f8e4f0d3169aac56eb"
+      },
+      "format": "json"
+    },
+    "clay_seq": {
+      "kind": "sequence",
+      "pattern": "motion/clay.%04d.png",
+      "first": 0,
+      "last": 11,
+      "format": "png",
+      "width": 320,
+      "height": 180,
+      "dtype": "uint16",
+      "hashes": "motion/clay.blake3"
+    },
+    "id_seq": {
+      "kind": "sequence",
+      "pattern": "motion/id.%04d.exr",
+      "first": 0,
+      "last": 11,
+      "format": "exr",
+      "width": 320,
+      "height": 180,
+      "dtype": "float",
+      "hashes": "motion/id.blake3"
+    },
+    "z_seq": {
+      "kind": "sequence",
+      "pattern": "motion/z.%04d.exr",
+      "first": 0,
+      "last": 11,
+      "format": "exr",
+      "width": 320,
+      "height": 180,
+      "dtype": "float",
+      "hashes": "motion/z.blake3"
+    }
+  },
+  "id_legend": {
+    "file": "id_legend",
+    "source": "cryptomatte",
+    "cryptomatte": {
+      "object": {
+        "layer": "CryptoObject",
+        "hash": "murmur3_32",
+        "id_type": "node_name",
+        "rank_levels": 6,
+        "manifest": "exr_metadata"
+      },
+      "material": {
+        "layer": "CryptoMaterial",
+        "hash": "murmur3_32",
+        "id_type": "material_name",
+        "rank_levels": 6,
+        "manifest": "exr_metadata"
+      }
+    },
+    "entry_count": 31,
+    "coverage": {
+      "labelled_share": 0.9583,
+      "unlabelled_share": 0.0,
+      "uncovered_share": 0.0417
+    }
+  },
+  "policy": {
+    "rules_version": "1",
+    "class_rules": [
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "ARCH_",
+        "class": "architecture"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "GLZ_",
+        "class": "glazing"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "SIGN_",
+        "class": "signage"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "HARD_",
+        "class": "ground"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "VEG_",
+        "class": "vegetation"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "SKY",
+        "class": "sky"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "PEOPLE",
+        "class": "people"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "WATER",
+        "class": "water"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "VEH_",
+        "class": "vehicle"
+      }
+    ],
+    "lock_by_default": true,
+    "locked_ids": [
+      "o:0b411b0a",
+      "o:5263bdbf",
+      "o:57b3d007",
+      "o:b42836e4",
+      "o:d5cf2e02",
+      "o:735a8655",
+      "o:ca5b90f3",
+      "o:0fb79ada",
+      "o:9013efbe",
+      "o:e68e9665",
+      "o:80da502f",
+      "o:5d710960",
+      "o:8bc8ab09",
+      "o:2ff3b239",
+      "o:c42ac1e2",
+      "m:0b411b0a",
+      "m:5263bdbf",
+      "m:57b3d007",
+      "m:b42836e4",
+      "m:e73d1390",
+      "m:735a8655",
+      "m:ca5b90f3",
+      "m:955b3500"
+    ],
+    "editable_ids": [
+      "o:929c9e95",
+      "o:55cbe981",
+      "o:ebb52806",
+      "o:c8a9bf52",
+      "m:929c9e95",
+      "m:b844e457",
+      "m:ebb52806",
+      "m:c8a9bf52"
+    ],
+    "text_lock": true,
+    "lint": {
+      "max_unlabelled_share": 0.05,
+      "unlabelled_share": 0.0,
+      "passed": true
+    }
+  },
+  "render": {
+    "session": "fixture",
+    "sampler": "progressive",
+    "time_s": null,
+    "denoiser": {
+      "beauty": "none",
+      "denoised_elements": []
+    }
+  },
+  "motion": {
+    "hero_still_packet_id": "pkt_7SQYQX24P7Q3G8BRC73P0P3HQP",
+    "sequence_resolution": {
+      "width": 320,
+      "height": 180
+    },
+    "frame0_matches_hero": true,
+    "clay_override": {
+      "material": "PLATE_clay_matte_0.7",
+      "keeps_glass": false,
+      "keeps_lights": true
+    },
+    "path_crossings": []
+  }
+}

@@ -1,0 +1,8 @@
+# Exceptions to scripts/hazard_scan.py. One per line:  <path or glob>[:<line>] <rule|*>   # why
+# Keep every entry justified; T52 prunes stale ones (python scripts/hazard_scan.py --strict-allow).
+
+# The portability test plants hazards on purpose to prove its lint can fail.
+tests/test_portability.py tmp-literal   # planted '/tmp/...' sample inside test_lint_catches_what_it_claims
+
+# Skip message that names the Blender fixture renderer script (fixtures/blender/render.sh, T2); never executed from Python.
+pixels/tests/test_egress_ingress.py sh-reference

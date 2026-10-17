@@ -1,0 +1,78 @@
+# seedance-2.5-i2v -- ByteDance plain image-to-video via Atlas (D); same-model fallbacks.
+# PLACEHOLDERS (BUILD_PLAN decisions 9 and 13): version is unpinned until the P0 smoke test; price.usd is
+# NOT a confirmed vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
+# endpoints are the vendors' public base URLs as understood on 2026-10-17 and stay unverified until the
+# adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
+# T7: params are the vendor FULL schema (advanced: true only hides a field in the UI drawer). price.usd is the
+# default-tier figure the router ranks on; price.by holds the tiers we know. Nothing is billed-price-verified yet.
+# Plain image-to-video: image is the strict first frame, no reference arrays. Same limits as the r2v manifest:
+# 4-30 s, 480p/720p 8-bit and 1080p 10-bit, no 4K, 24 fps output (recorded as JobStatus.output_fps by T18).
+id: seedance-2.5-i2v
+name: Seedance 2.5 image-to-video
+version: unpinned
+pinned: false
+kind: video_i2v
+model_id: dreamina-seedance-2-5-260628
+flags: [unverified_p0]
+inputs:
+  - {name: image, type: image, required: true}
+  - {name: prompt, type: text, required: true}
+outputs:
+  - {name: video, type: video, required: true}
+params:
+  - {name: duration, type: int, default: 5, range: [4, 30]}
+  - {name: resolution, type: enum, default: "480P", enum: ["480P", "720P", "1080P"]}
+  - {name: ratio, type: enum, default: "adaptive", enum: ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]}
+  - {name: camera_fixed, type: bool, default: false}
+  - {name: generate_audio, type: bool, default: false}
+  - {name: return_last_frame, type: bool, default: false, advanced: true}
+  - {name: seed, type: int, range: [-1, 2147483647], advanced: true}
+sizes:
+  arbitrary: {min_side: 300, max_side: 6000, aspect_min: 0.4, aspect_max: 2.5}
+  aspects: ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+price:
+  model: per_second
+  usd: 0.10
+  by: {"base": 0.134, "atlas_discounted": 0.0268}
+  status: unconfirmed
+  source: "usd: staffage 0.10 per second estimate (scout 02). by.base: Atlas list for Seedance 2.5 image-to-video, 0.134 per second (VIZMAKER.md section 4). by.atlas_discounted: that list with the stated 80 percent discount, derived here as 0.134 x 0.2."
+  as_of: 2026-10-17
+  notes: "UNCONFIRMED and the two sources disagree (0.10 against 0.134 base): the P0 smoke test reads the billed price. WaveSpeed list is about 0.36 per second at 720p and 0.90 at 1080p (VIZMAKER.md 13.33 credits per list dollar)."
+determinism: nondeterministic
+licence:
+  vendor_terms_url: unknown
+  training_opt_out: null
+allowed_tasks: [crop_pair_motion]
+routes:
+  - provider: atlas
+    endpoint: https://api.atlascloud.ai/api/v1
+    region: unknown
+    custody_grade: D
+    custody_status: confirmed
+    terms_hash: unknown
+    upload_visibility: public
+    same_model_fallback_of: null
+    model_slug: bytedance/seedance-2.5/image-to-video
+    allowed_hosts: [.atlascloud.ai, .aliyuncs.com]
+    note: "Atlas uploadMedia returns public OSS URLs: grade D, refused for NDA projects."
+  - provider: byteplus
+    endpoint: unknown
+    region: unknown
+    custody_grade: D
+    custody_status: pending_written_terms
+    terms_hash: unknown
+    upload_visibility: unknown
+    same_model_fallback_of: atlas
+    model_slug: dreamina-seedance-2-5-260628
+    allowed_hosts: [.bytepluses.com]
+    note: "Same model, other provider: fallback of the atlas route only, re-quoted, never silent."
+  - provider: wavespeed
+    endpoint: unknown
+    region: unknown
+    custody_grade: D
+    custody_status: pending_written_terms
+    terms_hash: unknown
+    upload_visibility: unknown
+    same_model_fallback_of: atlas
+    allowed_hosts: [.wavespeed.ai]
+    note: "Same model, other provider: fallback of the atlas route only, re-quoted, never silent."

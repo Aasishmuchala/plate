@@ -1,0 +1,14 @@
+{
+  "note": "synthetic: authored from the vendor's documented shapes, not captured",
+  "request": {
+    "method": "POST",
+    "url": "https://api.bfl.ai/v1/flux-3-image",
+    "body_hash": "f5799247"
+  },
+  "response": {
+    "status": 503,
+    "json": {
+      "detail": "service unavailable"
+    }
+  }
+}

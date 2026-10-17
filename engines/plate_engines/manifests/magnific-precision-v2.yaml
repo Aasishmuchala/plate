@@ -1,24 +1,35 @@
 # magnific-precision-v2 -- upscaler for AI layers only (D).
 # PLACEHOLDERS (BUILD_PLAN decisions 9 and 13): version is unpinned until the P0 smoke test; price.usd is
-# NOT a vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
+# NOT a confirmed vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
 # endpoints are the vendors' public base URLs as understood on 2026-10-17 and stay unverified until the
 # adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
+# T7: params are the vendor FULL schema (advanced: true only hides a field in the UI drawer). price.usd is the
+# default-tier figure the router ranks on; price.by holds the tiers we know. Nothing is billed-price-verified yet.
 id: magnific-precision-v2
 name: Magnific Precision v2
 version: unpinned
 pinned: false
 kind: upscale
+# Freepik API route POST /v1/ai/image-upscaler/precision (router plan T17); the model id string is not established.
+model_id: null
+plate_upscale_forbidden: true
+flags: [unverified_p0]
 inputs:
   - {name: image, type: image, required: true}
 outputs:
   - {name: image, type: image, required: true}
 params:
-  - {name: scale, type: int, default: null, range: null, enum: null}
+  - {name: scale, type: int, default: 2, range: [2, 4]}
+  - {name: sharpen, type: int, range: [0, 100], advanced: true}
+  - {name: smart_grain, type: int, range: [0, 100], advanced: true}
+  - {name: ultra_detail, type: int, range: [0, 100], advanced: true}
 price:
   model: per_image
-  usd: 0.0
+  usd: 0.32
   status: unconfirmed
-  notes: "UNCONFIRMED placeholder: usd is not a vendor price; refresh from the vendor catalogue at P0. Pricing unit (per image) is also assumed."
+  source: "VIZMAKER.md section 4: Magnific Precision was 2.67 credits (about USD 0.32 at the Professional rate) in the January 2026 tutorial; a 4x job failed on size."
+  as_of: 2026-10-17
+  notes: "UNCONFIRMED placeholder from the January 2026 reading; real price scales with output size. Pricing unit (per image) is assumed."
 determinism: nondeterministic
 licence:
   vendor_terms_url: unknown
@@ -33,4 +44,5 @@ routes:
     terms_hash: unknown
     upload_visibility: unknown
     same_model_fallback_of: null
+    allowed_hosts: [.freepik.com]
     note: "Terms and upload behaviour not yet established; AI layers only, never the plate."

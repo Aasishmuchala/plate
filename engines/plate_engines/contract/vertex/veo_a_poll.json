@@ -1,0 +1,36 @@
+{
+  "note": "synthetic: not done, then done with an inline video",
+  "request": {
+    "method": "POST",
+    "url": "https://asia-south1-aiplatform.googleapis.com/v1/projects/plate-test/locations/asia-south1/publishers/google/models/veo-3.1-generate-001:fetchPredictOperation",
+    "body": {
+      "operationName": "projects/plate-test/locations/asia-south1/publishers/google/models/veo-3.1-generate-001/operations/op-a"
+    }
+  },
+  "responses": [
+    {
+      "status": 200,
+      "json": {
+        "name": "projects/plate-test/locations/asia-south1/publishers/google/models/veo-3.1-generate-001/operations/op-a",
+        "done": false
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "name": "projects/plate-test/locations/asia-south1/publishers/google/models/veo-3.1-generate-001/operations/op-a",
+        "done": true,
+        "response": {
+          "@type": "type.googleapis.com/cloud.ai.large_models.vision.GenerateVideoResponse",
+          "raiMediaFilteredCount": 0,
+          "videos": [
+            {
+              "bytesBase64Encoded": "AAAAGGZ0eXBtcDQyAAAAAG1wNDJpc29tUExBVEUtRklYVFVSRS1DTElQLUFQTEFURS1GSVhUVVJFLUNMSVAtQVBMQVRFLUZJWFRVUkUtQ0xJUC1BUExBVEUtRklYVFVSRS1DTElQLUE=",
+              "mimeType": "video/mp4"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "note": "synthetic: authored from the vendor's documented shapes, not captured",
+  "request": {
+    "method": "GET",
+    "url": "https://api.atlascloud.ai/api/v1/model/prediction/pred-b"
+  },
+  "responses": [
+    {
+      "status": 200,
+      "json": {
+        "data": {
+          "id": "pred-b",
+          "status": "processing"
+        }
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "data": {
+          "id": "pred-b",
+          "status": "completed",
+          "outputs": [
+            "https://cdn.aliyuncs.com/out/b.png"
+          ]
+        }
+      }
+    }
+  ]
+}

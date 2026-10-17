@@ -1,13 +1,16 @@
 # wan-2.2-vace -- local previs video (C0, scheduled GPU windows).
 # PLACEHOLDERS (BUILD_PLAN decisions 9 and 13): version is unpinned until the P0 smoke test; price.usd is
-# NOT a vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
+# NOT a confirmed vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
 # endpoints are the vendors' public base URLs as understood on 2026-10-17 and stay unverified until the
 # adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
+# T7: params are the vendor FULL schema (advanced: true only hides a field in the UI drawer). price.usd is the
+# default-tier figure the router ranks on; price.by holds the tiers we know. Nothing is billed-price-verified yet.
 id: wan-2.2-vace
 name: Wan 2.2 VACE
 version: unpinned
 pinned: false
-kind: video_r2v
+kind: local_video
+model_id: Wan2.2-VACE
 inputs:
   - {name: reference_images, type: images, required: true}
   - {name: reference_video, type: video, required: false}
@@ -15,12 +18,17 @@ inputs:
 outputs:
   - {name: video, type: video, required: true}
 params:
-  - {name: duration_s, type: float, default: null, range: null, enum: null}
-  - {name: seed, type: int, default: null, range: null, enum: null}
+  - {name: duration_s, type: float, default: 4.0, range: [1, 10]}
+  - {name: fps, type: int, default: 24, range: [8, 30]}
+  - {name: num_inference_steps, type: int, default: 40, range: [1, 100], advanced: true}
+  - {name: guidance_scale, type: float, default: 5.0, range: [0, 20], advanced: true}
+  - {name: seed, type: int, range: [0, 4294967295], advanced: true}
 price:
   model: per_second
   usd: 0.0
   status: confirmed
+  source: "Local compute on owned hardware; no vendor fee."
+  as_of: 2026-10-17
   notes: "Local compute on owned hardware; no vendor fee. Power and amortisation are not modelled."
 determinism: best_effort
 licence:
@@ -36,4 +44,5 @@ routes:
     terms_hash: unknown
     upload_visibility: local
     same_model_fallback_of: null
+    max_inflight: 1
     note: "Runs on the render box; nothing leaves it."

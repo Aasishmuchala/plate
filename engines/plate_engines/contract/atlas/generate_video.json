@@ -1,0 +1,24 @@
+{
+  "note": "synthetic: authored from the behaviour pinned in atlas.py / atlas.ts, not captured from the vendor",
+  "request": {
+    "method": "POST",
+    "url": "https://api.atlascloud.ai/api/v1/model/generateVideo",
+    "body": {
+      "model": "kwaivgi/kling-v3.0-pro/image-to-video",
+      "image": "https://img.atlascloud.ai/in/plate.png",
+      "image_tail": "https://img.atlascloud.ai/in/end.png",
+      "prompt": "She walks to the gate.",
+      "resolution": "1080P",
+      "duration": 5,
+      "ratio": "16:9"
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "data": {
+        "id": "pred-vid-1"
+      }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "note": "synthetic: 1080P is 10-bit",
+  "request": {
+    "method": "POST",
+    "url": "https://api.atlascloud.ai/api/v1/model/generateVideo",
+    "body": {
+      "model": "bytedance/seedance-2.5/image-to-video",
+      "image": "https://static.atlascloud.ai/media/plate/start_a.png",
+      "prompt": "Camera holds still; late sun moves across the oak floor.",
+      "duration": 8,
+      "resolution": "1080P",
+      "ratio": "adaptive",
+      "camera_fixed": true,
+      "generate_audio": false,
+      "return_last_frame": false,
+      "seed": 7
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "code": 200,
+      "message": "success",
+      "data": {
+        "id": "pred_vid_hd",
+        "status": "created"
+      }
+    }
+  }
+}

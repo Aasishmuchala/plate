@@ -1,7 +1,7 @@
 """Command line for the gate core: `python -m plate_gates {selftest|pair|idmask|maskdiff|views}`.
 
 Same subcommands and arguments as ~/Desktop/test/vizmaker-dossier/tools/fidelity_bench.py. Pass --report on
-pair / maskdiff / views to wrap the JSON in the versioned gate report (report.gate_report).
+pair / maskdiff / views to wrap the JSON in the versioned gate report (report.GateReport via gate_report).
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from .thresholds import DEFAULT_THRESHOLDS_ID
 def _add_report_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--report", action="store_true", help="wrap the output in the versioned gate report")
     p.add_argument("--thresholds-id", default=DEFAULT_THRESHOLDS_ID)
+    p.add_argument("--engine", default=None, help="engine id recorded in the report")
     p.add_argument("--engine-version", default=None)
 
 
@@ -60,7 +61,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _emit(res: dict, args: argparse.Namespace) -> None:
     if args.report:
-        res = report_mod.gate_report(res, args.thresholds_id, args.engine_version)
+        res = report_mod.gate_report(res, args.thresholds_id, args.engine_version, args.engine)
     text = json.dumps(res, indent=1)
     out = getattr(args, "out", None)
     if out:

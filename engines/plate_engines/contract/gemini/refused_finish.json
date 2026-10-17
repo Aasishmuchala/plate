@@ -1,0 +1,23 @@
+{
+  "note": "synthetic: authored from the vendor's documented shapes, not captured",
+  "request": {
+    "method": "POST",
+    "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:generateContent",
+    "body_hash": "b44638f8"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "candidates": [
+        {
+          "finishReason": "SAFETY",
+          "safetyRatings": [
+            {
+              "category": "x"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

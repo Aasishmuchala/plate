@@ -1,0 +1,52 @@
+# Custody facts for the routes that have no engine manifest: the LLM route, the consumer login that is never
+# a route, and the web-app vendors with no adapter. Engine routes live in engines/plate_engines/manifests/*.yaml.
+# This file mirrors docs/custody.md section 2 (the matrix); if the two disagree, fix this file and add a line
+# to the custody.md change log. custody.llm_route() reads it on every call, so no restart is needed.
+#
+# Promoting the Anthropic API to C1 (custody.md "Promotion rule"): set `status: confirmed` and put the sha256 of
+# the filed written terms in `terms_hash`. A confirmed C1 without a terms hash is refused at load time.
+schema: 1
+
+llm:
+  route_id: anthropic-api
+  vendor: Anthropic API
+  provider: anthropic
+  grade: C1
+  status: pending_written_terms
+  terms_hash: unknown
+  upload_visibility: private
+  allowed_hosts: [api.anthropic.com]
+  models: {composer: claude-sonnet-5-5, judge: claude-opus-5-5}
+  note: NDA projects run without composer and judge until the written terms are filed
+
+never:
+  - route_id: anthropic-consumer-login
+    vendor: Anthropic consumer login
+    provider: anthropic
+    note: never a route for client data; client material goes only through the API key
+
+web_vendors:
+  - route_id: runway
+    vendor: Runway
+    provider: runway
+    grade: D
+    status: pending_written_terms
+    terms_hash: unknown
+    upload_visibility: unknown
+    note: web app, no adapter; files made there are imported and count as grade D
+  - route_id: higgsfield
+    vendor: Higgsfield
+    provider: higgsfield
+    grade: D
+    status: pending_written_terms
+    terms_hash: unknown
+    upload_visibility: unknown
+    note: web app and CLI, no adapter; files made there are imported and count as grade D
+  - route_id: fal
+    vendor: fal
+    provider: fal
+    grade: D
+    status: pending_written_terms
+    terms_hash: unknown
+    upload_visibility: unknown
+    note: not in the v1 roster; no adapter is written before its terms are held

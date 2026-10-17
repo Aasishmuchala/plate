@@ -1,9 +1,12 @@
 """`python -m plate_daemon`: load settings, take the app-data lock, recover, then serve.
 
-Reads `PLATE_HOME`, `PLATE_CONFIG`, `PLATE_PORT` (default 4610) and `PLATE_BIND` (comma-separated hosts,
-default 127.0.0.1; `scripts\\start-daemon.ps1 -Tailscale` passes `127.0.0.1,<tailscale ip>`). One uvicorn
-server listens on one pre-bound socket per host, so the lifespan and signal handling run once. Unspecified
-addresses (0.0.0.0, ::) are refused even if they arrive through DNS. `PLATE_FAKE_ENGINE` (JSON of
+Reads `PLATE_HOME`, `PLATE_CONFIG`, `PLATE_TOKEN_FILE`, `PLATE_PORT` (default 4610), `PLATE_DEV` and
+`PLATE_BIND` (default 127.0.0.1; `scripts\\start-daemon.ps1 -Tailscale` passes `127.0.0.1,<tailscale ip>`,
+the same as `PLATE_TAILSCALE_IP`). One uvicorn server listens on one pre-bound socket per address (the
+loopback one and, only when set, the Tailscale one), so the lifespan, the recovery pass and signal
+handling run once. Unspecified addresses (0.0.0.0, ::) are refused even if they arrive through DNS. Once
+the sockets are bound it prints `PLATE daemon http://127.0.0.1:4610/#token=<token>` on stdout: open that
+URL and the UI keeps the token (Decision 5). `PLATE_FAKE_ENGINE` (JSON of
 FakeEngine flags) scripts the in-process fake provider whose journal is `<home>/fake_engine.json`; a
 scripted SimulatedCrash exits the process hard, which is what the cross-process crash test relies on.
 Before serving, every project index gets `recover_on_boot` (re-poll, adopt or fail; never resubmit).
@@ -21,10 +24,10 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from . import __version__
+from .config import ConfigError, Settings, host_port
 from .engine_fake import FakeEngine
+from .index import Index
 from .lock import ProjectLocked, project_lock
-from .settings import ConfigError, Settings
-from .store import Index
 from .worker import recover_on_boot
 
 log = logging.getLogger("plate_daemon")
@@ -107,10 +110,15 @@ def main() -> int:
             return 2
         for s in socks:
             stack.callback(s.close)
-        urls = ", ".join(f"http://{h}:{settings.port}" for h in settings.bind)
-        print(f"PLATE daemon {__version__} on {urls} (home {settings.home})", flush=True)
+        print(f"PLATE daemon {settings.ui_url}", flush=True)
+        urls = ", ".join(f"http://{host_port(h, settings.port)}" for h in settings.bind)
+        log.info("plate_daemon %s on %s (home %s, dev %s)", __version__, urls, settings.home, settings.dev)
         config = uvicorn.Config(
-            app, log_level=os.environ.get("PLATE_LOG_LEVEL", "info").lower(), lifespan="on"
+            app,
+            log_level=os.environ.get("PLATE_LOG_LEVEL", "info").lower(),
+            lifespan="on",
+            proxy_headers=False,  # nothing proxies the daemon; never trust X-Forwarded-* from loopback
+            server_header=False,
         )
         uvicorn.Server(config).run(sockets=socks)
     return 0

@@ -1,0 +1,19 @@
+{
+  "note": "synthetic: authored from the vendor's documented shapes, not captured",
+  "request": {
+    "method": "POST",
+    "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:generateContent",
+    "body_hash": "ce62dacc"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "promptFeedback": {
+        "blockReason": "PROHIBITED_CONTENT"
+      },
+      "usageMetadata": {
+        "promptTokenCount": 9
+      }
+    }
+  }
+}

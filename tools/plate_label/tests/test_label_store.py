@@ -1,89 +1,123 @@
 from __future__ import annotations
 
 import json
-import re
+import os
 import warnings
 
 import pytest
-from blake3 import blake3
 
-from plate_label import __version__
+from plate_label import store
+from plate_label.pairs import Pair
 from plate_label.store import (
     LabelRecord,
     append_label,
-    file_blake3,
-    labelled_hashes,
-    list_images,
+    clean_seconds,
+    labelled_keys,
     read_labels,
-    record_label,
+    remove_line,
+    replace_with_retry,
 )
 
 
-def test_list_images_sorted_case_insensitively_and_filtered(images):
-    names = [p.relative_to(images).as_posix() for p in list_images(images)]
-    assert names == ["A_first.jpg", "b_second.PNG", "sub/c_third.webp"]  # no .txt, no dot-files
+def pair(**kw):
+    base = dict(take_id="S3", candidate=None, candidate_ref="out/a.png", plate=None, plate_ref="in/a.png")
+    base.update(kw)
+    return Pair(**base)
 
 
-def test_record_schema_and_round_trip(tmp_path):
-    out = tmp_path / "calib" / "labels.jsonl"  # parent is created on demand
-    rec = LabelRecord.new("sub/a.png", "ab" * 32, "fix", ["G01", "C01"], "ledge moved", "aasish", "take-7")
-    append_label(out, rec)
-    append_label(out, LabelRecord.new("b.png", "cd" * 32, "ship"))
-
-    raw = out.read_bytes()
-    assert b"\r" not in raw and raw.endswith(b"\n") and raw.count(b"\n") == 2
-    rows = read_labels(out)
-    assert [r["image"] for r in rows] == ["sub/a.png", "b.png"]
-    first = rows[0]
-    assert list(first) == [
-        "ts", "image", "image_blake3", "verdict", "reasons", "note", "rater", "take_id", "tool_version",
+def test_record_schema_key_order_and_optional_keys():
+    full = LabelRecord.for_pair(
+        pair(run_id="r12", gate_report="gates/r12.1.json"), "fix", ["P1", "A2"], 14.23, "aasish"
+    )
+    d = json.loads(full.to_json())
+    assert list(d) == [
+        "v", "at", "rater", "take_id", "plate", "candidate", "run_id", "verdict", "reasons", "seconds", "gate_report",
     ]  # fmt: skip
-    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", first["ts"])
-    assert first["reasons"] == ["G01", "C01"] and first["take_id"] == "take-7"
-    assert rows[1]["take_id"] is None and rows[1]["reasons"] == [] and rows[1]["tool_version"] == __version__
-    assert json.loads(rec.to_json()) == first or json.loads(rec.to_json())["image"] == "sub/a.png"
+    assert d["v"] == 1 and d["reasons"] == ["P1", "A2"] and d["seconds"] == 14.2
+    assert d["at"].endswith("Z") and "T" in d["at"]
+    assert "\n" not in full.to_json()
+
+    bare = LabelRecord.for_pair(pair(plate_ref=None), "ship", [], 0, "aasish")
+    d = json.loads(bare.to_json())
+    assert "run_id" not in d and "gate_report" not in d  # absent, not null
+    assert d["plate"] is None and d["verdict"] == "ship" and d["reasons"] == []
 
 
-def test_labelled_hashes_and_skip_logic(images, tmp_path):
-    out = tmp_path / "labels.jsonl"
-    a, b, _c = list_images(images)
-    record_label(out, images, a, "ship")
-    done = labelled_hashes(out)
-    assert done == {file_blake3(a)}
-    todo = [p for p in list_images(images) if file_blake3(p) not in done]
-    assert a not in todo and b in todo and len(todo) == 2
+def test_record_validation():
+    with pytest.raises(ValueError, match="verdict"):
+        LabelRecord.for_pair(pair(), "maybe", [], 1, "r")
+    with pytest.raises(ValueError, match="Z9"):
+        LabelRecord.for_pair(pair(), "fix", ["Z9"], 1, "r")
+    with pytest.raises(ValueError, match="rater"):
+        LabelRecord.for_pair(pair(), "ship", [], 1, " ")
+    for bad in [-1, float("nan"), float("inf"), 90_000, "3", True, None]:
+        with pytest.raises(ValueError, match="seconds"):
+            clean_seconds(bad)
+    assert clean_seconds(0) == 0.0 and clean_seconds(3) == 3.0 and clean_seconds(2.26) == 2.3
 
 
-def test_record_label_hashes_and_validates(images, tmp_path):
-    out = tmp_path / "labels.jsonl"
-    img = images / "A_first.jpg"
-    rec = record_label(out, images, img, "render_it", ["G03"], "", "me", None)
-    assert rec.image == "A_first.jpg" and rec.image_blake3 == blake3(img.read_bytes()).hexdigest()
-    with pytest.raises(ValueError):
-        record_label(out, images, img, "fix", [])
-    with pytest.raises(ValueError):
-        record_label(out, images, tmp_path / "elsewhere.png", "ship")  # outside the labelled folder
-    assert len(read_labels(out)) == 1  # failures wrote nothing
-
-
-def test_missing_file_and_corrupt_line(tmp_path):
-    out = tmp_path / "labels.jsonl"
-    assert read_labels(out) == [] and labelled_hashes(out) == set()
-    out.write_bytes(
-        b'{"image":"a.png","image_blake3":"aa","verdict":"ship"}\n{"image":"b.p'
-    )  # crash mid-write
+def test_append_read_round_trip_and_crash_recovery(tmp_path):
+    out = tmp_path / "calib" / "labels.jsonl"  # parent is created on demand
+    a = LabelRecord.for_pair(pair(), "ship", [], 2, "r1")
+    b = LabelRecord.for_pair(pair(take_id="S4"), "fix", ["P3"], 5, "r1")
+    append_label(out, a)
+    assert out.read_bytes().endswith(b"\n") and b"\r" not in out.read_bytes()
+    with open(out, "ab") as f:  # a crash mid-write leaves a partial line without a newline
+        f.write(b'{"v":1,"at"')
+    append_label(out, b)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        assert len(read_labels(out)) == 1
+        rows = read_labels(out)
+    assert [r["take_id"] for r in rows] == ["S3", "S4"]
     assert any("unreadable" in str(w.message) for w in caught)
-    append_label(out, LabelRecord.new("c.png", "cc", "ship"))  # must not glue onto the torn line
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        assert [r["image"] for r in read_labels(out)] == ["a.png", "c.png"]
+    assert read_labels(tmp_path / "nope.jsonl") == []
 
 
-def test_non_ascii_note_is_utf8(tmp_path):
+def test_labelled_keys_are_per_rater(tmp_path):
     out = tmp_path / "labels.jsonl"
-    append_label(out, LabelRecord.new("a.png", "aa", "ship", note="stüdio – ok"))
-    assert "stüdio – ok".encode() in out.read_bytes()
-    assert read_labels(out)[0]["note"] == "stüdio – ok"
+    append_label(out, LabelRecord.for_pair(pair(), "ship", [], 1, "alice"))
+    assert labelled_keys(out, "alice") == {("S3", "in/a.png", "out/a.png")}
+    assert labelled_keys(out, "bob") == set()
+    assert pair().key in labelled_keys(out, "alice")
+
+
+def test_remove_line_removes_only_the_last_match(tmp_path):
+    out = tmp_path / "labels.jsonl"
+    a = LabelRecord.for_pair(pair(), "ship", [], 1, "r")
+    b = LabelRecord.for_pair(pair(take_id="S4"), "fix", ["P1"], 2, "r")
+    la, lb = append_label(out, a), append_label(out, b)
+    assert remove_line(out, lb) is True
+    assert [r["take_id"] for r in read_labels(out)] == ["S3"]
+    assert out.read_bytes() == (la + "\n").encode("utf-8")
+    assert remove_line(out, lb) is False  # already gone
+    assert remove_line(tmp_path / "none.jsonl", la) is False
+    assert not list(tmp_path.glob("*.tmp"))  # no temp file left behind
+    # two identical lines (same text): only one goes
+    append_label(out, a)
+    twin = a.to_json()
+    with open(out, "a", encoding="utf-8", newline="\n") as f:
+        f.write(twin + "\n")
+    before = len(read_labels(out))
+    assert remove_line(out, twin) is True and len(read_labels(out)) == before - 1
+
+
+def test_replace_with_retry_survives_a_brief_lock(tmp_path, monkeypatch):
+    src, dst = tmp_path / "a.tmp", tmp_path / "a.jsonl"
+    src.write_text("x", encoding="utf-8", newline="\n")
+    real = os.replace
+    calls = {"n": 0}
+
+    def flaky(s, d):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError("held by an indexer")
+        return real(s, d)
+
+    monkeypatch.setattr(store.os, "replace", flaky)
+    monkeypatch.setattr(store.time, "sleep", lambda _s: None)
+    replace_with_retry(src, dst)
+    assert calls["n"] == 3 and dst.read_text(encoding="utf-8") == "x"
+
+    monkeypatch.setattr(store.os, "replace", lambda s, d: (_ for _ in ()).throw(PermissionError("locked")))
+    with pytest.raises(PermissionError):
+        replace_with_retry(src, tmp_path / "b", tries=2)

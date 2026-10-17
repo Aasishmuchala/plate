@@ -1,0 +1,17 @@
+{
+  "note": "synthetic: authored from the vendor's documented shapes, not captured",
+  "request": {
+    "method": "GET",
+    "url": "https://api.atlascloud.ai/api/v1/model/prediction/pred-failed"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "data": {
+        "id": "pred-failed",
+        "status": "failed",
+        "message": "safety policy violation"
+      }
+    }
+  }
+}

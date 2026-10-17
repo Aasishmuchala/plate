@@ -1,0 +1,34 @@
+{
+  "note": "synthetic: Kling O3 4K start/end (4K is the slug, no resolution field): pace words stripped from the prompt because image_tail is set; duration ceil(5.2)=6; ratio from source dims",
+  "request": {
+    "method": "POST",
+    "url": "https://api.atlascloud.ai/api/v1/model/generateVideo",
+    "body": {
+      "model": "kwaivgi/kling-video-o3-4k/image-to-video",
+      "image": "https://static.atlascloud.ai/media/plate/start_a.png",
+      "image_tail": "https://static.atlascloud.ai/media/plate/end_a.png",
+      "prompt": "A push in to the dining table; the light shifts to dusk.",
+      "duration": 6,
+      "cfg_scale": 0.5,
+      "ratio": "16:9",
+      "negative_prompt": "morphing, warping, extra people",
+      "elements": [
+        {
+          "image_url": "https://static.atlascloud.ai/media/plate/ref_sofa.png",
+          "name": "sofa"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "code": 200,
+      "message": "success",
+      "data": {
+        "id": "pred_kling_o3",
+        "status": "created"
+      }
+    }
+  }
+}

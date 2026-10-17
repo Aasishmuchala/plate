@@ -1,0 +1,25 @@
+{
+  "note": "synthetic: finished with a gcsUri output",
+  "request": {
+    "method": "POST",
+    "url": "https://us-central1-aiplatform.googleapis.com/v1/projects/plate-test/locations/us-central1/publishers/google/models/veo-3.1-generate-001:fetchPredictOperation",
+    "body": {
+      "operationName": "projects/plate-test/locations/us-central1/publishers/google/models/veo-3.1-generate-001/operations/op-c"
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "name": "projects/plate-test/locations/us-central1/publishers/google/models/veo-3.1-generate-001/operations/op-c",
+      "done": true,
+      "response": {
+        "videos": [
+          {
+            "gcsUri": "gs://plate-test-veo/out/c.mp4",
+            "mimeType": "video/mp4"
+          }
+        ]
+      }
+    }
+  }
+}

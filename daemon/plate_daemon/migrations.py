@@ -4,6 +4,13 @@ Each migration is a list of single statements (not a script) so `db.migrate` can
 explicit `BEGIN IMMEDIATE` transaction. `run_events` and `packet_events` are append-only: triggers abort
 any UPDATE or DELETE. A CHECK keeps the "SUBMITTED and later carry a provider_job_id" invariant at the
 storage layer too, so no code path can write a submitted run that recovery could not re-poll.
+
+M002 (router plan T5) adds what the project-folder cache needs: `assets` (one row per CAS object),
+`events` (the SSE bus log that `Last-Event-ID` replays), `project_meta` (the project's folder root and
+custody, so a project on the NAS is found by id), `runs.node_id` / `runs.quote_json`, a unique
+`idempotency_key`, `packets.view_hash`, and read-only aliases `runs.run_id` (= `id`) and
+`packets.manifest_hash` (= `manifest_blake3`) under the names the plan uses. Applied migrations are never
+edited: a change is a new numbered entry.
 """
 
 from __future__ import annotations
@@ -126,4 +133,33 @@ M001 = [
     *_append_only("run_events"),
 ]
 
-MIGRATIONS: list[tuple[int, list[str]]] = [(1, M001)]
+M002 = [
+    """CREATE TABLE assets (
+        hash TEXT PRIMARY KEY CHECK (length(hash) = 64),
+        ext TEXT NOT NULL,
+        bytes INTEGER NOT NULL CHECK (bytes >= 0),
+        phash TEXT,
+        added_utc TEXT NOT NULL
+    )""",
+    """CREATE TABLE events (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT,
+        at TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        json TEXT NOT NULL
+    )""",
+    "CREATE INDEX events_run ON events(run_id, seq)",
+    """CREATE TABLE project_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )""",
+    "ALTER TABLE runs ADD COLUMN node_id TEXT",
+    "ALTER TABLE runs ADD COLUMN quote_json TEXT",
+    "ALTER TABLE runs ADD COLUMN run_id TEXT GENERATED ALWAYS AS (id) VIRTUAL",
+    "CREATE INDEX runs_node ON runs(node_id)",
+    "CREATE UNIQUE INDEX runs_idempotency_key ON runs(idempotency_key) WHERE idempotency_key IS NOT NULL",
+    "ALTER TABLE packets ADD COLUMN view_hash TEXT",
+    "ALTER TABLE packets ADD COLUMN manifest_hash TEXT GENERATED ALWAYS AS (manifest_blake3) VIRTUAL",
+]
+
+MIGRATIONS: list[tuple[int, list[str]]] = [(1, M001), (2, M002)]

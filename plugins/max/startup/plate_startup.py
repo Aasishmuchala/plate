@@ -1,9 +1,11 @@
 """PLATE startup script for 3ds Max 2026, copied to scripts/startup by plugins/max/scripts/install.ps1.
 
-Reads repo_path from the PLATE config.json, puts <repo>/plugins/max on sys.path and imports
-plate_max. It registers nothing else yet (the dock and the Send action come later). Any failure is
-printed to the MAXScript Listener and swallowed, so a broken install can never stop Max starting.
-Stdlib only; it cannot import plate_max.config before sys.path is set, so the path logic is repeated.
+Reads repo_path from the single app-data config.json, puts <repo>/plugins/max on sys.path, imports
+plate_max and registers the PLATE_Dock macro (plate_max.bootstrap.register_macro), which opens the dock
+through plate_max.bootstrap.launch(). It does not update anything: no git pull, no network (BUILD_PLAN
+decision 25). Any failure is printed to the MAXScript Listener and swallowed, so a broken install can
+never stop Max starting. Stdlib only; it cannot import plate_max.config before sys.path is set, so the
+path logic is repeated.
 """
 
 from __future__ import annotations
@@ -44,6 +46,13 @@ def _boot() -> None:
         )
     except Exception as exc:  # never block Max startup
         print("[PLATE] plugin not loaded: {}: {}".format(type(exc).__name__, exc))
+        return
+    try:
+        from plate_max import bootstrap
+
+        print("[PLATE] macro {} registered".format(bootstrap.register_macro()))
+    except Exception as exc:  # the plugin is loaded; only the dock macro is missing
+        print("[PLATE] dock macro not registered: {}: {}".format(type(exc).__name__, exc))
 
 
 _boot()

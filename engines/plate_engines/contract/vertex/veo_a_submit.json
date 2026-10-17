@@ -1,0 +1,31 @@
+{
+  "note": "synthetic: Veo 3.1 predictLongRunning in asia-south1 (the unverified default region): image inline, defaults 8 s 1080p no audio",
+  "request": {
+    "method": "POST",
+    "url": "https://asia-south1-aiplatform.googleapis.com/v1/projects/plate-test/locations/asia-south1/publishers/google/models/veo-3.1-generate-001:predictLongRunning",
+    "body": {
+      "instances": [
+        {
+          "prompt": "Camera holds; steam rises from the cup.",
+          "image": {
+            "bytesBase64Encoded": "iVBORw0KGgoAAAANSUhEUgAAABAAAAAJCAIAAAC0SDtlAAABxElEQVR4AQG5AUb+AMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoDHGdgUPQSDsAAAAASUVORK5CYII=",
+            "mimeType": "image/png"
+          }
+        }
+      ],
+      "parameters": {
+        "durationSeconds": 8,
+        "aspectRatio": "16:9",
+        "resolution": "1080p",
+        "generateAudio": false,
+        "sampleCount": 1
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "name": "projects/plate-test/locations/asia-south1/publishers/google/models/veo-3.1-generate-001/operations/op-a"
+    }
+  }
+}

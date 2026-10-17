@@ -1,14 +1,17 @@
 """Structural similarity and edge metrics: SSIM, Canny, long-edge filtering, tolerance IoU, best shift.
 
 Ported from the structure section of ~/Desktop/test/vizmaker-dossier/tools/fidelity_bench.py.
-Kernels, sigmas and constants are unchanged; the only edit is that long_edges keeps components with
-a lookup table instead of one full-image compare per component (identical output, much faster).
+Kernels, sigmas and constants are unchanged; long_edges keeps components with a lookup table instead of one
+full-image compare per component (identical output, much faster) and can scale its cut-off with the
+evaluation width (30 px at 1500 wide, see long_edge_min_px).
 """
 
 from __future__ import annotations
 
 import cv2
 import numpy as np
+
+from .thresholds import long_edge_min_px
 
 LONG = 30  # px of connected edge length considered a structural edge at the evaluation width
 
@@ -40,8 +43,15 @@ def canny(gray: np.ndarray, sigma: float = 1.2) -> np.ndarray:
     return cv2.Canny(g, lo, hi) > 0
 
 
-def long_edges(e: np.ndarray, minlen: int = LONG) -> np.ndarray:
-    """Keep only 8-connected edge components with at least `minlen` pixels."""
+def long_edges(e: np.ndarray, minlen: int = LONG, *, width: int | None = None) -> np.ndarray:
+    """Keep only 8-connected edge components with at least `minlen` pixels.
+
+    Pass `width` (the evaluation width of the edge map) to scale the cut-off with resolution,
+    minlen = round(30 * width / 1500), instead of the fixed 30 px; width wins over minlen. The default
+    (minlen=30, no width) is the seed behaviour that the frozen goldens were recorded with.
+    """
+    if width is not None:
+        minlen = long_edge_min_px(width)
     n, lab, stats, _ = cv2.connectedComponentsWithStats(e.astype(np.uint8), connectivity=8)
     good = stats[:, cv2.CC_STAT_AREA] >= minlen
     good[0] = False  # label 0 is background

@@ -1,0 +1,18 @@
+{
+  "note": "synthetic: failed task with a sensitive-content code: refused",
+  "request": {
+    "method": "GET",
+    "url": "https://ark.ap-southeast.bytepluses.com/api/v3/contents/generations/tasks/cgt-fixture-c"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "id": "cgt-fixture-c",
+      "status": "failed",
+      "error": {
+        "code": "OutputVideoSensitiveContentDetected",
+        "message": "The output video may contain sensitive information."
+      }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "note": "synthetic: Kling v3 Pro without an end frame: pace words are kept; portrait source gives ratio 9:16",
+  "request": {
+    "method": "POST",
+    "url": "https://api.atlascloud.ai/api/v1/model/generateVideo",
+    "body": {
+      "model": "kwaivgi/kling-v3.0-pro/image-to-video",
+      "image": "https://static.atlascloud.ai/media/plate/start_portrait.png",
+      "prompt": "A slow dolly toward the balcony door.",
+      "duration": 5,
+      "cfg_scale": 0.5,
+      "ratio": "9:16",
+      "resolution": "1080P"
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "code": 200,
+      "message": "success",
+      "data": {
+        "id": "pred_kling_v3",
+        "status": "created"
+      }
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "note": "synthetic: completed r2v job",
+  "request": {
+    "method": "GET",
+    "url": "https://api.atlascloud.ai/api/v1/model/prediction/pred_r2v_1"
+  },
+  "responses": [
+    {
+      "status": 200,
+      "json": {
+        "code": 200,
+        "data": {
+          "id": "pred_r2v_1",
+          "status": "processing"
+        }
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "code": 200,
+        "data": {
+          "id": "pred_r2v_1",
+          "status": "completed",
+          "outputs": [
+            "https://atlas-media.oss-ap-southeast-1.aliyuncs.com/vid/r2v1.mp4"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,52 +1,48 @@
 name: ci
 on: [push, pull_request]
+permissions:
+  contents: read
+# No vendor network in CI: PLATE_LIVE is never set, every engine and the pixels worker run on fixtures and stubs.
 jobs:
-  fidelity-selftest:
-    # First CI job (BUILD_PLAN section 9, day 1): the fidelity harness proves itself before anything else runs.
-    strategy:
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --python 3.12
-      - run: uv run --no-sync python -m plate_gates.fidelity_bench selftest
-        env:
-          PYTHONPATH: gates
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --python 3.12
-      - run: uv run --no-sync ruff check .
-      - run: uv run --no-sync ruff format --check .
-      - run: uv run --no-sync pytest tests -q
-  python:
-    needs: fidelity-selftest
+  check:
+    # One matrix, both operating systems PLATE runs on (BUILD_PLAN decision 30). Steps run in the order of
+    # scripts/test.ps1 and `make test`; the fidelity harness proves itself before anything else runs.
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - uses: FedericoCarboni/setup-ffmpeg@v3
-      - run: uv sync --python 3.12
-      - run: uv run --no-sync pytest
-  ui:
-    needs: fidelity-selftest
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm ci
-      - run: npm test
+      - uses: FedericoCarboni/setup-ffmpeg@v3
+      - name: uv sync
+        run: uv sync --python 3.12
+      - name: npm ci (root workspace, includes ui)
+        run: npm ci
+      - name: fidelity_bench selftest
+        run: uv run --no-sync python -m plate_gates.fidelity_bench selftest
+        env:
+          PYTHONPATH: gates
+      - name: hazard scanner selftest
+        run: uv run --no-sync python scripts/hazard_scan.py --selftest
+      - name: Windows-hazard scan
+        run: uv run --no-sync python scripts/hazard_scan.py
+      - name: ruff check
+        run: uv run --no-sync ruff check .
+      - name: ruff format
+        run: uv run --no-sync ruff format --check .
+      - name: licence registry
+        # python -m plate_pixels.licences --check fails the build on a non-commercial model (T22 adds --check).
+        if: hashFiles('pixels/plate_pixels/licences.py') != ''
+        continue-on-error: false
+        run: uv run --no-sync python -m plate_pixels.licences --check
+      - name: pytest
+        run: uv run --no-sync pytest
+      - name: npm test
+        run: npm test
+      - name: npm run build
+        run: npm run build

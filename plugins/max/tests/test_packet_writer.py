@@ -538,3 +538,60 @@ def test_data_sequences_must_be_float_exr_with_one_frame_token_and_the_render_as
     ):
         with pytest.raises(packet.ManifestError, match=match):
             _build_motion(scene, tmp_path / f"m{n}", mutate)
+
+
+# ---- T9: daemon hashes into write_packet, the content scene digest in the manifest
+
+
+def _hashes_of(root, rels):
+    return {rel: {"hex": b3((root / rel).read_bytes()), "bytes": (root / rel).stat().st_size} for rel in rels}
+
+
+def test_write_packet_checks_the_manifest_against_the_daemon_hashes(scene, tmp_path):
+    root = tmp_path / "pkt"
+    manifest, leg, *_ = build_still(scene, root)
+    hashes = _hashes_of(root, ["beauty.exr", "display.tif"])
+    packet.write_packet(root, manifest, leg, hashes=hashes)
+    assert plate_spec.validate_packet_dir(root, check_files=True) == []
+    (root / "manifest.json").unlink()
+    stale = {**hashes, "display.tif": {"hex": "f" * 64, "bytes": hashes["display.tif"]["bytes"]}}
+    with pytest.raises(packet.ManifestError, match="changed since it was hashed"):
+        packet.write_packet(root, manifest, leg, hashes=stale)
+    with pytest.raises(packet.ManifestError, match="was not hashed"):
+        packet.write_packet(root, manifest, leg, hashes={"beauty.exr": hashes["beauty.exr"]})
+    assert not (root / "manifest.json").exists()  # refused before anything was written
+
+
+def test_file_ref_from_hashes(tmp_path):
+    hashes = {"beauty.exr": {"hex": "a" * 64, "bytes": 9}}
+    ref = packet.file_ref_from_hashes("beauty.exr", hashes, "exr", width=4)
+    assert ref == packet.file_ref("beauty.exr", 9, "a" * 64, "exr", width=4)
+    with pytest.raises(packet.ManifestError, match="no daemon hash"):
+        packet.file_ref_from_hashes("display.tif", hashes, "tiff")
+
+
+def test_the_manifest_scene_hash_names_the_content_digest(scene, tmp_path):
+    from packet_fixture import colour_block, render_block
+
+    manifest, leg, cam, sc = build_still(scene, tmp_path / "pkt")
+    assert manifest["scene_hash"]["digest_version"] == digest.SCENE_DIGEST_VERSION == "1"
+    assert manifest["scene_hash"]["hex"] == b3(digest.scene_hash_payload(sc))
+    # a hand-built digest without content lines is the interim file-meta format, version "0"
+    legacy = {k: v for k, v in sc.items() if k not in ("lines", "digest_version")}
+    rebuilt = packet.build_manifest(
+        cam,
+        legacy,
+        manifest["files"],
+        leg,
+        policy.derive_policy(leg),
+        "tula-wot",
+        "cam-main",
+        {"version": "2026.2"},
+        {"name": "vray", "version": "7.00.03"},
+        colour_block(),
+        render_block(),
+        scene_hash="b" * 64,
+        view_hash="c" * 64,
+    )
+    assert rebuilt["scene_hash"]["digest_version"] == "0"
+    assert plate_spec.validate_manifest(rebuilt) == []

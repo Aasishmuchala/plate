@@ -1,0 +1,32 @@
+{
+  "note": "synthetic: completed 1080P job",
+  "request": {
+    "method": "GET",
+    "url": "https://api.atlascloud.ai/api/v1/model/prediction/pred_vid_hd"
+  },
+  "responses": [
+    {
+      "status": 200,
+      "json": {
+        "code": 200,
+        "data": {
+          "id": "pred_vid_hd",
+          "status": "processing"
+        }
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "code": 200,
+        "data": {
+          "id": "pred_vid_hd",
+          "status": "completed",
+          "outputs": [
+            "https://atlas-media.oss-ap-southeast-1.aliyuncs.com/vid/hd.mp4"
+          ]
+        }
+      }
+    }
+  ]
+}

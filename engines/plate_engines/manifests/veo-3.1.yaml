@@ -1,13 +1,17 @@
 # veo-3.1 -- Google video via Vertex (C1 candidate).
 # PLACEHOLDERS (BUILD_PLAN decisions 9 and 13): version is unpinned until the P0 smoke test; price.usd is
-# NOT a vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
+# NOT a confirmed vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
 # endpoints are the vendors' public base URLs as understood on 2026-10-17 and stay unverified until the
 # adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
+# T7: params are the vendor FULL schema (advanced: true only hides a field in the UI drawer). price.usd is the
+# default-tier figure the router ranks on; price.by holds the tiers we know. Nothing is billed-price-verified yet.
 id: veo-3.1
 name: Veo 3.1
 version: unpinned
 pinned: false
 kind: video_i2v
+model_id: veo-3.1-generate-001
+flags: [unverified_p0]
 inputs:
   - {name: start_image, type: image, required: true}
   - {name: end_image, type: image, required: false}
@@ -15,13 +19,20 @@ inputs:
 outputs:
   - {name: video, type: video, required: true}
 params:
-  - {name: duration_s, type: float, default: null, range: null, enum: null}
-  - {name: seed, type: int, default: null, range: null, enum: null}
+  - {name: duration, type: int, default: 8, range: [4, 8]}
+  - {name: aspect_ratio, type: enum, default: "16:9", enum: ["16:9", "9:16"]}
+  - {name: resolution, type: enum, default: "1080p", enum: ["720p", "1080p"]}
+  - {name: generate_audio, type: bool, default: false}
+  - {name: negative_prompt, type: str, advanced: true}
+  - {name: seed, type: int, range: [0, 4294967295], advanced: true}
 price:
   model: per_second
-  usd: 0.0
+  usd: 0.21
+  by: {"1080P": 0.21}
   status: unconfirmed
-  notes: "UNCONFIRMED placeholder: usd is not a vendor price; refresh from the vendor catalogue at P0. Pricing unit (per second) is also assumed."
+  source: "VIZMAKER.md section 4: in-app 4 s 1080p no-audio Veo 3.1 job was 7 credits (USD 0.84) = 0.21 per second at the Professional rate; reseller markup is 1.05 to 2.6x Google list."
+  as_of: 2026-10-17
+  notes: "UNCONFIRMED: Vertex list price is not established; this is a reseller reading and likely above list."
 determinism: nondeterministic
 licence:
   vendor_terms_url: unknown
@@ -36,4 +47,5 @@ routes:
     terms_hash: unknown
     upload_visibility: private
     same_model_fallback_of: null
+    allowed_hosts: [.googleapis.com]
     note: "C1 candidate only: Vertex zero-retention terms and regional availability not yet confirmed in writing."

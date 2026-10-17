@@ -1,9 +1,15 @@
 """FastAPI surface of the daemon, all under `/api/v0` (transport contract: spec/PACKET.md section 9).
 
 `create_app(settings, engine=None)` wires the packet ingest, the run lifecycle and the event streams to
-the per-project indexes. Every route except `GET /api/v0/health` (the plugin's version handshake)
-requires `Authorization: Bearer <token>` from config.json, compared in constant time; anything else gets
-`401 {"error": "unauthorized"}`. `POST /api/v0/packets` additionally requires `X-Plate-Packet-Version`
+the per-project indexes. `auth.AuthMiddleware` wraps everything: Host and Origin allowlists on every
+request (403), and under `/api/` `Authorization: Bearer <token>` compared in constant time (401
+`{"error": "unauthorized"}`) except `GET /api/v0/health` (the plugin's version handshake) and the query
+token `GET /api/v0/events` accepts; the router keeps its own bearer dependency as a second check.
+`GET /api/v0/session` answers the UI's token check; `POST /api/v0/hash` hashes packet files and payloads
+for the plugin (`hashing`); `GET /api/v0/events` streams `sse.Bus`. Each project has its own CAS under
+its folder (`cas_for(project_id)`: the root the index registered, else `<home>/projects/<id>`), and puts
+are recorded in that project's index. The built UI (`ui/dist`) is served at `/` when it exists; otherwise
+`/` says how to build it. `POST /api/v0/packets` additionally requires `X-Plate-Packet-Version`
 whose major.minor the daemon reads (`426 {"supported": [...]}` otherwise), answers 202 / 200 known / 409 /
 422 `{"errors": [...]}`, and finishes hashing in a background task (inline when `settings.sync_ingest`).
 Body validation errors are reshaped to `422 {"errors": [...]}` so senders see one error format.
@@ -17,9 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import threading
 from collections.abc import AsyncIterator, Callable
@@ -30,15 +38,21 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.concurrency import run_in_threadpool
 
 from . import __version__
 from .adapter import SimulatedCrash
+from .auth import AuthMiddleware
 from .cas import CAS
+from .config import Settings, check_project_id
 from .engine_fake import FakeEngine
 from .export import NotExportable, export_run
+from .hashing import BadHashRequest, HashRefused, PayloadTooLarge, hash_paths, hash_payloads
+from .index import Index
 from .ingest import (
     PacketConflict,
     PacketInvalid,
@@ -51,7 +65,6 @@ from .ingest import (
 )
 from .machine import IllegalTransition, RunNotFound, create_run, events_after, get_run, run_events, transition
 from .models import RunCreate
-from .paths import cas_root
 from .quotes import (
     EnvelopeRequired,
     QuoteExpired,
@@ -61,17 +74,19 @@ from .quotes import (
     get_envelope,
     quote_run,
 )
-from .settings import Settings
+from .sse import Bus, EventFilter, UnknownProject
 from .states import RunState
-from .store import Index
 from .timeutil import utcnow
 from .worker import cancel_run, step
+
+log = logging.getLogger("plate_daemon")
 
 API = "/api/v0"
 VERSION_RE = re.compile(r"^\s*(\d+)\.(\d+)(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?\s*$")
 SSE_RETRY_MS = 2000
 SSE_POLL_S = 0.25
 MAX_WAIT_S = 120.0
+UI_NOT_BUILT = "UI not built: cd ui && npm run build\n"
 
 
 class ApiError(Exception):
@@ -114,6 +129,12 @@ class ExportBody(BaseModel):
     reason: str | None = None
 
 
+class HashBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    paths: list[str] = Field(default_factory=list, max_length=100_000)
+    payloads: dict[str, str] = Field(default_factory=dict)
+
+
 class EnvelopeBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     project_id: str
@@ -121,6 +142,18 @@ class EnvelopeBody(BaseModel):
     max_total_usd: float = Field(ge=0)
     max_per_run_usd: float = Field(ge=0)
     ttl_s: float = Field(gt=0)
+
+
+def require_packet_version(
+    request: Request, x_plate_packet_version: Annotated[str | None, Header()] = None
+) -> str:
+    # Module level, not inside create_app: under `from __future__ import annotations` FastAPI resolves a
+    # parameter's `Depends(...)` from module globals, and the seed's closure silently became a query param.
+    supported = list(request.app.state.settings.packet_versions)
+    mm = major_minor(x_plate_packet_version)
+    if mm is None or mm not in supported:
+        raise ApiError(426, {"supported": supported})
+    return mm
 
 
 def _fmt_validation(err: dict[str, Any]) -> str:
@@ -147,14 +180,29 @@ def create_app(
     engine: Any | None = None,
     *,
     clock: Callable[[], datetime] | None = None,
-    cas: CAS | None = None,
+    cas_for: Callable[[str], CAS] | None = None,
+    bus: Bus | None = None,
     crash_exits_process: bool = False,
 ) -> FastAPI:
     """Build the app. `clock` (aware-UTC callable) is swappable at `app.state.clock` for tests;
-    `crash_exits_process` turns a scripted SimulatedCrash into a hard process exit (python -m plate_daemon)."""
+    `cas_for(project_id)` overrides where a project's CAS lives; `crash_exits_process` turns a scripted
+    SimulatedCrash into a hard process exit (python -m plate_daemon)."""
     engine = engine if engine is not None else FakeEngine.from_env(journal=settings.home / "fake_engine.json")
-    cas = cas or CAS(cas_root(settings.home))
     index = Index(settings.home)
+    bus = bus or Bus(index)
+
+    def project_cas(project_id: str) -> CAS:
+        root = index.project_root(project_id) or settings.projects_dir / check_project_id(project_id)
+
+        def record(key: str, ext: str, nbytes: int) -> None:
+            try:
+                index.record_asset(project_id, key, ext, nbytes)
+            except sqlite3.Error as e:  # the index is a cache: the object is safe in the folder
+                log.warning("asset %s of %s not indexed: %s (plate reindex fixes it)", key, project_id, e)
+
+        return CAS(root / "assets", on_put=record)
+
+    cas_for = cas_for or project_cas
     active_ingests: set[str] = set()
     ingest_guard = threading.Lock()
 
@@ -168,7 +216,7 @@ def create_app(
             active_ingests.add(packet_id)
         try:
             with index.project(project_id) as conn:
-                finish_ingest(conn, cas, packet_id, cas_copy=settings.cas_copy)
+                finish_ingest(conn, cas_for(project_id), packet_id, cas_copy=settings.cas_copy)
         finally:
             with ingest_guard:
                 active_ingests.discard(packet_id)
@@ -186,12 +234,22 @@ def create_app(
         threading.Thread(target=resume_ingests, name="plate-resume-ingest", daemon=True).start()
         yield
 
-    app = FastAPI(title="PLATE daemon", version=__version__, lifespan=lifespan)
+    app = FastAPI(
+        title="PLATE daemon",
+        version=__version__,
+        lifespan=lifespan,
+        # No schema or docs pages: they would be served without the token (only /api/ is token-gated).
+        openapi_url=None,
+        docs_url=None,
+        redoc_url=None,
+    )
+    app.add_middleware(AuthMiddleware, settings=settings)
     app.state.settings = settings
     app.state.engine = engine
     app.state.clock = clock or utcnow
-    app.state.cas = cas
+    app.state.cas_for = cas_for
     app.state.index = index
+    app.state.bus = bus
 
     @app.exception_handler(ApiError)
     async def _api_error(_request: Request, exc: ApiError) -> JSONResponse:
@@ -208,12 +266,6 @@ def create_app(
         )
         if not ok:
             raise ApiError(401, {"error": "unauthorized"})
-
-    def require_packet_version(x_plate_packet_version: Annotated[str | None, Header()] = None) -> str:
-        mm = major_minor(x_plate_packet_version)
-        if mm is None or mm not in settings.packet_versions:
-            raise ApiError(426, {"supported": list(settings.packet_versions)})
-        return mm
 
     # ------------------------------------------------------------------ helpers
 
@@ -255,6 +307,32 @@ def create_app(
         }
 
     r = APIRouter(prefix=API, dependencies=[Depends(require_token)])
+
+    # ------------------------------------------------------------------ session and hashing
+
+    @r.get("/session")
+    def session() -> dict[str, Any]:
+        return {"ok": True, "daemon_version": __version__, "packet_versions": list(settings.packet_versions)}
+
+    @r.post("/hash")
+    def hash_route(body: HashBody) -> dict[str, Any]:
+        if not body.paths and not body.payloads:
+            raise ApiError(422, {"errors": ["give paths and/or payloads to hash"]})
+        try:
+            hashes = hash_paths(body.paths, settings.packets_dirs)
+            named = hash_payloads(body.payloads)
+        except PayloadTooLarge as e:
+            raise ApiError(413, {"error": "payload_too_large", "detail": str(e)}) from e
+        except BadHashRequest as e:
+            raise ApiError(422, {"errors": [str(e)]}) from e
+        except HashRefused as e:
+            raise ApiError(403, {"error": "forbidden_path", "detail": str(e)}) from e
+        except FileNotFoundError as e:
+            raise ApiError(404, {"error": "not_found", "path": str(e)}) from e
+        clash = sorted(set(hashes) & set(named))
+        if clash:
+            raise ApiError(422, {"errors": [f"payload names collide with paths: {clash[:3]}"]})
+        return {"hashes": {**hashes, **named}}
 
     # ------------------------------------------------------------------ packets
 
@@ -420,9 +498,10 @@ def create_app(
 
     @r.post("/runs/{run_id}/step")
     def step_route(run_id: str) -> dict[str, Any]:
-        with index.project(run_project(run_id)) as conn:
+        pid = run_project(run_id)
+        with index.project(pid) as conn:
             try:
-                step(conn, engine, run_id, now, cas=cas)
+                step(conn, engine, run_id, now, cas=cas_for(pid))
             except SimulatedCrash as e:
                 if crash_exits_process:
                     sys.stderr.write(f"plate_daemon: {e}; exiting as a crashed process would\n")
@@ -438,9 +517,12 @@ def create_app(
         dest = Path(body.dest)
         if not dest.is_absolute():
             raise ApiError(422, {"errors": [f"dest must be an absolute file path, got {body.dest!r}"]})
-        with index.project(run_project(run_id)) as conn:
+        pid = run_project(run_id)
+        with index.project(pid) as conn:
             try:
-                out = export_run(conn, run_id, dest, override=body.override, reason=body.reason, cas=cas)
+                out = export_run(
+                    conn, run_id, dest, override=body.override, reason=body.reason, cas=cas_for(pid)
+                )
             except NotExportable as e:
                 raise ApiError(409, {"error": "not_exportable", "detail": str(e)}) from e
             return {"run_id": run_id, "path": str(out)}
@@ -516,4 +598,48 @@ def create_app(
             return dict(env.model_dump(mode="json"), project_id=pid)
 
     app.include_router(r)
+
+    # ------------------------------------------------------------------ the event bus (query token allowed)
+
+    ev = APIRouter(prefix=API)
+
+    @ev.get("/events")
+    async def bus_events(
+        run_id: Annotated[str | None, Query()] = None,
+        project_id: Annotated[str | None, Query()] = None,
+        after: Annotated[int | None, Query()] = None,
+        last_event_id: Annotated[str | None, Header()] = None,
+    ) -> EventSourceResponse:
+        try:
+            pid = await run_in_threadpool(bus.resolve_project, run_id, project_id)
+            check_project_id(pid)
+        except UnknownProject as e:
+            raise ApiError(404 if run_id else 422, {"errors": [str(e)]}) from e
+        except ValueError as e:
+            raise ApiError(422, {"errors": [str(e)]}) from e
+        if pid not in await run_in_threadpool(index.project_ids):
+            raise ApiError(404, {"error": "not_found", "project_id": pid})
+        flt = EventFilter(project_id=pid, run_id=run_id, after=_cursor(after, last_event_id))
+
+        async def gen() -> AsyncIterator[ServerSentEvent]:
+            async for rec in bus.subscribe(flt):
+                yield ServerSentEvent(
+                    data=json.dumps(rec, ensure_ascii=False, separators=(",", ":")), id=str(rec["seq"])
+                )
+
+        return EventSourceResponse(gen(), ping=bus.heartbeat_s, headers={"Cache-Control": "no-cache"})
+
+    app.include_router(ev)
+
+    # ------------------------------------------------------------------ the built UI at /
+
+    ui_dist = Path(settings.ui_dist)
+    if (ui_dist / "index.html").is_file():
+        app.mount("/", StaticFiles(directory=ui_dist, html=True), name="ui")
+    else:
+
+        @app.get("/", response_class=PlainTextResponse, include_in_schema=False)
+        def ui_not_built() -> str:
+            return UI_NOT_BUILT
+
     return app

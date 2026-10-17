@@ -2,10 +2,13 @@
 
 An adapter submits a payload under an idempotency key and returns the provider's job id; `poll` reports
 `queued | running | succeeded | refused | failed` plus a result URL; `fetch` downloads the result bytes
-(raising `ResultExpired` once the provider's URL has lapsed); `cancel` stops spend. `lookup` is
-optional: an adapter that can find a job by idempotency key lets recovery adopt a job whose id was lost
-in a crash instead of failing it. Real adapters (Atlas and friends) live in `plate_engines` and arrive
-behind this protocol later; today only `engine_fake.FakeEngine` implements it.
+(raising `ResultExpired` once the provider's URL has lapsed); `cancel` stops spend. Two optional
+capabilities decide what crash recovery may do with a submit whose answer was lost: `lookup(key)` finds a
+job by idempotency key (recovery adopts it), and `idempotent_submit = True` declares that the provider
+dedupes on the key (recovery re-stages and submits the same request again). An adapter with neither gets the
+run FAILED as `submit_state_unknown` for a human: PLATE never resubmits blind. Real adapters (Atlas and
+friends) live in `plate_engines` and arrive behind this protocol in the pipeline (T25); today
+`engine_fake.FakeEngine` implements it.
 """
 
 from __future__ import annotations
@@ -51,3 +54,8 @@ def lookup_fn(engine: Any):
     if fn is None or getattr(engine, "supports_lookup", True) is False:
         return None
     return fn
+
+
+def submit_is_idempotent(engine: Any) -> bool:
+    """True only when the adapter says its provider dedupes submits on the idempotency key."""
+    return getattr(engine, "idempotent_submit", False) is True

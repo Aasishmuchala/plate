@@ -11,12 +11,16 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 # bare name: tests/test_portability.py reads any X.open(path) as the builtin text-mode open
 from PIL.Image import open as _pil_open
 
-__all__ = ["crop_pair", "crop_tiles", "region_tiles", "label_font", "load_rgb"]
+from .croppair import box_for
+from .io import to_uint8
+
+__all__ = ["crop_pair", "crop_tiles", "point_tiles", "region_tiles", "label_font", "load_rgb"]
 
 BG = (14, 14, 16)
 LABEL = (212, 162, 89)
@@ -45,10 +49,7 @@ def _crop_at(
 ) -> tuple[Image.Image, tuple[int, int, int, int]]:
     if zoom < 1.0:
         raise ValueError(f"zoom must be >= 1.0, got {zoom}")
-    w_full, h_full = im.size
-    w, h = max(int(w_full / zoom) // 2 * 2, 2), max(int(h_full / zoom) // 2 * 2, 2)
-    x0 = int(min(max(cx - w // 2, 0), w_full - w))
-    y0 = int(min(max(cy - h // 2, 0), h_full - h))
+    x0, y0, w, h = box_for(im.width, im.height, cx, cy, zoom)
     return im.crop((x0, y0, x0 + w, y0 + h)), (x0, y0, w, h)
 
 
@@ -69,16 +70,48 @@ def _fit_width(im: Image.Image, width: int, only_down: bool) -> Image.Image:
     return im.resize((width, max(int(round(im.height * width / im.width)), 1)), Image.LANCZOS)
 
 
-def crop_tiles(
-    images: list[Image.Image],
-    boxes_frac: list[tuple[float, float, float, float]],
-    labels: list[str],
-    tile_w: int = 900,
-) -> Image.Image:
-    """Grid with one row per image and one column per fractional box (x0, y0, x1, y1 in 0-1).
+def point_tiles(
+    img: Image.Image | np.ndarray, points: list[tuple[float, float]], size: int = 512
+) -> list[Image.Image]:
+    """100% inspection tiles around gate-flagged points: one size x size crop (native pixels, no resampling)
+    centred on each (x, y), clamped to stay inside the frame (smaller only if the frame itself is smaller)."""
+    if size < 2:
+        raise ValueError("size must be >= 2")
+    if isinstance(img, np.ndarray):
+        im = Image.fromarray(to_uint8(img)).convert("RGB")
+    else:
+        im = img.convert("RGB")
+    tiles = []
+    for x, y in points:
+        w, h = min(size, im.width), min(size, im.height)
+        x0 = int(min(max(round(x) - w // 2, 0), im.width - w))
+        y0 = int(min(max(round(y) - h // 2, 0), im.height - h))
+        tiles.append(im.crop((x0, y0, x0 + w, y0 + h)))
+    return tiles
 
-    Each crop is shown at 100% and downscaled only when wider than tile_w. Width = n_boxes * (tile_w + 6).
+
+def crop_tiles(
+    images: list[Image.Image] | Image.Image | np.ndarray,
+    boxes_frac: list[tuple[float, float, float, float]] | list[tuple[float, float]],
+    labels: list[str] | int | None = None,
+    tile_w: int = 900,
+    *,
+    size: int = 512,
+) -> Image.Image | list[Image.Image]:
+    """Two forms, told apart by the first argument.
+
+    crop_tiles(images, boxes_frac, labels, tile_w): grid with one row per image and one column per fractional
+    box (x0, y0, x1, y1 in 0-1). Each crop is shown at 100% and downscaled only when wider than tile_w.
+    Width = n_boxes * (tile_w + 6).
+
+    crop_tiles(img, points, size=512): a single image plus gate-flagged (x, y) points returns the list of
+    100% tiles from point_tiles (the size may also be the third positional argument).
     """
+    if isinstance(images, (Image.Image, np.ndarray)):
+        return point_tiles(images, boxes_frac, size=labels if isinstance(labels, int) else size)  # type: ignore[arg-type]
+    if labels is None or isinstance(labels, int):
+        raise ValueError("crop_tiles needs one label per image")
+    boxes_frac = list(boxes_frac)
     if not images or not boxes_frac:
         raise ValueError("crop_tiles needs at least one image and one box")
     if len(labels) != len(images):

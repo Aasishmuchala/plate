@@ -1,0 +1,18 @@
+{
+  "note": "synthetic: authored from the vendor's documented shapes, not captured",
+  "request": {
+    "method": "POST",
+    "url": "https://api.openai.com/v1/images/edits",
+    "body_hash": "dbad9a8e"
+  },
+  "response": {
+    "status": 429,
+    "json": {
+      "error": {
+        "code": "rate_limit_exceeded",
+        "message": "Slow down.",
+        "type": "image_generation_user_error"
+      }
+    }
+  }
+}

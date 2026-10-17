@@ -1,0 +1,11 @@
+{
+  "note": "synthetic: GCS JSON API media download (path written decoded because FixtureTransport matches the decoded request path)",
+  "request": {
+    "method": "GET",
+    "url": "https://storage.googleapis.com/storage/v1/b/plate-test-veo/o/out/c.mp4?alt=media"
+  },
+  "response": {
+    "status": 200,
+    "bytes_b64": "AAAAGGZ0eXBtcDQyAAAAAG1wNDJpc29tUExBVEUtRklYVFVSRS1DTElQLUJQTEFURS1GSVhUVVJFLUNMSVAtQlBMQVRFLUZJWFRVUkUtQ0xJUC1CUExBVEUtRklYVFVSRS1DTElQLUI="
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "note": "synthetic: completed Kling job",
+  "request": {
+    "method": "GET",
+    "url": "https://api.atlascloud.ai/api/v1/model/prediction/pred_kling_o3"
+  },
+  "responses": [
+    {
+      "status": 200,
+      "json": {
+        "code": 200,
+        "data": {
+          "id": "pred_kling_o3",
+          "status": "processing"
+        }
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "code": 200,
+        "data": {
+          "id": "pred_kling_o3",
+          "status": "completed",
+          "outputs": [
+            "https://atlas-media.oss-ap-southeast-1.aliyuncs.com/vid/kling_o3.mp4"
+          ]
+        }
+      }
+    }
+  ]
+}

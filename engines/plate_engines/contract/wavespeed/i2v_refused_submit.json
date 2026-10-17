@@ -1,0 +1,24 @@
+{
+  "note": "synthetic: policy rejection at submit",
+  "request": {
+    "method": "POST",
+    "url": "https://api.wavespeed.ai/api/v3/bytedance/seedance-v2.5/image-to-video",
+    "body": {
+      "prompt": "Camera holds still; late sun moves across the oak floor.",
+      "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAkAAAAQCAIAAABLKsIUAAABy0lEQVR4AQHAAT/+ACjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKAAoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgAKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoACjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKAAoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgAKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoACjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKAAoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgAKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoACjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKAAoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgAKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoACjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKAAoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgAKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoACjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKNnHnYEbKAtjAAAAAElFTkSuQmCC",
+      "duration": 5,
+      "resolution": "480p",
+      "camera_fixed": true,
+      "generate_audio": false,
+      "return_last_frame": false,
+      "seed": 7
+    }
+  },
+  "response": {
+    "status": 400,
+    "json": {
+      "code": 400,
+      "message": "request blocked: content policy violation"
+    }
+  }
+}

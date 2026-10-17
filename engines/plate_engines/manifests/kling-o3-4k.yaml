@@ -1,27 +1,41 @@
-# kling-o3-4k -- Kling image-to-video, 4K, via Atlas (D).
+# kling-o3-4k -- Kling image-to-video with start and end frames, 4K, via Atlas (D).
 # PLACEHOLDERS (BUILD_PLAN decisions 9 and 13): version is unpinned until the P0 smoke test; price.usd is
-# NOT a vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
+# NOT a confirmed vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
 # endpoints are the vendors' public base URLs as understood on 2026-10-17 and stay unverified until the
 # adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
+# T7: params are the vendor FULL schema (advanced: true only hides a field in the UI drawer). price.usd is the
+# default-tier figure the router ranks on; price.by holds the tiers we know. Nothing is billed-price-verified yet.
+# Inputs use the vendor names: image is the first frame, image_tail pins the end frame. With image_tail set, pace
+# words (slow, gently, leisurely...) are stripped from the prompt (atlas.strip_pace_words); keep negative_prompt
+# under 30 words.
 id: kling-o3-4k
 name: Kling O3 4K
 version: unpinned
 pinned: false
-kind: video_i2v
+kind: video_startend
+model_id: kwaivgi/kling-video-o3-4k/image-to-video
+flags: [unverified_p0]
 inputs:
-  - {name: start_image, type: image, required: true}
-  - {name: end_image, type: image, required: false}
+  - {name: image, type: image, required: true}
+  - {name: image_tail, type: image, required: false}
   - {name: prompt, type: text, required: true}
+  - {name: elements, type: json, required: false}
 outputs:
   - {name: video, type: video, required: true}
 params:
-  - {name: duration_s, type: float, default: null, range: null, enum: null}
-  - {name: seed, type: int, default: null, range: null, enum: null}
+  - {name: duration, type: int, default: 5, range: [1, 15]}
+  - {name: negative_prompt, type: str}
+  - {name: cfg_scale, type: float, default: 0.5, range: [0, 1], advanced: true}
+  - {name: resolution, type: enum, enum: ["1080P", "4K"]}
+  - {name: seed, type: int, range: [-1, 2147483647], advanced: true}
 price:
   model: per_second
-  usd: 0.0
+  usd: 0.357
+  by: {"base": 0.357, "atlas_discounted": 0.0536}
   status: unconfirmed
-  notes: "UNCONFIRMED placeholder: usd is not a vendor price; refresh from the vendor catalogue at P0. Pricing unit (per second) is also assumed."
+  source: "VIZMAKER.md section 4: Atlas Cloud lists Kling O3 4K at 0.357 per second with 85 percent off (0.0536 per second after discount)."
+  as_of: 2026-10-17
+  notes: "UNCONFIRMED: usd is the undiscounted Atlas list, so quotes err high; the P0 smoke test reads the billed price. The 4K resolution value is unverified."
 determinism: nondeterministic
 licence:
   vendor_terms_url: unknown
@@ -36,4 +50,6 @@ routes:
     terms_hash: unknown
     upload_visibility: public
     same_model_fallback_of: null
+    model_slug: kwaivgi/kling-video-o3-4k/image-to-video
+    allowed_hosts: [.atlascloud.ai, .aliyuncs.com]
     note: "Atlas uploadMedia returns public OSS URLs: grade D, refused for NDA projects."

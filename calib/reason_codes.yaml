@@ -1,0 +1,31 @@
+# Reason codes for the three-key labelling tool (tools/plate_label) and the calibration report
+# (gates/plate_gates/calibration.py). Fix and Render-it verdicts carry one or more of these.
+#
+# A and F are the Lensbook A/F repair codes (how an AI still or clip goes wrong); P are PLATE's own
+# gate codes (what a numeric gate is meant to catch). The code is the key: calib/labels.jsonl is joined
+# on it, so a code is never renumbered or reused. To add one, append a new key.
+version: 1
+groups:
+  A: Lensbook A-codes (stills)
+  F: Lensbook F-codes (film)
+  P: PLATE gate codes
+codes:
+  A1: geometry warp
+  A2: texture crawl
+  A3: scale drift
+  A4: vegetation slop
+  A5: re-cladding drift
+  F2: slideshow
+  F4: action ignored
+  F6: camera improvises
+  F7: continuity
+  F9: extra people or objects
+  F11: text or logos
+  F12: light shift
+  P1: registration
+  P2: invented edge
+  P3: colour shift
+  P4: texture band
+  P5: tone band
+  P6: outside-mask leak
+  P7: people implausible

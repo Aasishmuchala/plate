@@ -1,23 +1,31 @@
 # real-esrgan -- local upscaler for AI layers only (C0).
 # PLACEHOLDERS (BUILD_PLAN decisions 9 and 13): version is unpinned until the P0 smoke test; price.usd is
-# NOT a vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
+# NOT a confirmed vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
 # endpoints are the vendors' public base URLs as understood on 2026-10-17 and stay unverified until the
 # adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
+# T7: params are the vendor FULL schema (advanced: true only hides a field in the UI drawer). price.usd is the
+# default-tier figure the router ranks on; price.by holds the tiers we know. Nothing is billed-price-verified yet.
 id: real-esrgan
 name: Real-ESRGAN
 version: unpinned
 pinned: false
 kind: upscale
+model_id: RealESRGAN_x4plus
+plate_upscale_forbidden: true
 inputs:
   - {name: image, type: image, required: true}
 outputs:
   - {name: image, type: image, required: true}
 params:
-  - {name: scale, type: int, default: null, range: null, enum: null}
+  - {name: model_name, type: enum, default: "RealESRGAN_x4plus", enum: ["RealESRGAN_x4plus", "RealESRGAN_x2plus"]}
+  - {name: scale, type: int, default: 4, range: [1, 4]}
+  - {name: tile, type: int, default: 0, range: [0, 1024], advanced: true}
 price:
   model: per_image
   usd: 0.0
   status: confirmed
+  source: "Local compute on owned hardware; no vendor fee."
+  as_of: 2026-10-17
   notes: "Local compute on owned hardware; no vendor fee. Power and amortisation are not modelled."
 determinism: best_effort
 licence:
@@ -33,4 +41,5 @@ routes:
     terms_hash: unknown
     upload_visibility: local
     same_model_fallback_of: null
-    note: "Runs on the render box; nothing leaves it."
+    max_inflight: 1
+    note: "Runs on the render box; nothing leaves it. AI layers only, never the plate."

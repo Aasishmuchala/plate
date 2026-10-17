@@ -1,27 +1,50 @@
 # gpt-image-2.5 -- OpenAI image edit, direct (C1 candidate pending ZDR).
 # PLACEHOLDERS (BUILD_PLAN decisions 9 and 13): version is unpinned until the P0 smoke test; price.usd is
-# NOT a vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
+# NOT a confirmed vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
 # endpoints are the vendors' public base URLs as understood on 2026-10-17 and stay unverified until the
 # adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
+# T7: params are the vendor FULL schema (advanced: true only hides a field in the UI drawer). price.usd is the
+# default-tier figure the router ranks on; price.by holds the tiers we know. Nothing is billed-price-verified yet.
 id: gpt-image-2.5
 name: GPT Image 2.5
 version: unpinned
 pinned: false
 kind: image_edit
+model_id: gpt-image-2.5
+# unverified_p0: GPT Image 2.5 size caps are unverified (scout 02); the documented gpt-image-2 sizes are listed as
+# legal and the arbitrary envelope below is only their hull, to be confirmed or removed by the P0 smoke test.
+flags: [unverified_p0]
 inputs:
   - {name: image, type: image, required: true}
   - {name: prompt, type: text, required: true}
   - {name: mask, type: mask, required: false}
-  - {name: reference_images, type: images, required: false}
+  - {name: reference_images, type: images, required: false, max_items: 15}
 outputs:
   - {name: image, type: image, required: true}
 params:
-  - {name: seed, type: int, default: null, range: null, enum: null}
+  - {name: size, type: enum, default: "auto", enum: ["auto", "1024x1024", "1536x1024", "1024x1536"]}
+  - {name: quality, type: enum, default: "medium", enum: ["low", "medium", "high"]}
+  - {name: input_fidelity, type: enum, default: "high", enum: ["high", "low"], advanced: true}
+  - {name: output_format, type: enum, default: "png", enum: ["png", "jpeg", "webp"], advanced: true}
+  - {name: output_compression, type: int, range: [0, 100], advanced: true}
+  - {name: background, type: enum, enum: ["auto", "opaque", "transparent"], advanced: true}
+  - {name: moderation, type: enum, enum: ["auto", "low"], advanced: true}
+  - {name: n, type: int, default: 1, range: [1, 4], advanced: true}
+sizes:
+  legal:
+    - {w: 1024, h: 1024}
+    - {w: 1536, h: 1024}
+    - {w: 1024, h: 1536}
+  auto: true
+  arbitrary: {min_side: 1024, max_side: 1536, aspect_min: 0.6667, aspect_max: 1.5}
 price:
   model: per_image
-  usd: 0.0
+  usd: 0.16
+  by: {"1K_high": 0.16, "1K_medium": 0.07}
   status: unconfirmed
-  notes: "UNCONFIRMED placeholder: usd is not a vendor price; refresh from the vendor catalogue at P0. Pricing unit (per image) is also assumed."
+  source: "VIZMAKER.md section 4: in-app readings at USD 0.12 per credit (1K high create 1.35 credits, 1K medium edit 0.56). They carry reseller markup (0.8 to 3.1x OpenAI list), so treat them as a rough ceiling, not the OpenAI price."
+  as_of: 2026-10-17
+  notes: "UNCONFIRMED: OpenAI list price for GPT Image 2.5 is not established. Each extra reference image adds about USD 0.054 in-app."
 determinism: nondeterministic
 licence:
   vendor_terms_url: unknown
@@ -36,4 +59,5 @@ routes:
     terms_hash: unknown
     upload_visibility: private
     same_model_fallback_of: null
+    allowed_hosts: [api.openai.com]
     note: "C1 only after zero data retention (ZDR) approval for the image endpoints is held in writing."

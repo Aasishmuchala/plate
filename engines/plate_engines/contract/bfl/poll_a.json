@@ -1,0 +1,24 @@
+{
+  "note": "synthetic: authored from the vendor's documented shapes, not captured",
+  "request": {
+    "method": "GET",
+    "url": "https://api.bfl.ai/v1/get_result?id=bfl-a"
+  },
+  "responses": [
+    {
+      "status": 200,
+      "json": {
+        "status": "Pending"
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "status": "Ready",
+        "result": {
+          "sample": "https://delivery-eu.bfl.ai/results/a.png"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "note": "synthetic: authored from the behaviour pinned in atlas.py / atlas.ts, not captured from the vendor",
+  "request": {
+    "method": "POST",
+    "url": "https://api.atlascloud.ai/api/v1/model/generateImage",
+    "body": {
+      "model": "fixture/image-edit",
+      "prompt": "relight to dusk",
+      "images": [
+        "https://img.atlascloud.ai/in/plate.png"
+      ],
+      "resolution": "2K"
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "data": {
+        "id": "pred-img-1"
+      }
+    }
+  }
+}

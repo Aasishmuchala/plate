@@ -1,0 +1,18 @@
+{
+  "note": "synthetic: failed with a safety wording: refused",
+  "request": {
+    "method": "GET",
+    "url": "https://api.wavespeed.ai/api/v3/predictions/ws-fixture-c/result"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "code": 200,
+      "data": {
+        "id": "ws-fixture-c",
+        "status": "failed",
+        "error": "output rejected by the safety filter"
+      }
+    }
+  }
+}

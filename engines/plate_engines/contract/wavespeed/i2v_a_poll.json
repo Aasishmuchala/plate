@@ -1,0 +1,32 @@
+{
+  "note": "synthetic: processing, then completed with outputs",
+  "request": {
+    "method": "GET",
+    "url": "https://api.wavespeed.ai/api/v3/predictions/ws-fixture-a/result"
+  },
+  "responses": [
+    {
+      "status": 200,
+      "json": {
+        "code": 200,
+        "data": {
+          "id": "ws-fixture-a",
+          "status": "processing"
+        }
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "code": 200,
+        "data": {
+          "id": "ws-fixture-a",
+          "status": "completed",
+          "outputs": [
+            "https://cdn.wavespeed.ai/outputs/a.mp4"
+          ]
+        }
+      }
+    }
+  ]
+}

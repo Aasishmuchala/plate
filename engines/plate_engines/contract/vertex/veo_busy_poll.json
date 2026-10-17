@@ -1,0 +1,19 @@
+{
+  "note": "synthetic: a transient 429 while polling means still running",
+  "request": {
+    "method": "POST",
+    "url": "https://asia-south1-aiplatform.googleapis.com/v1/projects/plate-test/locations/asia-south1/publishers/google/models/veo-3.1-generate-001:fetchPredictOperation",
+    "body": {
+      "operationName": "projects/plate-test/locations/asia-south1/publishers/google/models/veo-3.1-generate-001/operations/op-busy"
+    }
+  },
+  "response": {
+    "status": 429,
+    "json": {
+      "error": {
+        "code": 429,
+        "message": "Quota exceeded"
+      }
+    }
+  }
+}
