@@ -12,7 +12,16 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from plate_daemon.budgets import Decision, Envelope, Policy, Spend, authorize, publish_alert, spend_snapshot
+from plate_daemon.budgets import (
+    Decision,
+    Envelope,
+    Policy,
+    Spend,
+    authorize,
+    is_unattended,
+    publish_alert,
+    spend_snapshot,
+)
 from plate_daemon.db import tx
 from plate_daemon.engine_fake import FakeEngine
 from plate_daemon.index import Index, apply_packet_entry
@@ -198,25 +207,40 @@ def test_unattended_mode_lowers_the_cap_and_raises_an_alert():
     assert d.approve and not d.unattended and d.alert is None
 
 
+@pytest.mark.parametrize(
+    ("idle_s", "unattended"),
+    [(0, False), (1799, False), (1799.999999, False), (1800, True), (1800.5, True), (3600, True)],
+)
+def test_unattended_starts_at_exactly_the_threshold_in_whole_seconds(idle_s, unattended):
+    last = T0 - timedelta(seconds=idle_s)
+    assert is_unattended(T0, last, POLICY) is unattended
+    d = authorize(quoted(1.0), POLICY, None, last, now=T0)
+    assert d.unattended is unattended and (d.alert is not None) is unattended
+    assert is_unattended(T0, None, POLICY)  # nobody has ever interacted: unattended
+    assert not is_unattended(T0, T0 + timedelta(seconds=5), POLICY)  # a clock skewed the other way
+
+
 def test_no_quote_or_an_expired_quote_is_never_authorized():
     bare = quoted().model_copy(update={"quote": None})
     assert authorize(bare, POLICY, env(), ATTENDED, now=T0).code == "no_quote"
     assert authorize(quoted(expires=T0), POLICY, env(), ATTENDED, now=T0).code == "quote_expired"
 
 
+# idle time is generated in whole seconds: as a float minute count 29.999999999999996 rounds to 30 min in a
+# timedelta but compares below the threshold, which put the boundary on both sides of the assertion.
 @settings(max_examples=300, deadline=None)
 @given(
     price=st.floats(0, 30, allow_nan=False),
     today=st.floats(0, 60, allow_nan=False),
     since=st.floats(0, 30, allow_nan=False),
-    idle_min=st.one_of(st.none(), st.floats(0, 600, allow_nan=False)),
+    idle_s=st.one_of(st.none(), st.integers(0, 36000)),
     agent=st.booleans(),
     envelope=st.one_of(
         st.none(), st.builds(lambda m, s: env(max_usd=m, spent=min(s, m)), st.floats(0, 40), st.floats(0, 40))
     ),
 )
-def test_every_approval_respects_every_cap(price, today, since, idle_min, agent, envelope):
-    last = None if idle_min is None else T0 - timedelta(minutes=idle_min)
+def test_every_approval_respects_every_cap(price, today, since, idle_s, agent, envelope):
+    last = None if idle_s is None else T0 - timedelta(seconds=idle_s)
     d = authorize(
         quoted(price),
         POLICY,
@@ -227,7 +251,7 @@ def test_every_approval_respects_every_cap(price, today, since, idle_min, agent,
         requester="agent" if agent else "auto",
     )
     assert isinstance(d, Decision)
-    unattended = last is None or idle_min >= POLICY.unattended_after_min
+    unattended = last is None or idle_s >= POLICY.unattended_after_min * 60
     assert d.unattended is unattended and (d.alert is not None) is unattended
     if not d.approve:
         assert d.by is None

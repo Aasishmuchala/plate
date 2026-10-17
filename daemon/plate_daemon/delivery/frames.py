@@ -9,7 +9,10 @@ yields `Frame` records one at a time (nothing is held beyond the frame being enc
     a list of paths and/or arrays    in that order
     an iterable of arrays            float [0, 1] (encoding as declared), uint8 or uint16; (H, W, 3 or 4)
 
-Files go through `plate_pixels.imageio` (PNG, TIFF, JPEG; 8 or 16 bit) or OpenImageIO (EXR, always linear).
+Files go through `plate_pixels.imageio` (PNG, TIFF, JPEG; 8 or 16 bit) or OpenImageIO (EXR, always linear;
+its `chromaticities` or ASWF `colorInteropID` say which primaries, and a frame in anything but Rec.709, such as
+the ACEScg EXRs `plate export` writes for an ACEScg packet, is converted to Rec.709 so the sRGB encode and the
+Rec.709 video tags that follow are true; an EXR that names no primaries is taken as Rec.709).
 Display images are sRGB-encoded unless the file is a float TIFF. Nothing here resizes, resamples or
 upscales: a frame whose size differs from the first is an error.
 """
@@ -72,6 +75,16 @@ def _from_array(a: np.ndarray, encoding: str) -> Frame:
     return Frame(rgb=np.ascontiguousarray(f[..., :3]), alpha=alpha, encoding=enc)
 
 
+def _exr_primaries(spec: Any) -> tuple[float, ...] | None:
+    """The chromaticities an EXR declares (`chromaticities`, else the ASWF `colorInteropID` of a space we know)."""
+    chroma = spec.getattribute("chromaticities")
+    if chroma is not None and len(chroma) == 8:
+        return tuple(float(v) for v in chroma)
+    from ..export import INTEROP_CHROMATICITIES
+
+    return INTEROP_CHROMATICITIES.get(spec.get_string_attribute("colorInteropID"))
+
+
 def _read_exr(path: Path) -> Frame:
     import OpenImageIO as oiio
 
@@ -88,8 +101,16 @@ def _read_exr(path: Path) -> Frame:
     data = np.asarray(data, dtype=np.float32).reshape(spec.height, spec.width, spec.nchannels)
     if spec.nchannels not in (3, 4):
         raise DeliveryError(f"{path.name}: {spec.nchannels} channels; delivery takes RGB or RGBA")
+    rgb = data[..., :3]
+    primaries = _exr_primaries(spec)
+    if primaries is not None:
+        from ..export import REC709_CHROMATICITIES, primaries_matrix
+
+        matrix = primaries_matrix(primaries, REC709_CHROMATICITIES)
+        if not np.allclose(matrix, np.eye(3)):
+            rgb = (rgb.astype(np.float64) @ matrix.T).astype(np.float32)
     return Frame(
-        rgb=np.ascontiguousarray(data[..., :3]),
+        rgb=np.ascontiguousarray(rgb),
         alpha=np.ascontiguousarray(data[..., 3]) if spec.nchannels == 4 else None,
         encoding="linear",
     )

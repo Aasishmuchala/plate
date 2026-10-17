@@ -20,8 +20,10 @@ its own G-buffer alone and 0 once its own edges are subtracted, while a rectangl
 one flag. Without a plate the detector is the G-buffer-only rule of the plan (use it for synthetic vectors).
 
 Tier C packets have no planar ids and no G-buffer: flags() returns None and report() says
-"tier C: no planar ids". Lettering inside signage is not scanned (signage is not planar-class here and has
-its own OCR text-lock).
+"tier C: no planar ids". A Tier A packet whose legend marks no planar id of a scanned class (the sender rule:
+architecture / ground / glazing at 0.5 % of the frame or more) is skipped the same way, with its own reason,
+"tier A: legend marks no planar ids". Lettering inside signage is not scanned (signage is not planar-class
+here and has its own OCR text-lock).
 """
 
 from __future__ import annotations
@@ -40,6 +42,8 @@ from .thresholds import long_edge_min_px
 
 __all__ = [
     "METRIC_ID",
+    "NO_GBUFFER_REASON",
+    "NO_PLANAR_REASON",
     "PLANAR_CLASSES",
     "TIER_C_REASON",
     "Flag",
@@ -53,6 +57,8 @@ __all__ = [
 METRIC_ID = "invention_flags"
 PLANAR_CLASSES = ("architecture", "ground", "glazing")
 TIER_C_REASON = "tier C: no planar ids"
+NO_PLANAR_REASON = "tier A: legend marks no planar ids"
+NO_GBUFFER_REASON = "tier A: no G-buffer edges or ids"
 
 
 @dataclass(frozen=True)
@@ -228,7 +234,8 @@ def report(
     tier: str = "A",
 ) -> dict[str, Any]:
     """flags() as a JSON-friendly gate record: {metric_id, count, flags, skipped, reason, status, params}.
-    `count` is None when skipped; `reason` is TIER_C_REASON for a Tier C packet or a legend without planar ids."""
+    `count` is None when skipped; `reason` says why: TIER_C_REASON for a Tier C packet, NO_PLANAR_REASON for a
+    Tier A legend without planar ids of a scanned class, NO_GBUFFER_REASON for a Tier A call with no edges or ids."""
     p = params or InventionParams()
     found = flags(test_rgb, ref_edges, ids, legend, width, plate_rgb=plate_rgb, params=p, tier=tier)
     w = ref_edges.width if ref_edges is not None else None
@@ -236,12 +243,20 @@ def report(
     skipped = found is None
     count = None if skipped else len(found)
     status, bound = verdict(count)
+    reason = None
+    if skipped:
+        if tier != "A":
+            reason = TIER_C_REASON
+        elif not planar_entries(legend):
+            reason = NO_PLANAR_REASON
+        else:
+            reason = NO_GBUFFER_REASON
     return {
         "metric_id": METRIC_ID,
         "count": count,
         "flags": [] if skipped else [f.to_dict() for f in found],
         "skipped": skipped,
-        "reason": TIER_C_REASON if skipped else None,
+        "reason": reason,
         "status": status,
         "bound": bound,
         "params": {

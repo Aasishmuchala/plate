@@ -1,8 +1,12 @@
 # Exceptions to scripts/hazard_scan.py. One per line:  <path or glob>[:<line>] <rule|*>   # why
-# Keep every entry justified; T52 prunes stale ones (python scripts/hazard_scan.py --strict-allow).
+# Kept to the minimum: each entry below was checked by running the scan without it (it then fails on exactly this
+# file and rule). CI runs the scan with --strict-allow, so an entry that stops matching anything fails the build
+# and must be deleted; a new entry needs a reason a reviewer can check.
 
-# The portability test plants hazards on purpose to prove its lint can fail.
+# The portability test plants a hard-coded POSIX temp path on purpose, to prove its own lint can fail
+# (test_lint_catches_what_it_claims). It is test data, never used as a path.
 tests/test_portability.py tmp-literal   # planted '/tmp/...' sample inside test_lint_catches_what_it_claims
 
-# Skip message that names the Blender fixture renderer script (fixtures/blender/render.sh, T2); never executed from Python.
-pixels/tests/test_egress_ingress.py sh-reference
+# A pytest.skip() message that tells the reader how to render the fixture ("fixtures/blender/render.sh"). It is
+# prose in a skip reason; nothing in Python runs or depends on that script.
+pixels/tests/test_egress_ingress.py sh-reference   # skip message naming the Blender fixture renderer script

@@ -21,16 +21,30 @@ from pymxs import runtime as rt
 from plate_max import digest
 from plate_max.bridge import colour, elements, render
 
+
 def names(obj):
     return sorted(str(n) for n in rt.getPropNames(obj))
+
 
 cam = rt.selection[0]
 print("camera", rt.classOf(cam), names(cam))
 print("renderer", rt.classOf(rt.renderers.current), names(rt.renderers.current))
-for cls in ("VRayZDepth", "VRayNormals", "VRayCryptomatte", "VRayWireColor", "VRayDiffuseFilter",
-            "VRaySamplerInfo", "VRayLightSelect", "VRayVelocity", "VRayRawLighting",
-            "VRayRawGlobalIllumination", "VRayReflection", "VRayRefraction", "VRaySpecular",
-            "VRaySelfIllumination"):
+for cls in (
+    "VRayZDepth",
+    "VRayNormals",
+    "VRayCryptomatte",
+    "VRayWireColor",
+    "VRayDiffuseFilter",
+    "VRaySamplerInfo",
+    "VRayLightSelect",
+    "VRayVelocity",
+    "VRayRawLighting",
+    "VRayRawGlobalIllumination",
+    "VRayReflection",
+    "VRayRefraction",
+    "VRaySpecular",
+    "VRaySelfIllumination",
+):
     make = getattr(rt, cls, None)
     print(cls, "MISSING" if make is None else names(make()))
 print("ColorPipelineMgr", rt.showInterface(rt.ColorPipelineMgr))

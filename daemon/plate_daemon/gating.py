@@ -12,7 +12,9 @@ registered here on the unchanged ring.
 What runs, with the threshold ids of `plate_gates/thresholds.yaml`:
 
     registration.residual_px, registration.shift_px   ECC residual and shift (hard)
-    outside_mask.de00, feather_band.de00_p99          bit identity outside the mask, drift in the feather (hard)
+    outside_mask.de00, feather_band.de00_p99          bit identity outside the mask (hard), drift in the feather
+                                                      (advisory until calibration, T23, sets a bound: the
+                                                      threshold stays hard in the set, the check is forced)
     gbuffer_edge_recall_r2                            G-buffer edge recall, CoC weighted, plate visibility (Tier A, hard)
     invention_flags                                   new long edges in planar architecture ids (Tier A, hard)
     material.de00_median, material.de00_p90           the worst LOCKED material (most pixels outside the mask)
@@ -26,6 +28,12 @@ Nothing is ever upsampled to be measured: the texture band is measured at native
 misses downgraded to advisory, as `texture.band_check` says), image edge agreement at min(1920, native). The
 verdict is `GateReport`'s: fail if a hard check fails, advisory if only advisory checks miss, else pass. A metric
 that could not be computed scores `fail` when its threshold is hard: an unmeasured hard gate never passes.
+
+Every check carries the threshold, op and unit it was held to (`report.scored_check`). The report's
+`flagged_points` are the boxes to look at first, in plate pixels: each invention flag, the three 128 px tiles with
+the highest mean dE00 over the region of a missed outside_mask / feather_band / material metric (the pixels
+outside the editable mask, the feather band inside it, the locked materials), and the image centre for a failed
+registration shift ("camera drift").
 """
 
 from __future__ import annotations
@@ -39,16 +47,30 @@ from typing import Any
 import numpy as np
 
 from plate_gates import align, coc, gbuffer, iddiff, invention, material_de, texture, thresholds, tone
+from plate_gates.color import ciede2000, srgb_to_lab
 from plate_gates.io import to_uint8
-from plate_gates.report import Check, EngineRef, GateReport
+from plate_gates.report import Check, EngineRef, FlaggedPoint, GateReport, scored_check
 
-__all__ = ["DepthFn", "LOCKED_SHARE", "TEXTURE_WIDTH", "EDGE_AGREEMENT_WIDTH", "run_gates", "score_of"]
+__all__ = [
+    "DepthFn",
+    "LOCKED_SHARE",
+    "TEXTURE_WIDTH",
+    "EDGE_AGREEMENT_WIDTH",
+    "TILE_PX",
+    "TILES_PER_METRIC",
+    "FEATHER_NOTE",
+    "run_gates",
+    "score_of",
+]
 
 DepthFn = Callable[[np.ndarray], np.ndarray]
 
 TEXTURE_WIDTH = 3840
 EDGE_AGREEMENT_WIDTH = 1920
 LOCKED_SHARE = 0.5  # a material with less than this share of its pixels inside the mask is locked
+TILE_PX = 128  # flagged-point tiles
+TILES_PER_METRIC = 3  # the worst tiles named per missed dE00 metric
+FEATHER_NOTE = "feather band: advisory until calibration (T23) sets a bound"
 
 
 # ---------------------------------------------------------------------------- inputs
@@ -105,16 +127,30 @@ class _Checks:
         backend: str | None = None,
     ) -> str:
         thr = self.ts.get(metric_id)
-        v = _finite(value)
-        if status is None:
-            if v is None:
-                status = "fail" if thr.effective_status(backend) == "hard" else "advisory"
-            else:
-                status, _ = self.ts.check(
-                    metric_id, v, variant=variant, backend=backend if thr.status_by_backend else None
-                )
-        self.items.append(Check(metric_id=metric_id, value=v, status=status))
-        return status
+        c = scored_check(
+            self.ts,
+            metric_id,
+            _finite(value),
+            status=status,
+            variant=variant,
+            backend=backend if thr.status_by_backend else None,
+        )
+        self.items.append(c)
+        return c.status
+
+    def misses(self, metric_id: str) -> bool:
+        """True when the measured value is outside its registered bound, whatever the check's status was
+        forced to (the advisory feather band still misses when it drifts)."""
+        for c in self.items:
+            if c.metric_id == metric_id and c.value is not None:
+                return self.ts.check(metric_id, c.value)[0] != "pass"
+        return False
+
+    def failed(self, metric_id: str) -> bool:
+        """True when a measured value scored `fail` (a metric that could not be measured does not count)."""
+        return any(
+            c.metric_id == metric_id and c.value is not None and c.status == "fail" for c in self.items
+        )
 
 
 # ---------------------------------------------------------------------------- the gates
@@ -148,20 +184,100 @@ def _locked_materials(
     ranks: np.ndarray,
     cov: np.ndarray,
     mask: np.ndarray | None,
-) -> tuple[list[str], list[str]]:
-    """(locked ids, edited ids) of the measured materials, by the share of their pixels inside the mask."""
+) -> tuple[list[str], list[str], np.ndarray | None]:
+    """(locked ids, edited ids, pixels of the locked ids) of the measured materials, by the share of their
+    pixels inside the mask. The pixel union is None when nothing is locked."""
     if mask is None:
-        return [], list(per)
+        return [], list(per), None
     if ranks.ndim == 2:
         ranks, cov = ranks[..., None], cov[..., None]
     locked, edited = [], []
+    locked_px = None
     for cid in per:
         target = np.uint32(material_de.id_to_u32(cid))
         px = np.where(ranks == target, cov, 0.0).sum(axis=2) >= material_de.MASK_THRESHOLD
         n = int(px.sum())
         inside = int((px & mask).sum())
-        (edited if n and inside / n >= LOCKED_SHARE else locked).append(cid)
-    return locked, edited
+        if n and inside / n >= LOCKED_SHARE:
+            edited.append(cid)
+        else:
+            locked.append(cid)
+            locked_px = px if locked_px is None else locked_px | px
+    return locked, edited, locked_px
+
+
+# ---------------------------------------------------------------------------- flagged points
+
+
+def _de00_px(a16: np.ndarray, b16: np.ndarray) -> np.ndarray:
+    """CIEDE2000 between two (n, 3) uint16 sRGB pixel lists."""
+    to8 = 255.0 / 65535.0
+    return ciede2000(srgb_to_lab(a16.astype(np.float64) * to8), srgb_to_lab(b16.astype(np.float64) * to8))
+
+
+def _worst_tiles(
+    de: np.ndarray, region: np.ndarray, n: int = TILES_PER_METRIC, tile: int = TILE_PX
+) -> list[tuple[int, int, int, int, float]]:
+    """The `n` tiles (x, y, w, h, mean dE00) with the highest mean dE00 over `region`, on a `tile` px grid whose
+    last row / column is clamped to the frame. Tiles with no region pixel, or a zero mean, are not named."""
+    h, w = region.shape
+    ys, xs = np.arange(0, h, tile), np.arange(0, w, tile)
+    cnt = np.add.reduceat(np.add.reduceat(region.astype(np.int32), ys, axis=0), xs, axis=1)
+    tot = np.add.reduceat(np.add.reduceat(de, ys, axis=0, dtype=np.float64), xs, axis=1)
+    mean = np.where(cnt > 0, tot / np.maximum(cnt, 1), 0.0)
+    out: list[tuple[int, int, int, int, float]] = []
+    for flat in np.argsort(-mean, axis=None, kind="stable")[:n]:
+        ty, tx = divmod(int(flat), mean.shape[1])
+        if not mean[ty, tx] > 0:
+            break
+        x, y = int(xs[tx]), int(ys[ty])
+        out.append((x, y, min(tile, w - x), min(tile, h - y), float(mean[ty, tx])))
+    return out
+
+
+def _de_points(
+    plate16: np.ndarray,
+    out16: np.ndarray,
+    changed: np.ndarray,
+    region: np.ndarray,
+    metric_id: str,
+    where: str,
+) -> list[FlaggedPoint]:
+    """The worst tiles of the dE00 between plate and output over `region` (computed on the changed pixels
+    only; an unchanged pixel is 0)."""
+    sel = region & changed
+    de = np.zeros(region.shape, dtype=np.float32)
+    if sel.any():
+        de[sel] = _de00_px(plate16[sel], out16[sel])
+    return [
+        FlaggedPoint(x=x, y=y, w=tw, h=th, metric_id=metric_id, note=f"mean dE00 {mean:.2f} {where}")
+        for x, y, tw, th, mean in _worst_tiles(de, region)
+    ]
+
+
+def _invention_points(inv: Mapping[str, Any], src_wh: tuple[int, int], w: int, h: int) -> list[FlaggedPoint]:
+    """One point per invention flag: its bbox (at the edge map's working size) scaled to plate pixels."""
+    sx, sy = w / float(src_wh[0]), h / float(src_wh[1])
+    pts = []
+    for f in inv.get("flags") or []:
+        x0, y0, x1, y1 = f["bbox"]
+        bx0, by0 = min(int(math.floor(x0 * sx)), w - 1), min(int(math.floor(y0 * sy)), h - 1)
+        bx1, by1 = (
+            min(max(int(math.ceil(x1 * sx)), bx0 + 1), w),
+            min(max(int(math.ceil(y1 * sy)), by0 + 1), h),
+        )
+        what = f.get("name") or f.get("id")
+        pts.append(
+            FlaggedPoint(
+                x=bx0,
+                y=by0,
+                w=bx1 - bx0,
+                h=by1 - by0,
+                metric_id=invention.METRIC_ID,
+                note=f"invented edge, {f.get('length_px')} px, in {what} ({f.get('class')})",
+            )
+        )
+    return pts
 
 
 def run_gates(
@@ -201,6 +317,8 @@ def run_gates(
     checks = _Checks()
     metrics: dict[str, Any] = {}
     notes: list[str] = []
+    points: list[FlaggedPoint] = []
+    locked_px: np.ndarray | None = None
 
     # registration (the engine's pixels against the plate, before compositing)
     reg = _registration(plate16, out16, m, registration)
@@ -214,7 +332,8 @@ def run_gates(
     om["mask_share"] = float(full.mean())
     metrics["outside_mask"] = om
     checks.add("outside_mask.de00", om["de00_max_outside"])
-    checks.add("feather_band.de00_p99", om["feather_band_p99"])
+    checks.add("feather_band.de00_p99", om["feather_band_p99"], status="advisory")  # decision 35
+    notes.append(FEATHER_NOTE)
     if m is None:
         notes.append("outside_mask: no mask, the whole frame is editable")
 
@@ -234,6 +353,7 @@ def run_gates(
         )
         metrics["invention"] = inv
         metrics["invention_flags"] = inv["count"]
+        points.extend(_invention_points(inv, (emap.width, emap.height), w, h))
         if inv["count"] is None:
             checks.add(invention.METRIC_ID, None, status="advisory")
             notes.append(f"invention: skipped ({inv['reason']})")
@@ -253,7 +373,7 @@ def run_gates(
             crypto_material = read_cryptomatte(exr, manifest, "material")
         ranks, cov = crypto_material
         per = material_de.per_material(plate8, out8, ranks, cov, legend)
-        locked, edited = _locked_materials(per, np.asarray(ranks), np.asarray(cov), m)
+        locked, edited, locked_px = _locked_materials(per, np.asarray(ranks), np.asarray(cov), m)
         metrics["material"] = {"per_id": per, "locked": locked, "edited": edited}
         if locked:
             worst_median = max(per[c]["de00_median"] for c in locked)
@@ -294,6 +414,36 @@ def run_gates(
             region = None if m is None else ~m if (~m).sum() >= 3 else None
             metrics["depth_agreement"] = depth_agreement.compare(depth_fn(plate8), depth_fn(out8), region)
             notes.append("depth agreement: advisory, no threshold in the set yet")
+    if depth_fn is not None:
+        notes.append(f"depth agreement backend: {getattr(depth_fn, 'name', 'unknown')}")
+        if tier != "C":
+            notes.append("depth agreement: not scored on tier A, the G-buffer is the reference")
+
+    # where to look first: invention boxes (above), the worst dE00 tiles of a missed metric, camera drift
+    regions: list[tuple[str, np.ndarray, str]] = []
+    if m is not None:
+        if checks.misses("outside_mask.de00"):
+            regions.append(("outside_mask.de00", ~m, "outside the mask"))
+        if checks.misses("feather_band.de00_p99"):
+            regions.append(("feather_band.de00_p99", iddiff.feather_band(m), "in the feather band"))
+    if locked_px is not None and checks.misses("material.de00_p90"):
+        regions.append(("material.de00_p90", locked_px, "on the locked materials"))
+    if regions:
+        changed = np.any(plate16 != out16, axis=-1)
+        for metric_id, region, where in regions:
+            points.extend(_de_points(plate16, out16, changed, region, metric_id, where))
+    if checks.failed("registration.shift_px"):
+        bw, bh = min(TILE_PX, w), min(TILE_PX, h)
+        points.append(
+            FlaggedPoint(
+                x=(w - bw) // 2,
+                y=(h - bh) // 2,
+                w=bw,
+                h=bh,
+                metric_id="registration.shift_px",
+                note="camera drift",
+            )
+        )
 
     if extra_metrics:
         metrics.update(extra_metrics)
@@ -303,6 +453,7 @@ def run_gates(
         tier=tier,
         metrics=metrics,
         checks=checks.items,
+        flagged_points=points,
         backend_notes=notes,
     )
 

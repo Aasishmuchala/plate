@@ -19,6 +19,11 @@ const count = (d: PlateNodeData, key: string): number | null => {
   return Array.isArray(v) ? v.length : null;
 };
 
+const whole = (d: PlateNodeData, key: string): number | null => {
+  const v = d.params?.[key];
+  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : null;
+};
+
 /** The facts line per kind. Null shows nothing. Node editors (T47) own the params; these only read them. */
 export const KIND_SUMMARY: Readonly<Record<NodeKind, (d: PlateNodeData) => string | null>> = {
   Plate: (d) => `${d.packetId && d.packetId !== "unlinked" ? d.packetId : "no packet linked"} · Tier ${d.tier ?? "?"}`,
@@ -52,8 +57,12 @@ export const KIND_SUMMARY: Readonly<Record<NodeKind, (d: PlateNodeData) => strin
   People: (d) => param(d, "cast") ?? "cast, placement, light",
   Set: () => "cross-view consistency",
   Compare: () => "A/B in the viewer",
-  Export: (d) => param(d, "format") ?? "png16 · exr · prores",
-  Review: () => "static review bundle",
+  // the Export editor's default format is png16; `exported` counts the takes it handed out
+  Export: (d) => `${param(d, "format") ?? "png16"} · ${whole(d, "exported") ?? 0} exported`,
+  Review: (d) => {
+    const n = whole(d, "bundleTakes");
+    return n === null ? "static review bundle" : `${n} in last bundle`;
+  },
   Light: () => "match a reference in Max",
   Scout: (d) => (param(d, "count") ? `${param(d, "count")} scout poses` : "scout poses from Max"),
   Concept: () => "unmeasured: look, never deliver",

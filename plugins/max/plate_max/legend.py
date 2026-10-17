@@ -9,6 +9,11 @@ Each entry's id is the hash of its name and nothing else, so two visible nodes (
 materials) with one name would merge into one ID with one class: that is a LegendError, not a
 warning. Entries also carry a digest, the BLAKE3 of the node's or material's record; BLAKE3 is not
 in the standard library, so the caller passes the hash function.
+
+planar (decision 43) is a sender-side class rule: an object entry of class architecture, ground or
+glazing (policy.PLANAR_CLASSES) whose pixel share is at least policy.PLANAR_MIN_SHARE gets
+planar: true. A node that carries "planar" (the plate_planar user property, read by
+autotag.planar_overrides) keeps its own value instead, true or false. Materials are never planar.
 """
 
 from __future__ import annotations
@@ -83,6 +88,15 @@ def _restrictive_class(classes: list[str]) -> str:
     return classes[0]
 
 
+def planar_by_rule(entry: dict[str, Any]) -> bool:
+    """The planar class rule for one object entry (its class and recorded pixel_share)."""
+    return (
+        entry.get("kind") == "object"
+        and entry.get("class") in policy_mod.PLANAR_CLASSES
+        and float(entry.get("pixel_share") or 0.0) >= policy_mod.PLANAR_MIN_SHARE
+    )
+
+
 def node_record(node: dict[str, Any], layer: str | None, tags: list[str]) -> dict[str, Any]:
     """The interim (digest_version "0") record a node's digest is taken over: its name, layer,
     material, tags and world transform. Mesh topology and shader parameters join in version 1."""
@@ -94,6 +108,21 @@ def node_record(node: dict[str, Any], layer: str | None, tags: list[str]) -> dic
         "tags": tags,
         "transform": node.get("transform"),
     }
+
+
+def _node_layer(node: dict[str, Any]) -> str | None:
+    layer = node.get("layer")
+    return str(layer) if layer is not None else None
+
+
+def _node_tags(node: dict[str, Any]) -> list[str]:
+    return sorted({str(t).lower() for t in node.get("tags") or ()})
+
+
+def record_bytes(node: dict[str, Any]) -> bytes:
+    """The canonical bytes an object entry's digest is taken over (what digest_fn is handed for this
+    node in build_id_legend): Send checks their size before it renders."""
+    return canonical_json_bytes(node_record(node, _node_layer(node), _node_tags(node)))
 
 
 def build_id_legend(
@@ -109,7 +138,9 @@ def build_id_legend(
     not from Max, so the caller passes it per node (default 0.0). A material's share is the sum over
     the objects that use it and its class is the most restrictive among them. digest_fn(bytes) -> 64
     hex BLAKE3 is applied to each canonical record unless the node already carries a "digest".
-    Raises LegendError for duplicate names, two materials sharing a name, or a missing digest.
+    planar: the node's own value when it has one (True or False is recorded), else true by
+    planar_by_rule, else absent. Raises LegendError for duplicate names, two materials sharing a
+    name, or a missing digest.
     """
     entries: list[dict[str, Any]] = []
     seen: dict[str, str] = {}
@@ -134,12 +165,12 @@ def build_id_legend(
 
     for node in nodes:
         name = str(node["name"])
-        layer = node.get("layer")
-        tags = sorted({str(t).lower() for t in node.get("tags") or ()})
+        layer = _node_layer(node)
+        tags = _node_tags(node)
         cls, source = policy_mod.classify_object(layer, tags)
         entry: dict[str, Any] = {"id": object_id(name), "kind": "object", "name": name}
         if layer is not None:
-            entry["layer"] = str(layer)
+            entry["layer"] = layer
         if node.get("material"):
             entry["material"] = str(node["material"])
         entry.update(
@@ -153,6 +184,8 @@ def build_id_legend(
         )
         if node.get("planar") is not None:
             entry["planar"] = bool(node["planar"])
+        elif planar_by_rule(entry):
+            entry["planar"] = True
         if node.get("detail_size_m"):
             entry["detail_size_m"] = float(node["detail_size_m"])
         claim(entry["id"], name, "node")

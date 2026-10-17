@@ -1,11 +1,23 @@
 // Project browser: the projects the daemon knows, open one onto the canvas, create one with its custody setting (NDA
 // toggle and allowed grades) and engine pins. An NDA project allows C0 and C1 routes only, the same rule the daemon
-// enforces (`plate_daemon.projects.check_custody`); the form simply cannot ask for more.
+// enforces (`plate_daemon.projects.check_custody`); the form simply cannot ask for more. For the open project the
+// panel also edits custody (loosening needs a reason, which the daemon ledgers) and imports a client's plate (Tier C,
+// consent record required) or packet kit; the imported packet then appears in the Plate editor's picker.
 
 import { type FormEvent, type ReactElement, useState } from "react";
 import { useGraphStore } from "../store";
 import { createProject, errorMessage, getProjectGraph, listProjects } from "./api";
 import { formatTime } from "./format";
+import {
+  CONSENT_REQUIRED,
+  type ImportAccepted,
+  importKit,
+  importTierC,
+  loosensCustody,
+  MAX_CONSENT_CHARS,
+  MIN_REASON_CHARS,
+  putCustody,
+} from "./importApi";
 import { usePanelsStore } from "./store";
 import { C, GRADE_COLOR, S, tint } from "./theme";
 import { CUSTODY_GRADES, type CustodyGrade, NDA_GRADES, type ProjectSummary } from "./types";
@@ -195,6 +207,330 @@ function CreateForm({ onCreated }: { onCreated: (p: ProjectSummary) => void }): 
   );
 }
 
+/** The grade set after the NDA flag changes: NDA keeps C0 and C1 only (at least those two when nothing was left). */
+function gradesForNda(grades: readonly CustodyGrade[], nda: boolean): CustodyGrade[] {
+  if (!nda) return [...grades];
+  const kept = grades.filter((g) => (NDA_GRADES as readonly string[]).includes(g));
+  return kept.length > 0 ? kept : [...NDA_GRADES];
+}
+
+const sameGrades = (a: readonly CustodyGrade[], b: readonly CustodyGrade[]): boolean =>
+  a.length === b.length && a.every((g) => b.includes(g));
+
+/**
+ * The open project's custody and its editor. Tightening posts as is; loosening (NDA off, or a grade added) asks for a
+ * reason first, because the daemon refuses it without one and ledgers it as an override.
+ */
+function CustodyRow({ project, onSaved }: { project: ProjectSummary; onSaved: () => void }): ReactElement {
+  const [editing, setEditing] = useState(false);
+  const [nda, setNda] = useState(project.custody.nda);
+  const [grades, setGrades] = useState<CustodyGrade[]>(project.custody.allowed_grades);
+  const [reason, setReason] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const loosens = loosensCustody(project.custody, { nda, allowed_grades: grades });
+  const changed = nda !== project.custody.nda || !sameGrades(grades, project.custody.allowed_grades);
+
+  const start = () => {
+    setNda(project.custody.nda);
+    setGrades(project.custody.allowed_grades);
+    setReason("");
+    setError(null);
+    setEditing(true);
+  };
+  const toggleNda = (on: boolean) => {
+    setNda(on);
+    setGrades((cur) => gradesForNda(cur, on));
+  };
+  const toggleGrade = (g: CustodyGrade, on: boolean) =>
+    setGrades((cur) => CUSTODY_GRADES.filter((x) => (x === g ? on : cur.includes(x))));
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (grades.length === 0) {
+      setError("Allow at least one custody grade.");
+      return;
+    }
+    const why = reason.trim();
+    if (loosens && why === "") {
+      setError("reason required");
+      return;
+    }
+    if (loosens && why.length < MIN_REASON_CHARS) {
+      setError(`reason must be at least ${MIN_REASON_CHARS} characters`);
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    try {
+      await putCustody(project.project_id, { nda, allowed_grades: grades, ...(why !== "" ? { reason: why } : {}) });
+      setEditing(false);
+      setReason("");
+      onSaved();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }} data-testid="custody-row">
+      <div style={{ ...S.row, justifyContent: "space-between" }}>
+        <h3 style={S.h}>Custody: {project.project_id}</h3>
+        {editing ? null : (
+          <button type="button" style={S.btn} onClick={start} aria-label="Edit custody">
+            Edit
+          </button>
+        )}
+      </div>
+      <span style={S.row} data-testid="custody-current">
+        {project.custody.nda ? <span style={tint(C.advisory)}>NDA</span> : <span style={S.chip}>not NDA</span>}
+        <GradeChips grades={project.custody.allowed_grades} />
+      </span>
+      {editing ? (
+        <form onSubmit={submit} noValidate style={{ ...S.section, background: C.bg }} aria-label="Custody editor" data-testid="custody-edit">
+          <label style={S.row}>
+            <input type="checkbox" checked={nda} onChange={(e) => toggleNda(e.target.checked)} />
+            NDA on (C0 and C1 routes only)
+          </label>
+          <fieldset style={{ ...S.row, border: 0, margin: 0, padding: 0 }}>
+            <legend style={{ ...S.muted, padding: 0 }}>Allowed custody grades</legend>
+            {CUSTODY_GRADES.map((g) => {
+              const locked = nda && !(NDA_GRADES as readonly string[]).includes(g);
+              return (
+                <label key={g} style={S.row}>
+                  <input
+                    type="checkbox"
+                    checked={grades.includes(g)}
+                    disabled={locked}
+                    onChange={(e) => toggleGrade(g, e.target.checked)}
+                    aria-label={`Custody allow ${g}`}
+                  />
+                  <span style={{ color: locked ? C.muted : GRADE_COLOR[g] }}>{g}</span>
+                </label>
+              );
+            })}
+          </fieldset>
+          {loosens ? (
+            <p style={{ ...S.muted, margin: 0 }}>
+              This loosens the project's custody. A reason of {MIN_REASON_CHARS} characters or more is required and goes
+              in the ledger.
+            </p>
+          ) : null}
+          <textarea
+            style={{ ...S.input, minHeight: 40, resize: "vertical" }}
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder={loosens ? "Why is this being loosened?" : "Reason (optional when tightening)"}
+            aria-label="Custody reason"
+          />
+          {error ? (
+            <p style={S.error} role="alert">
+              {error}
+            </p>
+          ) : null}
+          <span style={S.row}>
+            <button type="submit" style={{ ...S.btn, ...S.btnPrimary }} disabled={busy || !changed}>
+              Save custody
+            </button>
+            <button type="button" style={S.btn} onClick={() => setEditing(false)} disabled={busy}>
+              Cancel
+            </button>
+          </span>
+        </form>
+      ) : null}
+    </div>
+  );
+}
+
+type ImportMode = "tierc" | "kit";
+
+const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+
+/**
+ * Import a client's plate into the open project: a finished image with no scene behind it becomes a Tier C packet
+ * (consent record required, the same rule as the daemon's 428), or a client packet kit's folder plus the plate
+ * becomes a Tier A packet. The daemon answers 202 and ingests in the background; nothing else is done here, the
+ * packet turns up in the Plate editor's picker through its `packet.ingested` event.
+ */
+function ImportForm({ projectId }: { projectId: string | null }): ReactElement {
+  const [open, setOpen] = useState(false);
+  const [mode, setMode] = useState<ImportMode>("tierc");
+  const [plate, setPlate] = useState("");
+  const [shot, setShot] = useState("");
+  const [consent, setConsent] = useState("");
+  const [folder, setFolder] = useState("");
+  const [camera, setCamera] = useState("");
+  const [problems, setProblems] = useState<string[]>([]);
+  const [accepted, setAccepted] = useState<ImportAccepted | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (projectId === null) return;
+    const path = plate.trim();
+    const shotId = shot.trim();
+    const found: string[] = [];
+    if (mode === "tierc") {
+      if (path === "") found.push("Plate path is required.");
+      if (shotId === "") found.push("Shot id is required.");
+      if (consent.trim() === "") found.push(CONSENT_REQUIRED);
+    } else {
+      if (folder.trim() === "") found.push("Kit folder is required.");
+      if (camera.trim() === "") found.push("Camera name is required.");
+      if (path === "") found.push("Plate path is required.");
+    }
+    setAccepted(null);
+    setProblems(found);
+    if (found.length > 0) return;
+    setBusy(true);
+    try {
+      const made =
+        mode === "tierc"
+          ? await importTierC(projectId, { plate_path: path, shot_id: shotId, consent_record: consent.trim() })
+          : await importKit(projectId, {
+              folder: folder.trim(),
+              camera: camera.trim(),
+              plate_path: path,
+              ...(shotId !== "" ? { shot_id: shotId } : {}),
+            });
+      setAccepted(made);
+      // the consent record belongs to this plate alone; the kit folder is usually reused for the next camera
+      setPlate("");
+      setShot("");
+      setConsent("");
+      setCamera("");
+    } catch (err) {
+      setProblems([errorMessage(err)]);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const warnings = accepted ? strings(accepted.warnings) : [];
+  const flags = accepted ? strings(accepted.flags) : [];
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }} data-testid="import-client">
+      <button
+        type="button"
+        style={{ ...S.btn, alignSelf: "flex-start" }}
+        aria-expanded={open}
+        aria-controls="import-client-body"
+        onClick={() => setOpen((o) => !o)}
+      >
+        Import client plate
+      </button>
+      {open ? (
+        <form
+          id="import-client-body"
+          onSubmit={submit}
+          noValidate
+          style={{ ...S.section, background: C.bg }}
+          aria-label="Client import"
+        >
+          {projectId === null ? <p style={{ ...S.muted, margin: 0 }}>Open a project to import into it.</p> : null}
+          <fieldset style={{ ...S.row, border: 0, margin: 0, padding: 0 }}>
+            <legend style={{ ...S.muted, padding: 0 }}>Import mode</legend>
+            <label style={S.row}>
+              <input type="radio" name="import-mode" checked={mode === "tierc"} onChange={() => setMode("tierc")} />
+              Tier C plate
+            </label>
+            <label style={S.row}>
+              <input type="radio" name="import-mode" checked={mode === "kit"} onChange={() => setMode("kit")} />
+              Client kit
+            </label>
+          </fieldset>
+          {mode === "kit" ? (
+            <>
+              <input
+                style={S.input}
+                value={folder}
+                onChange={(e) => setFolder(e.target.value)}
+                placeholder="kit output folder (absolute path on the daemon's machine)"
+                aria-label="Kit folder"
+              />
+              <input
+                style={S.input}
+                value={camera}
+                onChange={(e) => setCamera(e.target.value)}
+                placeholder="camera name as exported by the kit"
+                aria-label="Camera name"
+              />
+            </>
+          ) : null}
+          <input
+            style={S.input}
+            value={plate}
+            onChange={(e) => setPlate(e.target.value)}
+            placeholder="the client's plate (absolute path on the daemon's machine)"
+            aria-label="Plate path"
+          />
+          <input
+            style={S.input}
+            value={shot}
+            onChange={(e) => setShot(e.target.value)}
+            placeholder={mode === "kit" ? "shot-id (optional)" : "shot-id"}
+            aria-label="Shot id"
+          />
+          {mode === "tierc" ? (
+            <>
+              <span style={S.muted}>Consent record (required for a Tier C plate)</span>
+              <textarea
+                style={{ ...S.input, minHeight: 56, resize: "vertical" }}
+                value={consent}
+                maxLength={MAX_CONSENT_CHARS}
+                onChange={(e) => setConsent(e.target.value)}
+                placeholder="Who agreed to what, and when."
+                aria-label="Consent record"
+                aria-required="true"
+              />
+            </>
+          ) : null}
+          {problems.length > 0 ? (
+            <div style={S.error} role="alert">
+              {problems.map((m) => (
+                <div key={m}>{m}</div>
+              ))}
+            </div>
+          ) : null}
+          {accepted ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }} role="status" data-testid="import-result">
+              <span>{`packet ${accepted.packet_id} ${accepted.status || "ingesting"}`}</span>
+              {accepted.stub ? (
+                <span style={S.muted}>Some Tier C layers came from stub models; treat depth and masks as placeholders.</span>
+              ) : null}
+              {flags.length > 0 ? (
+                <span style={S.row}>
+                  {flags.map((f) => (
+                    <span key={f} style={tint(C.advisory)}>
+                      {f}
+                    </span>
+                  ))}
+                </span>
+              ) : null}
+              {warnings.map((w) => (
+                <span key={w} style={S.muted}>
+                  {w}
+                </span>
+              ))}
+            </div>
+          ) : null}
+          <button
+            type="submit"
+            style={{ ...S.btn, ...S.btnPrimary, alignSelf: "flex-start" }}
+            disabled={busy || projectId === null}
+          >
+            {mode === "tierc" ? "Import Tier C plate" : "Import client kit"}
+          </button>
+        </form>
+      ) : null}
+    </div>
+  );
+}
+
 export function ProjectPanel(): ReactElement {
   const openId = useGraphStore((s) => s.projectId);
   const loadProject = useGraphStore((s) => s.loadProject);
@@ -269,6 +605,8 @@ export function ProjectPanel(): ReactElement {
           <PinsTable pins={current.engine_pins} />
         </div>
       ) : null}
+      {current ? <CustodyRow key={`custody:${current.project_id}`} project={current} onSaved={reload} /> : null}
+      <ImportForm key={`import:${openId ?? ""}`} projectId={openId} />
       <CreateForm
         onCreated={(p) => {
           reload();

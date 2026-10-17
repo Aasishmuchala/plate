@@ -1,11 +1,12 @@
 <#
 .SYNOPSIS
   Set up PLATE on a Windows 10/11 x64 machine (the render box): uv, Node LTS, the Python 3.12 venv, npm ci,
-  and config.json with the daemon token.
+  the UI build and config.json with the daemon token.
 .DESCRIPTION
   Installs uv (winget, else the official astral.sh installer) and Node LTS (winget) when they are missing
   (pass -NoInstall to only check), then runs `uv sync --python 3.12` and `npm ci` in the repo (the ui is an
-  npm workspace of the root package.json, so one `npm ci` installs it). Never installs the pixels CUDA extra.
+  npm workspace of the root package.json, so one `npm ci` installs it) and builds ui/dist, which the daemon
+  serves at /. Never installs the pixels CUDA extra.
   Finally it creates config.json in the app-data folder when it is missing (PLATE_HOME and PLATE_CONFIG are
   honoured) with a fresh token and prints the launch URL.
   Run from the repo root:  powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
@@ -53,6 +54,7 @@ if (-not $nodeOk) {
 
 Invoke-Step 'uv sync (Python 3.12 venv)' { uv sync --python 3.12 }
 Invoke-Step 'npm ci (root workspace, includes ui)' { npm ci }
+Invoke-Step 'building ui/dist (the daemon serves it at /)' { npm run build -w ui }
 
 if (-not (Test-Command 'ffmpeg')) {
     Write-Warning 'ffmpeg not on PATH: video-gate tests will be skipped. Install with: winget install --id Gyan.FFmpeg -e (or set PLATE_FFMPEG)'

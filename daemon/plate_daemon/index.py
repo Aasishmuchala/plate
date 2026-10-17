@@ -15,6 +15,14 @@ record's `state` (a RunState value) wins, else its `kind` maps through `KIND_STA
 from the record or its `data`. A run whose packet is not registered, or that claims a provider state with
 no `provider_job_id`, is skipped and reported. What the folder does not hold (quotes, envelopes, run and
 packet event logs, packet blob hashes, the SSE event log) is not recovered: write it to the folder first.
+
+The two human decisions that unlock export are in the folder, so the rebuild replays them into `run_events`
+(`replay_ledger_notes`): a ledger `override` record becomes the `override` note and a `done` record with
+`data.decision == "accepted"` the `accept` note, in the shapes `routes/runs.py` writes, so `run_view` shows
+the same `override`, `accepted` and `exportable` as before the rebuild. Their `at` is the rebuild time
+(`run_events` is append-only and `append_note` stamps the clock). Every stored png, jpg, tif or tiff then
+gets its perceptual hash in `assets.phash` (drop-to-resolve works on a fresh machine); unreadable files
+are skipped and counted, never reported as problems.
 """
 
 from __future__ import annotations
@@ -31,6 +39,7 @@ from typing import Any
 from .cas import CAS, hash_file
 from .config import PROJECT_ID_RE, check_project_id, index_db_path, index_dir
 from .db import connect, dumps, loads, migrate, tx
+from .machine import RunNotFound, append_note
 from .projects import Project
 from .states import PROVIDER_STATES, RunState
 from .timeutil import iso, utcnow
@@ -96,6 +105,8 @@ QUOTE_KEYS = (
 )
 PRIORITY_NAMES = ("client_deadline", "interactive", "agent_batch", "calibration")
 COUNTED_TABLES = ("assets", "packets", "runs", "events", "project_meta")
+OVERRIDE_PREFIX = "override: "  # the reason prefix routes/runs.py puts on an override note
+PHASH_EXTS = frozenset({"png", "jpg", "jpeg", "tif", "tiff"})
 
 
 class RebuildError(RuntimeError):
@@ -221,6 +232,56 @@ def apply_run(conn: sqlite3.Connection, project_id: str, run: dict[str, Any]) ->
     )
 
 
+def _note_exists(conn: sqlite3.Connection, run_id: str, kind: str, reason: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM run_events WHERE run_id = ? AND kind = ? AND reason = ?", (run_id, kind, reason)
+        ).fetchone()
+        is not None
+    )
+
+
+def replay_ledger_notes(conn: sqlite3.Connection, records: list[dict[str, Any]]) -> tuple[int, list[str]]:
+    """Replay the human decisions in the ledger into `run_events`; returns (notes added, problems).
+
+    `override` record -> note `override` (actor `by`, reason `override: <reason>`; a custody edit, which
+    has `data.what == "custody"`, is not a run override); `done` record with `data.decision == "accepted"`
+    -> note `accept` (reason: JSON of `scrub_log_id` and `decision`, as `accept_route` writes it). A note
+    already in the log (same run, kind and reason) is not added again, so replaying twice, or over an
+    index that kept its notes, changes nothing. Records for runs the index does not hold are skipped."""
+    added = 0
+    problems: list[str] = []
+    for rec in records:
+        rid = rec.get("run_id")
+        if not isinstance(rid, str) or not rid:
+            continue
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        kind = rec.get("kind")
+        if kind == "override":
+            if data.get("what") == "custody":
+                continue
+            note_kind = "override"
+            reason = OVERRIDE_PREFIX + str(rec.get("reason") or data.get("reason") or "")
+        elif kind == "done" and data.get("decision") == "accepted":
+            scrub_log_id = data.get("scrub_log_id")  # None stays None: `find_scrub` decides what it unlocks
+            note_kind = "accept"
+            reason = json.dumps({"scrub_log_id": scrub_log_id, "decision": "accepted"}, sort_keys=True)
+        else:
+            continue
+        actor = rec.get("by") if isinstance(rec.get("by"), str) and rec.get("by") else "human"
+        if not conn.execute("SELECT 1 FROM runs WHERE id = ?", (rid,)).fetchone():
+            continue
+        if _note_exists(conn, rid, note_kind, reason):
+            continue
+        try:
+            append_note(conn, rid, kind=note_kind, actor=actor, reason=reason)
+        except (RunNotFound, ValueError, sqlite3.IntegrityError) as e:
+            problems.append(f"run {rid}: {note_kind} note not replayed ({e})")
+            continue
+        added += 1
+    return added, problems
+
+
 # ---------------------------------------------------------------------------- the index
 
 
@@ -322,6 +383,8 @@ class Index:
         project = Project.load(project_dir)
         pid = project.project_id
         problems: list[str] = []
+        stored_images: list[tuple[str, Path]] = []
+        notes = 0
         conn = connect(self.db_path(pid))
         try:
             # Foreign keys off for the drop (no table order to get right); the replay checks references
@@ -351,6 +414,8 @@ class Index:
                         problems.append(f"assets/{key[:2]}/{path.name}: bytes do not match the hash, skipped")
                         continue
                     _insert_asset(conn, key, ext, size, None, None, mtime=path.stat().st_mtime)
+                    if ext.lower().lstrip(".") in PHASH_EXTS:
+                        stored_images.append((key, path))
                 records, ledger_problems = project.ledger_records()
                 problems.extend(ledger_problems)
                 for run in fold_run_records(records).values():
@@ -358,18 +423,51 @@ class Index:
                         apply_run(conn, pid, run)
                     except (RebuildError, ValueError, sqlite3.IntegrityError) as e:
                         problems.append(str(e))
+                notes, note_problems = replay_ledger_notes(conn, records)
+                problems.extend(note_problems)
                 dangling = conn.execute("PRAGMA foreign_key_check").fetchall()
                 if dangling:
                     raise RebuildError(
                         f"rebuild left dangling references: {[tuple(r) for r in dangling][:5]}"
                     )
             conn.execute("PRAGMA foreign_keys=ON")
+            # After the commit: decoding images is slow and must not hold the write lock.
+            phashed, phash_skipped = _phash_assets(conn, pid, stored_images)
         finally:
             conn.close()
         with self._lock:
             self._migrated.add(pid)
             self._owner = {k: v for k, v in self._owner.items() if v != pid}
-        return {"project_id": pid, **self.counts(pid), "problems": problems}
+        return {
+            "project_id": pid,
+            **self.counts(pid),
+            "problems": problems,
+            "notes_replayed": notes,
+            "phashed": phashed,
+            "phash_skipped": phash_skipped,
+        }
+
+
+def _phash_assets(
+    conn: sqlite3.Connection, project_id: str, images: list[tuple[str, Path]]
+) -> tuple[int, int]:
+    """Fill `assets.phash` for stored images. Returns (hashed, skipped); a file that is not a readable
+    image is skipped, not an error (a CAS object is whatever bytes were put there)."""
+    if not images:
+        return 0, 0
+    try:
+        from .phash import PhashIndex
+    except ImportError:  # numpy or Pillow missing: the index is still good, drop-to-resolve is lineage-only
+        return 0, len(images)
+    ph = PhashIndex(conn, project_id)
+    hashed = 0
+    for key, path in images:
+        try:
+            ph.add_file(path, key)
+        except Exception:  # PhashError, OSError, a decoder's own error: skip this file
+            continue
+        hashed += 1
+    return hashed, len(images) - hashed
 
 
 def _insert_asset(

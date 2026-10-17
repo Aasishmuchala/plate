@@ -4,13 +4,24 @@ Doctrine (spec/PACKET.md section 7): rules win. The tagger fills only the IDs no
 (class_source "unlabelled") and marks them "autotag"; it never changes a "rule" or "manual" entry. A
 guess never makes anything editable: editability still needs an editable layer prefix (policy.py), so
 an autotagged "vegetation" node on layer "0" stays locked. It only gives the lint, the dock and the
-router a better class than "other". Stdlib only, pure functions.
+router a better class than "other". Stdlib only; the guesses are pure functions.
+
+It also reads the artist's planar override (decision 43): the node user property plate_planar
+("true"/"false", also yes/no, 1/0, on/off) beats legend.py's planar class rule for that node. A value
+that is none of those is ignored, so the rule decides.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from typing import Any
+
+from .rt import runtime
+
+PLANAR_PROPERTY = "plate_planar"
+_TRUE = ("true", "yes", "1", "on")
+_FALSE = ("false", "no", "0", "off")
 
 # (class, keywords). The order is the tie-break when two classes score equally; a keyword matches a
 # whole word of the name (plural "s"/"es" allowed), never a fragment, so "carpet" is not "car" and
@@ -107,3 +118,50 @@ def apply_autotag_to_legend(
 ) -> dict[str, Any]:
     """A copy of an id_legend document with apply_autotag run over every entry."""
     return {**legend_doc, "entries": [apply_autotag(e, min_confidence) for e in legend_doc["entries"]]}
+
+
+# --------------------------------------------------------------------------- the planar override
+
+
+def parse_planar(value: Any) -> bool | None:
+    """A plate_planar value as True/False (pymxs hands back MAXScript booleans, numbers or strings),
+    None when it is missing or says neither."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value) if value in (0, 1) else None
+    text = str(value).strip().strip('"').lower()
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    return None
+
+
+def planar_property(node: Any) -> bool | None:
+    """The node's plate_planar user property (parse_planar), None when unset or unreadable."""
+    if node is None:
+        return None
+    try:
+        raw = runtime().getUserProp(node, PLANAR_PROPERTY)
+    except Exception:
+        return None
+    return parse_planar(raw)
+
+
+def planar_overrides(names: Iterable[str]) -> dict[str, bool]:
+    """{node name: planar} for every named scene node whose plate_planar property is set (names that
+    are not scene nodes, such as scatter items, have no property)."""
+    rt = runtime()
+    out: dict[str, bool] = {}
+    for name in names:
+        try:
+            node = rt.getNodeByName(str(name), exact=True)
+        except Exception:
+            node = None
+        value = planar_property(node)
+        if value is not None:
+            out[str(name)] = value
+    return out

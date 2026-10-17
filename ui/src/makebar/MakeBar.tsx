@@ -305,6 +305,7 @@ function NodeMakeBar({ node }: { node: GraphNode }) {
           quote={q}
           fresh={fresh}
           reason={entry.approvalReason}
+          blocking={entry.approvalBlocking === true}
           onApprove={() => void make(nodeId, projectId, { confirmed: true })}
           onCancel={() => closeApproval(nodeId)}
         />

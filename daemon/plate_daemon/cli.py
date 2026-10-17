@@ -1,4 +1,5 @@
-"""`plate`: run / gate / export / reindex / gc / pack / smoke over the daemon's own modules (router plan T34).
+"""`plate`: run / gate / export / reindex / gc / pack / smoke over the daemon's own modules (router plan T34), and
+review / import / deliver / timer / spend over the wave 8 libraries (T78).
 
     plate run <recipe.yaml|id> --project <dir> --packet <id|dir> [--engine ID] [--n N]
               [--approve auto|human] [--envelope USD] [--shot-class C] [--param K=V]
@@ -9,6 +10,13 @@
     plate gc <project> [--dry-run] [--min-age-hours H]
     plate pack <project> --out <zip> [--full] [--max-blob-mb MB]
     plate smoke [--live --budget-usd N --engines a,b] [--out report.json]
+    plate review <project> --runs r1,r2 [--watermark REVIEW] [--out dir] [--max-width PX] [--title T] [--reply-to ADDR]
+    plate import <file> --project <dir|id> --packet <id|dir> [--node ID] [--source higgsfield|runway|manual]
+                 [--cost-usd X] [--note TEXT]
+    plate deliver <run_id> --format prores4444|hevc|exr_sequence|av1_retag|fcpxml --to <dir>
+                  [--name N] [--override-reason TEXT] [--project DIR]
+    plate timer start|stop <deliverable_id> [--project P]     plate timer today [--project P]
+    plate spend <project> [--since ISO]
 
 `<project>` is a project folder or a project id this machine knows.
 
@@ -18,17 +26,29 @@ pipeline runs in this process on the same per-machine index (`PLATE_HOME`) and t
 run made here shows up in the UI and the ledger like any other.
 
 Exit codes: 0 ok, 1 an error that is not one of the next three (a failed run, a locked project, a bug),
-2 a gate failure (`run` ended GATE_FAIL, `gate` scored `fail`, `export` refused a failed run), 3 a custody,
-budget or approval refusal (nothing was sent), 4 usage (bad arguments, an unknown run, a recipe that cannot run).
+2 a gate failure (`run` or `import` ended GATE_FAIL, `gate` scored `fail`, `export` refused a failed run),
+3 a custody, budget, approval or delivery refusal (nothing was sent; `review` and `deliver` refuse a previs
+take and a GATE_FAIL take without an override, `import` refuses a file from a vendor the project's custody
+does not allow), 4 usage (bad arguments, an unknown run, a recipe that cannot run, and `timer` finding no daemon).
+
+`review`, `import` and `deliver` are the daemon's `POST /projects/{id}/review`, `POST /projects/{id}/import` and
+`POST /runs/{id}/deliver` run in this process (`review_bundle.export_review`, `imports.import_file`,
+`routes.delivery.deliver_run`: the same guards, so a previs take or a GATE_FAIL take without an override is
+refused here as it is there). `import` files a take made outside PLATE (Higgsfield, Runway, by hand) as a run:
+it is gated against the packet, ledgered and exportable like any other, and prints its run id and verdict.
+`timer` is the one command that talks to a running daemon (`POST /timer`, `GET /timer/today`, urllib, the
+bearer token from the install's config, loopback addresses only; `PLATE_DAEMON_URL` or `PLATE_PORT` says
+where). `spend` prints `Ledger.summarize` of the project's `runs.jsonl` per engine.
 
 `run` follows the doctrine rules in code: the packet's plate is the only starting point (no text-to-image), the
 engine never sees more than egress prepared, and the quote is printed and approved before a byte leaves.
 `--approve human` (the default) waits for `y`; `--approve auto` goes through the same cap, daily and unattended
 checks as the daemon's auto approval and exits 3 when one says no; `--envelope USD` makes the spend a hard
 ceiling either way. `--n N` runs a best-of-N group under one quote. A vendor engine needs `PLATE_LIVE=1` (without
-it the transport is recorded fixtures and could only fail); `PLATE_FAKE_ENGINE=1` swaps in the in-process fake
-engine, which echoes the plate egress prepared (a JSON object sets its flags: `echo`, `shift_px`, `size`,
-`behaviour`, ... as `engine_fake.FakeEngine`). Recipes that make video (`motion_croppair`) are run from the
+it the transport is recorded fixtures and could only fail); `PLATE_FAKE_ENGINE=1` swaps in the daemon's own
+`engine_fake.FakeEngine(echo=True)`, which hands back the plate egress prepared (a JSON object sets its flags:
+`echo`, `shift_px`, `size`, `behaviour`, ...; unlike the daemon's reading, `echo` is on unless the object says
+`false`, so a bare `{"shift_px": 6}` still scores real pixels). Recipes that make video (`motion_croppair`) are run from the
 Motion node, not here.
 
 `smoke` replays the recorded vendor fixtures (`plate_engines/contract`) through every adapter's minimum-cost
@@ -48,25 +68,31 @@ import re
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import zipfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, TextIO
 
 import httpx
 
 from . import __version__, canvas_rules, recipes
 from .cas import CAS
-from .config import PROJECT_ID_RE, ConfigError, Settings
+from .config import PROJECT_ID_RE, ConfigError, Settings, host_port
 from .custody import CustodyViolation
-from .engine_fake import FLAG_NAMES, RESULT_SCHEME, FakeEngine
+from .engine_fake import FALSE_WORDS, FLAG_NAMES, TRUE_WORDS, FakeEngine
 from .export import FORMATS as EXPORT_FORMATS
 from .export import MIN_OVERRIDE_REASON, NotExportable, export
 from .fsutil import replace_with_retry, temp_sibling, write_json_atomic
+from .imports import import_file
 from .index import Index, RebuildError
 from .ingest import PacketConflict, PacketInvalid, begin_ingest, finish_ingest, prepare_ingest
+from .ledger import Ledger
 from .lock import ProjectLocked
 from .machine import DuplicateRequest, IllegalTransition, RunNotFound, get_run, transition
 from .pipeline import FAKE_ENGINE_ID, PacketView, Pipeline, PipelineError
@@ -80,13 +106,13 @@ from .quotes import (
     create_envelope,
 )
 from .recipes import ProjectSheet, RecipeError, RunnableRecipe
+from .review_bundle import DEFAULT_WATERMARK, MAX_WIDTH_LIMIT
 from .states import RunState
 from .timeutil import iso, utcnow
 from .worker import FanOutError, fan_out
 
 __all__ = [
     "CliExit",
-    "CliFakeEngine",
     "EXIT_ERROR",
     "EXIT_GATE_FAIL",
     "EXIT_OK",
@@ -104,9 +130,6 @@ EXIT_REFUSED = 3
 EXIT_USAGE = 4
 
 STILL_KINDS = ("still_edit", "still_rephotograph")
-FAKE_FLAGS = (*FLAG_NAMES, "echo", "shift_px")
-TRUE_WORDS = {"1", "true", "yes", "on"}
-FALSE_WORDS = {"", "0", "false", "no", "off"}
 SHOT_CLASSES = ("wide", "medium", "close", "detail")
 ENVELOPE_TTL_S = 3600.0
 LOCK_WAIT_S = 10.0
@@ -127,63 +150,30 @@ class CliExit(Exception):
 # ---------------------------------------------------------------------------- the in-process fake engine
 
 
-class CliFakeEngine(FakeEngine):
-    """The daemon's FakeEngine, except that it hands back the PNG egress sent it (`echo`, the default), moved
-    `shift_px` to the right if asked, so the gates score real pixels. `echo: false` keeps the FakeEngine's
-    noise (give it a `size` equal to the plate, it never upscales), which is what makes a GATE_FAIL run."""
-
-    def __init__(self, *args: Any, echo: bool = True, shift_px: int = 0, **kwargs: Any):
-        super().__init__(*args, **kwargs)
-        self.echo = bool(echo)
-        self.shift_px = int(shift_px)
-        self._sent: dict[str, bytes] = {}
-
-    def submit(self, payload: dict[str, Any], idempotency_key: str) -> str:
-        import base64
-
-        job = super().submit(payload, idempotency_key)
-        image = (payload.get("inputs") or {}).get("image")
-        if isinstance(image, Mapping) and image.get("b64"):
-            self._sent[job] = base64.b64decode(image["b64"])
-        return job
-
-    def fetch(self, result_url: str) -> bytes:
-        data = super().fetch(result_url)
-        job = result_url[len(RESULT_SCHEME) :] if result_url.startswith(RESULT_SCHEME) else None
-        if not self.echo or job not in self._sent:
-            return data
-        sent = self._sent[job]
-        if not self.shift_px:
-            return sent
-        import cv2
-        import numpy as np
-
-        img = cv2.imdecode(np.frombuffer(sent, np.uint8), cv2.IMREAD_UNCHANGED)
-        return bytes(cv2.imencode(".png", np.roll(img, self.shift_px, axis=1))[1])
-
-
-def fake_engine_from_env(env: Mapping[str, str]) -> CliFakeEngine | None:
-    """`PLATE_FAKE_ENGINE`: unset, 0 or false means the real engines; 1 (or true, yes, on) the echoing fake
-    engine; a JSON object its flags."""
+def fake_engine_from_env(env: Mapping[str, str]) -> FakeEngine | None:
+    """`PLATE_FAKE_ENGINE`: unset, 0 or false means the real engines; 1 (or true, yes, on) the daemon's
+    `FakeEngine(echo=True)`, which hands back the PNG egress sent it so the gates score real pixels; a JSON
+    object its flags (`echo: false` with a `size` equal to the plate is its noise, which is how a GATE_FAIL run
+    is made). `echo` is on unless the object says otherwise, so `{"shift_px": 6}` is a six-pixel camera drift."""
     raw = (env.get("PLATE_FAKE_ENGINE") or "").strip()
     if raw.lower() in FALSE_WORDS:
         return None
-    if raw.lower() in TRUE_WORDS:
-        flags: dict[str, Any] = {}
-    else:
+    flags: dict[str, Any] = {}
+    if raw.lower() not in TRUE_WORDS:
         try:
             flags = json.loads(raw)
         except ValueError as e:
             raise CliExit(EXIT_USAGE, f"PLATE_FAKE_ENGINE must be 1 or a JSON object of flags ({e})") from e
         if not isinstance(flags, dict):
             raise CliExit(EXIT_USAGE, "PLATE_FAKE_ENGINE must be 1 or a JSON object of flags")
-    unknown = sorted(set(flags) - set(FAKE_FLAGS))
+    unknown = sorted(set(flags) - set(FLAG_NAMES))
     if unknown:
         raise CliExit(
-            EXIT_USAGE, f"PLATE_FAKE_ENGINE: unknown flag(s) {unknown}; known: {sorted(FAKE_FLAGS)}"
+            EXIT_USAGE, f"PLATE_FAKE_ENGINE: unknown flag(s) {unknown}; known: {sorted(FLAG_NAMES)}"
         )
+    flags.setdefault("echo", True)
     try:
-        return CliFakeEngine(**flags)
+        return FakeEngine(**flags)
     except (TypeError, ValueError) as e:
         raise CliExit(EXIT_USAGE, f"PLATE_FAKE_ENGINE: {e}") from e
 
@@ -311,7 +301,7 @@ def _parse_params(items: Sequence[str]) -> dict[str, Any]:
     return out
 
 
-def _engine_choice(session: Session, requested: str, fake: CliFakeEngine | None) -> str:
+def _engine_choice(session: Session, requested: str, fake: FakeEngine | None) -> str:
     """The engine id the run is quoted on. The fake engine replaces whatever the recipe names; a vendor needs
     PLATE_LIVE=1 (decision 8: nothing leaves by accident)."""
     if fake is not None:
@@ -1518,6 +1508,322 @@ def _smoke_one(
     return False
 
 
+# ---------------------------------------------------------------------------- plate review / import / deliver
+
+# What `POST /runs/{id}/deliver` accepts (`routes.delivery.FORMATS`; a test keeps the two equal).
+DELIVER_FORMATS = ("prores4444", "hevc", "exr_sequence", "av1_retag", "fcpxml")
+IMPORT_SOURCES = ("higgsfield", "runway", "manual")
+
+
+def _load_project(session: Session, ref: str) -> Project:
+    """The project at a folder or id, registered in this machine's index."""
+    root = resolve_project(session, ref)
+    try:
+        project = Project.load(root)
+    except (ProjectError, FileNotFoundError) as e:
+        raise CliExit(EXIT_USAGE, f"{ref}: {e}") from e
+    session.index.set_project_root(project.project_id, project.root, project.custody)
+    return project
+
+
+def _runs_indexed(session: Session, project: Project, run_ids: Sequence[str]) -> None:
+    """Every run id is a run of the project; the index is rebuilt from the folder once if one is missing."""
+
+    def missing() -> list[str]:
+        with session.index.project(project.project_id) as conn:
+            return [
+                r for r in run_ids if not conn.execute("SELECT 1 FROM runs WHERE id = ?", (r,)).fetchone()
+            ]
+
+    if missing():
+        with held(project.root):
+            session.index.rebuild_from_project(project.root)
+    lost = missing()
+    if lost:
+        raise CliExit(EXIT_USAGE, f"run {lost[0]} is not a run of project {project.project_id}")
+
+
+def cmd_review(session: Session, args: argparse.Namespace) -> int:
+    from .review_bundle import ReviewError, export_review
+    from .routes import ApiError
+    from .routes.review import check_reviewable, take_source
+
+    project = _load_project(session, args.project)
+    pid = project.project_id
+    run_ids = list(dict.fromkeys(r.strip() for r in args.runs.split(",") if r.strip()))
+    if not run_ids:
+        raise CliExit(EXIT_USAGE, "--runs needs at least one run id (r1,r2)")
+    _runs_indexed(session, project, run_ids)
+    ctx = SimpleNamespace(cas_for=session.cas_for, pipeline=session.pipeline())  # all `take_source` reads
+    out_dir = Path(args.out).resolve() if args.out else project.review_dir
+    options: dict[str, Any] = {"reply_to": args.reply_to}
+    if args.title is not None:
+        options["title"] = args.title
+    try:
+        sources = {}
+        with session.index.project(pid) as conn:
+            for rid in run_ids:
+                run = get_run(conn, rid)
+                check_reviewable(
+                    conn, run, project.root
+                )  # the delivery guard: previs and unforgiven GATE_FAIL
+                sources[rid] = take_source(ctx, run)
+        zip_path = export_review(
+            project, run_ids, out_dir, args.watermark, args.max_width, sources=sources, **options
+        )
+    except ApiError as e:
+        body = e.body
+        raise CliExit(
+            EXIT_REFUSED,
+            f"run {body.get('run_id')} is not reviewable ({body.get('code') or body.get('error')}): "
+            f"{body.get('detail') or e}",
+        ) from e
+    except ReviewError as e:
+        raise CliExit(EXIT_USAGE, str(e)) from e
+    except ValueError as e:  # watermark, max width, title, reply-to
+        raise CliExit(EXIT_USAGE, str(e)) from e
+    session.say(
+        f"review bundle {zip_path} ({len(run_ids)} take(s), {zip_path.stat().st_size / 1e6:.2f} MB, "
+        f"watermark {args.watermark})"
+    )
+    return EXIT_OK
+
+
+def cmd_import(session: Session, args: argparse.Namespace) -> int:
+    file = Path(args.file)
+    if not file.is_file():
+        raise CliExit(EXIT_USAGE, f"{file} is not a file")
+    project = _load_project(session, args.project)
+    pid = project.project_id
+    prepared = None
+    if Path(args.packet).is_dir():
+        try:
+            prepared = prepare_ingest(Path(args.packet).resolve())
+        except PacketInvalid as e:
+            raise CliExit(EXIT_USAGE, f"packet {args.packet}: {'; '.join(e.errors[:5])}") from e
+        if prepared.project_id != pid:
+            raise CliExit(
+                EXIT_USAGE,
+                f"packet {prepared.packet_id} belongs to project {prepared.project_id!r}, "
+                f"but {project.root} is project {pid!r}",
+            )
+    pipeline = session.pipeline()
+    packet_id = _packet_in_project(session, pipeline, project, args.packet, prepared)
+    run = import_file(
+        pipeline,
+        pid,
+        packet_id,
+        file.resolve(),
+        source=args.source,
+        node_id=args.node,
+        cost_usd=args.cost_usd,
+        note=args.note,
+        by="human",
+    )
+    session.say(f"imported {file.name} ({args.source}, declared {usd(args.cost_usd)}) as run {run.id}")
+    return _report_runs(session, pid, {run.id: run.state})
+
+
+def cmd_deliver(session: Session, args: argparse.Namespace) -> int:
+    from .delivery.guard import DeliveryError, DeliveryRefused, ToolMissing
+    from .lineage import LineageError
+    from .routes.delivery import deliver_run
+
+    pid, _project_dir = _locate(session, args.run_id, args.project)
+    pipeline = session.pipeline()
+    try:
+        done = deliver_run(
+            pipeline,
+            args.run_id,
+            args.format,
+            Path(args.to).resolve(),
+            name=args.name,
+            override_reason=args.override_reason,
+            by="human",
+        )
+    except DeliveryRefused as e:
+        raise CliExit(EXIT_REFUSED, f"not delivered: {e}") from e
+    except ToolMissing as e:
+        raise CliExit(EXIT_ERROR, f"not delivered: {e}") from e
+    except FileExistsError as e:
+        raise CliExit(EXIT_USAGE, f"not delivered: {e} (deliver never overwrites)") from e
+    except (DeliveryError, LineageError) as e:
+        raise CliExit(EXIT_USAGE, f"not delivered: {e}") from e
+    session.say(f"delivered {done['path']} ({done['format']})")
+    session.say(f"gate report {done['sidecar']}")
+    if args.override_reason:
+        session.say(f"override on the record: {args.override_reason}")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------- plate timer
+
+
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+DAEMON_TIMEOUT_S = 15.0
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry the bearer token somewhere the install never named: refuse it."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+def daemon_base(session: Session) -> str:
+    """The running daemon's address: `PLATE_DAEMON_URL`, else the loopback address in the settings
+    (`PLATE_PORT`, `PLATE_BIND`). The bearer token is only ever sent to a loopback host."""
+    raw = (
+        session.env.get("PLATE_DAEMON_URL")
+        or f"http://{host_port(session.settings.bind_host, session.settings.port)}"
+    )
+    parts = urllib.parse.urlsplit(raw)
+    if parts.scheme != "http" or (parts.hostname or "").lower() not in LOOPBACK_HOSTS:
+        raise CliExit(
+            EXIT_USAGE,
+            f"the daemon address {raw!r} is not http on 127.0.0.1 or localhost: the CLI sends its token "
+            "to a loopback daemon only",
+        )
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def _error_text(raw: bytes) -> str:
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return raw.decode("utf-8", "replace")[:300]
+    if isinstance(body, dict):
+        text = " ".join(str(body[k]) for k in ("error", "detail") if body.get(k))
+        if body.get("errors"):
+            text = (text + " " + "; ".join(str(e) for e in body["errors"])).strip()
+        return text or json.dumps(body)[:300]
+    return str(body)[:300]
+
+
+def daemon_call(
+    session: Session,
+    method: str,
+    path: str,
+    body: Mapping[str, Any] | None = None,
+    query: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """One authenticated call to the running daemon. Exit 4 when nothing answers; 1 when it answers with an error."""
+    base = daemon_base(session)
+    url = f"{base}/api/v0{path}" + (f"?{urllib.parse.urlencode(dict(query))}" if query else "")
+    data = None if body is None else json.dumps(dict(body)).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {session.settings.token}")
+    req.add_header("Accept", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)  # loopback: no proxy
+    try:
+        with opener.open(req, timeout=DAEMON_TIMEOUT_S) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        text = _error_text(e.read())
+        hint = " (the token in this install's config.json is not the daemon's)" if e.code == 401 else ""
+        raise CliExit(EXIT_ERROR, f"the daemon at {base} answered {e.code}: {text}{hint}") from e
+    except OSError as e:  # refused, unreachable, timed out: nothing is listening
+        reason = getattr(e, "reason", e)
+        raise CliExit(
+            EXIT_USAGE,
+            f"no daemon answered at {base} ({reason}): start it with scripts/start-daemon.sh "
+            "(scripts\\start-daemon.ps1 on Windows), or name it with PLATE_DAEMON_URL / PLATE_PORT",
+        ) from e
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except ValueError as e:
+        raise CliExit(EXIT_ERROR, f"the daemon at {base} answered something that is not JSON") from e
+    if not isinstance(doc, dict):
+        raise CliExit(EXIT_ERROR, f"the daemon at {base} answered {type(doc).__name__}, not an object")
+    return doc
+
+
+def _project_id_of(ref: str) -> str:
+    """A project id from a project folder or an id."""
+    root = Path(ref)
+    if (root / "project.json").is_file():
+        try:
+            return Project.load(root).project_id
+        except (ProjectError, FileNotFoundError) as e:
+            raise CliExit(EXIT_USAGE, f"{ref}: {e}") from e
+    return ref
+
+
+def cmd_timer(session: Session, args: argparse.Namespace) -> int:
+    pid = _project_id_of(args.project) if args.project else None
+    if args.timer_cmd == "today":
+        doc = daemon_call(session, "GET", "/timer/today", query={"project_id": pid} if pid else None)
+        rows = doc.get("rows") or []
+        total = (doc.get("totals") or {}).get("minutes", 0)
+        session.say(f"human minutes {doc.get('day')}" + (f" in {pid}" if pid else "") + f": {total} min")
+        for row in rows:
+            session.say(f"  {row.get('deliverable_id')}: {row.get('minutes')} min")
+        running = doc.get("running")
+        if isinstance(running, Mapping):
+            session.say(f"running: {running.get('deliverable_id')} since {running.get('started_at')}")
+        return EXIT_OK
+    body: dict[str, Any] = {"deliverable_id": args.deliverable_id, "action": args.timer_cmd}
+    if pid:
+        body["project_id"] = pid
+    doc = daemon_call(session, "POST", "/timer", body)
+    if args.timer_cmd == "start":
+        if doc.get("already_running"):
+            session.say(f"timer already running: {doc.get('deliverable_id')} since {doc.get('started_at')}")
+        else:
+            session.say(f"timer started: {doc.get('deliverable_id')} at {doc.get('started_at')}")
+    else:
+        session.say(f"timer stopped: {doc.get('deliverable_id')}, {doc.get('minutes')} min recorded")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------- plate spend
+
+
+def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
+    """Left-aligned first column, right-aligned numbers, two spaces between."""
+    widths = [max(len(str(r[i])) for r in [header, *rows]) for i in range(len(header))]
+
+    def line(cells: Sequence[str]) -> str:
+        rest = [str(c).rjust(w) for c, w in zip(cells[1:], widths[1:], strict=True)]
+        return "  ".join([str(cells[0]).ljust(widths[0]), *rest]).rstrip()
+
+    return [line(header), *(line(r) for r in rows)]
+
+
+def cmd_spend(session: Session, args: argparse.Namespace) -> int:
+    root = resolve_project(session, args.project)
+    project = Project.load(root)
+    try:
+        summary = Ledger(root).summarize(args.since)
+    except ValueError as e:  # a --since that is not an ISO date or time
+        raise CliExit(EXIT_USAGE, f"--since {args.since!r}: {e}") from e
+    rows = [
+        [
+            engine,
+            str(b["generations"]),
+            f"{b['spent_usd_quoted']:.4f}",
+            f"{b['spent_usd_billed']:.4f}",
+            str(b["accepted"]),
+        ]
+        for engine, b in summary["by_engine"].items()
+    ]
+    rows.append(
+        [
+            "total",
+            str(summary["generations"]),
+            f"{summary['spent_usd_quoted']:.4f}",
+            f"{summary['spent_usd_billed']:.4f}",
+            str(summary["accepted"]),
+        ]
+    )
+    session.say(f"spend for {project.project_id}" + (f" since {args.since}" if args.since else ""))
+    for text in _table(["engine", "runs", "quoted USD", "billed USD", "accepted"], rows):
+        session.say(text)
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------------------- parser and entry point
 
 
@@ -1530,7 +1836,10 @@ class _Parser(argparse.ArgumentParser):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = _Parser(prog="plate", description="PLATE command line: run, gate, export, reindex, gc, pack, smoke.")
+    p = _Parser(
+        prog="plate",
+        description="PLATE command line: run, gate, export, reindex, gc, pack, smoke, review, import, deliver, timer, spend.",
+    )
     p.add_argument("--version", action="version", version=f"plate {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="command", parser_class=_Parser)
 
@@ -1594,6 +1903,56 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--budget-usd", type=float, help="stop before the running total passes this")
     s.add_argument("--engines", help="comma-separated engine ids (default: all)")
     s.add_argument("--out", help="also write the report JSON here")
+
+    v = sub.add_parser("review", help="a client review bundle (static HTML A/B wipe) of finished takes")
+    v.add_argument("project")
+    v.add_argument("--runs", required=True, help="comma-separated run ids")
+    v.add_argument("--watermark", default=DEFAULT_WATERMARK, help="text across every proxy (default REVIEW)")
+    v.add_argument("--out", help="output folder (default: the project's review/ folder)")
+    v.add_argument(
+        "--max-width", type=int, default=MAX_WIDTH_LIMIT, help="widest proxy in pixels (at most 2048)"
+    )
+    v.add_argument("--title", help="title of the review page")
+    v.add_argument("--reply-to", help="where the client's comment form sends its answer")
+
+    i = sub.add_parser("import", help="file a take made outside PLATE as a gated, ledgered run")
+    i.add_argument("file")
+    i.add_argument("--project", required=True, help="the project folder or id")
+    i.add_argument(
+        "--packet", required=True, help="the id of an ingested packet, or a packet folder to ingest"
+    )
+    i.add_argument("--node", help="the graph node the take belongs to")
+    i.add_argument("--source", choices=IMPORT_SOURCES, default="manual", help="where the file came from")
+    i.add_argument("--cost-usd", type=float, default=0.0, help="what the take cost, as declared (default 0)")
+    i.add_argument("--note", help="a note kept with the run")
+
+    d = sub.add_parser(
+        "deliver", help="encode a run's take for delivery (ProRes 4444, HEVC, EXR, AV1 re-tag)"
+    )
+    d.add_argument("run_id")
+    d.add_argument("--format", required=True, choices=DELIVER_FORMATS)
+    d.add_argument("--to", required=True, help="the output folder")
+    d.add_argument("--name", help="file name stem (default: the run id)")
+    d.add_argument(
+        "--override-reason", help=f"why a GATE_FAIL take ships anyway ({MIN_OVERRIDE_REASON}+ characters)"
+    )
+    d.add_argument("--project", help="the project folder, if this machine's index does not know the run")
+
+    t = sub.add_parser("timer", help="the human-minute timer of the running daemon")
+    tsub = t.add_subparsers(dest="timer_cmd", required=True, metavar="start|stop|today", parser_class=_Parser)
+    for word, text in (
+        ("start", "start the timer on a deliverable"),
+        ("stop", "stop it and record the minutes"),
+    ):
+        tw = tsub.add_parser(word, help=text)
+        tw.add_argument("deliverable_id")
+        tw.add_argument("--project", help="the project (folder or id) the minutes belong to")
+    td = tsub.add_parser("today", help="today's recorded minutes per deliverable")
+    td.add_argument("--project", help="only this project (folder or id)")
+
+    y = sub.add_parser("spend", help="a project's spend per engine, from its ledger")
+    y.add_argument("project")
+    y.add_argument("--since", metavar="ISO", help="only records from this date or time (2026-10-01)")
     return p
 
 
@@ -1604,6 +1963,11 @@ COMMANDS: dict[str, Callable[[Session, argparse.Namespace], int]] = {
     "reindex": cmd_reindex,
     "gc": cmd_gc,
     "pack": cmd_pack,
+    "review": cmd_review,
+    "import": cmd_import,
+    "deliver": cmd_deliver,
+    "timer": cmd_timer,
+    "spend": cmd_spend,
 }
 # Errors whose code is not 1, in order: the first matching class wins.
 ERROR_CODES: tuple[tuple[type[BaseException], int], ...] = (

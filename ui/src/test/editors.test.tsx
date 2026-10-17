@@ -852,7 +852,7 @@ describe("MaskEditor", () => {
     fireEvent.click(screen.getByTestId("mask-paint-save"));
     await waitFor(() => expect(paramsOf().maskHash).toBe("mask_hash_0123456789abcdef"));
     const up = calls.find((c) => c.method === "POST" && c.path === "/assets");
-    expect(up?.search).toBe("?kind=mask");
+    expect(up?.search).toBe("?kind=mask&project_id=p1");
     const png = up?.body as Uint8Array;
     expect(Array.from(png.subarray(0, 4))).toEqual([0x89, 0x50, 0x4e, 0x47]);
     const view = new DataView(png.buffer, png.byteOffset, png.byteLength);
@@ -1000,6 +1000,8 @@ describe("MotionEditor", () => {
 
   const motionRoutes = (router: unknown = ROUTER_ADVISORY): Record<string, Route> => ({
     "POST /projects/p1/nodes/n1/preview": router,
+    // the store saves the graph before a quote (decision 31); the daemon answers with the stored graph
+    "PUT /projects/p1/graph": (c: Call) => c.body,
     "POST /runs/run_1/approve": [{ id: "run_1", state: "APPROVED" }],
   });
 

@@ -33,12 +33,21 @@ SPEC_IDS = {
     "video.duration_s",
     "image_edge_agreement",
     "long_edge_min_px",
+    # registered by ts-2026.10.18-draft (T80): they lived as module constants before
+    "router.D_px_median",
+    "router.disocclusion_fraction",
+    "router.orbit_deg",
+    "depth_agreement.abs_rel",
+    "depth_agreement.delta_1",
+    "depth_agreement.edge_f1",
+    "set.cross_view_de00_p90",
+    "recolour.de00_median",
 }
 
 
 def test_set_id_and_every_spec_metric_is_present_exactly_once():
     ts = thresholds.load()
-    assert ts.id == "ts-2026.10.17-draft" == thresholds.DEFAULT_THRESHOLDS_ID
+    assert ts.id == "ts-2026.10.18-draft" == thresholds.DEFAULT_THRESHOLDS_ID
     assert set(ts.metrics) == SPEC_IDS
     raw = yaml.safe_load(thresholds._YAML.read_text(encoding="utf-8"))
     assert [e["id"] for e in raw["metrics"]] == list(ts.metrics)  # no duplicates swallowed by the dict
@@ -56,7 +65,7 @@ def test_every_entry_has_provenance_and_a_known_status():
         ("registration.residual_px", "hard"),
         ("registration.shift_px", "hard"),
         ("outside_mask.de00", "hard"),
-        ("feather_band.de00_p99", "hard"),
+        ("feather_band.de00_p99", "advisory"),  # hard in ts-2026.10.17-draft; 1.0 fails any large edit
         ("gbuffer_edge_recall_r2", "hard"),
         ("invention_flags", "hard"),
         ("material.de00_median", "hard"),

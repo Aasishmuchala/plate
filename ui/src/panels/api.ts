@@ -165,23 +165,62 @@ export const postVerdict = (runId: string, body: VerdictBody): Promise<unknown> 
 export const timerAction = (deliverableId: string, action: "start" | "stop"): Promise<unknown> =>
   postJson("/timer", { deliverable_id: deliverableId, action });
 
-/** `GET /timer/today` as rows: an array of rows, `{rows|deliverables|today: [...]}`, or a `{deliverable: minutes}` map. */
-export async function getTimerToday(): Promise<TimerRow[]> {
+/** The timer the daemon is running right now; `since` is when it started, in epoch milliseconds. */
+export interface RunningTimer {
+  deliverable_id: string;
+  since: number;
+}
+
+/** `GET /timer/today`: today's minutes per deliverable and the running timer, if any. */
+export interface TimerToday {
+  rows: TimerRow[];
+  running: RunningTimer | null;
+}
+
+/** `running` from the daemon is `{deliverable_id, started_at: ISO}`; `since` (epoch ms or ISO) is taken as well. */
+function toRunning(raw: unknown): RunningTimer | null {
+  if (!isRecord(raw) || typeof raw.deliverable_id !== "string" || raw.deliverable_id === "") return null;
+  const at = raw.since ?? raw.started_at;
+  const ms = typeof at === "number" ? at : typeof at === "string" ? Date.parse(at) : Number.NaN;
+  return { deliverable_id: raw.deliverable_id, since: Number.isFinite(ms) ? ms : Date.now() };
+}
+
+/**
+ * `GET /timer/today`: the rows from an array, `{rows|deliverables|today: [...]}`, or a `{deliverable: minutes}` map,
+ * and `running` from `{running: {deliverable_id, started_at}}` (null when nothing runs).
+ */
+export async function getTimerToday(): Promise<TimerToday> {
   const body = await fetchJson<unknown>("/timer/today");
+  const running = isRecord(body) ? toRunning(body.running) : null;
   const listed = asList<unknown>(body, "rows", "deliverables", "today");
-  const out: TimerRow[] = [];
+  const rows: TimerRow[] = [];
   for (const r of listed) {
     if (isRecord(r) && typeof r.deliverable_id === "string" && typeof r.minutes === "number") {
-      out.push({ deliverable_id: r.deliverable_id, minutes: r.minutes });
+      rows.push({ deliverable_id: r.deliverable_id, minutes: r.minutes });
     }
   }
-  if (out.length > 0 || Array.isArray(body)) return out;
+  if (rows.length > 0 || Array.isArray(body)) return { rows, running };
   if (isRecord(body)) {
     const map = isRecord(body.minutes) ? body.minutes : body;
-    for (const [k, v] of Object.entries(map)) if (typeof v === "number") out.push({ deliverable_id: k, minutes: v });
+    for (const [k, v] of Object.entries(map)) if (typeof v === "number") rows.push({ deliverable_id: k, minutes: v });
   }
-  return out;
+  return { rows, running };
 }
+
+/**
+ * The deliverable named by a `409 timer_running` refusal (`{error: "timer_running", detail, running: {deliverable_id}}`):
+ * another timer is already running and has to be stopped first. Null for any other error.
+ */
+export function timerConflict(err: unknown): string | null {
+  if (!(err instanceof ApiError) || err.status !== 409 || !isRecord(err.body)) return null;
+  if (err.body.error !== "timer_running") return null;
+  const id = isRecord(err.body.running) ? err.body.running.deliverable_id : null;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
+/** True for `409 timer_not_running`: the daemon has no timer, whatever this panel believed. */
+export const timerNotRunning = (err: unknown): boolean =>
+  err instanceof ApiError && err.status === 409 && isRecord(err.body) && err.body.error === "timer_not_running";
 
 // ---------------------------------------------------------------------------------------------------- resolve
 

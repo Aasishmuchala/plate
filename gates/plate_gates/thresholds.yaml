@@ -1,7 +1,10 @@
-# PLATE gate thresholds, one entry per metric. Threshold-set id: ts-2026.10.17-draft.
+# PLATE gate thresholds, one entry per metric. Threshold-set id: ts-2026.10.18-draft (the active set).
 #
 # Changing a number means adding a NEW set id; a shipped report keeps pointing at the set it was scored
-# against. Fields per entry:
+# against. The previous set, ts-2026.10.17-draft, is frozen in threshold_sets/ and still loads
+# (plate_gates.threshold_sets.load_set). ts-2026.10.18-draft = that set, plus the router, depth-agreement,
+# cross-view and recolour numbers that lived only as module constants, with feather_band.de00_p99 advisory
+# and the ensemble weights below. Fields per entry:
 #   id             metric id (what a gate reports under)
 #   value | range  the bound, or [low, high] inclusive; with `value`, `op` is le | ge | eq
 #   resolution_px  image width the number is only valid at (null = resolution independent)
@@ -11,7 +14,7 @@
 # Optional: unit, tier (the gate only applies to that packet tier), tol (eq tolerance), variants
 # (named alternative bounds, e.g. preview), status_by_backend (status depends on the flow backend), param
 # (the bound is supplied at check time, e.g. the shot duration).
-set_id: ts-2026.10.17-draft
+set_id: ts-2026.10.18-draft
 metrics:
   - id: registration.residual_px
     op: le
@@ -40,8 +43,8 @@ metrics:
     value: 1.0
     unit: dE00
     resolution_px: null
-    status: hard
-    provenance: BUILD_PLAN decision 14; feather lives inside the mask (4-12 px)
+    status: advisory
+    provenance: BUILD_PLAN decision 14 set it hard at 1.0; ts-2026.10.18-draft makes it advisory because 1.0 fails any large in-mask edit (T16 integration note, wave 8 decision 35) until the three-key labelling (T23) fixes a measured bound; feather lives inside the mask (4-12 px)
   - id: gbuffer_edge_recall_r2
     op: ge
     value: 0.90
@@ -163,3 +166,97 @@ metrics:
     resolution_px: 1500
     status: hard
     provenance: fidelity_bench LONG = 30 px at 1500 wide; scaled as round(30 * width / 1500)
+  - id: router.D_px_median
+    op: ge
+    value: 8.0
+    variants:
+      vray_only_below: 8.0
+      whole_frame_at_or_above: 24.0
+    unit: px
+    resolution_px: null
+    status: advisory
+    provenance: BUILD_PLAN decision 15 via T28 (router_math.D_VRAY_ONLY_PX 8, D_WHOLE_FRAME_PX 24); median detail size D(p) = fx * s / Z(p); below 8 px render in V-Ray, 8 to 24 px AI by region, 24 px and over a whole-frame re-photograph may be allowed. Advisory while PLATE_ROUTER_MODE is advisory (P1); blocking mode (P3) is a router setting, not a threshold status
+  - id: router.disocclusion_fraction
+    op: le
+    value: 0.02
+    variants:
+      ai_interpolate_max: 0.02
+      rendered_endpoints_plus_clay_max: 0.10
+    unit: fraction
+    resolution_px: null
+    status: advisory
+    provenance: BUILD_PLAN decision 15 via T28 (router_math.DISOCC_AI_MAX 0.02, DISOCC_CLAY_MAX 0.10); share of end-frame pixels the start frame never saw; up to 2 % AI may interpolate, 2 to 10 % rendered start and end frames plus a clay reference, over 10 % render the move
+  - id: router.orbit_deg
+    op: le
+    value: 30.0
+    unit: deg
+    resolution_px: null
+    status: advisory
+    provenance: BUILD_PLAN decision 15 via T28 (router_math.ORBIT_MAX_DEG 30); an orbit over 30 degrees is rendered whatever the disocclusion fraction
+  - id: depth_agreement.abs_rel
+    op: le
+    value: 0.10
+    unit: ratio
+    resolution_px: null
+    status: advisory
+    tier: C
+    provenance: T16 depth_agreement.compare (median |a*z_ref+b - z_est| / z_est after the scale-and-shift fit). The module defines the metric and no bound; 0.10 is a first-guess triage number, to be fitted by calibration (router plan decision 3, image-only depth agreement is never a delivery gate)
+  - id: depth_agreement.delta_1
+    op: ge
+    value: 0.90
+    unit: fraction within 1.25x
+    resolution_px: null
+    status: advisory
+    tier: C
+    provenance: T16 depth_agreement.compare (fraction of valid pixels within DELTA_1_RATIO 1.25 of z_est, either way). First-guess triage bound, no calibrated data yet
+  - id: depth_agreement.edge_f1
+    op: ge
+    value: 0.50
+    unit: F1 at 2 px, 2 % rule
+    resolution_px: null
+    status: advisory
+    tier: C
+    provenance: T16 depth_agreement.compare (F1 of the depth-edge maps, EDGE_REL 0.02, EDGE_TOL_PX 2). First-guess triage bound, no calibrated data yet
+  - id: set.cross_view_de00_p90
+    op: le
+    value: 3.0
+    unit: dE00
+    resolution_px: null
+    status: hard
+    provenance: T30 setgate.P90_HARD; p90 of the per-material dE00 between a view's output and the hero view's target Lab at world-position correspondences (Set-consistency gate)
+  - id: recolour.de00_median
+    op: le
+    value: 1.0
+    variants:
+      recomposition: 1.0
+      ratio: 2.5
+      degraded: 4.0
+    unit: dE00
+    resolution_px: null
+    status: advisory
+    provenance: T31 recolour.EXPECTED_DE00 per method (recomposition 1.0, ratio 2.5, degraded 4.0); median dE00 of the recoloured material against the re-rendered one. Advisory because the degraded path is expected to miss on dark semi-gloss panels (correct behaviour); the base value is the recomposition bound
+
+# Weights of the calibration ensemble (calib/README.md format), T23's DEFAULT_ENSEMBLE. A weight is a number or
+# {weight, scale}. Every id must be a metric above. A first guess: refit only with enough labels to fit on a set
+# other than the one the bet is scored on, and re-issue the set id when it changes.
+ensemble:
+  registration.residual_px: 2.0
+  registration.shift_px: 1.0
+  outside_mask.de00: 1.0
+  feather_band.de00_p99: 1.0
+  gbuffer_edge_recall_r2: 3.0
+  invention_flags: 3.0
+  material.de00_median: 2.0
+  material.de00_p90: 1.0
+  ral.de00: 1.0
+  texture.lapvar: 2.0
+  texture.fine_ratio: 1.0
+  tone.luma: 0.5
+  tone.contrast: 0.5
+  tone.sat: 0.5
+  video.first_frame: 1.0
+  video.last_frame: 1.0
+  video.camera_lock_median_flow_px: 2.0
+  video.phase_corr_px: 0.5
+  video.reproj_edge_recall: 2.0
+  image_edge_agreement: 0.5

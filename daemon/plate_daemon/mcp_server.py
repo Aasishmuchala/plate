@@ -55,6 +55,8 @@ from blake3 import blake3
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
+from plate_engines.adapters.transport import make_client
+
 from . import __version__, custody
 from .canvas_rules import NODE_KINDS
 from .config import Settings, check_project_id, host_port
@@ -70,10 +72,12 @@ from .worker import MAX_FAN_OUT
 
 __all__ = [
     "AGENT_FORBIDDEN_KINDS",
+    "LOOPBACK_HOSTS",
     "MCP_HOST",
     "NOTE",
     "RESERVED_NODE_KEYS",
     "TOOL_NAMES",
+    "LoopbackOnlyTransport",
     "McpError",
     "PlateBackend",
     "PlateTools",
@@ -225,16 +229,54 @@ def scrub_nda(value: Any, path: str = "") -> tuple[Any, list[str]]:
 # ---------------------------------------------------------------------------- the daemon, as a client sees it
 
 
-def default_client(settings: Settings | None = None, url: str | None = None) -> httpx.Client:
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+class LoopbackOnlyTransport(httpx.BaseTransport):
+    """Delegates to `inner` for requests to one loopback `host:port` and refuses every other target (a redirect,
+    a stray absolute URL), so the MCP session can only ever talk to the local daemon."""
+
+    def __init__(self, inner: httpx.BaseTransport, port: int):
+        self._inner = inner
+        self.port = port
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        url = request.url
+        port = url.port or {"http": 80, "https": 443}.get(url.scheme)
+        if (url.host or "").lower() not in LOOPBACK_HOSTS or port != self.port:
+            raise httpx.UnsupportedProtocol(
+                f"the MCP client only talks to the local daemon (127.0.0.1/localhost:{self.port}), "
+                f"not {url.host}:{port}"
+            )
+        return self._inner.handle_request(request)
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def default_client(
+    settings: Settings | None = None, url: str | None = None, transport: httpx.BaseTransport | None = None
+) -> httpx.Client:
     """An `httpx.Client` for the local daemon: `PLATE_DAEMON_URL` or `--daemon-url`, else the loopback address
-    in the settings; the bearer token is the install's own (`Settings.load`)."""
+    in the settings; the bearer token is the install's own (`Settings.load`). Built through the engines'
+    `make_client` (custody: no httpx client outside egress and transport) over a transport that is pinned to
+    that one loopback host and port, so the session cannot be pointed at, or redirected to, anything else.
+    `transport` replaces the network leg (tests)."""
     settings = settings or Settings.load()
     base = (
         url or os.environ.get("PLATE_DAEMON_URL") or f"http://{host_port(settings.bind_host, settings.port)}"
     )
-    return httpx.Client(
-        base_url=base, headers={"Authorization": f"Bearer {settings.token}"}, timeout=httpx.Timeout(120.0)
-    )
+    target = httpx.URL(base)
+    if (target.host or "").lower() not in LOOPBACK_HOSTS:
+        raise McpError(
+            "not_loopback",
+            f"the MCP server only talks to the daemon on 127.0.0.1 or localhost, not {target.host!r}",
+        )
+    port = target.port or {"http": 80, "https": 443}.get(target.scheme, settings.port)
+    client = make_client(LoopbackOnlyTransport(transport or httpx.HTTPTransport(), port), timeout=120.0)
+    client.base_url = target
+    client.headers["Authorization"] = f"Bearer {settings.token}"
+    return client
 
 
 def _detail(body: Any) -> str:
@@ -979,6 +1021,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         print(json.dumps(doc, indent=2))
         return 0
+    try:  # fail at start, not on the agent's first call, when the daemon address is not loopback
+        default_client(url=args.daemon_url).close()
+    except McpError as e:
+        print(f"plate mcp: {e.message}", file=sys.stderr)
+        return 2
     server = build_server(lambda: PlateTools(PlateBackend(default_client(url=args.daemon_url))))
     server.run("stdio")
     return 0

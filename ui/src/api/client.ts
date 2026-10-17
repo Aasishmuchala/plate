@@ -1,10 +1,17 @@
 // Daemon API client. The per-install bearer token arrives once in the URL fragment (`#token=...`, printed by the
 // daemon on start), is moved into sessionStorage and sent as `Authorization: Bearer`. EventSource cannot set
 // headers, so the SSE helper alone puts the token in the query string; the daemon accepts `?token=` on
-// `GET /api/v0/events` and nowhere else (T25 route note).
+// `GET /api/v0/events` and nowhere else (T25 route note). Every request also says `X-Plate-Client: ui`: that header
+// is how the daemon tells a person at the canvas from MCP, curl or the Max plugin (decision 37).
+
+import type { Graph, LoadableGraph } from "../nodeTypes";
 
 export const API_PREFIX = "/api/v0";
 export const TOKEN_KEY = "plate.token";
+
+/** Sent on every UI request; only these requests (and approvals `by: "human"`) count as a human at the canvas. */
+export const CLIENT_HEADER = "X-Plate-Client";
+export const CLIENT_ID = "ui";
 
 export interface TokenStorage {
   getItem(key: string): string | null;
@@ -62,14 +69,34 @@ export function apiUrl(path: string): string {
   return `${API_PREFIX}${path.startsWith("/") ? "" : "/"}${path}`;
 }
 
+/** One canvas-rule refusal in a daemon error body: an edge rule (`edge`) or a node problem (`node`). */
+export interface ApiViolation {
+  edge?: { id: string; source?: string; target?: string };
+  node?: string | null;
+  code: string;
+  message: string;
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
+
+function violationsOf(body: unknown): ApiViolation[] | null {
+  if (!isRecord(body) || !Array.isArray(body.violations)) return null;
+  return body.violations.filter(
+    (v): v is ApiViolation => isRecord(v) && typeof v.code === "string" && typeof v.message === "string",
+  );
+}
+
 export class ApiError extends Error {
   status: number;
   body: unknown;
+  /** `body.violations` of a canvas-rule refusal (`PUT /projects/{id}/graph` answers 422 with them); else null. */
+  violations: ApiViolation[] | null;
   constructor(status: number, body: unknown, message: string) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.body = body;
+    this.violations = violationsOf(body);
   }
 }
 
@@ -77,6 +104,7 @@ export class ApiError extends Error {
 export async function fetchJson<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
+  headers.set(CLIENT_HEADER, CLIENT_ID);
   const token = getToken();
   if (token && !headers.has("Authorization")) headers.set("Authorization", `Bearer ${token}`);
   if (init.body !== undefined && init.body !== null && !headers.has("Content-Type")) {
@@ -101,6 +129,19 @@ export const postJson = <T = unknown>(path: string, body: unknown): Promise<T> =
 
 export const putJson = <T = unknown>(path: string, body: unknown): Promise<T> =>
   fetchJson<T>(path, { method: "PUT", body: JSON.stringify(body) });
+
+/**
+ * `PUT /projects/{id}/graph`: store the canvas graph. The daemon answers `{ok, project_id, graph}` with the graph as
+ * stored, whose node status fields (`gateStatus`, `approved`, `approvedBy`, `scrubLogId`) it derived itself
+ * (decision 31); a bare graph is accepted too, and a body with no graph falls back to what was sent. A rule
+ * refusal throws an `ApiError` (422) whose `violations` name the edge.
+ */
+export async function saveGraph(projectId: string, graph: Graph): Promise<LoadableGraph> {
+  const body = await putJson<unknown>(`/projects/${encodeURIComponent(projectId)}/graph`, graph);
+  const stored = isRecord(body) && isRecord(body.graph) ? body.graph : body;
+  if (isRecord(stored) && Array.isArray(stored.nodes) && Array.isArray(stored.edges)) return stored as unknown as LoadableGraph;
+  return graph;
+}
 
 /** `GET /api/v0/health` (no token needed): the plugin's version handshake, also the status bar's heartbeat. */
 export interface Health {

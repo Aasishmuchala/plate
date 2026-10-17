@@ -28,9 +28,9 @@ from plate_gates.compare import read_image, write_png
 from plate_gates.composite import composite_masked
 
 RGB16 = cv2.IMREAD_COLOR | cv2.IMREAD_ANYDEPTH
-plate = read_image("manual/plate16.png", RGB16)[..., ::-1]            # cv2 reads BGR; the compositor wants RGB
-ai = read_image("manual/result.png", RGB16)[..., ::-1]         # the vendor's result, already the plate's size
-mask = read_image("mask.png", cv2.IMREAD_GRAYSCALE) > 127      # white = editable
+plate = read_image("manual/plate16.png", RGB16)[..., ::-1]  # cv2 reads BGR; the compositor wants RGB
+ai = read_image("manual/result.png", RGB16)[..., ::-1]  # the vendor's result, already the plate's size
+mask = read_image("mask.png", cv2.IMREAD_GRAYSCALE) > 127  # white = editable
 out = composite_masked(plate, ai, mask, feather_px=8)
 write_png("manual/composite16.png", np.ascontiguousarray(out[..., ::-1]))
 ```

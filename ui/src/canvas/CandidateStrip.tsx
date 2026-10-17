@@ -4,14 +4,16 @@
 // keys or the viewer; the strip is marked `data-plate-keys` for the panels' key scope). Comparing or picking a row
 // also selects that run in the panels (T36), so the gate panel, the scrub and the verdict keys follow the strip.
 // A GATE_FAIL row shows its first failing check and an "Override (reason required)" button; the override is
-// ledgered by the daemon and only then shown here. Agents' runs show the envelope they spent from.
+// ledgered by the daemon and only then shown here. Agents' runs show the envelope they spent from. A run that is
+// queued or in flight (QUEUED..FETCHING) has a Cancel button (T71); the chip moves when the daemon's event arrives.
 
 import { type FormEvent, type KeyboardEvent, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { StateChip } from "../nodes/badges";
+import { errorMessage } from "../panels/api";
 import { usePanelsStore } from "../panels/store";
 import { useThumb } from "./assets";
-import { overrideRun, UI_ACTOR } from "./runApi";
+import { cancelRun, overrideRun, UI_ACTOR } from "./runApi";
 import { type Candidate, MAX_CANDIDATES, nodeCandidates, useRunStore } from "./runStore";
 
 /** Show a candidate against its plate in the viewer and make it the panels' selected run. */
@@ -25,6 +27,11 @@ export function pickCandidate(nodeId: string, runId: string): void {
   useRunStore.getState().pick(nodeId, runId);
   compareCandidate(nodeId, runId);
 }
+
+/** States a run can still be cancelled from: queued, or with a vendor (or on its way to / from one). */
+const CANCELLABLE: ReadonlySet<string> = new Set(["QUEUED", "STAGING", "SUBMITTED", "RUNNING", "FETCHING"]);
+
+export const isCancellable = (state: string): boolean => CANCELLABLE.has(state);
 
 const fmtValue = (v: number | null): string => (v === null ? "n/a" : Number.isInteger(v) ? String(v) : v.toFixed(3));
 
@@ -83,8 +90,22 @@ function OverrideForm({ cand, onDone }: { cand: Candidate; onDone: () => void })
 
 function Row({ cand, rank, picked, comparing }: { cand: Candidate; rank: number; picked: boolean; comparing: boolean }) {
   const [overriding, setOverriding] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
   const open = () => compareCandidate(cand.nodeId, cand.runId);
   const fail = cand.state === "GATE_FAIL";
+  const cancel = () => {
+    if (cancelling) return;
+    setCancelling(true);
+    setCancelError(null);
+    cancelRun(cand.runId, "cancelled from the candidate strip").then(
+      () => setCancelling(false),
+      (err: unknown) => {
+        setCancelling(false);
+        setCancelError(errorMessage(err));
+      },
+    );
+  };
   return (
     <li
       className={`cand${picked ? " is-picked" : ""}${comparing ? " is-comparing" : ""}`}
@@ -102,6 +123,23 @@ function Row({ cand, rank, picked, comparing }: { cand: Candidate; rank: number;
       {cand.envelopeId ? (
         <span className="chip chip-envelope" data-testid="candidate-envelope" title="an agent's run: spent from this envelope">
           envelope {cand.envelopeId}
+        </span>
+      ) : null}
+      {isCancellable(cand.state) ? (
+        <button
+          type="button"
+          className="btn btn-ghost nodrag"
+          onClick={cancel}
+          disabled={cancelling}
+          title="cancel this run"
+          data-testid="candidate-cancel"
+        >
+          Cancel
+        </button>
+      ) : null}
+      {cancelError ? (
+        <span className="cand-error" role="alert" data-testid="candidate-cancel-error">
+          {cancelError}
         </span>
       ) : null}
       {fail ? (

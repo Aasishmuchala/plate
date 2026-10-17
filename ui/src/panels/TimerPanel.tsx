@@ -1,9 +1,11 @@
 // Human-minute timer. One deliverable at a time: Space (with this panel focused) or the button starts and stops the
 // timer, and the daemon ledgers the elapsed human minutes. "Today" lists the minutes per deliverable the daemon has
 // recorded. The bet is measured in human minutes per deliverable, so this is a measurement tool, not decoration.
+// The daemon owns the timer: `GET /timer/today` says which one is running (a reload, or another window, started it),
+// and a Start refused with `409 timer_running` names the deliverable to stop first.
 
 import { type KeyboardEvent, type ReactElement, useEffect, useState } from "react";
-import { errorMessage, getTimerToday, timerAction } from "./api";
+import { errorMessage, getTimerToday, timerAction, timerConflict, timerNotRunning } from "./api";
 import { formatElapsed, formatMinutes } from "./format";
 import { C, S } from "./theme";
 import { useLoad } from "./useLoad";
@@ -24,7 +26,17 @@ export function TimerPanel(): ReactElement {
   const [now, setNow] = useState(() => Date.now());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [conflict, setConflict] = useState<string | null>(null);
   const today = useLoad("timer-today", getTimerToday);
+
+  // A timer the daemon reports as running is this panel's running timer (on mount, and after each start or stop).
+  useEffect(() => {
+    const r = today.data?.running;
+    if (!r) return;
+    setRunning({ id: r.deliverable_id, since: r.since });
+    setNow(Date.now());
+    setConflict(null);
+  }, [today.data]);
 
   useEffect(() => {
     if (!running) return;
@@ -35,10 +47,19 @@ export function TimerPanel(): ReactElement {
   const toggle = async () => {
     if (busy) return;
     setError(null);
+    setConflict(null);
     setBusy(true);
     try {
       if (running) {
-        await timerAction(running.id, "stop");
+        try {
+          await timerAction(running.id, "stop");
+        } catch (err) {
+          if (timerNotRunning(err)) {
+            setRunning(null); // the daemon has no timer: whatever this panel believed is over
+            today.reload();
+          }
+          throw err;
+        }
         setRunning(null);
         today.reload();
       } else {
@@ -56,8 +77,31 @@ export function TimerPanel(): ReactElement {
         const t = Date.now();
         setNow(t);
         setRunning({ id, since: t });
+        today.reload();
       }
     } catch (err) {
+      const other = running ? null : timerConflict(err);
+      if (other) setConflict(other);
+      else setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // The refusal's one-click way out: stop the timer that is in the way, then the artist starts theirs.
+  const stopConflicting = async () => {
+    if (busy || !conflict) return;
+    setError(null);
+    setBusy(true);
+    try {
+      await timerAction(conflict, "stop");
+      setConflict(null);
+      today.reload();
+    } catch (err) {
+      if (timerNotRunning(err)) {
+        setConflict(null);
+        today.reload();
+      }
       setError(errorMessage(err));
     } finally {
       setBusy(false);
@@ -72,7 +116,7 @@ export function TimerPanel(): ReactElement {
     }
   };
 
-  const rows = today.data ?? [];
+  const rows = today.data?.rows ?? [];
   return (
     <section style={S.section} aria-label="Timer" data-testid="timer-panel" tabIndex={0} onKeyDown={onKeyDown}>
       <h3 style={S.h}>Timer</h3>
@@ -96,8 +140,16 @@ export function TimerPanel(): ReactElement {
         </button>
       </div>
       <p style={{ margin: 0, color: running ? C.pass : C.muted }} data-testid="timer-state" role="status">
-        {running ? `Running ${formatElapsed(now - running.since)}` : "Stopped. Focus this panel and press Space to start."}
+        {running ? `Running ${formatElapsed(Math.max(0, now - running.since))}` : "Stopped. Focus this panel and press Space to start."}
       </p>
+      {conflict ? (
+        <p style={{ ...S.error, ...S.row }} role="alert" data-testid="timer-conflict">
+          <span>{`stop ${conflict} first`}</span>
+          <button type="button" style={S.btn} disabled={busy} onClick={() => void stopConflicting()} data-testid="timer-conflict-stop">
+            Stop
+          </button>
+        </p>
+      ) : null}
       {error ? (
         <p style={S.error} role="alert">
           {error}

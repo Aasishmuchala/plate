@@ -7,6 +7,8 @@ import json
 import os
 import socket
 import threading
+import time
+import urllib.parse
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,7 +33,16 @@ class Stub:
             "status": "ingesting",
             "events_url": "/api/v0/packets/pkt_X/events",
         }
+        self.post_script = []  # (status, body, delay_s) per POST in turn; the last one repeats
+        self.packets_dirs = ["/plate/packets"]
+        self.events = []  # the SSE frames the events route serves, a list of event dicts
+        self.events_status = 200
         self.seen = []
+
+    def next_post(self):
+        if not self.post_script:
+            return self.post_status, self.post_body, 0.0
+        return self.post_script.pop(0) if len(self.post_script) > 1 else self.post_script[0]
 
 
 @contextmanager
@@ -46,8 +57,30 @@ def serve(stub: Stub):
             self.wfile.write(raw)
 
         def do_GET(self):  # noqa: N802
-            if self.path == "/api/v0/health":
+            url = urllib.parse.urlsplit(self.path)
+            stub.seen.append((self.path, {k.lower(): v for k, v in self.headers.items()}, None))
+            authorised = self.headers.get("Authorization") == f"Bearer {stub.token}"
+            if url.path == "/api/v0/health":
                 self._send(200, stub.health)
+            elif url.path == "/api/v0/session":
+                if not authorised:
+                    return self._send(401, {"error": "unauthorized"})
+                self._send(200, {**stub.health, "packets_dirs": stub.packets_dirs})
+            elif url.path.endswith("/events"):
+                if not authorised:
+                    return self._send(401, {"error": "unauthorized"})
+                if stub.events_status != 200:
+                    return self._send(stub.events_status, {"error": "nope"})
+                after = int(dict(urllib.parse.parse_qsl(url.query)).get("after", "0"))
+                text = "retry: 1000\n\n: keep-alive comment\n\n" + "".join(
+                    f"id: {ev['seq']}\ndata: {json.dumps(ev)}\n\n" for ev in stub.events if ev["seq"] > after
+                )
+                raw = text.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
             else:
                 self._send(404, {"error": "unknown route"})
 
@@ -76,7 +109,13 @@ def serve(stub: Stub):
             stub.seen.append((self.path, {k.lower(): v for k, v in self.headers.items()}, body))
             if self.path == "/api/v0/hash":
                 return self._hash(body)
-            self._send(stub.post_status, stub.post_body)
+            status, answer, delay = stub.next_post()
+            if delay:
+                time.sleep(delay)
+            try:
+                self._send(status, answer)
+            except OSError:  # the client timed out and hung up
+                pass
 
         def log_message(self, *args):
             pass
@@ -380,3 +419,169 @@ def test_system_proxies_are_never_used(monkeypatch, tmp_path):
         assert transport.handshake(url)["ok"] is True
         out = transport.hash_files([folder / "id_legend.json"], {"token": TOKEN, "daemon_url": url})
     assert len(out) == 1
+
+
+# ---- session (GET /api/v0/session)
+
+
+def test_session_returns_the_daemons_answer_with_the_bearer():
+    stub = Stub()
+    with serve(stub) as url:
+        out = transport.session({"token": TOKEN, "daemon_url": url})
+    assert out["packets_dirs"] == ["/plate/packets"] and out["packet_versions"] == ["0.1"]
+    path, headers, _ = stub.seen[-1]
+    assert path == "/api/v0/session" and headers["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_session_with_a_wrong_token_is_unauthorized():
+    stub = Stub()
+    with serve(stub) as url, pytest.raises(transport.Unauthorized, match="daemon rejected the token"):
+        transport.session({"token": "wrong", "daemon_url": url})
+
+
+def test_session_without_a_token_never_touches_the_network():
+    with pytest.raises(transport.Unauthorized, match="no token"):
+        transport.session({"token": "", "daemon_url": "http://127.0.0.1:9"})
+
+
+def test_session_on_an_old_daemon_is_unexpected():
+    stub = Stub()
+
+    with serve(stub) as url:
+        with pytest.raises(transport.UnexpectedStatus) as err:
+            transport.session({"token": TOKEN, "daemon_url": url + "/nothing-here"})
+    assert err.value.status_code == 404
+
+
+# ---- post timeout and the re-post
+
+
+def test_the_post_timeout_is_30_s_plus_15_s_per_gib(tmp_path, monkeypatch):
+    folder = tmp_path / "pkt"
+    (folder / "motion").mkdir(parents=True)
+    (folder / "beauty.exr").write_bytes(b"x" * 1000)
+    (folder / "motion" / "z.0000.exr").write_bytes(b"y" * 24)
+    assert transport.folder_bytes(folder) == 1024
+    assert transport.post_timeout_s(folder) == pytest.approx(30 + 15 * 1024 / 2**30)
+    assert transport.folder_bytes(tmp_path / "missing") == 0
+    seen = []
+
+    def fake_request(req, timeout_s):
+        seen.append(timeout_s)
+        return 202, {"status": "ingesting"}
+
+    monkeypatch.setattr(transport, "folder_bytes", lambda f: 3 * transport.GIB)
+    monkeypatch.setattr(transport, "_request", fake_request)
+    transport.post_packet(folder, {"token": TOKEN, "daemon_url": "http://127.0.0.1:9"})
+    transport.post_packet(folder, {"token": TOKEN, "daemon_url": "http://127.0.0.1:9"}, timeout_s=7)
+    assert seen == [pytest.approx(75.0), 7.0]
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [(200, {"packet_id": "pkt_X", "status": "known"}), (202, {"packet_id": "pkt_X", "status": "ingesting"})],
+)
+def test_a_timed_out_post_is_reposted_once_and_200_or_202_is_success(tmp_path, status, body):
+    stub = Stub()
+    stub.post_script = [(202, stub.post_body, 1.0), (status, body, 0.0)]
+    with serve(stub) as url:
+        out = transport.post_packet(tmp_path, {"token": TOKEN, "daemon_url": url}, timeout_s=0.3)
+    assert out == {"status_code": status, "body": body, "reposted": True}
+    posts = [entry for entry in stub.seen if entry[0] == "/api/v0/packets"]
+    assert len(posts) == 2 and posts[0][2] == posts[1][2]  # the same folder, the same request
+
+
+def test_a_repost_answering_anything_else_is_post_timed_out(tmp_path):
+    stub = Stub()
+    stub.post_script = [(202, stub.post_body, 1.0), (409, {"error": "conflict"}, 0.0)]
+    with serve(stub) as url, pytest.raises(transport.PostTimedOut) as err:
+        transport.post_packet(tmp_path, {"token": TOKEN, "daemon_url": url}, timeout_s=0.3)
+    assert str(err.value).startswith("timed out; re-post answered 409")
+    assert err.value.status_code == 409 and isinstance(err.value, transport.TransportError)
+
+
+def test_a_repost_that_times_out_too_is_post_timed_out(tmp_path):
+    stub = Stub()
+    stub.post_script = [(202, stub.post_body, 1.0)]
+    with serve(stub) as url, pytest.raises(transport.PostTimedOut) as err:
+        transport.post_packet(tmp_path, {"token": TOKEN, "daemon_url": url}, timeout_s=0.3)
+    assert err.value.status_code is None and "re-post answered nothing" in str(err.value)
+    assert len([e for e in stub.seen if e[0] == "/api/v0/packets"]) == 2  # never a third
+
+
+def test_a_silent_daemon_is_a_daemon_timeout(tmp_path):
+    stub = Stub()
+    stub.post_script = [(202, stub.post_body, 1.0)]
+    with serve(stub) as url, pytest.raises(transport.DaemonTimeout):
+        transport._request(
+            transport.urllib.request.Request(url + "/api/v0/packets", data=b"{}", method="POST"), 0.3
+        )
+    assert issubclass(transport.DaemonTimeout, transport.DaemonUnreachable)
+
+
+# ---- following the ingest (events_url)
+
+
+def test_parse_sse_reads_data_frames_only():
+    text = 'retry: 500\n\n: comment\n\nid: 1\ndata: {"seq": 1, "type": "ingest.file"}\n\ndata: not json\n\n'
+    assert transport.parse_sse(text) == [{"seq": 1, "type": "ingest.file"}]
+    assert transport.parse_sse('id: 2\r\ndata: {"seq": 2}\r\n\r\n') == [{"seq": 2}]
+
+
+def test_follow_ingest_reports_ingested():
+    stub = Stub()
+    stub.events = [
+        {"seq": 1, "type": "ingest.file", "data": {"relpath": "beauty.exr"}},
+        {"seq": 2, "type": "ingest.done", "data": {}},
+    ]
+    with serve(stub) as url:
+        out = transport.follow_ingest("/api/v0/packets/pkt_X/events", {"token": TOKEN, "daemon_url": url})
+    assert out == {"ingest": "ingested", "problem": None}
+    path, headers, _ = stub.seen[-1]
+    query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(path).query))
+    assert query == {"wait_s": "0", "after": "0"} and headers["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_follow_ingest_reports_the_failure_errors():
+    stub = Stub()
+    stub.events = [{"seq": 1, "type": "ingest.failed", "data": {"errors": ["a: bad", "b: worse"]}}]
+    with serve(stub) as url:
+        out = transport.follow_ingest(
+            url + "/api/v0/packets/pkt_X/events", {"token": TOKEN, "daemon_url": url}
+        )
+    assert out["ingest"] == "failed: a: bad; b: worse"
+
+
+def test_follow_ingest_polls_one_second_apart_until_the_window_ends():
+    stub = Stub()
+    stub.events = [{"seq": 3, "type": "ingest.file", "data": {}}]
+    now = [0.0]
+    sleeps = []
+
+    def sleep(s):
+        sleeps.append(s)
+        now[0] += s
+
+    with serve(stub) as url:
+        out = transport.follow_ingest(
+            "/api/v0/packets/pkt_X/events?wait_s=60",
+            {"token": TOKEN, "daemon_url": url},
+            sleep=sleep,
+            clock=lambda: now[0],
+        )
+    assert out == {"ingest": "ingesting", "problem": None}
+    assert sleeps == [1.0] * 5  # polls at 0, 1, 2, 3, 4 and 5 s
+    polls = [urllib.parse.urlsplit(p).query for p, _, _ in stub.seen if p.startswith("/api/v0/packets/pkt_X")]
+    assert len(polls) == 6 and polls[0] == "wait_s=0&after=0" and polls[-1] == "wait_s=0&after=3"
+
+
+def test_follow_ingest_never_raises_for_the_daemon():
+    stub = Stub()
+    stub.events_status = 404
+    with serve(stub) as url:
+        out = transport.follow_ingest("/api/v0/packets/pkt_X/events", {"token": TOKEN, "daemon_url": url})
+    assert out["ingest"] == "ingesting" and "404" in out["problem"]
+    gone = transport.follow_ingest(
+        "/api/v0/packets/pkt_X/events", {"token": TOKEN, "daemon_url": f"http://127.0.0.1:{_closed_port()}"}
+    )
+    assert gone["ingest"] == "ingesting" and "unreadable" in gone["problem"]

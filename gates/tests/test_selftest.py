@@ -59,7 +59,9 @@ def test_gate_report_envelope():
         "tier",
         "metrics",
         "checks",
+        "thresholds",
         "verdict",
+        "flagged_points",
         "backend_notes",
         "created_utc",
     }
@@ -75,7 +77,7 @@ def test_gate_report_envelope():
 
 def test_thresholds_decision_14_values_with_scout_corrections():
     ts = thresholds.load()
-    assert ts.id == DEFAULT_THRESHOLDS_ID == "ts-2026.10.17-draft"
+    assert ts.id == DEFAULT_THRESHOLDS_ID == "ts-2026.10.18-draft"
     assert ts.get("registration.residual_px").value == 1.0
     assert ts.get("gbuffer_edge_recall_r2").variants == {"delivery": 0.90, "preview": 0.85}
     assert ts.get("texture.lapvar").range == (300, 600) and ts.get("texture.lapvar").status == "hard"

@@ -23,7 +23,14 @@ NEVER_EDITABLE_CLASSES = ("architecture", "glazing", "signage", "other")
 
 DEFAULT_MAX_UNLABELLED_SHARE = 0.05
 SCHEMA_MAX_UNLABELLED_SHARE = 0.25
-RULES_VERSION = "1"
+RULES_VERSION = "2"  # 2: GRND_ joins HARD_ as a ground prefix
+
+# Decision 43, the sender-side planar rule: an object of one of these classes covering at least
+# PLANAR_MIN_SHARE of the frame is marked planar in the legend (the invention-flag gate scans those;
+# plate_gates.invention.PLANAR_CLASSES is the same set). The node user property plate_planar
+# (autotag.planar_property) overrides it either way.
+PLANAR_CLASSES = ("architecture", "ground", "glazing")
+PLANAR_MIN_SHARE = 0.005
 
 
 def _layer_rule(pattern: str, cls: str) -> dict[str, str]:
@@ -38,6 +45,7 @@ CLASS_RULES: tuple[dict[str, str], ...] = (
     _layer_rule("GLAZING", "glazing"),
     _layer_rule("SIGN_", "signage"),
     _layer_rule("HARD_", "ground"),
+    _layer_rule("GRND_", "ground"),
     _layer_rule("VEG_", "vegetation"),
     _layer_rule("GRASS", "vegetation"),
     _layer_rule("SKY", "sky"),

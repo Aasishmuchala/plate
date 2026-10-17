@@ -160,6 +160,8 @@ function daemon(opts: { price?: number; approve?: Reply; runs?: Record<string, R
     if (url.endsWith("/api/v0/projects") && method === "GET") {
       return { body: [{ project_id: "p1", custody: { nda: false, allowed_grades: ["C0", "C1", "C2", "D"] } }] };
     }
+    // the Make bar saves the graph before every quote (T68); the daemon answers with the graph it stored
+    if (url.endsWith("/api/v0/projects/p1/graph") && method === "PUT") return { body: { ok: true, project_id: "p1", graph: body } };
     if (url.endsWith("/api/v0/projects/p1/nodes/edit-1/quote") && method === "POST") {
       const q = quote({ price_usd: price });
       return { body: { run: run("run_1", { quote: q }), quote: q } };
@@ -529,7 +531,7 @@ describe("Make bar", () => {
     await waitFor(() => expect(screen.queryByTestId("approval-dialog")).toBeNull());
   });
 
-  it("under the cap Make approves as auto; a daemon refusal of auto asks the human instead", async () => {
+  it("under the cap Make approves as the human who clicked; a daemon refusal opens the dialog with its reason", async () => {
     const calls = daemon({ approve: { status: 422, body: { error: "auto_cap", detail: "a human approves this one" } } });
     loadPlateEdit();
     mountCanvas();
@@ -539,7 +541,8 @@ describe("Make bar", () => {
     await waitFor(() => expect(makeBar().getByTestId("make-make")).toBeEnabled());
     fireEvent.click(makeBar().getByTestId("make-make"));
     const dialog = await screen.findByTestId("approval-dialog");
-    expect(calls.find((c) => c.url.endsWith("/approve"))?.body).toEqual({ by: "auto" });
+    // a click in the browser is a person (T68, decision 37): the cap only decides whether the dialog asks first
+    expect(calls.find((c) => c.url.endsWith("/approve"))?.body).toEqual({ by: "human" });
     expect(dialog).toHaveTextContent("a human approves this one");
   });
 

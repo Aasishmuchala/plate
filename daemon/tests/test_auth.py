@@ -19,7 +19,10 @@ def test_session_needs_the_token(client, auth):
     assert client.get("/api/v0/session", headers={"Authorization": "Basic x"}).status_code == 401
     ok = client.get("/api/v0/session", headers=auth)
     assert ok.status_code == 200
-    assert ok.json() == {"ok": True, "daemon_version": __version__, "packet_versions": ["0.1"]}
+    # T59 added packets_dirs, projects_dir, dev and cas_copy; the original keys must stay.
+    assert (
+        ok.json().items() >= {"ok": True, "daemon_version": __version__, "packet_versions": ["0.1"]}.items()
+    )
 
 
 def test_seed_routes_are_behind_the_token_and_no_schema_is_served(client, auth):

@@ -58,6 +58,7 @@ each one opens its own floating dock, keeps its own `show_dock()` singleton, and
    def max_main_window():
        try:
            import qtmax
+
            return qtmax.GetQMaxMainWindow()
        except Exception:  # noqa: BLE001
            return None

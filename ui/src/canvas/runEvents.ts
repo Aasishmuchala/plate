@@ -4,6 +4,10 @@
 // run would starve every other request. Without a project id it falls back to the per-run stream from
 // `api/client.sse`. `run.state` moves a candidate's chip; on a terminal state the run is read once
 // (`GET /runs/{id}`, plus `/gate` for a GATE_FAIL without checks) and unwatched; `siblings.ranked` orders the strip.
+// T71: the hub remembers the highest `seq` it saw per project, so a stream reopened later (a second Make) asks for
+// `&after=<seq>` and never replays the project's history; `hub.onKind(kind, handler)` routes the records that are
+// not about one run's state (`alert`, `packet.ingested`, `plugin.job`, `run.accepted`, `graph.saved`,
+// `packet.superseded`); `hub.follow(projectId)` keeps the open project's stream up so those arrive between Makes.
 
 import { API_PREFIX, type EventSourceLike, getToken, type RunEvent, sse } from "../api/client";
 import { getGateReport, getRun } from "./runApi";
@@ -13,12 +17,26 @@ import { type BusRecord, isRunState, isTerminal, type RunWire } from "./runTypes
 export type RecordHandler = (rec: BusRecord) => void;
 export type EventSourceFactory = (url: string) => EventSourceLike;
 
-const browserFactory: EventSourceFactory = (url) => new EventSource(url) as unknown as EventSourceLike;
+/** A source that never delivers: a page with no EventSource (a test, an old webview) just gets no live updates. */
+const inertSource = (): EventSourceLike => ({ onmessage: null, onerror: null, addEventListener: () => {}, close: () => {} });
 
-/** `/api/v0/events?project_id=…&token=…` (the only route that takes the token in the query). */
-export function projectEventsUrl(projectId: string, token: string | null): string {
+const browserFactory: EventSourceFactory = (url) => {
+  if (typeof EventSource === "undefined") return inertSource();
+  try {
+    return new EventSource(url) as unknown as EventSourceLike;
+  } catch {
+    return inertSource();
+  }
+};
+
+/**
+ * `/api/v0/events?project_id=…&token=…[&after=<seq>]` (the only route that takes the token in the query). `after` is
+ * the hub's cursor for a project it has seen before; the first open of a project has none.
+ */
+export function projectEventsUrl(projectId: string, token: string | null, after?: number | null): string {
   const q = new URLSearchParams({ project_id: projectId });
   if (token) q.set("token", token);
+  if (typeof after === "number" && Number.isFinite(after)) q.set("after", String(after));
   return `${API_PREFIX}/events?${q.toString()}`;
 }
 
@@ -41,11 +59,15 @@ export function parseRecord(data: unknown): BusRecord | null {
 interface ProjectStream {
   source: EventSourceLike;
   handlers: Map<string, Set<RecordHandler>>;
+  /** Callers of `hub.follow(project)`: they hold the stream open with no run watched. */
+  follows: number;
 }
 
 export class RunEventHub {
   private streams = new Map<string, ProjectStream>();
   private perRun = new Map<string, { close: () => void; handlers: Set<RecordHandler> }>();
+  private cursors = new Map<string, number>();
+  private kindHandlers = new Map<string, Set<RecordHandler>>();
   private factory: EventSourceFactory;
 
   constructor(factory: EventSourceFactory = browserFactory) {
@@ -73,40 +95,95 @@ export class RunEventHub {
     return this.streams.size + this.perRun.size;
   }
 
+  /** Close every stream and forget the cursors (a logout, or a test reset). `onKind` handlers stay registered. */
   closeAll(): void {
     for (const s of this.streams.values()) s.source.close();
     for (const r of this.perRun.values()) r.close();
     this.streams.clear();
     this.perRun.clear();
+    this.cursors.clear();
+  }
+
+  /** The highest `seq` seen on a project's stream, or null before its first record (the next open has no cursor). */
+  cursor(projectId: string): number | null {
+    return this.cursors.get(projectId) ?? null;
+  }
+
+  /**
+   * Handle records of one `kind` from any project stream: `alert`, `packet.ingested`, `plugin.job`, `run.accepted`,
+   * `graph.saved`, `packet.superseded` (the run-state kinds already reach `watch` handlers by run id). Returns the
+   * unsubscribe function. Registering does not open a stream: `follow` or `watch` does.
+   */
+  onKind(kind: string, handler: RecordHandler): () => void {
+    const set = this.kindHandlers.get(kind) ?? new Set<RecordHandler>();
+    set.add(handler);
+    this.kindHandlers.set(kind, set);
+    return () => {
+      set.delete(handler);
+      if (set.size === 0 && this.kindHandlers.get(kind) === set) this.kindHandlers.delete(kind);
+    };
+  }
+
+  /** Keep the project's stream open with no run watched, so `onKind` records arrive between Makes. */
+  follow(projectId: string): () => void {
+    const stream = this.openProject(projectId);
+    stream.follows += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      stream.follows = Math.max(0, stream.follows - 1);
+      this.releaseProject(projectId, stream);
+    };
+  }
+
+  private emitKind(rec: BusRecord): void {
+    for (const h of [...(this.kindHandlers.get(rec.kind) ?? [])]) {
+      try {
+        h(rec);
+      } catch (err) {
+        console.error(`event handler for ${rec.kind} threw`, err);
+      }
+    }
+  }
+
+  private openProject(projectId: string): ProjectStream {
+    const open = this.streams.get(projectId);
+    if (open) return open;
+    const source = this.factory(projectEventsUrl(projectId, getToken(), this.cursors.get(projectId)));
+    const handlers = new Map<string, Set<RecordHandler>>();
+    source.onmessage = (ev: MessageEvent) => {
+      const rec = parseRecord(ev.data);
+      if (!rec) return;
+      if (typeof rec.seq === "number" && rec.seq > (this.cursors.get(projectId) ?? 0)) this.cursors.set(projectId, rec.seq);
+      // Group records (siblings.ranked) carry no run id: every watcher of the project sees them.
+      const targets = rec.run_id ? [handlers.get(rec.run_id)] : [...handlers.values()];
+      for (const set of targets) for (const h of set ?? []) h(rec);
+      this.emitKind(rec);
+    };
+    const stream: ProjectStream = { source, handlers, follows: 0 };
+    this.streams.set(projectId, stream);
+    return stream;
+  }
+
+  /** Close a project's stream once no run is watched and nobody follows it. */
+  private releaseProject(projectId: string, stream: ProjectStream): void {
+    if (stream.handlers.size === 0 && stream.follows === 0 && this.streams.get(projectId) === stream) {
+      stream.source.close();
+      this.streams.delete(projectId);
+    }
   }
 
   private watchProject(runId: string, projectId: string, handler: RecordHandler): () => void {
-    let stream = this.streams.get(projectId);
-    if (!stream) {
-      const source = this.factory(projectEventsUrl(projectId, getToken()));
-      const handlers = new Map<string, Set<RecordHandler>>();
-      source.onmessage = (ev: MessageEvent) => {
-        const rec = parseRecord(ev.data);
-        if (!rec) return;
-        // Group records (siblings.ranked) carry no run id: every watcher of the project sees them.
-        const targets = rec.run_id ? [handlers.get(rec.run_id)] : [...handlers.values()];
-        for (const set of targets) for (const h of set ?? []) h(rec);
-      };
-      stream = { source, handlers };
-      this.streams.set(projectId, stream);
-    }
+    const stream = this.openProject(projectId);
     const set = stream.handlers.get(runId) ?? new Set<RecordHandler>();
     set.add(handler);
     stream.handlers.set(runId, set);
-    const s = stream;
     return () => {
-      const hs = s.handlers.get(runId);
+      const hs = stream.handlers.get(runId);
       hs?.delete(handler);
-      if (hs && hs.size === 0) s.handlers.delete(runId);
-      if (s.handlers.size === 0 && this.streams.get(projectId) === s) {
-        s.source.close();
-        this.streams.delete(projectId);
-      }
+      if (hs && hs.size === 0) stream.handlers.delete(runId);
+      this.releaseProject(projectId, stream);
     };
   }
 
@@ -118,7 +195,9 @@ export class RunEventHub {
         runId,
         (ev: RunEvent) => {
           const rec = parseRecord(ev.data);
-          if (rec) for (const h of handlers) h(rec);
+          if (!rec) return;
+          for (const h of handlers) h(rec);
+          this.emitKind(rec);
         },
         { create: this.factory },
       );

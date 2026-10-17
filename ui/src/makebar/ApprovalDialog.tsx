@@ -1,5 +1,6 @@
 // The approval dialog (T35): shown when a quote's total is at or over the per-run auto cap, or when the daemon
-// refuses an automatic approval. A human reads the terms and approves; Escape or Cancel keeps the quote unspent.
+// refuses an approval. A human reads the terms and approves; Escape or Cancel keeps the quote unspent. A blocking
+// refusal (the daily or unattended cap, T68) shows the daemon's reason with nothing to approve.
 
 import { useEffect, useRef } from "react";
 import { CustodyChip } from "./CustodyChip";
@@ -10,14 +11,17 @@ export interface ApprovalDialogProps {
   fresh: boolean;
   /** The daemon's reason, when it asked for a human. */
   reason: string | null;
+  /** No click can approve this spend now: say why, offer only Close. */
+  blocking?: boolean;
   onApprove: () => void;
   onCancel: () => void;
 }
 
-export function ApprovalDialog({ quote, fresh, reason, onApprove, onCancel }: ApprovalDialogProps) {
+export function ApprovalDialog({ quote, fresh, reason, blocking = false, onApprove, onCancel }: ApprovalDialogProps) {
   const approveRef = useRef<HTMLButtonElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    approveRef.current?.focus();
+    (approveRef.current ?? closeRef.current)?.focus();
   }, []);
   const q = quote.quote;
   const n = quote.runs.length;
@@ -29,6 +33,7 @@ export function ApprovalDialog({ quote, fresh, reason, onApprove, onCancel }: Ap
         aria-modal="true"
         aria-labelledby="approve-title"
         data-testid="approval-dialog"
+        data-blocking={blocking}
         onClick={(e) => e.stopPropagation()}
         onKeyDown={(e) => {
           if (e.key === "Escape") {
@@ -37,7 +42,7 @@ export function ApprovalDialog({ quote, fresh, reason, onApprove, onCancel }: Ap
           }
         }}
       >
-        <h2 id="approve-title">Approve this spend</h2>
+        <h2 id="approve-title">{blocking ? "This spend is blocked" : "Approve this spend"}</h2>
         <p>
           {reason ??
             `${formatUsd(quote.totalUsd)} is at or over the auto-approve cap of ${formatUsd(quote.autoCapUsd)}: approve it yourself.`}
@@ -63,14 +68,22 @@ export function ApprovalDialog({ quote, fresh, reason, onApprove, onCancel }: Ap
           <dd>{formatEta(q.eta_s)}</dd>
         </dl>
         <div className="dialog-actions">
-          <button type="button" className="btn btn-ghost" onClick={onCancel}>
-            Cancel
-          </button>
-          <button type="button" className="btn btn-primary" ref={approveRef} disabled={!fresh} onClick={onApprove} data-testid="approval-approve">
-            Approve and make
-          </button>
+          {blocking ? (
+            <button type="button" className="btn" ref={closeRef} onClick={onCancel} data-testid="approval-close">
+              Close
+            </button>
+          ) : (
+            <>
+              <button type="button" className="btn btn-ghost" onClick={onCancel}>
+                Cancel
+              </button>
+              <button type="button" className="btn btn-primary" ref={approveRef} disabled={!fresh} onClick={onApprove} data-testid="approval-approve">
+                Approve and make
+              </button>
+            </>
+          )}
         </div>
-        {!fresh ? <p className="make-error">The quote expired: close this and quote again.</p> : null}
+        {!fresh && !blocking ? <p className="make-error">The quote expired: close this and quote again.</p> : null}
       </div>
     </div>
   );

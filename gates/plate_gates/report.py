@@ -9,6 +9,11 @@ thresholds that scored it. Re-scoring never rewrites an old report: write() alwa
 
 verdict is 'fail' iff any hard check fails, 'advisory' if only advisory / calibration_needed checks miss (or
 nothing was scored), else 'pass'.
+
+Every check scored against a registered threshold id also carries what it was held to (`threshold`, `op`,
+`unit`; null for an unregistered id), the report lists those thresholds under `thresholds` with the registered
+status (a check can be forced advisory while its threshold is still hard: the feather band, until calibration
+sets a bound), and `flagged_points` names the image boxes a human should look at first.
 """
 
 from __future__ import annotations
@@ -32,7 +37,10 @@ from .thresholds import DEFAULT_THRESHOLDS_ID
 __all__ = [
     "EngineRef",
     "Check",
+    "FlaggedPoint",
     "GateReport",
+    "ThresholdRef",
+    "scored_check",
     "metric_code_hash",
     "verdict_of",
     "write",
@@ -89,9 +97,86 @@ class EngineRef(BaseModel):
 
 
 class Check(BaseModel):
+    """One scored metric. `threshold` / `op` / `unit` say what it was held to (thresholds.Threshold.describe);
+    they stay null for an id that is not in the threshold set."""
+
     metric_id: str
     value: float | None
     status: Status
+    threshold: float | list[float] | None = None
+    op: str | None = None
+    unit: str | None = None
+
+
+class ThresholdRef(BaseModel):
+    """A registered threshold as a report saw it: op, the bound (`value`, or `range` for a [low, high] entry),
+    unit, the registered status (hard / advisory / calibration_needed) and the width it is valid at."""
+
+    op: str | None = None
+    value: float | None = None
+    range: list[float] | None = None
+    unit: str | None = None
+    status: Literal["hard", "advisory", "calibration_needed"]
+    resolution_px: int | None = None
+
+
+class FlaggedPoint(BaseModel):
+    """An image box (pixels, plate coordinates, clamped to the frame) worth a human look, and why."""
+
+    x: int
+    y: int
+    w: int
+    h: int
+    metric_id: str
+    note: str = ""
+
+
+def threshold_ref(
+    thr: thresholds.Threshold,
+    description: dict[str, Any] | None = None,
+    *,
+    backend: str | None = None,
+    variant: str | None = None,
+    target: float | None = None,
+) -> ThresholdRef:
+    """The ThresholdRef of `thr`: `description` is a Threshold.describe() result (computed when absent)."""
+    d = description if description is not None else thr.describe(variant=variant, target=target)
+    b = d.get("threshold")
+    is_range = isinstance(b, (list, tuple))
+    return ThresholdRef(
+        op=d.get("op"),
+        value=None if is_range or b is None else float(b),
+        range=[float(b[0]), float(b[1])] if is_range else None,
+        unit=d.get("unit"),
+        status=thr.effective_status(backend),
+        resolution_px=thr.resolution_px,
+    )
+
+
+def scored_check(
+    ts: thresholds.ThresholdSet,
+    metric_id: str,
+    value: float | None,
+    *,
+    status: Status | None = None,
+    variant: str | None = None,
+    backend: str | None = None,
+    target: float | None = None,
+) -> Check:
+    """A Check for a registered metric: scored by ThresholdSet.check unless `status` is forced, with the
+    threshold, op and unit it was held to filled in. An unregistered id raises KeyError."""
+    thr = ts.get(metric_id)
+    if status is None:
+        if value is None:  # an unmeasured hard gate never passes
+            status = "fail" if thr.effective_status(backend) == "hard" else "advisory"
+        else:
+            status, _ = ts.check(metric_id, value, variant=variant, backend=backend, target=target)
+    return Check(
+        metric_id=metric_id,
+        value=_jsonable(value),
+        status=status,
+        **thr.describe(variant=variant if variant in thr.variants else None, target=target),
+    )
 
 
 def verdict_of(checks: list[Check]) -> Status:
@@ -111,7 +196,9 @@ class GateReport(BaseModel):
     tier: str | None = None
     metrics: dict[str, bool | int | float | dict | list | str | None] = Field(default_factory=dict)
     checks: list[Check] = Field(default_factory=list)
+    thresholds: dict[str, ThresholdRef] = Field(default_factory=dict)
     verdict: Status = "advisory"
+    flagged_points: list[FlaggedPoint] = Field(default_factory=list)
     backend_notes: list[str] = Field(default_factory=list)
     created_utc: str = Field(default_factory=_now_utc)
 
@@ -123,7 +210,31 @@ class GateReport(BaseModel):
     @model_validator(mode="after")
     def _derive_verdict(self) -> GateReport:
         self.verdict = verdict_of(self.checks)
+        self._describe_checks()
         return self
+
+    def _describe_checks(self) -> None:
+        """Fill what the producers left out, for the committed set only (a report scored against another set
+        id keeps what it has): a check on a registered id with a fixed bound gets its threshold / op / unit,
+        and every described check gets its entry under `thresholds`. Variant and param entries (the
+        gbuffer preview bound, the shot duration) are never guessed: their producers fill them."""
+        ts = thresholds.load()
+        if self.threshold_set_id != ts.id:
+            return
+        checks = []
+        for c in self.checks:
+            thr = ts.metrics.get(c.metric_id)
+            if thr is None or thr.op == "param":
+                checks.append(c)
+                continue
+            if c.op is None and c.threshold is None and c.unit is None and not thr.variants and not thr.param:
+                c = c.model_copy(update=thr.describe())
+            checks.append(c)
+            if c.op is not None and c.metric_id not in self.thresholds:
+                self.thresholds[c.metric_id] = threshold_ref(
+                    thr, {"threshold": c.threshold, "op": c.op, "unit": c.unit}
+                )
+        self.checks = checks
 
     @classmethod
     def score(
@@ -146,23 +257,23 @@ class GateReport(BaseModel):
         """
         ts = thresholds.load()
         checks = []
+        refs = {}
         for metric_id, value in values.items():
             thr = ts.get(metric_id)
-            status, _ = ts.check(
-                metric_id,
-                value,
-                variant=(variants or {}).get(metric_id),
-                backend=backend if thr.status_by_backend else None,
-                target=(targets or {}).get(metric_id),
+            be = backend if thr.status_by_backend else None
+            variant, target = (variants or {}).get(metric_id), (targets or {}).get(metric_id)
+            c = scored_check(ts, metric_id, value, variant=variant, backend=be, target=target)
+            checks.append(c)
+            refs[metric_id] = threshold_ref(
+                thr, {"threshold": c.threshold, "op": c.op, "unit": c.unit}, backend=be
             )
-            v = _jsonable(value)
-            checks.append(Check(metric_id=metric_id, value=v, status=status))
         return cls(
             threshold_set_id=ts.id,
             engine=engine,
             tier=tier,
             metrics={**values, **(extra_metrics or {})},
             checks=checks,
+            thresholds=refs,
             backend_notes=list(backend_notes or []),
         )
 

@@ -37,11 +37,11 @@ Some AI services run on our own computers. Others are online companies. We grade
 | **C2** | a reseller whose written terms we hold |
 | **D** | we do not hold written terms, or the image would sit at a public web address |
 
-Today we do not yet hold written terms from any online service, so we treat every online route as **D**. For projects under a confidentiality agreement, we use only C0 and C1: today that means our own computers only. Nothing is sent online without your written consent naming the service. What leaves our computers is only the picture itself, without names, file details or project information.
+Today we do not yet hold written terms from any online service, so we treat every online route as **D**. For projects under a confidentiality agreement, we use only C0 and C1: today that means our own computers only. On an open project, nothing is sent online until the studio has recorded your consent on the project; on a project under a confidentiality agreement, the software itself refuses every route below C1. What leaves our computers is only the picture itself, without names, file details or project information.
 
 ## Nothing is spent without a price
 
-Before any online AI run, we see the price, the service and its grade. Nothing runs until a person has approved it.
+Before any online AI run, we see the price, the service and its grade. Nothing is spent until a person has approved it, either that run, or a per-run cap or budget envelope the studio set in advance.
 
 ## Marks you may see
 

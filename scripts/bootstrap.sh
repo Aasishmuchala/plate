@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Set up PLATE on macOS (the dev machine): uv, Node, the Python 3.12 venv, npm ci, config.json with the token.
+# Set up PLATE on macOS (the dev machine): uv, Node, the Python 3.12 venv, npm ci, the UI build, config.json with the token.
 # Mac twin of scripts/bootstrap.ps1. Run from anywhere:  scripts/bootstrap.sh [--no-install]
 #   --no-install   only check for uv and Node, never install them
 # Never installs the pixels CUDA extra.
@@ -51,6 +51,8 @@ echo "==> uv sync (Python 3.12 venv)"
 uv sync --python 3.12
 echo "==> npm ci (root workspace, includes ui)"
 npm ci
+echo "==> building ui/dist (the daemon serves it at /)"
+npm run build -w ui
 
 have ffmpeg || echo "warning: ffmpeg not on PATH: video-gate tests will be skipped (brew install ffmpeg, or set PLATE_FFMPEG)" >&2
 

@@ -3,8 +3,9 @@
 V-Ray is simulated here (FakeVRay): with the renderer's raw-image output on, render() writes a real
 multilayer EXR (OpenEXR from the dev venv) holding every render element in the element manager, with
 Cryptomatte ids, coverage and manifests built from the scene's pixel shares; the VFB save writes a
-16-bit TIFF of the rendered size. The daemon is a stdlib http.server (health, /hash with BLAKE3 from
-the dev venv, /packets). Every packet written is checked with plate_spec.validate_packet_dir.
+16-bit TIFF of the rendered size. The daemon is a stdlib http.server (health, session, /hash with
+BLAKE3 from the dev venv, /packets, the packet event log). Every packet written is checked with
+plate_spec.validate_packet_dir.
 """
 
 from __future__ import annotations
@@ -13,6 +14,8 @@ import json
 import math
 import struct
 import threading
+import time
+import urllib.parse
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,8 +26,9 @@ import pytest
 from packet_fixture import STUB_TOKEN, StubDaemon
 
 import plate_spec
-from plate_max import PLUGIN_VERSION, exr_header, legend, policy
+from plate_max import PLUGIN_VERSION, exr_header, legend, policy, transport
 from plate_max.actions import send_packet
+from plate_max.bridge import hashing
 from plate_max.recipes import CameraRecipe
 
 np = pytest.importorskip("numpy")
@@ -50,7 +54,12 @@ def _app_data(monkeypatch, tmp_path):
 
 
 class Daemon:
-    """GET /api/v0/health, POST /api/v0/hash (packet_fixture.StubDaemon) and POST /api/v0/packets."""
+    """GET /api/v0/health, GET /api/v0/session, POST /api/v0/hash (packet_fixture.StubDaemon), POST
+    /api/v0/packets and GET /api/v0/packets/<id>/events.
+
+    post_script, when set, answers the POSTs in turn: (status, body, delay_s) each, the last one
+    repeating; a delay sleeps before answering (a daemon slower than the plugin's timeout). events is
+    the event log every packet's events route serves (default: one ingest.done)."""
 
     def __init__(self, root: Path):
         self.hasher = StubDaemon(root)
@@ -59,10 +68,28 @@ class Daemon:
             "daemon_version": PLUGIN_VERSION,
             "packet_versions": ["0.1"],
         }
+        self.packets_dirs = [str(root)]
+        self.session_status: int | None = None  # answer /session with this status instead
         self.post_status = 202
         self.post_body: dict[str, Any] = {"status": "ingesting"}
+        self.post_script: list[tuple[int, dict[str, Any], float]] = []
         self.posted: list[dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = [{"seq": 1, "type": "ingest.done", "data": {}}]
+        self.event_requests: list[str] = []
         self.health_calls = 0
+        self.session_calls = 0
+
+    def next_post(self) -> tuple[int, dict[str, Any], float]:
+        if not self.post_script:
+            return self.post_status, self.post_body, 0.0
+        return self.post_script.pop(0) if len(self.post_script) > 1 else self.post_script[0]
+
+    def sse(self, after: int) -> bytes:
+        frames = ["retry: 1000\n\n"]
+        for ev in self.events:
+            if int(ev.get("seq", 0)) > after:
+                frames.append(f"id: {ev.get('seq')}\ndata: {json.dumps(ev)}\n\n")
+        return "".join(frames).encode("utf-8")
 
 
 @contextmanager
@@ -76,10 +103,32 @@ def serve_daemon(daemon: Daemon):
             self.end_headers()
             self.wfile.write(raw)
 
+        def _authorised(self) -> bool:
+            return self.headers.get("Authorization") == f"Bearer {daemon.hasher.token}"
+
         def do_GET(self):  # noqa: N802
-            if self.path == "/api/v0/health":
+            url = urllib.parse.urlsplit(self.path)
+            if url.path == "/api/v0/health":
                 daemon.health_calls += 1
                 self._send(200, daemon.health)
+            elif url.path == "/api/v0/session":
+                daemon.session_calls += 1
+                if not self._authorised():
+                    return self._send(401, {"error": "unauthorized"})
+                if daemon.session_status is not None:
+                    return self._send(daemon.session_status, {"error": "session refused"})
+                self._send(200, {**daemon.health, "packets_dirs": list(daemon.packets_dirs)})
+            elif url.path.startswith("/api/v0/packets/") and url.path.endswith("/events"):
+                daemon.event_requests.append(self.path)
+                if not self._authorised():
+                    return self._send(401, {"error": "unauthorized"})
+                after = int(dict(urllib.parse.parse_qsl(url.query)).get("after", "0"))
+                raw = daemon.sse(after)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
             else:
                 self._send(404, {"error": "unknown route"})
 
@@ -89,10 +138,16 @@ def serve_daemon(daemon: Daemon):
             if self.path == "/api/v0/hash":
                 self._send(*daemon.hasher.answer(self.headers, body))
             elif self.path == "/api/v0/packets":
-                if self.headers.get("Authorization") != f"Bearer {STUB_TOKEN}":
+                if not self._authorised():
                     return self._send(401, {"error": "unauthorized"})
                 daemon.posted.append({**body, "version": self.headers.get("X-Plate-Packet-Version")})
-                self._send(daemon.post_status, daemon.post_body)
+                status, answer, delay = daemon.next_post()
+                if delay:
+                    time.sleep(delay)
+                try:
+                    self._send(status, answer)
+                except OSError:  # the plugin gave up waiting and closed the connection
+                    pass
             else:
                 self._send(404, {"error": "unknown route"})
 
@@ -351,9 +406,15 @@ def test_full_send_writes_a_packet_plate_spec_accepts(install_scene, daemon_env)
         "display.tif",
         "id_legend.json",
         "manifest.json",
+        "scene_digest.txt",
     ]
 
     manifest, leg = read_json(root / "manifest.json"), read_json(root / "id_legend.json")
+    # the scene digest is a file of the packet, and the scene hash is its BLAKE3
+    digest_ref = manifest["files"]["x_scene_digest"]
+    assert digest_ref["path"] == "scene_digest.txt" and digest_ref["kind"] == "file"
+    assert digest_ref["hash"]["hex"] == manifest["scene_hash"]["hex"]
+    assert (root / "scene_digest.txt").read_bytes().startswith(b"plate-scene-digest 1\n")
     assert manifest["packet_id"] == result.packet_id and manifest["project_id"] == "tula-wot"
     assert manifest["shot_id"] == "cam-front" and manifest["host"]["version"] == "2026.2"
     assert manifest["renderer"] == {"name": "vray", "version": "V_Ray_7_hotfix_3"}
@@ -396,6 +457,17 @@ def test_full_send_writes_a_packet_plate_spec_accepts(install_scene, daemon_env)
     # the daemon got the folder, with the packet version header
     assert daemon.posted[-1]["packet_path"] == str(root.resolve())
     assert daemon.posted[-1]["version"] == "0.1.1" and daemon.health_calls == 1
+    assert daemon.session_calls == 1  # the preflight's token and folder check
+    # after the 202 the packet's event log was followed until ingest.done
+    assert result.ingest == "ingested" and result.code is None
+    assert result.events_url == f"/api/v0/packets/{result.packet_id}/events"
+    assert "wait_s=0" in daemon.event_requests[0]
+    out = result.as_dict()
+    assert {k: out[k] for k in ("status_code", "packet_id", "ingest")} == {
+        "status_code": 202,
+        "packet_id": result.packet_id,
+        "ingest": "ingested",
+    }
     assert progress[0][0] == 0 and progress[-1][:2] == (1, 1) and "sent" in progress[-1][2]
     journal = read_json(Path(result.journal))
     assert journal["finished"] == "ok" and journal["steps"][-1]["step"] == "post"
@@ -477,8 +549,9 @@ def test_an_incompatible_daemon_stops_every_camera_before_rendering(install_scen
     scene, _ = vray_scene(install_scene)
     results = send(["CAM_front", "CAM_aerial"], packets, cfg)
     assert [r.ok for r in results] == [False, False]
-    assert all("version" in r.errors[0] and r.stage == "daemon" for r in results)
-    assert scene.render_calls == [] and daemon.health_calls == 1
+    assert all("version" in r.errors[0] and r.stage == "preflight" for r in results)
+    assert {r.code for r in results} == {send_packet.PREFLIGHT_VERSION}
+    assert scene.render_calls == [] and daemon.health_calls == 1 and daemon.session_calls == 0
 
 
 def test_an_unreachable_daemon_is_reported_not_raised(install_scene, tmp_path):
@@ -486,6 +559,7 @@ def test_an_unreachable_daemon_is_reported_not_raised(install_scene, tmp_path):
     cfg = {"token": STUB_TOKEN, "daemon_url": "http://127.0.0.1:9"}
     [result] = send_packet.run(["CAM_front"], tmp_path, cfg["daemon_url"], {"config": cfg})
     assert not result.ok and "unreachable" in result.errors[0]
+    assert result.stage == "preflight" and result.code == send_packet.PREFLIGHT_UNREACHABLE
 
 
 def test_one_bad_camera_never_stops_the_others(install_scene, daemon_env):
@@ -553,10 +627,25 @@ def test_unlabelled_share_over_the_limit_blocks_the_packet(install_scene, daemon
     assert any("no manifest" in w for w in result.warnings)
 
 
-def test_a_packets_folder_the_daemon_refuses_is_reported(install_scene, daemon_env, tmp_path):
-    _, cfg, _ = daemon_env
+def test_a_packets_folder_outside_the_session_is_refused_before_rendering(
+    install_scene, daemon_env, tmp_path
+):
+    _, cfg, packets = daemon_env
+    scene, _ = vray_scene(install_scene)
+    elsewhere = tmp_path / "not-the-packets-folder"
+    [result] = send(["CAM_front"], elsewhere, cfg)
+    assert not result.ok and result.stage == "preflight" and result.code == send_packet.PREFLIGHT_OUT_ROOT
+    assert result.errors[0].startswith(f"{elsewhere} is outside the daemon's packets folders: ")
+    assert str(packets) in result.errors[0]
+    assert scene.render_calls == [] and not elsewhere.exists()
+
+
+def test_a_hash_refusal_after_the_preflight_is_still_reported(install_scene, daemon_env, tmp_path):
+    """The session lists a folder /hash then refuses (a daemon reconfigured mid-Send): stage hash, 403."""
+    daemon, cfg, _ = daemon_env
     vray_scene(install_scene)
     elsewhere = tmp_path / "not-the-packets-folder"
+    daemon.packets_dirs.append(str(elsewhere))
     [result] = send(["CAM_front"], elsewhere, cfg)
     assert not result.ok and result.stage == "hash"
     assert "daemon" in result.errors[0] and "403" in result.errors[0]
@@ -678,6 +767,113 @@ def test_dock_options_object_and_recipe_subjects_are_accepted(install_scene, dae
     opts = ActionOptions(recipes={}, progress=None, backup=False, config=cfg, project_id="tula-wot")
     results = send_packet.run([CameraRecipe(camera="CAM_entry")], packets, cfg["daemon_url"], opts)
     assert [r.camera for r in results] == ["CAM_entry"] and results[0].ok, results[0].errors
+
+
+# --------------------------------------------------------------------------- big payloads, planar, post
+
+
+def test_a_30000_line_scene_digest_is_hashed_by_path_and_validates(install_scene, daemon_env):
+    """30 000 extra geometry nodes: the digest text is far over the payload limit (and the daemon's
+    4 MiB cap), so it must travel as scene_digest.txt, never as a payload after the render."""
+    from fake_pymxs import make_node
+
+    daemon, cfg, packets = daemon_env
+    scene, _ = vray_scene(install_scene)
+    scene.objects.extend(
+        make_node(f"ARCH_filler_{i:05d}", "ARCH_filler", "MAT_brick", x=i) for i in range(30000)
+    )
+    [result] = send(["CAM_front"], packets, cfg)
+    assert result.ok, (result.stage, result.errors)
+    root = Path(result.packet_dir)
+    text = (root / "scene_digest.txt").read_bytes()
+    assert text.count(b"\nnode|") >= 30000 and len(text) > hashing.PAYLOAD_LIMIT
+    payload_sizes = [
+        len(v) * 3 // 4 for body in daemon.hasher.requests for v in (body.get("payloads") or {}).values()
+    ]
+    assert max(payload_sizes) <= hashing.PAYLOAD_LIMIT  # nothing big went in memory
+    assert any(str(root / "scene_digest.txt") in (body.get("paths") or []) for body in daemon.hasher.requests)
+    assert plate_spec.validate_packet_dir(root, check_files=True) == []
+
+
+def test_planar_follows_the_class_rule_and_the_user_property(install_scene, daemon_env):
+    from fake_pymxs import make_node
+
+    _, cfg, packets = daemon_env
+    scene = install_scene("clubhouse")
+    scene.objects.append(make_node("GRND_terrace", "GRND_terrace", "MAT_stone"))
+    shares = dict(scene.pixel_shares)
+    shares["SKY_dome"] = 0.08
+    shares["GRND_terrace"] = 0.03
+    shares["ARCH_column_02"] = 0.004  # under the 0.5 % floor: a sliver is not a planar region
+    scene.renderWidth, scene.renderHeight = 160, 90
+    gamma_colour(scene)
+    FakeVRay(scene, shares=shares)
+    wall = scene.getNodeByName("ARCH_wall_north")
+    wall.user_props["plate_planar"] = "false"  # the artist knows this wall is a fluted relief
+    [result] = send(["CAM_front"], packets, cfg)
+    assert result.ok, result.errors
+    leg = read_json(Path(result.packet_dir) / "id_legend.json")
+    objects = {e["name"]: e for e in leg["entries"] if e["kind"] == "object"}
+    planar = {name for name, e in objects.items() if e.get("planar") is True}
+    assert {"ARCH_wall_south", "GLZ_curtainwall_s", "HARD_paving_01", "GRND_terrace"} <= planar
+    assert objects["GRND_terrace"]["class"] == "ground"
+    assert objects["ARCH_wall_north"]["planar"] is False  # the property wins over the rule
+    assert "planar" not in objects["ARCH_column_02"]
+    assert not any(e.get("planar") for e in objects.values() if e["class"] not in policy.PLANAR_CLASSES)
+    assert not any("planar" in e for e in leg["entries"] if e["kind"] == "material")
+    assert plate_spec.validate_packet_dir(result.packet_dir, check_files=True) == []
+
+
+def test_a_post_that_times_out_is_reposted_and_known_is_success(install_scene, daemon_env):
+    daemon, cfg, packets = daemon_env
+    vray_scene(install_scene)
+    known = {"packet_id": "set-below", "status": "known"}
+    daemon.post_script = [(202, {"status": "ingesting"}, 1.2), (200, known, 0.0)]
+    [result] = send(["CAM_front"], packets, cfg, post_timeout_s=0.3)
+    assert result.ok, (result.stage, result.errors)
+    assert result.status_code == 200 and result.stage == "done" and result.ingest == "ingested"
+    assert len(daemon.posted) == 2 and daemon.posted[0]["packet_path"] == daemon.posted[1]["packet_path"]
+    assert any("timed out" in w and "re-post" in w for w in result.warnings)
+
+
+def test_a_repost_that_is_refused_is_an_error_naming_its_status(install_scene, daemon_env):
+    daemon, cfg, packets = daemon_env
+    vray_scene(install_scene)
+    daemon.post_script = [
+        (202, {"status": "ingesting"}, 1.2),
+        (422, {"errors": ["manifest.json missing"]}, 0.0),
+    ]
+    [result] = send(["CAM_front"], packets, cfg, post_timeout_s=0.3)
+    assert not result.ok and result.stage == "post"
+    assert result.errors[0].startswith("post: daemon: timed out; re-post answered 422")
+
+
+def test_a_202_whose_ingest_fails_is_reported(install_scene, daemon_env):
+    daemon, cfg, packets = daemon_env
+    vray_scene(install_scene)
+    daemon.post_body = {"packet_id": "x", "status": "ingesting", "events_url": "/api/v0/packets/x/events"}
+    daemon.events = [
+        {"seq": 1, "type": "ingest.file", "data": {"relpath": "beauty.exr"}},
+        {"seq": 2, "type": "ingest.failed", "data": {"errors": ["files.beauty_exr: blake3 mismatch"]}},
+    ]
+    [result] = send(["CAM_front"], packets, cfg)
+    assert result.status_code == 202 and result.events_url == "/api/v0/packets/x/events"
+    assert result.ingest.startswith("failed") and "blake3 mismatch" in result.ingest
+    assert not result.ok and result.stage == "ingest" and result.code == send_packet.INGEST_FAILED
+    assert daemon.event_requests[0].startswith("/api/v0/packets/x/events?")
+
+
+def test_an_ingest_still_running_after_the_window_is_ingesting(install_scene, daemon_env):
+    daemon, cfg, packets = daemon_env
+    vray_scene(install_scene)
+    daemon.events = [{"seq": 1, "type": "ingest.file", "data": {"relpath": "beauty.exr"}}]
+    [result] = send(["CAM_front"], packets, cfg, ingest_follow_s=0.0)
+    assert result.ok and result.ingest == "ingesting" and len(daemon.event_requests) == 1
+
+
+def test_post_timeout_grows_with_the_packet(monkeypatch, tmp_path):
+    monkeypatch.setattr(transport, "folder_bytes", lambda folder: 2 * transport.GIB)
+    assert transport.post_timeout_s(tmp_path) == pytest.approx(60.0)
 
 
 # --------------------------------------------------------------------------- exr_header

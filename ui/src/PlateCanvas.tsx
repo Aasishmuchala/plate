@@ -1,8 +1,10 @@
 // The canvas: xyflow renders the graph from the zustand store with one component per node kind (nodes/), typed
 // handles and the enforced rules (a refused connection never connects and says why on the target node for 4 s);
 // the Make bar is docked at the bottom; a status bar shows the daemon heartbeat and the token state; a NodeList
-// sidebar lists the nodes and the last refusal. App passes the editor, viewer and panels in as children of the
-// sidebar. One dark theme (MaxGaffer palette) lives in canvas/canvas.css.
+// sidebar lists the nodes and the last refusal. The sidebar mounts the artist-path editor (Plate, Edit, Export,
+// Review: `pathEditorFor`) of the selected node; App passes the other editors, the viewer and the panels in as
+// children of the sidebar. The add palette leaves out Colour and Compare (decision 41: the kinds stay in NODE_KINDS so
+// saved graphs load). One dark theme (MaxGaffer palette) lives in canvas/canvas.css.
 
 import {
   Background,
@@ -14,12 +16,15 @@ import {
   ReactFlow,
   useReactFlow,
 } from "@xyflow/react";
-import { type ReactNode, useCallback, useMemo } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo } from "react";
 import { useDaemonStatus } from "./api/useDaemonStatus";
 import { attemptConnect, checkConnection, connectionFromDrop } from "./canvas/connect";
 import { deriveNodeInfo, NodeInfoContext } from "./canvas/derive";
 import { useRunStore } from "./canvas/runStore";
+import { pathEditorFor } from "./editors";
+import { FAKE_ENGINE } from "./makebar/engines";
 import { MakeBar } from "./makebar/MakeBar";
+import { useMakeStore } from "./makebar/makeStore";
 import { NODE_KINDS, type NodeKind } from "./nodeTypes";
 import { PLATE_NODE_TYPES } from "./nodes/kinds";
 import { edgeType } from "./nodes/ports";
@@ -30,9 +35,22 @@ export { MakeBar };
 /** Fit the graph on load, but never blow a small graph up past 100%. */
 const FIT_VIEW = { maxZoom: 1, padding: 0.2 } as const;
 
+/**
+ * A stub daemon (`/health` says `stub_engine`) that has no `GET /engines` still runs its fake engine: add it to the
+ * build's catalogue the Make bar fell back to. A daemon that lists its engines lists the fake itself (T61).
+ */
+function useStubEngineFallback(stubEngine: boolean): void {
+  const engines = useMakeStore((s) => s.engines);
+  useEffect(() => {
+    if (!stubEngine || engines?.source !== "fallback" || engines.engines.some((e) => e.id === FAKE_ENGINE.id)) return;
+    useMakeStore.setState({ engines: { ...engines, engines: [...engines.engines, FAKE_ENGINE] } });
+  }, [stubEngine, engines]);
+}
+
 /** Daemon health from `GET /api/v0/health` and whether this tab holds a bearer token. */
 export function StatusBar() {
   const { state, health, tokenPresent } = useDaemonStatus();
+  useStubEngineFallback(state === "up" && health?.stub_engine === true);
   const daemon =
     state === "checking"
       ? "checking"
@@ -80,6 +98,19 @@ export function NodeList() {
   );
 }
 
+/** Kinds the add palette leaves out (decision 41): Recolour, LightMix and Set cover photometry; Compare is P5. */
+export const PALETTE_HIDDEN: ReadonlySet<NodeKind> = new Set<NodeKind>(["Colour", "Compare"]);
+
+/** The kinds the add palette offers, in NODE_KINDS order. */
+export const PALETTE_KINDS: readonly NodeKind[] = NODE_KINDS.filter((k) => !PALETTE_HIDDEN.has(k));
+
+/** The artist-path editor (Plate, Edit, Export, Review) of the selected node; nothing for any other kind. */
+function SelectedPathEditor() {
+  const selected = useGraphStore((s) => s.nodes.find((n) => n.selected));
+  const Editor = selected ? pathEditorFor(selected.data.kind) : null;
+  return Editor && selected ? <Editor nodeId={selected.id} /> : null;
+}
+
 /** Add a node near the middle of the visible canvas, nudged so repeated adds do not stack exactly. */
 function AddPalette() {
   const addNode = useGraphStore((s) => s.addNode);
@@ -100,7 +131,7 @@ function AddPalette() {
       <details>
         <summary>+ node</summary>
         <div className="add-palette-grid">
-          {NODE_KINDS.map((k) => (
+          {PALETTE_KINDS.map((k) => (
             <button
               key={k}
               type="button"
@@ -199,6 +230,7 @@ export default function PlateCanvas({ children }: { children?: ReactNode }) {
           </div>
           <aside className="plate-side">
             <NodeList />
+            <SelectedPathEditor />
             {children}
           </aside>
         </div>

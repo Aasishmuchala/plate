@@ -30,18 +30,23 @@ jobs:
       - name: hazard scanner selftest
         run: uv run --no-sync python scripts/hazard_scan.py --selftest
       - name: Windows-hazard scan
-        run: uv run --no-sync python scripts/hazard_scan.py
+        # --strict-allow also fails on a scripts/hazard_allow.txt entry that no longer matches anything.
+        run: uv run --no-sync python scripts/hazard_scan.py --strict-allow
       - name: ruff check
         run: uv run --no-sync ruff check .
       - name: ruff format
         run: uv run --no-sync ruff format --check .
       - name: licence registry
-        # python -m plate_pixels.licences --check fails the build on a non-commercial model (T22 adds --check).
-        if: hashFiles('pixels/plate_pixels/licences.py') != ''
-        continue-on-error: false
+        # Fails the build when any pixels/ module or requirements file names a non-commercial model weight.
         run: uv run --no-sync python -m plate_pixels.licences --check
       - name: pytest
         run: uv run --no-sync pytest
+      - name: pytest scripts
+        # scripts/ is outside pytest's testpaths: the hazard scanner, claims check and CI parity tests.
+        run: uv run --no-sync pytest scripts/tests
+      - name: claims as tests
+        # Every public claim in README.md and docs/client-explainer.md must have a passing test (claims.yaml).
+        run: uv run --no-sync python scripts/claims_check.py
       - name: npm test
         run: npm test
       - name: npm run build

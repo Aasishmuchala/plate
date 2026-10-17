@@ -7,7 +7,8 @@ phases, so a crash in between leaves an id recovery re-polls), SUBMITTED -> RUNN
 running or succeeded), RUNNING -> FETCHING / REFUSED / FAILED(timeout), FETCHING -> NORMALIZING (fetch the
 bytes into the CAS at once: result URLs expire), NORMALIZING -> GATING (`normalize_fn`, a stub by default),
 GATING -> DONE or GATE_FAIL (`gate_fn`; the stub fails only on `params.force_gate_fail`). A poll that shows
-no progress leaves the state alone. `run_to_completion` loops `step`, sleeping `poll_interval_s` between
+no progress leaves the state alone; a poll that raises (an unknown job, a transport fault) fails the run as
+`provider_poll_error` and never propagates. `run_to_completion` loops `step`, sleeping `poll_interval_s` between
 idle polls. A queued run whose request is identical to another run's is CANCELLED as `duplicate_request`.
 
 `Runner(index, bus, adapters, gate_fn, normalize_fn)` drives every project of an `Index`: `tick()` advances
@@ -24,6 +25,7 @@ SUBMITTED); a run in STAGING whose intent was written but whose id was not is ad
 `engine.lookup` when the adapter has one, re-staged with the same idempotency key when the adapter declares
 `idempotent_submit`, otherwise FAILED as `submit_state_unknown` for a human; a STAGING run with no intent
 never reached the provider and simply submits on its next step; an expired QUOTED run becomes EXPIRED.
+`recover_on_boot` leaves pipeline runs (`skip=is_pipeline_run`) to `Pipeline.resume`, which knows their real engine.
 Steps on one run are serialised by an in-process lock (the API's step and cancel routes run on a thread
 pool), and the daemon's app-data lock keeps a second process away.
 """
@@ -274,7 +276,11 @@ def _staging(c: _Ctx, run: Run) -> RunState:
 
 def _polling(c: _Ctx, run: Run) -> RunState:
     st = run.state
-    res: PollResult = c.engine.poll(run.provider_job_id)
+    try:
+        res: PollResult = c.engine.poll(run.provider_job_id)
+    except Exception as e:  # an unknown job or a transport fault ends the run; it never unwinds the worker
+        # FAILED with the provider id kept: a job may exist, so the spend settles instead of refunding.
+        return _fail(c, run, "provider_poll_error", f"{type(e).__name__}: {e}"[:500])
     _fault(c.engine, st, "after_effect")
     if res.status == "refused":
         transition(
@@ -459,16 +465,26 @@ def _non_terminal_ids(conn: sqlite3.Connection) -> list[str]:
     ]
 
 
+def is_pipeline_run(run: Run) -> bool:
+    """`pipeline.is_pipeline_run`, bound late: the pipeline module imports this one."""
+    from .pipeline import is_pipeline_run as _is_pipeline_run
+
+    return _is_pipeline_run(run)
+
+
 def _recover(
     conn: sqlite3.Connection,
     adapter_for: Callable[[Run], Any],
     clock: Clock,
     cas: CAS | None,
+    skip: Callable[[Run], bool] | None = None,
 ) -> list[dict[str, str]]:
     actions: list[dict[str, str]] = []
     for rid in _non_terminal_ids(conn):
         with run_lock(rid):
             run = get_run(conn, rid)
+            if skip is not None and skip(run):
+                continue
             if run.provider_job_id:
                 if run.state is S.STAGING:
                     engine = adapter_for(run)
@@ -493,10 +509,20 @@ def _recover(
 
 
 def recover_on_boot(
-    conn: sqlite3.Connection, engine: Any, clock: Clock = utcnow, *, cas: CAS | None = None
+    conn: sqlite3.Connection,
+    engine: Any,
+    clock: Clock = utcnow,
+    *,
+    cas: CAS | None = None,
+    skip: Callable[[Run], bool] | None = is_pipeline_run,
 ) -> list[dict[str, str]]:
-    """Reconcile every non-terminal run after a restart. Returns one action record per run touched."""
-    return _recover(conn, lambda run: engine, clock, cas)
+    """Reconcile every non-terminal run after a restart. Returns one action record per run touched.
+
+    `engine` is the one engine every run is reconciled against, which is only right for seed runs (the
+    in-process fake). A run for which `skip(run)` is true is left alone: by default pipeline runs, which the
+    pipeline resumes with their real engine (`Pipeline.resume` through `StagedEngine` / `AdapterBridge`), so
+    boot never resubmits one to the wrong provider. Pass `skip=None` to reconcile every run."""
+    return _recover(conn, lambda run: engine, clock, cas, skip)
 
 
 def cancel_run(

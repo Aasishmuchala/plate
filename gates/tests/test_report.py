@@ -33,15 +33,24 @@ def test_fields_and_defaults():
         "tier",
         "metrics",
         "checks",
+        "thresholds",
         "verdict",
+        "flagged_points",
         "backend_notes",
         "created_utc",
     ]
     assert d["gate_version"] == __version__ == "0.1.0"
-    assert d["threshold_set_id"] == "ts-2026.10.17-draft"
+    assert d["threshold_set_id"] == "ts-2026.10.18-draft"
     assert d["engine"] == {"id": "nano-banana-2.1", "version": "2026-10"} and d["tier"] == "A"
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", d["created_utc"])
-    assert d["checks"][0] == {"metric_id": "texture.lapvar", "value": 412.0, "status": "pass"}
+    assert d["checks"][0] == {
+        "metric_id": "texture.lapvar",
+        "value": 412.0,
+        "status": "pass",
+        "threshold": [300.0, 600.0],
+        "op": "range",
+        "unit": "variance",
+    }  # what the check was held to rides along (T60)
     assert GateReport().engine is None
 
 

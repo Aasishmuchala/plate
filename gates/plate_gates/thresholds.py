@@ -9,6 +9,8 @@ number means adding a NEW set id; a shipped report keeps pointing at the set it 
 
 check() returns 'fail' only for a hard threshold that is missed; a missed advisory / calibration_needed
 threshold returns 'advisory' (reported, never blocks); anything inside its bound returns 'pass'.
+
+describe() says what a check was held to ({threshold, op, unit}); gate reports copy it onto every check they score.
 """
 
 from __future__ import annotations
@@ -27,14 +29,28 @@ __all__ = [
     "ThresholdSet",
     "load",
     "check",
+    "describe",
     "long_edge_min_px",
 ]
 
-DEFAULT_THRESHOLDS_ID = "ts-2026.10.17-draft"
+DEFAULT_THRESHOLDS_ID = "ts-2026.10.18-draft"
 
 _YAML = Path(__file__).with_name("thresholds.yaml")
 
 Status = Literal["hard", "advisory", "calibration_needed"]
+
+# Units for the metrics whose yaml entry declares none (the yaml is data other tasks own; a report still names
+# what a number is measured in). A unit declared in the yaml always wins.
+DEFAULT_UNITS: dict[str, str] = {
+    "gbuffer_edge_recall_r2": "ratio",
+    "texture.lapvar": "variance",
+    "texture.fine_ratio": "ratio",
+    "tone.luma": "levels/255",
+    "tone.contrast": "levels/255",
+    "tone.sat": "levels/255",
+    "video.reproj_edge_recall": "ratio",
+    "image_edge_agreement": "ratio",
+}
 
 
 class Threshold(BaseModel):
@@ -91,6 +107,23 @@ class Threshold(BaseModel):
             )
         return float(self.value)
 
+    def describe(self, variant: str | None = None, target: float | None = None) -> dict[str, object]:
+        """What a check scored against this entry is held to: {threshold, op, unit}.
+
+        threshold is the bound (a float, or [low, high] for a range entry; None while a param entry has no
+        target yet), op is le / ge / eq / param, or "range" for a [low, high] entry, unit the yaml unit (else
+        DEFAULT_UNITS, else None). `variant` / `target` pick the bound exactly as bound() does.
+        """
+        try:
+            b = self.bound(variant, target)
+        except ValueError:  # a param entry whose bound is supplied at check time and was not
+            b = None
+        return {
+            "threshold": [float(b[0]), float(b[1])] if isinstance(b, tuple) else b,
+            "op": "range" if self.range is not None else self.op,
+            "unit": self.unit or DEFAULT_UNITS.get(self.id),
+        }
+
     def passes(self, value: float, variant: str | None = None, target: float | None = None) -> bool:
         v = float(value)
         if math.isnan(v):
@@ -139,6 +172,16 @@ class ThresholdSet(BaseModel):
             return "pass", thr
         return ("fail" if thr.effective_status(backend) == "hard" else "advisory"), thr
 
+    def describe(
+        self, metric_id: str, *, variant: str | None = None, target: float | None = None
+    ) -> dict[str, object]:
+        """{threshold, op, unit} of a registered metric (Threshold.describe); KeyError for an unknown id.
+
+        check() keeps returning (status, Threshold) because every caller unpacks that pair; the Threshold it
+        hands back carries the same description, and report.scored_check() joins the two into a Check.
+        """
+        return self.get(metric_id).describe(variant=variant, target=target)
+
     def long_edge_min_px(self, width: int) -> int:
         """Minimum connected-edge length at an evaluation width: round(30 * width / 1500)."""
         thr = self.get("long_edge_min_px")
@@ -166,6 +209,11 @@ def check(
 ) -> tuple[Literal["pass", "fail", "advisory"], Threshold]:
     """Module-level shorthand for load().check(...)."""
     return load().check(metric_id, value, variant=variant, backend=backend, target=target)
+
+
+def describe(metric_id: str, *, variant: str | None = None, target: float | None = None) -> dict[str, object]:
+    """Shorthand for load().describe(...)."""
+    return load().describe(metric_id, variant=variant, target=target)
 
 
 def long_edge_min_px(width: int) -> int:

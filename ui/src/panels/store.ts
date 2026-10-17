@@ -1,8 +1,15 @@
 // Panel state shared across panels: the project's runs, the selected candidate run, its scrub progress and logged
-// scrub, the verdicts given, and the viewer request ("Open tiles"). The graph itself stays in `useGraphStore`; this
-// store holds only what the panels need to talk to each other and to the viewer.
+// scrub, the verdicts given, the takes accepted, and the viewer request ("Open tiles"). The graph itself stays in
+// `useGraphStore`; this store holds only what the panels need to talk to each other and to the viewer.
+//
+// Accept (doctrine 7): `acceptRun` needs the run's logged full scrub, posts `/runs/{id}/accept` with it, then marks
+// the producing node approved on the canvas and saves the graph, so the daemon (which owns `approved`) and the
+// canvas rules both see the accepted take.
 
 import { create } from "zustand";
+import { acceptRun as postAccept, UI_ACTOR } from "../canvas/runApi";
+import { useRunStore } from "../canvas/runStore";
+import { useGraphStore } from "../store";
 import type { Point, Size, ViewerMode } from "../viewer/types";
 import { errorMessage, listRuns, postScrub, postVerdict } from "./api";
 import {
@@ -56,6 +63,8 @@ export interface PanelsState {
   /** run id -> scrub_log_id returned by the daemon. */
   scrubLogs: Record<string, string>;
   verdicts: Record<string, VerdictName>;
+  /** run id -> true once the daemon accepted the take. */
+  accepted: Record<string, true>;
   viewer: ViewerRequest;
   rater: string;
   /** The last thing a key or button did, shown under the verdict keys. */
@@ -70,6 +79,8 @@ export interface PanelsState {
   logScrub: () => Promise<Outcome>;
   /** Record a verdict for the selected run. Refused without a logged full scrub. */
   recordVerdict: (verdict: VerdictName, reasons: string[]) => Promise<Outcome>;
+  /** Accept a take: refused here without its logged full scrub; on success its node is approved and the graph saved. */
+  acceptRun: (runId: string) => Promise<Outcome>;
   setDrop: (drop: DropState) => void;
   openTiles: (points: Point[]) => void;
   setViewerMode: (mode: ViewerMode) => void;
@@ -88,6 +99,7 @@ export function initialPanelsState(): Pick<
   | "scrub"
   | "scrubLogs"
   | "verdicts"
+  | "accepted"
   | "viewer"
   | "rater"
   | "outcome"
@@ -103,6 +115,7 @@ export function initialPanelsState(): Pick<
     scrub: EMPTY_SCRUB,
     scrubLogs: {},
     verdicts: {},
+    accepted: {},
     viewer: { mode: "wipe", tiles: [] },
     rater: readRater(),
     outcome: null,
@@ -112,6 +125,23 @@ export function initialPanelsState(): Pick<
 
 const fail = (message: string): Outcome => ({ ok: false, message });
 const done = (message: string): Outcome => ({ ok: true, message });
+
+/** The canvas node that made a run: the daemon's answer, else the runs list, else the candidate strip. */
+function producingNode(answer: { node_id?: string | null } | null, runId: string, runs: RunRow[]): string | null {
+  return answer?.node_id ?? runs.find((r) => r.id === runId)?.node_id ?? useRunStore.getState().candidates[runId]?.nodeId ?? null;
+}
+
+/** After the daemon accepted: approve the producing node with the scrub that allowed it, then save the graph. */
+async function approveOnCanvas(nodeId: string, scrubLogId: string): Promise<Outcome> {
+  useGraphStore.getState().setNodeStatus(nodeId, { approved: true, approvedBy: UI_ACTOR, scrubLogId }, { id: scrubLogId, fullScrub: true });
+  const graph = useGraphStore.getState();
+  if (graph.nodes.find((n) => n.id === nodeId)?.data.approved !== true) {
+    return fail(`take accepted, but the canvas did not mark it: ${graph.lastRefusal ?? `no node ${nodeId}`}`);
+  }
+  await graph.saveNow();
+  const saveError = useGraphStore.getState().saveError;
+  return saveError ? fail(`take accepted, but the graph was not saved: ${saveError.message}`) : done("take accepted");
+}
 
 export const usePanelsStore = create<PanelsState>()((set, get) => ({
   ...initialPanelsState(),
@@ -171,6 +201,24 @@ export const usePanelsStore = create<PanelsState>()((set, get) => ({
         out = done(`${VERDICT_LABEL[verdict]} recorded`);
       } catch (err) {
         out = fail(`verdict not recorded: ${errorMessage(err)}`);
+      }
+    }
+    set({ outcome: out });
+    return out;
+  },
+  acceptRun: async (runId) => {
+    const scrubLogId = get().scrubLogs[runId];
+    let out: Outcome;
+    if (!scrubLogId) {
+      out = fail("a full scrub must be logged before the take is accepted");
+    } else {
+      try {
+        const answer = await postAccept(runId, scrubLogId, UI_ACTOR);
+        set((s) => ({ accepted: { ...s.accepted, [runId]: true } }));
+        const nodeId = producingNode(answer, runId, get().runs);
+        out = nodeId ? await approveOnCanvas(nodeId, scrubLogId) : done("take accepted (its node is not on this canvas)");
+      } catch (err) {
+        out = fail(`take not accepted: ${errorMessage(err)}`);
       }
     }
     set({ outcome: out });

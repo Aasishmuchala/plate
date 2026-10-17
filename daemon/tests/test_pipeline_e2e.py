@@ -86,6 +86,13 @@ def sync_settings(plate_env, monkeypatch) -> Settings:
     return Settings.load()
 
 
+@pytest.fixture
+def dev_settings(sync_settings, monkeypatch) -> Settings:
+    """The seed's dev driver (`POST /runs/{id}/queue`, `/step`) is mounted only under PLATE_DEV=1 (decision 36)."""
+    monkeypatch.setenv("PLATE_DEV", "1")
+    return Settings.load()
+
+
 def _client(settings: Settings, engine) -> TestClient:
     c = TestClient(create_app(settings, engine), base_url=BASE)
     c.app.state.pipeline.sleep = lambda _s: None
@@ -158,13 +165,13 @@ def test_packet_to_gated_output_on_the_fake_engine(sync_settings, auth, tmp_path
             "registration.residual_px",
             "registration.shift_px",
             "outside_mask.de00",
-            "feather_band.de00_p99",
             "gbuffer_edge_recall_r2",
             "invention_flags",
             "material.de00_median",
             "material.de00_p90",
         ):
             assert status[hard] == "pass", (hard, status)
+        assert status["feather_band.de00_p99"] == "advisory"  # decision 35: advisory until calibration (T23)
         assert rep["threshold_set_id"] and rep["metric_code_hash"]
         project_dir = sync_settings.projects_dir / PROJECT
         assert (project_dir / rep["path"]).is_file()
@@ -219,11 +226,13 @@ def test_packet_to_gated_output_on_the_fake_engine(sync_settings, auth, tmp_path
         assert c.get(f"/api/v0/assets/{out_key}?fmt=png", headers=auth).content == cas.read_bytes(out_key)
         assert c.get(f"/api/v0/assets/{'0' * 64}", headers=auth).status_code == 404
 
-        # Export writes the gated composite (with its lineage), never the engine's raw bytes.
+        # Export writes the gated composite (with its lineage), never the engine's raw bytes. It goes through
+        # `export.export` (decision 39), which adds the lineage and an sRGB ICC profile: the pixels are the
+        # composite's, the file bytes are not the CAS object's.
         dest = tmp_path / "out" / "take.png"
         r = c.post(f"/api/v0/runs/{run_id}/export", json={"dest": str(dest)}, headers=auth)
         assert r.status_code == 200, r.text
-        assert dest.read_bytes() == cas.read_bytes(out_key)
+        assert np.array_equal(decode_png16(dest.read_bytes()), out)
         lin = lineage.read(dest)
         assert lin is not None and lin.run_id == run_id and lin.packet_id == packet_id and lin.node_id == "e"
 
@@ -354,8 +363,8 @@ def test_best_of_three_runs_under_one_approval_and_is_ranked(sync_settings, auth
         assert len(ranked) == 1 and sorted(ranked[0]["data"]["order"]) == sorted(s["id"] for s in sibs.json())
 
 
-def test_the_step_driver_runs_pipeline_runs_through_the_real_gates(sync_settings, auth):
-    with _client(sync_settings, EchoEngine()) as c:
+def test_the_step_driver_runs_pipeline_runs_through_the_real_gates(dev_settings, auth):
+    with _client(dev_settings, EchoEngine()) as c:
         _setup(c, auth)
         run_id = _quote(c, auth)["run"]["id"]
         r = c.post(f"/api/v0/runs/{run_id}/approve", json={"by": "human", "start": False}, headers=auth)
@@ -388,14 +397,14 @@ def test_a_region_crop_sends_only_the_mask_box_and_lands_back_in_place(sync_sett
         assert rep["metrics"]["registration"]["residual_px"] <= 1.0
 
 
-def test_a_restarted_daemon_drives_on_the_runs_it_left_in_flight(sync_settings, auth):
-    with _client(sync_settings, EchoEngine()) as c:
+def test_a_restarted_daemon_drives_on_the_runs_it_left_in_flight(dev_settings, auth):
+    with _client(dev_settings, EchoEngine()) as c:
         _setup(c, auth)
         run_id = _quote(c, auth)["run"]["id"]
         c.post(f"/api/v0/runs/{run_id}/approve", json={"by": "human", "start": False}, headers=auth)
         assert c.post(f"/api/v0/runs/{run_id}/queue", headers=auth).json()["state"] == "QUEUED"
     engine = EchoEngine()
-    with _client(sync_settings, engine) as c:  # the new daemon's start-up resumes the queued run
+    with _client(dev_settings, engine) as c:  # the new daemon's start-up resumes the queued run
         deadline = time.monotonic() + 60
         state = "QUEUED"
         while state not in ("DONE", "GATE_FAIL", "FAILED") and time.monotonic() < deadline:

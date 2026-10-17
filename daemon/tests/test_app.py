@@ -46,6 +46,7 @@ def test_root_serves_ui_dist_when_present(tmp_path, monkeypatch, auth):
 
 def test_packet_to_export_on_the_project_cas(tmp_path, monkeypatch, auth):
     monkeypatch.setenv("PLATE_SYNC_INGEST", "1")
+    monkeypatch.setenv("PLATE_DEV", "1")  # the seed driver (POST /runs, /quote, /queue, /step): decision 36
     settings = Settings.load()
     packet = plate_spec.materialize_example("tierA_still_clubhouse", settings.packets_dirs[0] / "pkt")
     manifest = json.loads((packet / "manifest.json").read_text(encoding="utf-8"))

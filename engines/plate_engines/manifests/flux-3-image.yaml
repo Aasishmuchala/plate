@@ -26,6 +26,15 @@ params:
   - {name: output_format, type: enum, default: "png", enum: ["jpeg", "png"]}
   - {name: safety_tolerance, type: int, range: [0, 6], advanced: true}
   - {name: prompt_upsampling, type: bool, default: false, advanced: true}
+# UNCONFIRMED until the BFL smoke test: these sizes come from the build plan (T61), not from a BFL spec for
+# FLUX 3. Because flags keeps unverified_p0, plate_pixels.sizes ignores the arbitrary envelope while legal
+# presets exist, so egress picks one of the two legal sizes and never guesses.
+sizes:
+  legal:
+    - {w: 1024, h: 1024, label: "1MP"}
+    - {w: 1440, h: 1440}
+  arbitrary: {min_side: 256, max_side: 1440, aspect_min: 0.33, aspect_max: 3.0}
+  auto: false
 price:
   model: per_image
   usd: 0.12

@@ -1,4 +1,4 @@
-.PHONY: help setup selftest hazard test test-py test-ui lint fmt check spec daemon pixels label
+.PHONY: help setup selftest hazard licences claims build test test-py test-scripts test-ui ci lint fmt check spec daemon pixels label
 
 PYPATH := spec:daemon:pixels:engines:gates:plugins/max:tools
 PY := PYTHONPATH=$(PYPATH) .venv/bin/python
@@ -8,9 +8,12 @@ RUFF := .venv/bin/ruff
 help:
 	@echo "make setup     uv sync (Python 3.12) + npm install"
 	@echo "make selftest  fidelity_bench selftest (first CI job)"
-	@echo "make hazard    Windows-hazard scan (fcntl, os.rename, open() without encoding, ...)"
+	@echo "make hazard    Windows-hazard scanner selftest, then the scan (fcntl, os.rename, open() without encoding, ...)"
+	@echo "make licences  fail on a non-commercial model weight named anywhere in pixels/"
+	@echo "make claims    run the tests behind every public claim (claims.yaml); fail if one lacks a passing test"
 	@echo "make test      selftest, hazard scan, then pytest and npm test"
 	@echo "make lint      ruff check + format check"
+	@echo "make ci        every step of .github/workflows/ci.yml, in its order"
 	@echo "make spec      validate the three example packets"
 	@echo "make daemon    run the daemon on 127.0.0.1:4610 (fake engine)"
 	@echo "make pixels    run the pixels worker in stub mode"
@@ -30,9 +33,25 @@ test-ui:
 	npm test
 
 hazard:
-	$(PY) scripts/hazard_scan.py
+	$(PY) scripts/hazard_scan.py --selftest
+	$(PY) scripts/hazard_scan.py --strict-allow
+
+licences:
+	$(PY) -m plate_pixels.licences --check
+
+claims:
+	$(PY) scripts/claims_check.py
+
+build:
+	npm run build
+
+test-scripts:
+	$(PYTEST) scripts/tests
 
 test: selftest hazard test-py test-ui
+
+# The CI job, step for step (scripts/tests/test_ci_parity.py keeps this, the justfile and ci.yml in step).
+ci: selftest hazard lint licences test-py test-scripts claims test-ui build
 
 lint:
 	$(RUFF) check .

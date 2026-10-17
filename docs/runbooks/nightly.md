@@ -80,7 +80,7 @@ from plate_daemon.config import Settings
 from plate_daemon.scheduler import Nightly
 
 nightly = Nightly(Settings.load())
-record = nightly.run_now(["reconcile"], force=True)   # one job; omit the list for all of them
+record = nightly.run_now(["reconcile"], force=True)  # one job; omit the list for all of them
 print(json.dumps({k: v["status"] for k, v in record["jobs"].items()}, indent=1))
 ```
 

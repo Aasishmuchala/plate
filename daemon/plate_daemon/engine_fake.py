@@ -19,14 +19,25 @@ same request always gives the same pixels and a different input gives different 
 keeps the seed's one-line `PLATE-FAKE-RESULT <job> <key>` body for tests written against it. The provider
 dedupes on the idempotency key (`idempotent_submit`), as the plan requires of real adapters that claim it.
 
+`echo=True` makes the result the PNG the submit payload carried (`inputs.image.b64`, decoded), so the gates
+score real pixels instead of noise; `shift_px` then moves it that many pixels to the right with edge
+replication (a negative value moves it left), which is how a test or a demo makes a camera-drift GATE_FAIL.
+A payload that carried no image has nothing to echo and gets the deterministic noise. The echoed bytes are
+held in memory only (the newest `ECHO_KEEP` jobs), never in the journal: a restarted daemon echoes again once
+the pipeline re-submits, and a fetch for a job whose image was lost raises `ResultExpired`.
+
 Jobs, the call counters and the call log (`calls`: one `{op, job, key}` per submit, poll, fetch, cancel and
 lookup) persist to a JSON `journal` with atomic replaces, so a daemon killed mid-run restarts against the
 same provider state: that is what makes "exactly one submit" across a real process restart an honest
-assertion. `PLATE_FAKE_ENGINE` (JSON of these flags) configures the daemon's in-process instance.
+assertion. `PLATE_FAKE_ENGINE` configures the daemon's in-process instance: a JSON object of these flags, or
+`1` (also `true`, `yes`, `on`) for the echoing fake (`{"echo": true}`); unset, empty, `0` or `false` mean the
+defaults.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import copy
 import json
 import os
@@ -34,6 +45,7 @@ import struct
 import threading
 import time
 import zlib
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Literal
 
@@ -50,6 +62,9 @@ CRASH_PHASES = ("before", "after_effect", "after_persist", "after_commit")
 RESULT_SCHEME = "fake://results/"
 SLOW_POLLS = 6
 DEFAULT_SIZE = (64, 64)
+ECHO_KEEP = 32
+TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
+FALSE_WORDS = frozenset({"", "0", "false", "no", "off"})
 FLAG_NAMES = (
     "seed",
     "behaviour",
@@ -65,6 +80,8 @@ FLAG_NAMES = (
     "supports_lookup",
     "size",
     "output",
+    "echo",
+    "shift_px",
 )
 
 
@@ -115,6 +132,41 @@ def payload_digest(payload: dict[str, Any]) -> tuple[str, str, int]:
     return inputs_hash, params_hash, variant
 
 
+def payload_image(payload: dict[str, Any]) -> bytes | None:
+    """The bytes of `inputs.image.b64` in a provider payload, or None when it carries no decodable image."""
+    image = (payload.get("inputs") or {}).get("image")
+    b64 = image.get("b64") if isinstance(image, dict) else None
+    if not isinstance(b64, str) or not b64:
+        return None
+    try:
+        return base64.b64decode(b64, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def shift_right(png: bytes, shift_px: int) -> bytes:
+    """`png` moved `shift_px` pixels to the right (left when negative), the uncovered columns filled by
+    replicating the edge column. Zero returns the bytes untouched; the dtype and channels are kept."""
+    if not shift_px:
+        return png
+    import cv2
+    import numpy as np
+
+    img = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError("echo: the submitted image is not a decodable PNG")
+    w = img.shape[1]
+    k = min(abs(int(shift_px)), w)
+    if shift_px > 0:
+        out = np.concatenate([np.repeat(img[:, :1], k, axis=1), img[:, : w - k]], axis=1)
+    else:
+        out = np.concatenate([img[:, k:], np.repeat(img[:, -1:], k, axis=1)], axis=1)
+    ok, enc = cv2.imencode(".png", out)
+    if not ok:
+        raise ValueError("echo: could not re-encode the shifted image")
+    return bytes(enc)
+
+
 def render(
     seed: int, inputs_hash: str, params_hash: str, variant: int, size: tuple[int, int] = DEFAULT_SIZE
 ) -> bytes:
@@ -147,6 +199,8 @@ class FakeEngine:
         supports_lookup: bool = False,
         size: tuple[int, int] | list[int] = DEFAULT_SIZE,
         output: Literal["png", "text"] = "png",
+        echo: bool = False,
+        shift_px: int = 0,
         journal: Path | None = None,
     ):
         if behaviour not in BEHAVIOURS:
@@ -175,8 +229,11 @@ class FakeEngine:
         self.supports_lookup = supports_lookup
         self.size = (w, h)
         self.output = output
+        self.echo = bool(echo)
+        self.shift_px = int(shift_px)
         self.journal = Path(journal) if journal is not None else None
         self._lock = threading.RLock()
+        self._echo_src: OrderedDict[str, bytes] = OrderedDict()
         self._crashed = False
         self._state = _empty_state()
         if self.journal is not None and self.journal.exists():
@@ -187,9 +244,18 @@ class FakeEngine:
     @classmethod
     def from_env(cls, journal: Path | None, env_var: str = "PLATE_FAKE_ENGINE") -> FakeEngine:
         raw = os.environ.get(env_var, "").strip()
-        flags = json.loads(raw) if raw else {}
+        word = raw.lower()
+        if word in TRUE_WORDS:
+            flags: Any = {"echo": True}
+        elif word in FALSE_WORDS:
+            flags = {}
+        else:
+            try:
+                flags = json.loads(raw)
+            except ValueError as e:
+                raise ValueError(f"{env_var} must be 1, 0 or a JSON object of FakeEngine flags ({e})") from e
         if not isinstance(flags, dict):
-            raise ValueError(f"{env_var} must be a JSON object of FakeEngine flags")
+            raise ValueError(f"{env_var} must be 1, 0 or a JSON object of FakeEngine flags")
         unknown = set(flags) - set(FLAG_NAMES)
         if unknown:
             raise ValueError(f"{env_var}: unknown FakeEngine flags {sorted(unknown)}")
@@ -202,6 +268,8 @@ class FakeEngine:
         flags.setdefault("behaviour", self.behaviour)
         flags.setdefault("size", self.size)
         flags.setdefault("output", self.output)
+        flags.setdefault("echo", self.echo)
+        flags.setdefault("shift_px", self.shift_px)
         new = FakeEngine(journal=self.journal, **flags)
         if self.journal is None:
             with self._lock:
@@ -298,18 +366,31 @@ class FakeEngine:
                     "inputs_hash": inputs_hash,
                     "params_hash": params_hash,
                     "variant": variant,
+                    "has_image": payload_image(payload) is not None,
                     "polls": 0,
                     "cancelled": False,
                 }
                 st["by_key"][idempotency_key] = job_id
             self._log("submit", job_id, idempotency_key)
             self._save()
+            self._keep_echo_source(job_id, payload)
         if self.crash_after_submit_before_persist and not self._crashed:
             self._crashed = True
             raise SimulatedCrash(
                 "simulated crash after the provider accepted the job, before the id was persisted"
             )
         return job_id
+
+    def _keep_echo_source(self, job_id: str, payload: dict[str, Any]) -> None:
+        """Hold the PNG a submit carried so `fetch` can hand it back. Every submit does this, deduped ones
+        included: a restarted daemon that re-submits the same key refills what it lost."""
+        data = payload_image(payload) if self.echo else None
+        if data is None:
+            return
+        self._echo_src[job_id] = data
+        self._echo_src.move_to_end(job_id)
+        while len(self._echo_src) > ECHO_KEEP:
+            self._echo_src.popitem(last=False)
 
     def poll(self, provider_job_id: str) -> PollResult:
         with self._lock:
@@ -345,6 +426,11 @@ class FakeEngine:
                 raise ResultExpired(f"{result_url}: no such job")
             if self.output == "text":
                 return f"PLATE-FAKE-RESULT {job_id} {job['idempotency_key']}\n".encode()
+            if self.echo and job.get("has_image"):
+                sent = self._echo_src.get(job_id)
+                if sent is None:
+                    raise ResultExpired(f"{result_url}: the image to echo is gone (resubmit the job)")
+                return shift_right(sent, self.shift_px)
             return render(
                 self.seed,
                 job.get("inputs_hash", ""),

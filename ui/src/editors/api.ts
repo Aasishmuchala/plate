@@ -1,16 +1,17 @@
 // Daemon calls behind the node editors. Every call goes through the token-carrying `fetchJson`; every response is
 // normalised here so the editors see small typed shapes and never throw on a field a daemon version omits.
 //
-//   POST /api/v0/pixels/idpick   {packet_id, x, y, kind?}      -> {id, name, class?, kind?, editable?, depth_m?}   (T47 spec)
+//   POST /api/v0/pixels/idpick   {packet_id, x, y, kind?}      -> {id, name, class, kind, editable, locked, coverage, depth_m}
+//                                                                                                                     (T62 route)
 //   POST /api/v0/pixels/segment  {packet_id, points}           -> {mask_hash?, segments}                           (T47 spec: pixels /segment)
 //   POST /api/v0/pixels/ocr      {packet_id}                   -> {boxes: [{bbox, text, conf}], shape}             (pixels /ocr)
-//   POST /api/v0/assets?kind=mask  body = PNG bytes            -> {hash}                      (a mask to CAS; no task owns it yet)
+//   POST /api/v0/assets?kind=mask&project_id=<id>  body = PNG bytes -> {hash}                  (T56: a mask to the project's CAS)
 //   POST /api/v0/projects/{pid}/nodes/{node}/preview {what, params}  -> router | set | lightmix | recolour numbers
-//                                                                       (numeric, no spend, no engine; no task owns it yet)
+//                                                                       (numeric, no spend, no engine; T48, router: T73)
 //   POST /api/v0/plugin/jobs     {action, ...}                 -> {id, state}     (T48 queue; the Max dock polls it)
+//   GET  /api/v0/plugin/jobs/{id}                              -> {id, state, result?: {ok, detail?, packet_id?}}
 //
-// "No task owns it yet" routes are listed in README.md for the integrator; the editors show the daemon's refusal (a
-// 404 included) in a notice and stay usable by hand.
+// The editors show the daemon's refusal (a 404 included) in a notice and stay usable by hand.
 
 import { fetchJson, postJson } from "../api";
 import { errorMessage } from "../panels/api";
@@ -34,6 +35,10 @@ export interface IdPickResult {
   kind: "object" | "material" | "segment";
   /** False when policy locks this id (the daemon's word) or its class is never editable. */
   editable: boolean;
+  /** True when the packet policy locks this id; null when the daemon does not say. */
+  locked: boolean | null;
+  /** Share of the pixel the id covers, 0..1 (Cryptomatte coverage); null when the daemon does not say. */
+  coverage: number | null;
   /** Packet Z at the pixel in metres, when the daemon sends it (the People ground-point picker uses it). */
   depthM: number | null;
 }
@@ -42,12 +47,15 @@ export function parseIdPick(body: unknown): IdPickResult {
   const r = isRecord(body) ? body : {};
   const cls: IdClass = isIdClass(r.class) ? r.class : "other";
   const kind = r.kind === "material" || r.kind === "segment" ? r.kind : "object";
+  const locked = typeof r.locked === "boolean" ? r.locked : null;
   return {
     id: str(r.id),
     name: str(r.name) ?? str(r.id) ?? "",
     class: cls,
     kind,
-    editable: r.editable === false ? false : !NEVER_EDITABLE.has(cls),
+    editable: r.editable === false || locked === true ? false : !NEVER_EDITABLE.has(cls),
+    locked,
+    coverage: num(r.coverage),
     depthM: num(r.depth_m),
   };
 }
@@ -110,9 +118,13 @@ export async function ocr(body: { packet_id: string }): Promise<OcrResult> {
   };
 }
 
-/** `POST /assets?kind=mask`: store a PNG mask in the project's CAS; returns its hash. */
-export async function uploadMask(png: Uint8Array<ArrayBuffer>): Promise<string> {
-  const r = await fetchJson<unknown>("/assets?kind=mask", { method: "POST", body: png, headers: { "Content-Type": "image/png" } });
+/** `POST /assets?kind=mask&project_id=<id>`: store a PNG mask in that project's CAS; returns its hash. */
+export async function uploadMask(png: Uint8Array<ArrayBuffer>, projectId: string): Promise<string> {
+  const r = await fetchJson<unknown>(`/assets?kind=mask&project_id=${enc(projectId)}`, {
+    method: "POST",
+    body: png,
+    headers: { "Content-Type": "image/png" },
+  });
   const o = isRecord(r) ? r : {};
   const hash = str(o.hash) ?? str(o.content_hash);
   if (!hash) throw new Error("the daemon stored the mask but returned no hash");
@@ -128,8 +140,25 @@ export function preview(projectId: string, nodeId: string, what: PreviewWhat, pa
   return postJson<unknown>(`/projects/${enc(projectId)}/nodes/${enc(nodeId)}/preview`, { what, params });
 }
 
+/**
+ * The daemon's router preview as the Motion editor's `RouterCard`. `route_move` answers `{mode, verdict, numbers:
+ * {...}, explanation}`; the T73 preview route answers the same numbers flat (`D_px_median`, `disocclusion_fraction`,
+ * `orbit_deg` next to `verdict`). Both shapes (and a `{router: ...}` wrapper) are folded into the nested one that
+ * `parseRouterCard` reads. Null when the body is not a router verdict.
+ */
+export function parseRouterPreview(body: unknown): RouterCard | null {
+  const top = isRecord(body) && isRecord(body.router) ? body.router : body;
+  if (!isRecord(top)) return null;
+  if (isRecord(top.numbers)) return parseRouterCard(top);
+  const numbers: Record<string, unknown> = {};
+  for (const k of ["D_px_median", "disocclusion_fraction", "orbit_deg", "detail_verdict", "crossings"]) {
+    if (k in top) numbers[k] = top[k];
+  }
+  return parseRouterCard({ ...top, numbers });
+}
+
 export async function routerPreview(projectId: string, nodeId: string, params: Record<string, unknown>): Promise<RouterCard | null> {
-  return parseRouterCard(await preview(projectId, nodeId, "router", params));
+  return parseRouterPreview(await preview(projectId, nodeId, "router", params));
 }
 
 /** One Set row: a material, its Lab on the hero, and its cross-view ΔE00 p90 on each other view. */
@@ -263,16 +292,37 @@ export async function recolourPreview(
 
 // ---------------------------------------------------------------------------------------------------- plugin queue
 
+/** A job on the plugin queue as the editors see it. `detail` / `resultPacketId` come from the dock's answer. */
 export interface PluginJob {
   id: string;
+  /** `queued | claimed | done | failed | cancelled` (the daemon's word; an unknown state is kept as sent). */
   state: string;
+  /** The dock's `detail` text (why a job failed, or what it did); null until the job has an answer. */
+  detail: string | null;
+  /** The packet the dock sent for this job (`result.packet_id`), e.g. the re-render of a Light match. */
+  resultPacketId: string | null;
+}
+
+/** States after which a job never changes again; the Light editor stops polling there. */
+export const PLUGIN_JOB_FINAL: ReadonlySet<string> = new Set(["done", "failed", "cancelled"]);
+
+function toPluginJob(body: unknown, fallbackId?: string): PluginJob {
+  const o = isRecord(body) ? body : {};
+  const id = str(o.id) ?? str(o.job_id) ?? fallbackId;
+  if (!id) throw new Error("the daemon returned a job with no id");
+  const result = isRecord(o.result) ? o.result : {};
+  return { id, state: str(o.state) ?? "queued", detail: str(result.detail) ?? str(result.reason), resultPacketId: str(result.packet_id) };
 }
 
 /** `POST /plugin/jobs`: the daemon queues a job for the Max dock to pick up (T48's `plugin_queue`). */
 export async function queuePluginJob(job: { action: string } & Record<string, unknown>): Promise<PluginJob> {
   const r = await postJson<unknown>("/plugin/jobs", job);
   const o = isRecord(r) ? r : {};
-  const id = str(o.id) ?? str(o.job_id);
-  if (!id) throw new Error("the daemon queued the job but returned no id");
-  return { id, state: str(o.state) ?? "queued" };
+  if (!str(o.id) && !str(o.job_id)) throw new Error("the daemon queued the job but returned no id");
+  return toPluginJob(r);
+}
+
+/** `GET /plugin/jobs/{id}`: one job's state and, once the dock has answered, its result. */
+export async function getPluginJob(id: string): Promise<PluginJob> {
+  return toPluginJob(await fetchJson<unknown>(`/plugin/jobs/${enc(id)}`), id);
 }

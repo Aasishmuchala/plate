@@ -11,12 +11,20 @@ Two entry points share those rules:
 - `export_run(conn, run_id, dest, ...)` copies the stored bytes to one file (the daemon's `POST /runs/{id}/export`).
 - `export(run, fmt, out_dir, override=None, ...)` is what `plate export` calls: it decodes the run's gated
   composite (the 16-bit PNG in the CAS), writes it as `tiff16`, `png16` or `exr` with `plate_pixels.imageio`
-  (an EXR is the sRGB display master decoded to linear half float, Rec.709 chromaticities), embeds the run's
-  lineage in the file (`lineage.embed`: the file name is not the only thing that says where it came from) and
+  (an EXR is the sRGB display master decoded to linear half float in the packet's working primaries), embeds
+  the run's lineage in the file (`lineage.embed`: the file name is not the only thing that says where it came from) and
   writes `<name>.gate.json` beside it (the stored gate report plus an `export` block naming the files). The
   sibling is shared by the formats of one take (tiff16 and exr of the same run and name): a second export adds
   its file to the block; a report that belongs to another run blocks the export. The image is written under a
   temp name and moved into place last; a lineage failure leaves nothing behind.
+
+Colour tags. A tiff16 and a png16 are sRGB-encoded (that is what the gates scored) and carry the sRGB ICC
+profile. An EXR carries `chromaticities` (the primaries of its pixels), the ASWF `colorInteropID` (which OIIO
+reads as `oiio:ColorSpace`) and `plate:colourspace` naming the space, all three from the packet's declared
+`colour.working_space`: `lin_rec709` (the default; also what a `display_only` Tier C packet gets, since the
+display image is decoded with the sRGB EOTF) or `acescg` (the Rec.709 pixels are converted to AP1 with a
+Bradford-adapted matrix first, so the tags always describe the pixels in the file). `delivery.frames` reads the
+same tags back and converts to Rec.709 before it encodes.
 """
 
 from __future__ import annotations
@@ -24,6 +32,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -45,6 +54,17 @@ FORMATS: dict[str, str] = {"tiff16": ".tif", "png16": ".png", "exr": ".exr"}
 OVERRIDE_PREFIX = "override: "
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
 REC709_CHROMATICITIES = (0.64, 0.33, 0.30, 0.60, 0.15, 0.06, 0.3127, 0.3290)
+AP1_CHROMATICITIES = (0.713, 0.293, 0.165, 0.830, 0.128, 0.044, 0.32168, 0.33767)
+DEFAULT_WORKING_SPACE = "lin_rec709"
+# packet colour.working_space -> (name written as plate:colourspace, ASWF colorInteropID, chromaticities)
+WORKING_SPACES: dict[str, tuple[str, str, tuple[float, ...]]] = {
+    "lin_rec709": ("lin_rec709", "lin_rec709_scene", REC709_CHROMATICITIES),
+    "acescg": ("ACEScg", "lin_ap1_scene", AP1_CHROMATICITIES),
+}
+# interop id -> chromaticities, for an EXR that names its space but carries no chromaticities
+INTEROP_CHROMATICITIES: dict[str, tuple[float, ...]] = {
+    iid: chroma for _, iid, chroma in WORKING_SPACES.values()
+}
 
 
 class NotExportable(Exception):
@@ -143,32 +163,82 @@ def _decode16(data: bytes, what: str) -> np.ndarray:
     return img.astype(np.uint16) * 257 if img.dtype == np.uint8 else img.astype(np.uint16)
 
 
-def _write_exr(path: Path, rgb16: np.ndarray) -> None:
-    """The sRGB display image as scene-linear half float: the EOTF decode of what the gates scored."""
+def _xyz_from_rgb(chroma: Sequence[float]) -> np.ndarray:
+    """3x3 matrix taking linear RGB with these chromaticities (rx, ry, gx, gy, bx, by, wx, wy) to XYZ."""
+    rx, ry, gx, gy, bx, by, wx, wy = (float(v) for v in chroma)
+    prim = np.array(
+        [
+            [rx / ry, gx / gy, bx / by],
+            [1.0, 1.0, 1.0],
+            [(1 - rx - ry) / ry, (1 - gx - gy) / gy, (1 - bx - by) / by],
+        ]
+    )
+    white = np.array([wx / wy, 1.0, (1 - wx - wy) / wy])
+    return prim * np.linalg.solve(prim, white)
+
+
+_BRADFORD = np.array([[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367], [0.0389, -0.0685, 1.0296]])
+
+
+def primaries_matrix(src: Sequence[float], dst: Sequence[float]) -> np.ndarray:
+    """3x3 matrix taking linear RGB in the `src` primaries to linear RGB in the `dst` primaries (Bradford
+    chromatic adaptation between the two white points; the identity when the chromaticities are equal)."""
+    if np.allclose(src, dst, atol=1e-6):
+        return np.eye(3)
+    src_xyz, dst_xyz = _xyz_from_rgb(src), _xyz_from_rgb(dst)
+    src_white, dst_white = src_xyz.sum(axis=1), dst_xyz.sum(axis=1)
+    gain = (_BRADFORD @ dst_white) / (_BRADFORD @ src_white)
+    adapt = np.linalg.inv(_BRADFORD) @ np.diag(gain) @ _BRADFORD
+    return np.linalg.inv(dst_xyz) @ adapt @ src_xyz
+
+
+def packet_working_space(conn: sqlite3.Connection, packet_id: str | None) -> str:
+    """The packet's declared `colour.working_space` when it is one an EXR can be tagged with, else the default
+    (`display_only` Tier C packets, a packet that is not in the index, a manifest that cannot be read)."""
+    if not packet_id:
+        return DEFAULT_WORKING_SPACE
+    try:
+        row = conn.execute("SELECT path FROM packets WHERE packet_id = ?", (packet_id,)).fetchone()
+        manifest = json.loads((Path(row[0]) / "manifest.json").read_text(encoding="utf-8-sig"))
+        space = manifest["colour"]["working_space"]
+    except (sqlite3.Error, TypeError, KeyError, OSError, ValueError):
+        return DEFAULT_WORKING_SPACE
+    return space if space in WORKING_SPACES else DEFAULT_WORKING_SPACE
+
+
+def _write_exr(path: Path, rgb16: np.ndarray, working_space: str = DEFAULT_WORKING_SPACE) -> None:
+    """The sRGB display image as scene-linear half float: the EOTF decode of what the gates scored, in the
+    primaries of `working_space` and tagged with them (chromaticities, colorInteropID, plate:colourspace)."""
     from plate_pixels import exr as pexr
     from plate_pixels.ocio import srgb_eotf
 
-    lin = srgb_eotf(rgb16.astype(np.float64) / 65535.0).astype(np.float32)
+    if working_space not in WORKING_SPACES:
+        raise ValueError(f"working space {working_space!r}: use one of {', '.join(WORKING_SPACES)}")
+    name, interop_id, chroma = WORKING_SPACES[working_space]
+    lin = srgb_eotf(rgb16.astype(np.float64) / 65535.0)
+    lin = (lin @ primaries_matrix(REC709_CHROMATICITIES, chroma).T).astype(np.float32)
     pexr.write_multilayer(
         path,
         {"RGBA": {"R": lin[..., 0], "G": lin[..., 1], "B": lin[..., 2]}},
         dtypes={"RGBA": "half"},
         header_attrs={
-            "chromaticities": REC709_CHROMATICITIES,
-            "plate:colour": "scene-linear Rec.709, the sRGB EOTF applied to the gated display composite",
+            "chromaticities": chroma,
+            "colorInteropID": interop_id,
+            "plate:colourspace": name,
+            "plate:colour": f"scene-linear {name}, the sRGB EOTF applied to the gated display composite",
         },
     )
 
 
-def _write_image(path: Path, fmt: str, rgb16: np.ndarray) -> None:
-    from plate_pixels import imageio
+def _write_image(path: Path, fmt: str, rgb16: np.ndarray, working_space: str = DEFAULT_WORKING_SPACE) -> None:
+    from plate_pixels import icc, imageio
 
     if fmt == "tiff16":
-        imageio.write_tiff16(path, rgb16)
+        imageio.write_tiff16(path, rgb16, icc=icc.SRGB_ICC)  # the pixels are sRGB-encoded: say so
     elif fmt == "png16":
         imageio.write_png16(path, rgb16)
     else:
-        _write_exr(path, rgb16)
+        _write_exr(path, rgb16, working_space)
 
 
 def _report_for(run: Run, project_dir: Path | None) -> tuple[dict[str, Any], str | None]:
@@ -192,13 +262,15 @@ def export(
     cas: CAS,
     project_dir: Path | str | None = None,
     name: str | None = None,
+    working_space: str | None = None,
 ) -> Exported:
     """Write the run's result to `out_dir/<name>.<ext>` (+ `<name>.gate.json`); see the module docstring.
 
     `override` is the written reason (10 characters at least) that lets a GATE_FAIL run out; a reason recorded
     earlier on the run counts when none is given. `name` defaults to the run id. Raises `NotExportable` for a
     run that may not leave (GATE_FAIL without a reason, any state but DONE and GATE_FAIL, no result blob, a
-    blob that fails its hash, a destination that exists) and `ValueError` for an unknown format or name."""
+    blob that fails its hash, a destination that exists) and `ValueError` for an unknown format, name or
+    working space. `working_space` (`lin_rec709` | `acescg`) tags an EXR; the default is the packet's declared one."""
     if fmt not in FORMATS:
         raise ValueError(f"unknown format {fmt!r}; use one of {', '.join(FORMATS)}")
     stem = name or run.id
@@ -206,6 +278,8 @@ def export(
         raise ValueError(
             f"export name {stem!r}: letters, digits, '.', '_' and '-' only (it is a Windows file name)"
         )
+    if working_space is not None and working_space not in WORKING_SPACES:
+        raise ValueError(f"working space {working_space!r}: use one of {', '.join(WORKING_SPACES)}")
     out_dir = Path(out_dir)
     project_dir = Path(project_dir) if project_dir is not None else None
     reason = override.strip() if override is not None else None
@@ -250,7 +324,7 @@ def export(
     # the temp name keeps the real extension: the writers and `lineage.embed` pick their codec by it
     image_tmp = temp_sibling(dest).with_suffix(dest.suffix)
     try:
-        _write_image(image_tmp, fmt, rgb16)
+        _write_image(image_tmp, fmt, rgb16, working_space or packet_working_space(conn, run.packet_id))
         try:
             lineage.embed(image_tmp, lin)
         except (lineage.LineageError, OSError) as e:

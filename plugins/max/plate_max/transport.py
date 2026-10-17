@@ -1,12 +1,20 @@
 """Talks to the PLATE daemon over loopback HTTP, exactly as spec/PACKET.md section 9 says.
 
-handshake() is GET /api/v0/health (the version check before Send); post_packet() is POST
+handshake() is GET /api/v0/health (the version check before Send); session() is GET /api/v0/session
+with the bearer (the token check, and the packets folders the daemon reads); post_packet() is POST
 /api/v0/packets with the bearer token and X-Plate-Packet-Version. compatible() judges a health
 answer (packet version and daemon version). hash_files() / hash_payloads() are POST /api/v0/hash:
 Max's Python has no BLAKE3, so the loopback daemon hashes for the plugin (BUILD_PLAN decision 5b).
+follow_ingest() reads a packet's events_url after a 202 until the ingest ends or a few seconds pass.
 Standard library urllib only, with proxies switched off: the daemon is 127.0.0.1 and a system proxy
 must never see the token. Status handling: 200/202/409/422/426 are returned for the dock to show; 401
-raises Unauthorized; a dead or silent daemon raises DaemonUnreachable.
+raises Unauthorized; a dead daemon raises DaemonUnreachable and a silent one DaemonTimeout (a kind of
+DaemonUnreachable).
+
+post_packet's timeout grows with the folder (30 s + 15 s per GiB: the daemon validates the packet
+before it answers). A POST that times out is sent once more, for the same folder: the daemon answers
+200 "known" when the first one got through, 202 when it did not, and either is a success; anything
+else is PostTimedOut.
 """
 
 from __future__ import annotations
@@ -14,17 +22,29 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from . import PACKET_VERSION, PLUGIN_VERSION, SENDER
 
 PASS_THROUGH_STATUS = (200, 202, 409, 422, 426)
+REPOST_OK_STATUS = (200, 202)  # what a re-post after a timeout may answer for the Send to succeed
 HASH_PAYLOAD_LIMIT = 4 * 1024 * 1024  # the daemon's cap on in-memory payloads per request
 HASH_TIMEOUT_S = 600.0  # a 400 MB EXR on a NAS takes a while to stream through BLAKE3
+SESSION_TIMEOUT_S = 3.0
+POST_TIMEOUT_BASE_S = 30.0
+POST_TIMEOUT_PER_GIB_S = 15.0  # the daemon validates (and reads) the packet before it answers
+GIB = 1024**3
+FOLLOW_WINDOW_S = 5.0  # how long Send follows events_url after a 202
+FOLLOW_INTERVAL_S = 1.0
+FOLLOW_REQUEST_TIMEOUT_S = 3.0
+INGEST_DONE = "ingest.done"
+INGEST_FAILED = "ingest.failed"
 
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -49,6 +69,22 @@ class HashRefused(TransportError):
 
 class DaemonUnreachable(TransportError):
     """Nothing answered on the daemon URL (not running, wrong port, firewall, timeout)."""
+
+
+class DaemonTimeout(DaemonUnreachable):
+    """The daemon took the request but did not answer within the timeout."""
+
+
+class PostTimedOut(TransportError):
+    """POST /api/v0/packets timed out and the one re-post answered something other than 200/202
+    (status_code None: the re-post got no answer either)."""
+
+    def __init__(self, status_code: int | None, body: Any = None, detail: str | None = None):
+        shown = status_code if status_code is not None else f"nothing ({detail})"
+        tail = f" ({body})" if body else ""
+        super().__init__(f"timed out; re-post answered {shown}{tail}")
+        self.status_code = status_code
+        self.body = body
 
 
 class UnexpectedStatus(TransportError):
@@ -79,12 +115,29 @@ def _request(req: urllib.request.Request, timeout_s: float) -> tuple[int, Any]:
             return exc.code, _decode(exc.read())
         finally:
             exc.close()
-    except OSError as exc:  # URLError, timeouts and connection errors are all OSError
+    except urllib.error.URLError as exc:  # connect failures; a connect timeout arrives wrapped
+        if isinstance(exc.reason, TimeoutError):
+            raise DaemonTimeout(f"{req.full_url}: timed out after {timeout_s:g} s") from exc
+        raise DaemonUnreachable(f"{req.full_url}: {exc}") from exc
+    except TimeoutError as exc:  # the answer did not come in time (socket.timeout is TimeoutError)
+        raise DaemonTimeout(f"{req.full_url}: timed out after {timeout_s:g} s") from exc
+    except OSError as exc:  # connection resets and the rest are OSError too
         raise DaemonUnreachable(f"{req.full_url}: {exc}") from exc
 
 
 def _url(daemon_url: str, path: str) -> str:
     return daemon_url.rstrip("/") + path
+
+
+def _daemon_url(config: Mapping[str, Any]) -> str:
+    return str(config.get("daemon_url") or "http://127.0.0.1:4610")
+
+
+def _token(config: Mapping[str, Any]) -> str:
+    token = config.get("token")
+    if not token:
+        raise Unauthorized("no token in config.json: run the installer or start the daemon once")
+    return str(token)
 
 
 def handshake(daemon_url: str, timeout_s: float = 3.0) -> dict[str, Any]:
@@ -135,12 +188,26 @@ def compatible(health: dict[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
-def _post_hash(body: dict[str, Any], config: dict[str, Any], timeout_s: float) -> dict[str, Any]:
-    token = config.get("token")
-    if not token:
-        raise Unauthorized("no token in config.json: run the installer or start the daemon once")
+def session(config: Mapping[str, Any], timeout_s: float = SESSION_TIMEOUT_S) -> dict[str, Any]:
+    """GET /api/v0/session with the bearer: the daemon's answer ({ok, daemon_version, packet_versions,
+    packets_dirs, projects_dir, dev, cas_copy}). No token or 401 raises Unauthorized (no token never
+    touches the network); any other non-200 raises UnexpectedStatus."""
     req = urllib.request.Request(
-        _url(config.get("daemon_url") or "http://127.0.0.1:4610", "/api/v0/hash"),
+        _url(_daemon_url(config), "/api/v0/session"),
+        headers={"Authorization": f"Bearer {_token(config)}"},
+    )
+    status, body = _request(req, timeout_s)
+    if status == 401:
+        raise Unauthorized(f"daemon rejected the token ({body})")
+    if status != 200 or not isinstance(body, dict):
+        raise UnexpectedStatus(status, body)
+    return body
+
+
+def _post_hash(body: dict[str, Any], config: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+    token = _token(config)
+    req = urllib.request.Request(
+        _url(_daemon_url(config), "/api/v0/hash"),
         data=json.dumps(body).encode("utf-8"),
         method="POST",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -194,25 +261,148 @@ def hash_payloads(
     return {name: _pick(hashes, name) for name in payloads}
 
 
-def post_packet(packet_path: Path | str, config: dict[str, Any], timeout_s: float = 10.0) -> dict[str, Any]:
-    """POST /api/v0/packets. Returns {"status_code", "body"} for 200/202/409/422/426."""
-    token = config.get("token")
-    if not token:
-        raise Unauthorized("no token in config.json: run the installer or start the daemon once")
+def folder_bytes(folder: Path | str) -> int:
+    """Total size of the files under folder (0 for a folder that is not there)."""
+    total = 0
+    for path in Path(folder).rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def post_timeout_s(folder: Path | str) -> float:
+    """The POST /api/v0/packets timeout for a packet folder: 30 s + 15 s per GiB of it."""
+    return POST_TIMEOUT_BASE_S + POST_TIMEOUT_PER_GIB_S * folder_bytes(folder) / GIB
+
+
+def post_packet(
+    packet_path: Path | str, config: dict[str, Any], timeout_s: float | None = None
+) -> dict[str, Any]:
+    """POST /api/v0/packets. Returns {"status_code", "body"} for 200/202/409/422/426 (plus
+    "reposted": True when the first POST timed out and the re-post answered 200 or 202).
+
+    timeout_s None picks post_timeout_s(packet_path). On a timeout the same folder is posted once
+    more with the same timeout; a re-post that answers anything but 200/202 (or nothing) raises
+    PostTimedOut."""
+    token = _token(config)
     payload = json.dumps({"packet_path": str(Path(packet_path).resolve()), "sender": dict(SENDER)})
-    req = urllib.request.Request(
-        _url(config.get("daemon_url") or "http://127.0.0.1:4610", "/api/v0/packets"),
-        data=payload.encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "X-Plate-Packet-Version": PACKET_VERSION,
-            "Content-Type": "application/json",
-        },
-    )
-    status, body = _request(req, timeout_s)
+    timeout = post_timeout_s(packet_path) if timeout_s is None else float(timeout_s)
+
+    def request() -> urllib.request.Request:
+        return urllib.request.Request(
+            _url(_daemon_url(config), "/api/v0/packets"),
+            data=payload.encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-Plate-Packet-Version": PACKET_VERSION,
+                "Content-Type": "application/json",
+            },
+        )
+
+    try:
+        status, body = _request(request(), timeout)
+    except DaemonTimeout as first:
+        try:
+            status, body = _request(request(), timeout)
+        except DaemonUnreachable as exc:
+            raise PostTimedOut(None, detail=str(exc)) from first
+        if status not in REPOST_OK_STATUS:
+            raise PostTimedOut(status, body) from first
+        return {"status_code": status, "body": body, "reposted": True}
     if status == 401:
         raise Unauthorized(f"daemon rejected the token ({body})")
     if status not in PASS_THROUGH_STATUS:
         raise UnexpectedStatus(status, body)
     return {"status_code": status, "body": body}
+
+
+# --------------------------------------------------------------------------- following an ingest
+
+
+def events_url_for(packet_id: str) -> str:
+    """The daemon's event log route for a packet (what a 202 names as events_url)."""
+    return f"/api/v0/packets/{urllib.parse.quote(str(packet_id), safe='')}/events"
+
+
+def _events_request_url(daemon_url: str, events_url: str, after: int) -> str:
+    """events_url (absolute, or relative to the daemon) with wait_s=0, so the daemon answers with the
+    events it has instead of holding the stream open, and after=<last seq seen>."""
+    full = events_url if "://" in events_url else _url(daemon_url, "/" + events_url.lstrip("/"))
+    parts = urllib.parse.urlsplit(full)
+    query = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query) if k not in ("wait_s", "after")]
+    query += [("wait_s", "0"), ("after", str(after))]
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
+def parse_sse(text: str) -> list[dict[str, Any]]:
+    """The JSON data of every server-sent event in text (frames split by a blank line; "retry:",
+    "id:" and comment lines skipped; a frame whose data is not a JSON object is dropped)."""
+    events: list[dict[str, Any]] = []
+    for frame in text.replace("\r\n", "\n").split("\n\n"):
+        data = [line[5:].lstrip(" ") for line in frame.split("\n") if line.startswith("data:")]
+        if not data:
+            continue
+        try:
+            doc = json.loads("\n".join(data))
+        except ValueError:
+            continue
+        if isinstance(doc, dict):
+            events.append(doc)
+    return events
+
+
+def _ingest_errors(event: Mapping[str, Any]) -> str:
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    errors = data.get("errors") if isinstance(data, dict) else None
+    if isinstance(errors, list) and errors:
+        return "; ".join(str(e) for e in errors)
+    if isinstance(errors, str) and errors:
+        return errors
+    return "the daemon gave no reason"
+
+
+def follow_ingest(
+    events_url: str,
+    config: Mapping[str, Any],
+    window_s: float = FOLLOW_WINDOW_S,
+    interval_s: float = FOLLOW_INTERVAL_S,
+    timeout_s: float = FOLLOW_REQUEST_TIMEOUT_S,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """GET events_url (bearer) every interval_s for up to window_s, until an ingest.done or
+    ingest.failed event. Returns {"ingest": "ingested" | "failed: <errors>" | "ingesting", "problem":
+    None or why the events could not be read (the ingest is then still "ingesting")}. Never raises
+    for the daemon: the packet was already accepted, so a follow that fails only leaves it unknown."""
+    token = _token(config)
+    daemon_url = _daemon_url(config)
+    deadline = clock() + max(0.0, float(window_s))
+    after = 0
+    while True:
+        req = urllib.request.Request(
+            _events_request_url(daemon_url, events_url, after),
+            headers={"Authorization": f"Bearer {token}", "Accept": "text/event-stream"},
+        )
+        try:
+            with _opener.open(req, timeout=timeout_s) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            return {"ingest": "ingesting", "problem": f"events answered HTTP {exc.code}"}
+        except OSError as exc:
+            return {"ingest": "ingesting", "problem": f"events unreadable: {exc}"}
+        for event in parse_sse(text):
+            seq = event.get("seq")
+            if isinstance(seq, int) and seq > after:
+                after = seq
+            if event.get("type") == INGEST_DONE:
+                return {"ingest": "ingested", "problem": None}
+            if event.get("type") == INGEST_FAILED:
+                return {"ingest": f"failed: {_ingest_errors(event)}", "problem": None}
+        if clock() + interval_s > deadline:
+            return {"ingest": "ingesting", "problem": None}
+        sleep(interval_s)

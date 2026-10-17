@@ -15,6 +15,8 @@ export interface EngineRouteSummary {
   /** The router's grade when the daemon sends it; otherwise derived (pending terms = D). */
   effective_grade?: CustodyGrade;
   status?: "active" | "retired";
+  /** Who can see an upload on this route (`local`, `private`, `public_url`, …), when the daemon sends it. */
+  upload_visibility?: string;
 }
 
 /** One manifest param (`plate_engines.models.Param`), shown in the advanced drawer. */
@@ -45,8 +47,10 @@ export interface ProjectCustody {
 }
 
 /** How a node kind runs. `engine`: a vendor or local model, chosen in the Make bar. `inprocess`: a numeric node or
- * a Max round trip (T48): still quoted and approved, at 0 USD and C0. `none`: nothing to make (the pipeline runs
- * Comp/Colour/Gate itself; Export, Review and Concept have their own flows; a Concept is never generated). */
+ * a Max round trip (T48): still quoted and approved, at 0 USD and C0; the Judge (decision 41) is quoted the same way
+ * but priced and graded by its LLM route (custody D until the Anthropic terms are filed, so NDA projects get
+ * `unavailable: custody`). `none`: nothing to make (the pipeline runs Comp/Colour/Gate itself; Export, Review and
+ * Concept have their own flows; a Concept is never generated). */
 export type MakeMode =
   | { mode: "engine"; engineKinds: readonly string[]; tasks: readonly string[] }
   | { mode: "inprocess" }
@@ -68,12 +72,12 @@ export const MAKE_MODES: Readonly<Record<NodeKind, MakeMode>> = {
   Set: { mode: "inprocess" },
   Light: { mode: "inprocess" },
   Scout: { mode: "inprocess" },
+  Judge: { mode: "inprocess" },
   Plate: { mode: "none" },
   Mask: { mode: "none" },
   Comp: { mode: "none" },
   Colour: { mode: "none" },
   Gate: { mode: "none" },
-  Judge: { mode: "none" },
   Compare: { mode: "none" },
   Export: { mode: "none" },
   Review: { mode: "none" },
@@ -146,8 +150,9 @@ const C = "confirmed" as const;
 
 /**
  * Used only when the daemon has no `GET /api/v0/engines`: id, name, kind, tasks and route grades of
- * `engines/plate_engines/manifests/*.yaml` (a vitest checks they still match). No params and no prices: the quote
- * always comes from the daemon, which prices and custody-checks the request itself.
+ * `engines/plate_engines/manifests/*.yaml` (a vitest checks they still match one to one, so the daemon's own fake
+ * engine is not in this list: see `FAKE_ENGINE`). No params and no prices: the quote always comes from the daemon,
+ * which prices and custody-checks the request itself.
  */
 export const FALLBACK_ENGINES: readonly EngineSummary[] = [
   { id: "flux-3-image", name: "FLUX 3 Image", kind: "image_edit", allowed_tasks: ["relight", "vegetation", "sky", "rephotograph_close"], routes: [r("bfl", "D", C)] },
@@ -165,3 +170,33 @@ export const FALLBACK_ENGINES: readonly EngineSummary[] = [
   { id: "veo-3.1", name: "Veo 3.1", kind: "video_i2v", allowed_tasks: ["crop_pair_motion"], routes: [r("vertex", "C1", P)] },
   { id: "wan-2.2-vace", name: "Wan 2.2 VACE", kind: "local_video", allowed_tasks: ["previs"], routes: [r("local", "C0", C)] },
 ];
+
+/**
+ * The daemon's own fake engine, exactly as `GET /api/v0/engines` lists it when the daemon runs the FakeEngine
+ * (`PLATE_FAKE_ENGINE=1`; `/health` says `stub_engine: true`): local, C0, free, echoes the plate (T61).
+ */
+export const FAKE_ENGINE: EngineSummary = {
+  id: "fake",
+  name: "Fake (echo)",
+  kind: "image_edit",
+  allowed_tasks: [...IMAGE_TASKS],
+  routes: [
+    {
+      route_id: "local",
+      provider: "local",
+      custody_grade: "C0",
+      custody_status: "confirmed",
+      effective_grade: "C0",
+      status: "active",
+      upload_visibility: "local",
+    },
+  ],
+  params: [],
+  presets: ["default"],
+  price: { usd: 0, model: "flat", status: "confirmed" },
+};
+
+/** The build's catalogue for a daemon without `/engines`, plus `FAKE_ENGINE` when that daemon runs its stub engine. */
+export function fallbackEngines(stubEngine: boolean): EngineSummary[] {
+  return stubEngine ? [...FALLBACK_ENGINES, FAKE_ENGINE] : [...FALLBACK_ENGINES];
+}

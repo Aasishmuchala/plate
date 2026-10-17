@@ -53,7 +53,7 @@ These are the claims this repository stands behind; each is meant to be backed b
 - There is no text-to-image node, the plate is never upscaled, and an invented camera angle needs an explicit override.
 - A take that fails a hard gate is kept and flagged and cannot be exported without a written reason; a shipped gate report is never rewritten.
 - An agent over MCP cannot approve, deliver, override or export a master.
-- Previs output (PREVIS) and Concept images can never reach Export, Review or Delivery.
+- Previs output (PREVIS) can never reach Export or Delivery (a watermarked previs may go into a Review), and Concept images can never reach Export, Review or Delivery.
 
 ## Status
 

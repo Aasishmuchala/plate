@@ -1,10 +1,19 @@
 """Send Packet: render each camera into a tier A Shot Packet and hand it to the daemon.
 
+Before the first camera, the preflight (daemon_gate): GET /api/v0/health and transport.compatible
+(the daemon reads this packet version and is this release), then GET /api/v0/session with the token
+(PREFLIGHT_TOKEN when the daemon rejects it) and out_root checked against the session's packets_dirs
+(PREFLIGHT_OUT_ROOT when it is outside every one: /hash would refuse every file after the render).
+Any failure stops every camera at stage "preflight" before anything renders. Batch Cameras runs
+send_packet.run once per camera, so the preflight runs again at the start of every camera.
+
 Per camera, in this order (any failure stops that camera, records why, and moves on to the next):
 
   colour    bridge.colour.detect_colour_pipeline(): an unknown mode stops before anything renders
   lint      policy.lint_scene(): scaled / shifted / hidden camera, no V-Ray, node names with ':'
   backup    bridge.safety.backup() when options.backup (before the scene is touched)
+  preflight every legend record that will be hashed in memory is checked against the payload limit
+            (PAYLOAD_TOO_LARGE names the node and the size): nothing oversize reaches the hash step
   elements  bridge.elements.ensure_default_set() + ensure_optin(recipe.extra_elements)
   render    bridge.render.render_packet_frame() into a local staging folder, at the recipe's overscan
             (plan_frame: the dimension that is short of the engine aspect grows, the original frame
@@ -14,20 +23,25 @@ Per camera, in this order (any failure stops that camera, records why, and moves
             Cryptomatte manifests, and rank-0 coverage per ID (the legend's pixel_share)
   packet    beauty.exr and display.tif moved into <out_root>/<packet_id>/ (shutil.move, any volume)
   legend    the visible names of the Cryptomatte object manifest -> legend.build_id_legend, digests
-            from the daemon; the policy derived from it and narrowed to recipe.editable_classes;
-            policy.lint on the measured coverage
-  hash      BLAKE3 of every file and payload from the daemon (POST /api/v0/hash, decision 5b)
+            from the daemon, planar by the class rule or the node's plate_planar property; the policy
+            derived from it and narrowed to recipe.editable_classes; policy.lint on the measured coverage
+  hash      BLAKE3 of every file and payload from the daemon (POST /api/v0/hash, decision 5b); the
+            big ones by path: id_legend.json, and the scene digest written as scene_digest.txt
+            (file role x_scene_digest)
   manifest  packet.build_manifest + packet.write_packet (the manifest last)
-  post      transport.post_packet (200/202 ok; 409, 422, 426 reported)
+  post      transport.post_packet (200/202 ok; 409, 422, 426 reported), with a timeout that grows
+            with the folder and one re-post after a timeout; then events_url is followed for a few
+            seconds and result.ingest says "ingested", "failed: <errors>" (the camera fails) or
+            "ingesting"
 
-The daemon handshake (health + transport.compatible) runs once before the first camera: without a
-compatible daemon nothing can be hashed, so no camera is rendered for nothing. run() never raises
-across cameras; every outcome is a SendResult. Every pymxs read goes through rt.runtime().
+run() never raises across cameras; every outcome is a SendResult carrying status_code, events_url,
+packet_id and ingest. Every pymxs read goes through rt.runtime().
 """
 
 from __future__ import annotations
 
 import math
+import os
 import platform
 import re
 import shutil
@@ -39,7 +53,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .. import PACKET_VERSION, digest, packet, policy, transport
+from .. import PACKET_VERSION, autotag, digest, packet, policy, transport
 from .. import legend as legend_mod
 from ..bridge import colour, elements, hashing, render, safety
 from ..bridge.scene import current_frame, get_camera, rt_attr, scene_path, set_prop
@@ -67,6 +81,15 @@ DATA_ELEMENTS_FLOAT = ("zdepth", "cryptomatte_object", "cryptomatte_material", "
 REQUIRED_ELEMENTS = ("beauty", *elements.DEFAULT_ELEMENTS)
 OK_STATUS = (200, 202)
 
+# Why a Send stopped before anything rendered (SendResult.code; stage "preflight").
+PREFLIGHT_UNREACHABLE = "PREFLIGHT_UNREACHABLE"
+PREFLIGHT_VERSION = "PREFLIGHT_VERSION"
+PREFLIGHT_TOKEN = "PREFLIGHT_TOKEN"
+PREFLIGHT_SESSION = "PREFLIGHT_SESSION"
+PREFLIGHT_OUT_ROOT = "PREFLIGHT_OUT_ROOT"
+PAYLOAD_TOO_LARGE = hashing.PAYLOAD_TOO_LARGE
+INGEST_FAILED = "INGEST_FAILED"  # the daemon took the packet (202) and then failed to ingest it
+
 # maxVersion() -> #(release, api, sdk, product, update, hotfix, build, year, "update text") on 2026
 # (TODO-verify the indices on the box, ONBOX.md step 1); vrayVersion() -> #("7.00.03", ...) (TODO-verify).
 MAX_VERSION_FN = "maxVersion"  # TODO-verify
@@ -78,11 +101,18 @@ Progress = Callable[[int, int, str], None]
 class SendAbort(Exception):
     """Stops one camera's Send at a stage, with the reason (and lint problems) for the dock."""
 
-    def __init__(self, stage: str, reason: str, problems: list[dict[str, Any]] | None = None):
+    def __init__(
+        self,
+        stage: str,
+        reason: str,
+        problems: list[dict[str, Any]] | None = None,
+        code: str | None = None,
+    ):
         super().__init__(reason)
         self.stage = stage
         self.reason = reason
         self.problems = list(problems or [])
+        self.code = code
 
 
 @dataclass
@@ -97,6 +127,9 @@ class SendResult:
     warnings: list[str] = field(default_factory=list)
     status_code: int | None = None  # the daemon's answer to POST /api/v0/packets
     daemon: Any = None  # its body
+    code: str | None = None  # PREFLIGHT_*, PAYLOAD_TOO_LARGE or INGEST_FAILED when one stopped it
+    events_url: str | None = None  # the packet's event log, followed after the POST
+    ingest: str | None = None  # "ingested", "failed: <errors>" or "ingesting" once posted
     backup: str | None = None
     render: dict[str, Any] | None = None
     frame: dict[str, Any] | None = None  # plan_frame(): rendered size, safe frame, overscan
@@ -115,6 +148,9 @@ class SendResult:
             "warnings": list(self.warnings),
             "status_code": self.status_code,
             "daemon": self.daemon,
+            "code": self.code,
+            "events_url": self.events_url,
+            "ingest": self.ingest,
             "backup": self.backup,
             "render": self.render,
             "frame": self.frame,
@@ -152,6 +188,8 @@ OPTION_KEYS = (
     "max_unlabelled_share",
     "journal",
     "vfb_corrections_baked",
+    "post_timeout_s",
+    "ingest_follow_s",
 )
 
 
@@ -443,9 +481,11 @@ def legend_nodes(
     manifest: dict[str, str], coverage: Coverage, scene_nodes: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """(nodes for legend.build_id_legend, warnings): every name in the Cryptomatte object manifest
-    that covers pixels at rank 0, carrying its scene node's layer, material and tags. A covered name
-    that is not a scene geometry node (a proxy or scatter item) still enters, unlabelled (so locked).
-    A manifest id that is not the Cryptomatte hash of its name stops the Send."""
+    that covers pixels at rank 0, carrying its scene node's layer, material and tags, and "planar"
+    when the node's plate_planar user property sets it (autotag.planar_overrides; otherwise the
+    legend's class rule decides). A covered name that is not a scene geometry node (a proxy or
+    scatter item) still enters, unlabelled (so locked). A manifest id that is not the Cryptomatte
+    hash of its name stops the Send."""
     by_name = {str(n["name"]): n for n in scene_nodes}
     nodes: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -470,7 +510,24 @@ def legend_nodes(
     unnamed = sum(share for hex_id, share in coverage.shares.items() if hex_id not in named)
     if unnamed > 0:
         warnings.append(f"Cryptomatte ids without a manifest name cover {unnamed:.2%} of the frame")
+    overrides = autotag.planar_overrides(n["name"] for n in nodes if n["name"] in by_name)
+    for node in nodes:
+        if node["name"] in overrides:
+            node["planar"] = overrides[node["name"]]
     return nodes, warnings
+
+
+def payload_preflight(nodes: list[dict[str, Any]]) -> None:
+    """SendAbort("preflight", PAYLOAD_TOO_LARGE) when a legend record that will be hashed in memory
+    (legend.record_bytes) is over the payload limit: checked before the render, so the hash step
+    after it can never refuse one (the scene digest and the legend file go by path, whatever their
+    size)."""
+    for node in nodes:
+        size = len(legend_mod.record_bytes(node))
+        try:
+            hashing.check_payload(f"legend record of {node['name']}", size)
+        except hashing.PayloadTooLarge as exc:
+            raise SendAbort("preflight", str(exc), code=PAYLOAD_TOO_LARGE) from exc
 
 
 def narrow_policy(pol: dict[str, Any], leg: dict[str, Any], classes: list[str] | None) -> dict[str, Any]:
@@ -569,19 +626,78 @@ def recipe_for(camera: str, options: Any, saved: dict[str, CameraRecipe] | None 
 # --------------------------------------------------------------------------- the daemon gate
 
 
-def daemon_gate(config: dict[str, Any]) -> tuple[bool, str]:
-    """(ok, reason) from GET /api/v0/health and transport.compatible: a reason always names the
-    version or the reachability problem."""
+class Gate(tuple):
+    """daemon_gate's answer: unpacks as (ok, reason) exactly as it always has, and carries code (a
+    PREFLIGHT_* name, "" when ok) and session (GET /api/v0/session's answer, None when the check
+    stopped before it)."""
+
+    code: str
+    session: dict[str, Any] | None
+
+    def __new__(cls, ok: bool, reason: str, code: str = "", session: dict[str, Any] | None = None):
+        gate = super().__new__(cls, (bool(ok), str(reason)))
+        gate.code = code
+        gate.session = session
+        return gate
+
+    @property
+    def ok(self) -> bool:
+        return bool(self[0])
+
+    @property
+    def reason(self) -> str:
+        return str(self[1])
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    """path is folder or below it, both resolved and case-folded as the OS compares them."""
+    try:
+        child = Path(os.path.normcase(str(path.resolve())))
+        parent = Path(os.path.normcase(str(folder.resolve())))
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return child == parent or parent in child.parents
+
+
+def daemon_gate(config: dict[str, Any], out_root: Path | str | None = None) -> Gate:
+    """The preflight: GET /api/v0/health and transport.compatible, then GET /api/v0/session with the
+    token, then out_root (when given) against the session's packets_dirs. A failure's reason names
+    the version, reachability, token or folder problem and its code is PREFLIGHT_UNREACHABLE,
+    PREFLIGHT_VERSION, PREFLIGHT_TOKEN ("daemon rejected the token", or no token at all),
+    PREFLIGHT_SESSION or PREFLIGHT_OUT_ROOT ("<out_root> is outside the daemon's packets folders:
+    ..."). Never raises for the daemon."""
     url = str(config.get("daemon_url") or DEFAULT_DAEMON_URL)
     try:
         health = transport.handshake(url)
     except transport.TransportError as exc:
-        return False, f"daemon unreachable at {url} (version check not possible): {exc}"
+        return Gate(
+            False, f"daemon unreachable at {url} (version check not possible): {exc}", PREFLIGHT_UNREACHABLE
+        )
     ok, reason = transport.compatible(health)
-    if ok:
-        return True, ""
-    problems = [str(p) for p in health.get("problems") or []]
-    return False, f"daemon version check failed: {'; '.join(problems) or reason}"
+    if not ok:
+        problems = [str(p) for p in health.get("problems") or []]
+        return Gate(False, f"daemon version check failed: {'; '.join(problems) or reason}", PREFLIGHT_VERSION)
+    session_config = {**config, "daemon_url": url}
+    try:
+        session = transport.session(session_config)
+    except transport.Unauthorized as exc:
+        return Gate(False, str(exc), PREFLIGHT_TOKEN)
+    except transport.DaemonUnreachable as exc:
+        return Gate(False, f"daemon unreachable at {url} (session check): {exc}", PREFLIGHT_UNREACHABLE)
+    except transport.TransportError as exc:
+        return Gate(False, f"daemon session check failed: {exc}", PREFLIGHT_SESSION)
+    if out_root is not None:
+        listed = session.get("packets_dirs")
+        dirs = [str(d) for d in listed if d] if isinstance(listed, list) else []
+        if not any(_inside(Path(out_root), Path(d)) for d in dirs):
+            shown = ", ".join(dirs) or "(the daemon names none)"
+            return Gate(
+                False,
+                f"{Path(out_root)} is outside the daemon's packets folders: {shown}",
+                PREFLIGHT_OUT_ROOT,
+                session,
+            )
+    return Gate(True, "", "", session)
 
 
 # --------------------------------------------------------------------------- one camera
@@ -682,6 +798,10 @@ def _render_and_write(
         if journal is not None:
             journal.record(stage, camera, detail=detail)
 
+    step("preflight")
+    scene_nodes = digest.scene_nodes()
+    payload_preflight(scene_nodes)  # before the scene is touched
+
     step("elements")
     defaults = elements.ensure_default_set()
     if not defaults.ok:
@@ -762,7 +882,7 @@ def _render_and_write(
         shutil.rmtree(staging, ignore_errors=True)
 
     step("legend")
-    nodes, warnings = legend_nodes(facts.object_layer.manifest or {}, facts.coverage, digest.scene_nodes())
+    nodes, warnings = legend_nodes(facts.object_layer.manifest or {}, facts.coverage, scene_nodes)
     result.warnings.extend(warnings)
     try:
         leg = hashing.with_daemon_digests(
@@ -779,7 +899,8 @@ def _render_and_write(
 
     step("hash")
     hashes = hashing.hash_packet_files(root, config, rels=[BEAUTY_NAME, DISPLAY_NAME])
-    hashes.update(hashing.sidecar_hashes(config, legend=leg))
+    hashes.update(hashing.sidecar_hashes(config, legend=leg, folder=root))
+    scene_hash = hashing.hash_scene(scene, config, folder=root, hashes=hashes)
 
     step("manifest")
     header = facts.header
@@ -803,6 +924,7 @@ def _render_and_write(
             channels="RGBA" if tif[2] == 4 else "RGB",
         ),
         "id_legend": packet.file_ref_from_hashes("id_legend.json", hashes, "json"),
+        hashing.SCENE_DIGEST_ROLE: hashing.scene_digest_ref(hashes),
     }
     render_block = _render_block(rr, str(option(options, "session", "interactive")))
     renderer_class = _renderer_class()
@@ -823,8 +945,8 @@ def _render_and_write(
             {"name": "vray", "version": vray_version(renderer_class)},
             colour_block,
             render_block,
-            scene_hash=hashing.hash_scene(scene, config),
-            view_hash=hashing.hash_view(view_payload, config),
+            scene_hash=scene_hash,
+            view_hash=hashing.hash_view(view_payload, config, folder=root),
             supersedes=_supersedes(options, camera),
             custody=option(options, "custody"),
             max_unlabelled_share=share_limit,
@@ -835,19 +957,38 @@ def _render_and_write(
     note("manifest", packet_id)
 
     step("post")
-    answer = transport.post_packet(root, config)
+    answer = transport.post_packet(root, config, timeout_s=option(options, "post_timeout_s"))
     status, body = answer["status_code"], answer["body"]
     result.status_code, result.daemon = status, body
+    if answer.get("reposted"):
+        result.warnings.append(f"the POST timed out; the re-post of the same folder answered HTTP {status}")
     if status in OK_STATUS:
+        note("post", f"HTTP {status}")
+        step("ingest")
+        follow_ingest(result, body, config, options)
         result.ok = True
         result.stage = "done"
-        note("post", f"HTTP {status}")
         return
     if status == 426:
         raise SendAbort("post", f"daemon refused packet version {PACKET_VERSION} (HTTP 426): {body}")
     if status == 409:
         raise SendAbort("post", f"daemon already holds a different packet under this id (HTTP 409): {body}")
     raise SendAbort("post", f"daemon rejected the packet (HTTP {status}): {body}")
+
+
+def follow_ingest(result: SendResult, body: Any, config: dict[str, Any], options: Any) -> None:
+    """After a 200/202: result.events_url (the answer's, else the packet's event route) followed for
+    options.ingest_follow_s (default transport.FOLLOW_WINDOW_S) into result.ingest. An ingest the
+    daemon failed is SendAbort("ingest", INGEST_FAILED); one still running is not a failure."""
+    events_url = body.get("events_url") if isinstance(body, dict) else None
+    result.events_url = str(events_url or transport.events_url_for(str(result.packet_id)))
+    window = float(option(options, "ingest_follow_s", transport.FOLLOW_WINDOW_S))
+    state = transport.follow_ingest(result.events_url, config, window_s=window)
+    result.ingest = str(state["ingest"])
+    if state.get("problem"):
+        result.warnings.append(f"ingest not followed ({result.events_url}): {state['problem']}")
+    if result.ingest.startswith("failed"):
+        raise SendAbort("ingest", f"ingest: {result.ingest}", code=INGEST_FAILED)
 
 
 # --------------------------------------------------------------------------- entry point
@@ -899,7 +1040,8 @@ def run(
         return results
 
     notify_progress(progress, 0, total, "checking the daemon")
-    gate_ok, gate_reason = daemon_gate(config)
+    gate = daemon_gate(config, out_root)
+    gate_ok, gate_reason = gate
     saved: dict[str, CameraRecipe] = {}
     try:
         saved = load_recipes()
@@ -909,7 +1051,7 @@ def run(
         result = SendResult(camera=camera)
         results.append(result)
         if not gate_ok:
-            result.stage, result.errors = "daemon", [gate_reason]
+            result.stage, result.code, result.errors = "preflight", gate.code, [gate_reason]
             notify_progress(progress, index + 1, total, f"{camera}: {gate_reason}")
             continue
 
@@ -926,11 +1068,16 @@ def run(
         except SendAbort as abort:
             result.ok = False
             result.stage = abort.stage
+            result.code = abort.code or result.code
             result.errors.append(abort.reason)
             result.problems.extend(abort.problems)
         except transport.TransportError as exc:  # hashing or posting: the daemon said no or went away
             result.ok = False
             result.errors.append(f"{result.stage}: daemon: {exc}")
+        except hashing.PayloadTooLarge as exc:  # the preflight stops these: a last net
+            result.ok = False
+            result.code = PAYLOAD_TOO_LARGE
+            result.errors.append(f"{result.stage}: {exc}")
         except Exception as exc:  # anything unexpected stops this camera, never the batch
             result.ok = False
             result.errors.append(f"{result.stage}: {type(exc).__name__}: {exc}")

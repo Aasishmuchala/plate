@@ -237,9 +237,13 @@ def test_graph_writes_are_held_to_the_canvas_rules(sync_client):
     assert r.status_code == 422 and r.json()["violations"][0]["code"] == "SCRUB_REQUIRED"
     approved["nodes"][1]["scrubLogId"] = "scrub_1"
     assert c.put("/api/v0/projects/p1/graph", json=approved, headers=auth).status_code == 200
-    # The rejected writes left the last good graph on disk.
+    # The rejected writes left the last good graph on disk, and (decision 31, T59) the server
+    # rewrote the client's claimed approval from the index: no run, no accept, so nothing approved.
     saved = json.loads((settings.projects_dir / "p1" / "project.json").read_text(encoding="utf-8"))
-    assert saved["graph"] == approved
+    edit = saved["graph"]["nodes"][1]
+    assert edit.get("approved", False) is False
+    assert edit.get("gateStatus", "none") == "none"
+    assert "scrubLogId" not in edit
 
 
 @needs_room_a
@@ -273,7 +277,15 @@ def test_node_quotes_refuse_what_the_pipeline_cannot_run(sync_client):
     assert lone.status_code == 422 and lone.json()["error"] == "NO_PLATE_ANCHOR"
     assert quote("e").status_code == 422  # no engine named anywhere
     assert quote("e", engine_id="no-such-engine").json()["error"] == "unknown_engine"
-    assert quote("e", engine_id="flux-3-image").json()["error"] == "no_sizes"  # egress never guesses a size
+    # Egress never guesses a size: a cloud engine whose manifest declares none is refused at the quote. Every
+    # shipped image engine declares sizes now (flux-3-image since T61), so strip them from this app's copy.
+    manifests = c.app.state.pipeline.manifests
+    flux = manifests["flux-3-image"]
+    manifests["flux-3-image"] = flux.model_copy(update={"sizes": None})
+    try:
+        assert quote("e", engine_id="flux-3-image").json()["error"] == "no_sizes"
+    finally:
+        manifests["flux-3-image"] = flux
     up = quote("e", engine_id="real-esrgan")  # an upscaler: the plate is never upscaled
     assert up.status_code == 422 and up.json()["error"] == "engine_kind"
     assert quote("e", engine_id="fake", feather_px=40).status_code == 422  # the feather lives inside 4-12 px

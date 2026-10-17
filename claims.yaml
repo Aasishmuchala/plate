@@ -1,0 +1,425 @@
+# Claims as tests. Every public-facing sentence in README.md ("What the code enforces") and
+# docs/client-explainer.md is tied here to the tests that make it true, and scripts/claims_check.py runs those
+# tests by node id. If a claim has no passing test, or a sentence in either document is not covered by a claim,
+# the build fails.
+#
+#   python scripts/claims_check.py            run every listed test; exit 1 if any claim lacks a passing one
+#   python scripts/claims_check.py --static   check the file and the documents only (no tests run)
+#   python scripts/claims_check.py --list     print the claims and their tests
+#
+# Shape of a claim:
+#   id       short name (used in reports and by --only)
+#   says     where the claim is made: [{file, quote}], quote being a plain-text fragment of that file
+#            (markdown bold and code marks are ignored when matching). A document edit that removes
+#            or rewords the fragment fails the check until the claim is re-read and re-tied.
+#   tests    pytest node ids relative to the repo root, `path.py::test_name[::more]` (a name without a
+#            parameter id selects every parameter), or `vitest:<ui test file>::<test title>`.
+#            ALL listed tests must pass; a skipped test does not count as passing.
+#   caveat   (optional) where the sentence says more than the code enforces. Printed as a warning on every run.
+#
+# `covered` names the documents whose every paragraph, bullet and table row must hold at least one `says`
+# quote; `exempt` lists the few sentences that make no claim (framing), each with a reason.
+
+version: 1
+
+covered:
+  - file: README.md
+    section: "What the code enforces"
+  - file: docs/client-explainer.md
+
+exempt:
+  - file: README.md
+    text: "These are the claims this repository stands behind"
+    why: "Introduces the list; makes no claim of its own."
+  - file: docs/client-explainer.md
+    text: "We build your images from the 3D model in 3ds Max and V-Ray"
+    why: "Framing paragraph; each rule it points to is a bullet below, tied to its own tests."
+  - file: docs/client-explainer.md
+    text: "Some AI services run on our own computers"
+    why: "Introduces the grade table; each grade is a row below."
+  - file: docs/client-explainer.md
+    text: "Questions about any of this are welcome"
+    why: "A courtesy line, not a claim."
+
+claims:
+  # ------------------------------------------------------------------------------------------ pixels
+  - id: outside_mask_zero
+    says:
+      - file: README.md
+        quote: "outside the mask the delivered pixels are the render, bit for bit"
+      - file: docs/client-explainer.md
+        quote: "Anything we did not mean to change is your original render, pixel for pixel."
+    tests:
+      - gates/tests/test_composite_masked.py::test_outside_the_mask_is_the_plate_exactly
+      - gates/tests/test_depth_material.py::test_outside_mask_identical_for_a_composite
+      - gates/tests/test_depth_material.py::test_outside_mask_catches_a_one_pixel_leak
+      - daemon/tests/test_pipeline_e2e.py::test_packet_to_gated_output_on_the_fake_engine
+
+  - id: only_editable_ids
+    says:
+      - file: README.md
+        quote: "AI pixels land only inside the IDs a packet marks editable"
+      - file: docs/client-explainer.md
+        quote: "AI may touch only the parts we mark as editable"
+      - file: docs/client-explainer.md
+        quote: "The building, its glass, its signs and its materials are locked."
+    tests:
+      - spec/tests/test_packet_schema.py::test_architecture_can_never_be_editable
+      - spec/tests/test_packet_schema.py::test_signage_can_never_be_editable
+      - spec/tests/test_packet_schema.py::test_editable_material_on_locked_object_is_rejected
+      - spec/tests/test_packet_schema.py::test_autotag_cannot_override_a_never_editable_rule
+      - spec/tests/test_packet_schema.py::test_manual_override_of_architecture_rule_still_cannot_be_editable
+      - daemon/tests/test_pipeline_e2e.py::test_a_mask_node_narrows_the_edit_and_a_locked_id_is_refused
+      - gates/tests/test_textlock.py::test_apply_restores_the_plate_inside_the_box_bit_exactly
+
+  - id: plate_never_upscaled
+    says:
+      - file: README.md
+        quote: "the plate is never upscaled"
+      - file: docs/client-explainer.md
+        quote: "We never enlarge your render with AI."
+    tests:
+      - engines/tests/test_router.py::test_choose_a_plate_never_reaches_an_upscaler
+      - engines/tests/test_router.py::test_choose_forbidden_tasks_are_doctrine_refusals
+      - engines/tests/test_loader.py::test_invalid_documents_are_rejected
+      - daemon/tests/test_motion_croppair.py::test_the_plate_is_never_upscaled
+
+  - id: render_it_again
+    says:
+      - file: docs/client-explainer.md
+        quote: "If an image needs more detail, we render it again."
+    tests:
+      - gates/tests/test_router_math.py::test_leaf_detail_at_10m_and_30m
+      - gates/tests/test_router_math.py::test_orbit_35_degrees_is_render_move_even_with_little_disocclusion
+      - gates/tests/test_router_math.py::test_threshold_crossing_forces_render_move_and_blocks_in_blocking_mode
+      - engines/tests/test_router.py::test_choose_rephotograph_refuses_wide_and_undeclared_shots
+
+  - id: no_text_to_image
+    says:
+      - file: README.md
+        quote: "There is no text-to-image node"
+    tests:
+      - engines/tests/test_adapters_image.py::test_there_is_no_text_to_image_path
+      - engines/tests/test_router.py::test_choose_forbidden_tasks_are_doctrine_refusals
+      - "vitest:ui/src/canvasRules.test.ts::has no text-to-image or image-creator node kind"
+      - "vitest:ui/src/store.test.ts::rejects an unknown node kind, so there is no way to load a text-to-image node"
+
+  - id: invented_angle_needs_override
+    says:
+      - file: README.md
+        quote: "an invented camera angle needs an explicit override"
+    tests:
+      - daemon/tests/test_routes_packets.py::test_canvas_rules_agree_with_the_shared_vectors
+      - daemon/tests/test_motion_croppair.py::test_orbit_over_thirty_degrees_is_blocked_and_an_override_labels_it
+      - engines/tests/test_router.py::test_choose_forbidden_tasks_are_doctrine_refusals
+      - "vitest:ui/src/canvasRules.test.ts::an Edit with params.cameraOverride and no override+label is INVENTED_ANGLE"
+
+  # ------------------------------------------------------------------------------------------ spend
+  - id: quote_before_spend
+    says:
+      - file: README.md
+        quote: "Every run is quoted (provider, model, price, custody grade) and approved before any spend"
+      - file: docs/client-explainer.md
+        quote: "Before any online AI run, we see the price, the service and its grade."
+      - file: docs/client-explainer.md
+        quote: "Nothing is spent until a person has approved it, either that run, or a per-run cap or budget envelope the studio set in advance."
+    tests:
+      - daemon/tests/test_machine_properties.py::test_every_pair_pure
+      - daemon/tests/test_machine_properties.py::test_every_pair_against_sqlite
+      - daemon/tests/test_machine_properties.py::test_submitted_needs_the_provider_id_persisted_first
+      - daemon/tests/test_machine_properties.py::test_approved_needs_an_approver
+      - daemon/tests/test_budgets.py::test_no_quote_or_an_expired_quote_is_never_authorized
+      - daemon/tests/test_budgets.py::test_build_quote_from_a_manifest
+      - daemon/tests/test_budgets.py::test_agents_must_pass_an_envelope
+      - daemon/tests/test_budgets.py::test_auto_approves_only_below_the_per_run_cap
+      - daemon/tests/test_budgets.py::test_the_envelope_bounds_an_agent
+      - daemon/tests/test_mcp.py::test_new_envelope_is_a_command_line_act_not_a_tool
+      - daemon/tests/test_pipeline_e2e.py::test_packet_to_gated_output_on_the_fake_engine
+      - "vitest:ui/src/test/canvas.test.tsx::Quote shows provider · model · price USD · custody grade · ETA and a countdown; Make then enables"
+
+  - id: quote_expires_in_15_minutes
+    says:
+      - file: README.md
+        quote: "a quote expires after 15 minutes"
+    tests:
+      - daemon/tests/test_machine_properties.py::test_an_expired_quote_cannot_be_approved
+      - daemon/tests/test_machine_properties.py::test_a_live_quote_is_approved
+      - daemon/tests/test_machine_properties.py::test_the_raw_machine_expires_instead_of_approving
+      - daemon/tests/test_budgets.py::test_build_quote_from_a_manifest
+      - daemon/tests/test_pipeline_e2e.py::test_an_expired_quote_cannot_be_approved
+      - "vitest:ui/src/test/canvas.test.tsx::quote expiry disables Make and says to quote again"
+
+  # ------------------------------------------------------------------------------------------ custody
+  - id: nda_c0_c1_only
+    says:
+      - file: README.md
+        quote: "On an NDA project nothing goes to a route graded below C1"
+      - file: docs/client-explainer.md
+        quote: "For projects under a confidentiality agreement, we use only C0 and C1"
+      - file: docs/client-explainer.md
+        quote: "today that means our own computers only"
+    tests:
+      - daemon/tests/test_custody.py::test_nda_is_capped_at_c0_c1_whatever_the_lists_say
+      - daemon/tests/test_custody.py::test_filter_routes_on_nda_keeps_only_local_today
+      - daemon/tests/test_egress.py::test_grade_d_route_on_nda_is_refused_before_any_transport_call
+      - daemon/tests/test_pipeline_e2e.py::test_a_d_route_on_an_nda_project_is_refused_before_anything_is_built
+      - engines/tests/test_router.py::test_a_nda_project_relight_only_reaches_the_local_engine
+      - engines/tests/test_router.py::test_nda_video_has_no_cloud_path
+      - daemon/tests/test_previs.py::test_an_nda_project_never_reaches_atlas
+
+  - id: pending_terms_count_as_d
+    says:
+      - file: README.md
+        quote: "a route whose written terms are pending counts as grade D"
+      - file: docs/client-explainer.md
+        quote: "Today we do not yet hold written terms from any online service, so we treat every online route as D."
+    tests:
+      - daemon/tests/test_custody.py::test_pending_counts_as_d_and_public_uploads_are_d
+      - daemon/tests/test_custody.py::test_effective_grade_agrees_with_the_router_on_every_manifest_route
+      - daemon/tests/test_custody.py::test_anthropic_api_is_a_pending_c1_so_nda_runs_without_composer_and_judge
+      - daemon/tests/test_custody.py::test_yaml_agrees_with_docs_custody_md
+      - daemon/tests/test_egress.py::test_pending_c1_route_counts_as_d_on_nda
+      - engines/tests/test_router.py::test_g_pending_c1_route_is_excluded_at_c1_and_included_at_d
+      - engines/tests/test_router.py::test_atlas_is_never_routable_below_grade_d
+
+  - id: custody_grades_as_described
+    says:
+      - file: docs/client-explainer.md
+        quote: "stays on our computers; nothing is sent anywhere"
+      - file: docs/client-explainer.md
+        quote: "a company that has agreed in writing not to keep your image and not to learn from it"
+      - file: docs/client-explainer.md
+        quote: "a reseller whose written terms we hold"
+      - file: docs/client-explainer.md
+        quote: "we do not hold written terms, or the image would sit at a public web address"
+    tests:
+      - daemon/tests/test_custody.py::test_grades_order_by_strictness
+      - daemon/tests/test_custody.py::test_unknown_grade_is_refused
+      - daemon/tests/test_custody.py::test_yaml_agrees_with_docs_custody_md
+      - daemon/tests/test_custody.py::test_matrix_shows_every_vendor_at_its_effective_grade
+      - engines/tests/test_manifests_load.py::test_local_routes_are_c0_confirmed_local
+      - engines/tests/test_router.py::test_public_uploads_are_grade_d_even_if_a_route_claims_otherwise
+
+  - id: consent_before_anything_leaves
+    says:
+      - file: docs/client-explainer.md
+        quote: "On an open project, nothing is sent online until the studio has recorded your consent on the project"
+      - file: docs/client-explainer.md
+        quote: "on a project under a confidentiality agreement, the software itself refuses every route below C1."
+    caveat: >-
+      For an open project the consent is the allowed_grades the artist records on the project (a project with no
+      custody set yet is local-only), which is a human step the code can only honour: it cannot check that the
+      client's written consent exists. NDA projects have no consent override in code (they stay on C0 and C1).
+    tests:
+      - daemon/tests/test_custody.py::test_project_with_no_custody_is_local_only
+      - daemon/tests/test_custody.py::test_project_allowed_is_the_stricter_intersection
+      - daemon/tests/test_projects.py::test_custody_rules
+      - daemon/tests/test_routes_misc.py::test_tierc_without_a_consent_record_is_428
+      - daemon/tests/test_previs.py::test_a_route_that_leaves_the_box_needs_an_approval
+
+  - id: nda_egress
+    says:
+      - file: docs/client-explainer.md
+        quote: "What leaves our computers is only the picture itself, without names, file details or project information."
+    tests:
+      - daemon/tests/test_egress.py::test_nda_packet_capture
+      - daemon/tests/test_egress.py::test_a_raw_png_body_is_stripped
+      - daemon/tests/test_egress.py::test_urlsafe_base64_png_inside_json_is_stripped
+      - daemon/tests/test_egress.py::test_project_identifiers_in_a_body_are_blocked
+      - daemon/tests/test_egress.py::test_jpeg_and_other_formats_never_leave
+      - daemon/tests/test_egress.py::test_machine_paths_are_blocked_on_every_project
+      - daemon/tests/test_egress.py::test_destination_outside_the_allowlist_is_blocked
+      - daemon/tests/test_egress.py::test_no_httpx_client_outside_egress_and_transport
+      - daemon/tests/test_mcp_server_egress.py::test_the_client_cannot_be_aimed_or_redirected_elsewhere
+      - daemon/tests/test_mcp_server_egress.py::test_a_non_loopback_daemon_url_is_refused_before_a_client_exists
+
+  # ------------------------------------------------------------------------------------------ gates
+  - id: gates_measure_not_opine
+    says:
+      - file: docs/client-explainer.md
+        quote: "Every AI-assisted image is checked by measurements, not opinion, and compared with the original render."
+      - file: docs/client-explainer.md
+        quote: "did anything move? did the building's edges stay where they were?"
+      - file: docs/client-explainer.md
+        quote: "did the colours of the materials stay true?"
+      - file: docs/client-explainer.md
+        quote: "does the fine detail look natural, neither smeared nor over-sharpened?"
+      - file: docs/client-explainer.md
+        quote: "did anything change outside the area we edited?"
+    tests:
+      - gates/tests/test_register.py::test_pure_translation_is_all_shift_and_no_residual
+      - gates/tests/test_gbuffer.py::test_analytic_edges_recovered
+      - gates/tests/test_gbuffer.py::test_weights_and_visibility_change_the_recall
+      - gates/tests/test_depth_material.py::test_material_shift_de5_p90_near_5_and_others_untouched
+      - gates/tests/test_texture_tone_bands.py::test_crunched_scene_trips_the_hard_band_at_native_width
+      - gates/tests/test_texture_tone_bands.py::test_upscaled_content_reads_soft_at_the_band_resolution
+      - gates/tests/test_depth_material.py::test_outside_mask_catches_a_one_pixel_leak
+      - daemon/tests/test_judge.py::test_a_numeric_gate_failure_forces_fix
+
+  - id: gate_verdicts
+    says:
+      - file: docs/client-explainer.md
+        quote: "Each image gets one result:"
+      - file: docs/client-explainer.md
+        quote: "every check that can block an image was met"
+      - file: docs/client-explainer.md
+        quote: "nothing blocking failed, but a softer guide was missed; a person looks at it"
+    tests:
+      - gates/tests/test_report.py::test_verdict_is_fail_iff_a_hard_check_fails
+      - gates/tests/test_report.py::test_verdict_cannot_be_forced
+      - gates/tests/test_thresholds.py::test_hard_miss_fails_and_pass_passes
+      - gates/tests/test_thresholds.py::test_advisory_and_calibration_misses_never_fail
+
+  - id: gate_fail_is_not_exportable
+    says:
+      - file: README.md
+        quote: "A take that fails a hard gate is kept and flagged and cannot be exported without a written reason"
+      - file: docs/client-explainer.md
+        quote: "a blocking check was missed. The image is kept, marked, and not delivered unless a person writes down why"
+    tests:
+      - daemon/tests/test_delivery.py::test_gate_fail_needs_an_override_with_a_real_reason_and_logs_it
+      - daemon/tests/test_delivery.py::test_a_failing_report_on_a_done_run_still_needs_the_override
+      - daemon/tests/test_delivery.py::test_from_run_logs_the_override_on_the_run_exactly_like_export
+      - daemon/tests/test_pipeline_e2e.py::test_a_drifted_result_fails_its_gates_and_exports_only_after_an_override
+      - "vitest:ui/src/test/canvas.test.tsx::a GATE_FAIL override needs a reason and is posted to the daemon before it shows"
+
+  - id: gate_report_shows_numbers_and_version
+    says:
+      - file: docs/client-explainer.md
+        quote: "The report shows each measurement next to the limit, and the version of the checks that produced it."
+    tests:
+      - gates/tests/test_report.py::test_fields_and_defaults
+      - gates/tests/test_report.py::test_metric_code_hash_covers_every_module_once_per_process
+      - gates/tests/test_thresholds.py::test_set_id_and_every_spec_metric_is_present_exactly_once
+      - daemon/tests/test_pipeline_e2e.py::test_packet_to_gated_output_on_the_fake_engine
+
+  - id: shipped_report_never_rewritten
+    says:
+      - file: README.md
+        quote: "a shipped gate report is never rewritten"
+      - file: docs/client-explainer.md
+        quote: "If we later improve the checks, old reports stay as they were."
+    tests:
+      - gates/tests/test_report.py::test_write_numbers_files_and_never_overwrites
+      - daemon/tests/test_lineage.py::test_reports_are_numbered_never_overwritten_and_read_back
+      - daemon/tests/test_lineage.py::test_rescore_writes_the_next_version_and_records_where_from
+      - daemon/tests/test_lineage.py::test_rescore_after_ship_leaves_the_shipped_file_byte_identical
+      - daemon/tests/test_lineage.py::test_tampering_with_a_shipped_report_is_detected
+
+  - id: lineage_inside_the_file
+    says:
+      - file: docs/client-explainer.md
+        quote: "Every image we deliver carries a record inside the file of how it was made"
+    tests:
+      - daemon/tests/test_lineage.py::test_png_round_trip_keeps_icc_and_pixels
+      - daemon/tests/test_lineage.py::test_tiff_embed_is_lossless_and_adds_only_the_xmp_tag
+      - daemon/tests/test_lineage.py::test_exr_single_part_round_trip_changes_nothing_but_the_header
+      - daemon/tests/test_lineage.py::test_exr_multipart_gets_the_attribute_on_every_part
+      - daemon/tests/test_cli.py::test_export_writes_each_format_with_lineage_and_one_shared_gate_json
+      - daemon/tests/test_pipeline_e2e.py::test_packet_to_gated_output_on_the_fake_engine
+
+  # ------------------------------------------------------------------------------------------ agents and marks
+  - id: mcp_cannot_approve_or_deliver
+    says:
+      - file: README.md
+        quote: "An agent over MCP cannot approve, deliver, override or export a master."
+    tests:
+      - daemon/tests/test_mcp.py::test_tool_list_is_exactly_the_eight_names
+      - daemon/tests/test_mcp.py::test_add_node_refuses_delivery_nodes_and_human_only_fields
+      - daemon/tests/test_mcp.py::test_export_review_holds_watermarked_proxies_and_no_master
+      - daemon/tests/test_mcp.py::test_run_node_without_an_envelope_is_an_error
+      - daemon/tests/test_mcp.py::test_an_envelope_of_another_project_is_refused
+      - daemon/tests/test_mcp.py::test_new_envelope_is_a_command_line_act_not_a_tool
+
+  - id: previs_is_not_deliverable
+    says:
+      - file: README.md
+        quote: "Previs output (PREVIS) can never reach Export or Delivery (a watermarked previs may go into a Review)"
+      - file: docs/client-explainer.md
+        quote: "PREVIS across a moving picture: a rough preview made by AI, to agree a camera move with you."
+      - file: docs/client-explainer.md
+        quote: "It is not a measured image and it is never a deliverable."
+    caveat: >-
+      docs/artist-manual.md (the previs section) still says previs can never reach Review. The code lets a
+      watermarked PREVIS motion into a client Review on purpose (canvas_rules.py: "a Review may show it"; shared
+      vector "a previs motion may be shown in a review"); Export and Delivery are refused. README.md and the
+      client explainer are accurate as written; the manual should say "Export or Delivery" for previs.
+    tests:
+      - daemon/tests/test_previs.py::test_export_of_a_previs_output_is_refused
+      - daemon/tests/test_previs.py::test_the_shared_vectors_hold_the_previs_rule
+      - daemon/tests/test_previs.py::test_draft_run_makes_a_watermarked_480p_previs
+      - daemon/tests/test_delivery.py::test_previs_is_refused_with_no_override_path
+      - daemon/tests/test_delivery.py::test_fcpxml_refuses_media_whose_sidecar_says_previs_or_unresolved_fail
+
+  - id: concept_is_not_deliverable
+    says:
+      - file: README.md
+        quote: "Concept images can never reach Export, Review or Delivery."
+      - file: docs/client-explainer.md
+        quote: "CONCEPT, UNMEASURED across a still: an idea sketch, not checked against the model."
+      - file: docs/client-explainer.md
+        quote: "It is never delivered as a final image."
+    tests:
+      - daemon/tests/test_routes_packets.py::test_canvas_rules_agree_with_the_shared_vectors
+      - daemon/tests/test_routes_packets.py::test_graph_writes_are_held_to_the_canvas_rules
+      - "vitest:ui/src/canvasRules.test.ts::refuses Concept -> Export"
+      - "vitest:ui/src/canvasRules.test.ts::refuses the concept tier reaching Export through intermediate nodes"
+      - "vitest:ui/src/canvasRules.test.ts::refuses Concept -> Review and allows a measured path into Export"
+      - "vitest:ui/src/test/canvas.test.tsx::marks a Concept node and everything downstream of it as concept_unmeasured with a permanent watermark"
+
+  - id: review_copies_are_marked_and_reduced
+    says:
+      - file: docs/client-explainer.md
+        quote: "REVIEW across a picture in a review bundle: a reduced copy for your comments, not the delivery file."
+    tests:
+      - daemon/tests/test_review_bundle.py::test_watermark_is_tiled_at_twelve_percent
+      - daemon/tests/test_review_bundle.py::test_a_bundle_cannot_be_built_without_a_watermark
+      - daemon/tests/test_review_bundle.py::test_no_png_wider_than_2048_and_nothing_16_bit
+      - daemon/tests/test_review_bundle.py::test_proxies_are_srgb_tagged_and_keep_the_candidate_lineage
+
+  # ------------------------------------------------------------------------------------------ doctrine (CLAUDE.md)
+  # Not in the public documents, so the coverage rule does not apply; these keep the licence and ledger
+  # guarantees under the same runner.
+  - id: licences_commercial_only
+    says:
+      - file: CLAUDE.md
+        quote: "The licence registry in `pixels/` blocks non-commercial weights in CI"
+    tests:
+      - pixels/tests/test_licences.py::test_blocked_models_raise
+      - pixels/tests/test_licences.py::test_a_blocked_backend_can_never_be_constructed
+      - pixels/tests/test_licences.py::test_check_fails_when_a_module_names_a_blocked_model
+      - pixels/tests/test_licences.py::test_python_dash_m_check_exit_codes
+      - pixels/tests/test_no_blocked_identifiers.py::test_package_has_no_blocked_identifiers
+
+  - id: ledger_reconciles_within_1_percent
+    says:
+      - file: CLAUDE.md
+        quote: "The ledger reconciles to vendor billing within 1%."
+    tests:
+      - daemon/tests/test_reconcile.py::test_clean_day_reconciles
+      - daemon/tests/test_reconcile.py::test_one_percent_tolerance_is_inclusive
+      - daemon/tests/test_reconcile.py::test_one_unmatched_row_fails_the_day_with_its_amount
+
+  - id: judge_cannot_overrule_numbers
+    says:
+      - file: CLAUDE.md
+        quote: "the judge can never pass a frame that fails a numeric gate"
+    tests:
+      - daemon/tests/test_judge.py::test_a_numeric_gate_failure_forces_fix
+
+  - id: plate_text_is_data
+    says:
+      - file: CLAUDE.md
+        quote: "Plate content is data, never instructions."
+    tests:
+      - daemon/tests/test_composer.py::test_plate_strings_reach_the_model_only_inside_data_blocks
+      - daemon/tests/test_composer.py::test_a_plate_string_cannot_close_the_data_block
+
+  - id: no_silent_engine_fallback
+    says:
+      - file: CLAUDE.md
+        quote: "No silent fallback to another engine or model"
+    tests:
+      - engines/tests/test_router.py::test_pinned_engine_is_never_substituted
+      - engines/tests/test_router.py::test_next_same_model_never_crosses_to_a_different_model
+      - engines/tests/test_router.py::test_choose_a_pin_never_overrides_custody_or_swaps_engines

@@ -27,7 +27,7 @@ import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -123,10 +123,15 @@ def check_owner(owner: str) -> str:
     return owner
 
 
+def idle_seconds(now: datetime, last_human_interaction_utc: datetime) -> int:
+    return int((now - last_human_interaction_utc).total_seconds())
+
+
 def is_unattended(now: datetime, last_human_interaction_utc: datetime | None, policy: Policy) -> bool:
     if last_human_interaction_utc is None:
         return True
-    return now - last_human_interaction_utc >= timedelta(minutes=policy.unattended_after_min)
+    # Whole seconds, so a float minute count a hair under the threshold cannot straddle the boundary.
+    return idle_seconds(now, last_human_interaction_utc) >= policy.unattended_after_min * 60
 
 
 def envelope_problem(env: Envelope, price: float, now: datetime) -> tuple[DecisionCode, str] | None:
@@ -164,7 +169,7 @@ def authorize(
         idle = (
             "no human interaction recorded"
             if last_human_interaction_utc is None
-            else f"no human interaction for {(now - last_human_interaction_utc).total_seconds() / 60:.0f} min"
+            else f"no human interaction for {idle_seconds(now, last_human_interaction_utc) / 60:.0f} min"
         )
         alert = (
             f"unattended spend: {idle}; auto and agent approvals capped at {policy.unattended_cap_usd:.2f} USD "

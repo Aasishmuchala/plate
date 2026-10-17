@@ -2,9 +2,12 @@
 // approve, plus the engine list and the project's custody. Responses are normalised here so the bar only sees
 // `RunWire` / `QuoteWire` / `EngineSummary`.
 //
-//   POST /api/v0/projects/{pid}/nodes/{node}/quote  {engine_id, preset, region_crop, params}  -> {run, quote} | Run
+//   POST /api/v0/projects/{pid}/nodes/{node}/quote  {engine_id, preset, region_crop, params, prompt?, recipe?,
+//                                                    task?, shot_class?}  -> {run, quote} | Run   (never `attempt`:
+//                                                    the daemon numbers attempts itself, decision 40)
 //   POST /api/v0/runs/{id}/fanout {n}               -> Run[] | {runs: Run[]}   (sibling 0 is the quoted run)
-//   POST /api/v0/runs/{id}/approve {by, envelope_id?, reason?}  approves the run's whole sibling group
+//   POST /api/v0/runs/{id}/approve {by, envelope_id?, reason?}  approves the run's whole sibling group; refusals are
+//                                                    409/422 {error, detail} with the codes in HUMAN_REFUSALS
 //   GET  /api/v0/engines                             -> EngineSummary[] | {engines: [...]}  (FALLBACK on 404)
 //   GET  /api/v0/projects                            -> [{project_id, custody: {nda, allowed_grades}}] | {projects}
 
@@ -19,7 +22,28 @@ export interface QuoteRequest {
   preset: string;
   region_crop: boolean;
   params: Record<string, unknown>;
+  /** From the node's params when set: an explicit prompt wins over a recipe (decision 33). */
+  prompt?: string;
+  recipe?: string;
+  task?: string;
+  shot_class?: string;
 }
+
+/** The node params a quote carries at the top level of its body. */
+export const QUOTE_NODE_FIELDS = ["prompt", "recipe", "task", "shot_class"] as const;
+
+/** The approval refusals that put the approval dialog in front of the artist with the daemon's reason. */
+export const HUMAN_REFUSALS: ReadonlySet<string> = new Set([
+  "auto_cap",
+  "envelope_required",
+  "auto_approval_denied",
+  "approval_refused",
+  "daily_cap",
+  "unattended_cap",
+]);
+
+/** Of those, the ones no click can approve today: the dialog only says why. */
+export const BLOCKING_REFUSALS: ReadonlySet<string> = new Set(["daily_cap", "unattended_cap"]);
 
 export interface QuoteResponse {
   run: RunWire;
@@ -69,6 +93,12 @@ export function errorText(err: unknown): string {
     return typeof b === "string" && b ? `${err.status} ${b}` : err.message;
   }
   return err instanceof Error ? err.message : String(err);
+}
+
+/** The daemon's own sentence for a refusal (`detail`), else the one-line `errorText`. */
+export function errorDetail(err: unknown): string {
+  if (err instanceof ApiError && isObj(err.body) && typeof err.body.detail === "string" && err.body.detail) return err.body.detail;
+  return errorText(err);
 }
 
 /** The refusal code of a daemon error body (`auto_cap`, `envelope_required`, `quote_expired`, …). */

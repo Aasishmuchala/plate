@@ -1,7 +1,7 @@
 """`plate` (router plan T34): run / gate / export / reindex / gc / pack / smoke, in process.
 
 Every test calls `cli.main(argv, env=...)` against a throw-away PLATE_HOME and the committed Blender packet
-`fixtures/packets/room_a`; the vendor is the CLI's in-process fake engine (`PLATE_FAKE_ENGINE=1`), which echoes
+`fixtures/packets/room_a`; the vendor is the daemon's in-process `FakeEngine(echo=True)` (`PLATE_FAKE_ENGINE=1`), which echoes
 the plate egress prepared so the gates score real pixels (`{"echo": false, "size": [640, 360]}` is its noise,
 which is how a GATE_FAIL run is made). The smoke runs on the recorded vendor fixtures with the socket layer
 blocked; `smoke --live` is exercised with an injected transport and never reaches a network.
@@ -27,6 +27,7 @@ from plate_daemon import cli, lineage
 from plate_daemon.api import create_app
 from plate_daemon.cas import CAS
 from plate_daemon.config import Settings
+from plate_daemon.engine_fake import FakeEngine
 from plate_daemon.index import Index
 from plate_daemon.machine import run_events
 from plate_daemon.projects import Project
@@ -94,7 +95,7 @@ def test_fake_engine_env_is_off_on_or_json():
     assert cli.fake_engine_from_env({}) is None
     assert cli.fake_engine_from_env({"PLATE_FAKE_ENGINE": "0"}) is None
     on = cli.fake_engine_from_env({"PLATE_FAKE_ENGINE": "1"})
-    assert isinstance(on, cli.CliFakeEngine) and on.echo and on.shift_px == 0
+    assert type(on) is FakeEngine and on.echo and on.shift_px == 0
     flagged = cli.fake_engine_from_env(
         {"PLATE_FAKE_ENGINE": '{"echo": false, "shift_px": 3, "size": [8, 8]}'}
     )
@@ -106,7 +107,7 @@ def test_fake_engine_env_is_off_on_or_json():
 
 
 def test_echo_engine_hands_back_the_png_it_was_sent():
-    eng = cli.CliFakeEngine()
+    eng = FakeEngine(echo=True)
     import base64
 
     png = bytes(cv2.imencode(".png", np.full((4, 6, 3), 99, np.uint8))[1])

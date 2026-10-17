@@ -1,15 +1,17 @@
 // Light node editor (T47): match the plate's lighting to a reference image in Max. "Match in Max" asks the daemon to
 // queue a `light.match` job; the Max dock picks it up, runs MaxGaffer on the camera with the locks, re-renders and
 // sends a packet that supersedes this one. "Vantage preview" queues `light.vantage_preview` (the live link). Locked
-// parameters are never touched by the match.
+// parameters are never touched by the match. After queuing, the editor polls `GET /plugin/jobs/{id}` every 3 s and
+// follows the job queued -> claimed -> done | failed, showing the dock's `detail` and the packet it sent.
 // Node params: `referenceHash` (CAS hash of the reference image), `camera` (Max camera name; empty = the packet's),
 // `locks` (MaxGaffer parameter keys), `deep` (deep match).
 
-import { type ReactElement, useState } from "react";
+import { type ReactElement, useEffect, useState } from "react";
+import { ApiError } from "../api";
 import { useThumb } from "../canvas/assets";
-import { errorMessage, type PluginJob, queuePluginJob } from "./api";
+import { errorMessage, getPluginJob, PLUGIN_JOB_FINAL, type PluginJob, queuePluginJob } from "./api";
 import { asBool, asString, asStringList, useNodeEditor, usePlate, useStill } from "./params";
-import { E } from "./theme";
+import { E, type Tone } from "./theme";
 import { Button, Chip, EditorFrame, Field, Notice, Section, Toggle, useAction } from "./widgets";
 
 /** MaxGaffer's fixed rig parameters (`core/genome.py` PARAMS), grouped for the lock menu. */
@@ -19,11 +21,30 @@ export const LOCK_GROUPS: readonly { group: string; keys: readonly string[] }[] 
   { group: "Exposure", keys: ["exposure.ev", "exposure.wb_kelvin"] },
 ];
 
+/** How often a queued job is asked about (ms). */
+export const JOB_POLL_MS = 3000;
+
+const JOB_VERB: Readonly<Record<string, string>> = {
+  queued: "queued",
+  claimed: "claimed by Max",
+  done: "done",
+  failed: "failed",
+  cancelled: "cancelled",
+};
+const JOB_TONE: Readonly<Record<string, Tone>> = { queued: "info", claimed: "info", done: "pass", failed: "fail", cancelled: "advisory" };
+
+/** The three stops of a job: queued, claimed, then where it ended (done until it fails or is cancelled). */
+export function jobSteps(state: string): [string, string, string] {
+  return ["queued", "claimed", state === "failed" || state === "cancelled" ? state : "done"];
+}
+
 export function LightEditor({ nodeId }: { nodeId: string }): ReactElement {
   const { params, set } = useNodeEditor(nodeId);
   const plate = usePlate(nodeId);
   const upstream = useStill(nodeId);
   const [job, setJob] = useState<{ kind: string; job: PluginJob } | null>(null);
+  const [pollError, setPollError] = useState<string | null>(null);
+  const [lost, setLost] = useState(false);
 
   const referenceHash = asString(params.referenceHash);
   const camera = asString(params.camera);
@@ -37,12 +58,48 @@ export function LightEditor({ nodeId }: { nodeId: string }): ReactElement {
     set({ locks: next.length > 0 ? next.sort() : undefined });
   };
 
+  const follow = (kind: string, queued: PluginJob): void => {
+    setPollError(null);
+    setLost(false);
+    setJob({ kind, job: queued });
+  };
   const [match, matchState] = useAction(async () => {
-    setJob({ kind: "match", job: await queuePluginJob({ action: "light.match", packet_id: packetId, camera: camera || undefined, reference_hash: referenceHash, locks, deep }) });
+    follow("match", await queuePluginJob({ action: "light.match", packet_id: packetId, camera: camera || undefined, reference_hash: referenceHash, locks, deep }));
   }, errorMessage);
   const [vantage, vantageState] = useAction(async () => {
-    setJob({ kind: "vantage preview", job: await queuePluginJob({ action: "light.vantage_preview", packet_id: packetId, camera: camera || undefined }) });
+    follow("vantage preview", await queuePluginJob({ action: "light.vantage_preview", packet_id: packetId, camera: camera || undefined }));
   }, errorMessage);
+
+  // follow the job the dock is working on until it is done, failed or cancelled; stop when the editor closes
+  const jobId = job?.job.id ?? null;
+  const watching = job !== null && !PLUGIN_JOB_FINAL.has(job.job.state) && !lost;
+  useEffect(() => {
+    if (!watching || jobId === null) return;
+    let alive = true;
+    let busy = false;
+    const timer = setInterval(() => {
+      if (busy) return;
+      busy = true;
+      getPluginJob(jobId)
+        .then((next) => {
+          if (!alive) return;
+          setPollError(null);
+          setJob((cur) => (cur && cur.job.id === jobId ? { ...cur, job: next } : cur));
+        })
+        .catch((err: unknown) => {
+          if (!alive) return;
+          if (err instanceof ApiError && err.status === 404) setLost(true);
+          setPollError(errorMessage(err));
+        })
+        .finally(() => {
+          busy = false;
+        });
+    }, JOB_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [watching, jobId]);
 
   const error = matchState.error ?? vantageState.error;
 
@@ -95,12 +152,37 @@ export function LightEditor({ nodeId }: { nodeId: string }): ReactElement {
         </Button>
       </div>
       {job ? (
-        <div style={E.row}>
-          <Chip tone="info" testId="light-job">
-            {job.kind} queued: job {job.job.id} ({job.job.state})
+        <div style={E.row} data-testid="light-job-row">
+          <Chip tone={JOB_TONE[job.job.state] ?? "info"} testId="light-job">
+            {job.kind} {JOB_VERB[job.job.state] ?? job.job.state}: job {job.job.id} ({job.job.state})
           </Chip>
-          {job.kind === "match" ? <span style={E.note}>Max re-renders the camera and sends a packet that supersedes this one</span> : null}
+          <span style={E.note} data-testid="light-job-steps">
+            {jobSteps(job.job.state).map((step, i) => (
+              <span key={step} data-active={step === job.job.state ? "true" : undefined} style={step === job.job.state ? { fontWeight: 600 } : undefined}>
+                {i > 0 ? " \u2192 " : ""}
+                {step}
+              </span>
+            ))}
+          </span>
+          {job.job.detail ? (
+            <span style={E.note} data-testid="light-job-detail">
+              {job.job.detail}
+            </span>
+          ) : null}
+          {job.job.resultPacketId ? (
+            <Chip tone="pass" testId="light-job-packet">
+              packet {job.job.resultPacketId}
+            </Chip>
+          ) : null}
+          {job.kind === "match" && !PLUGIN_JOB_FINAL.has(job.job.state) ? (
+            <span style={E.note}>Max re-renders the camera and sends a packet that supersedes this one</span>
+          ) : null}
         </div>
+      ) : null}
+      {pollError ? (
+        <Notice tone="error" testId="light-job-error">
+          {lost ? `the daemon no longer has this job: ${pollError}` : `could not read the job's state (will retry): ${pollError}`}
+        </Notice>
       ) : null}
       {packetId === null ? (
         <Notice testId="light-nopacket">connect this node to a plate with a packet first</Notice>

@@ -1,7 +1,9 @@
 // Verdict keys and the full-scrub gate. `1` Ship, `2` Fix, `3` Render-it act on the selected candidate. A verdict (and
-// the later accept) needs a logged full scrub: the "Full scrub" box enables only after the viewer has shown all four
+// the accept) needs a logged full scrub: the "Full scrub" box enables only after the viewer has shown all four
 // quadrants of the image at 100% or more, and ticking it logs the scrub with the daemon. Fix and Render-it then ask
-// for reason codes (Enter submits, Esc cancels); Ship goes straight through.
+// for reason codes (Enter submits, Esc cancels); Ship goes straight through. "Accept take" sits in the same row: it
+// enables once the scrub is logged and is the offered next step after a Ship; accepting approves the take's node
+// on the canvas (which unlocks motion downstream) and saves the graph.
 //
 // Key scope: the viewer keeps `1` for "zoom to 100%" while it has focus (and anything marked `data-plate-keys` keeps
 // its own digits), so plain digits are ignored there. Shift+1/2/3 always gives a verdict, even from the viewer.
@@ -62,9 +64,12 @@ export function VerdictPanel(): ReactElement {
   const setRater = usePanelsStore((s) => s.setRater);
   const logScrub = usePanelsStore((s) => s.logScrub);
   const recordVerdict = usePanelsStore((s) => s.recordVerdict);
+  const accepted = usePanelsStore((s) => (s.selectedRunId ? s.accepted[s.selectedRunId] === true : false));
+  const acceptRun = usePanelsStore((s) => s.acceptRun);
 
   const [pending, setPending] = useState<VerdictName | null>(null);
   const [reasons, setReasons] = useState<string[]>([]);
+  const [accepting, setAccepting] = useState(false);
 
   // a different candidate starts a fresh verdict
   useEffect(() => {
@@ -129,6 +134,17 @@ export function VerdictPanel(): ReactElement {
 
   const full = isFullScrub(scrub);
   const canTick = Boolean(runId) && full && !logged;
+  const canAcceptTake = Boolean(runId) && Boolean(logged) && !accepted && !accepting;
+  const offerAccept = given === "ship" && canAcceptTake;
+
+  const accept = async (id: string) => {
+    setAccepting(true);
+    try {
+      await acceptRun(id);
+    } finally {
+      setAccepting(false);
+    }
+  };
 
   return (
     <section style={S.section} aria-label="Verdict" data-testid="verdict-panel">
@@ -156,19 +172,42 @@ export function VerdictPanel(): ReactElement {
           </label>
         </div>
       </div>
-      <div style={S.row} role="group" aria-label="Verdict keys">
-        {(Object.entries(VERDICT_KEYS) as [string, VerdictName][]).map(([key, verdict]) => (
-          <button
-            key={key}
-            type="button"
-            style={{ ...S.btn, ...(given === verdict ? { borderColor: C.accent, color: C.accent } : {}) }}
-            disabled={!runId}
-            data-testid={`verdict-${verdict}`}
-            onClick={() => choose(verdict)}
-          >
-            <kbd>{key}</kbd> {VERDICT_LABEL[verdict]}
-          </button>
-        ))}
+      <div style={S.row}>
+        <div style={S.row} role="group" aria-label="Verdict keys">
+          {(Object.entries(VERDICT_KEYS) as [string, VerdictName][]).map(([key, verdict]) => (
+            <button
+              key={key}
+              type="button"
+              style={{ ...S.btn, ...(given === verdict ? { borderColor: C.accent, color: C.accent } : {}) }}
+              disabled={!runId}
+              data-testid={`verdict-${verdict}`}
+              onClick={() => choose(verdict)}
+            >
+              <kbd>{key}</kbd> {VERDICT_LABEL[verdict]}
+            </button>
+          ))}
+        </div>
+        <button
+          type="button"
+          style={{ ...S.btn, ...(offerAccept ? S.btnPrimary : {}) }}
+          disabled={!canAcceptTake}
+          data-testid="accept-take"
+          data-offered={offerAccept}
+          title={
+            accepted
+              ? "this take is accepted"
+              : logged
+                ? offerAccept
+                  ? "Ship recorded: accept this take"
+                  : "accept this take (approves its node)"
+                : "log the full scrub first"
+          }
+          onClick={() => {
+            if (runId) void accept(runId);
+          }}
+        >
+          {accepted ? "Accepted" : accepting ? "Accepting…" : "Accept take"}
+        </button>
       </div>
       {pending ? (
         <fieldset style={{ border: `1px solid ${C.line}`, borderRadius: 4, margin: 0, padding: 6 }} data-testid="reason-picker">

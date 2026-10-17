@@ -3,13 +3,14 @@
 //              class colours. A class that policy never opens (architecture, glazing, signage, other) is refused here.
 //   Paint      brush add / erase on a layer at working resolution, exported as a PNG mask to the CAS.
 //   SAM        click points, pixels `/segment` returns the region (the stub returns k-means labels).
-//   Text lock  shows the OCR boxes whose pixels are composited back from the plate.
+//   Text lock  shows the OCR boxes whose pixels are composited back from the plate (a view only).
 // Output (node params): `ids` + `idInfo` (the picked ids), `maskHash` (the painted mask), `samHash`, `textLock`. The
-// daemon unions them, intersects with the packet's editable ids and re-applies the text lock; this editor never widens
-// what the policy allows.
+// daemon unions them, intersects with the packet's editable ids and always applies the packet's text lock
+// (`textLock` here only toggles the OCR view); this editor never widens what the policy allows. The painted mask is
+// stored in the open project's CAS, so saving needs a project.
 
 import { type ReactElement, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { idPick, errorMessage, ocr, type OcrBox, segment, uploadMask } from "./api";
+import { errorMessage, idPick, type IdPickResult, ocr, type OcrBox, segment, uploadMask } from "./api";
 import { ImageStage } from "./ImageStage";
 import {
   CLASS_COLOURS,
@@ -28,6 +29,7 @@ import {
   toRaster,
   workSize,
 } from "./maskMath";
+import { useGraphStore } from "../store";
 import { asBool, asString, useNodeEditor, usePlate } from "./params";
 import { C, E } from "./theme";
 import { Button, Chip, EditorFrame, Notice, RangeField, Section, Toggle, useAction } from "./widgets";
@@ -70,6 +72,8 @@ export function MaskEditor({ nodeId }: { nodeId: string }): ReactElement {
   const [brush, setBrush] = useState(12);
   const [erase, setErase] = useState(false);
   const [boxes, setBoxes] = useState<OcrBox[]>([]);
+  const [lastPick, setLastPick] = useState<IdPickResult | null>(null);
+  const projectId = useGraphStore((s) => s.projectId);
   const [, redraw] = useReducer((n: number) => n + 1, 0);
   const canvas = useRef<HTMLCanvasElement | null>(null);
   const last = useRef<Point | null>(null);
@@ -110,11 +114,17 @@ export function MaskEditor({ nodeId }: { nodeId: string }): ReactElement {
     if (!packetId) return;
     const r = await idPick({ packet_id: packetId, x: p.x, y: p.y });
     if (r.id === null) {
+      setLastPick(null);
       setNote(`no Cryptomatte id at (${p.x}, ${p.y}): uncovered pixels stay locked`);
       return;
     }
+    setLastPick(r);
     if (!r.editable) {
-      setNote(`${r.name} is ${r.class}: policy never opens that class, so it cannot join the mask`);
+      setNote(
+        r.locked === true
+          ? `${r.name} is locked by the packet policy, so it cannot join the mask`
+          : `${r.name} is ${r.class}: policy never opens that class, so it cannot join the mask`,
+      );
       return;
     }
     if (picked.some((x) => x.id === r.id)) {
@@ -141,8 +151,9 @@ export function MaskEditor({ nodeId }: { nodeId: string }): ReactElement {
 
   const [saveMask, saveState] = useAction(async () => {
     if (!layer) return;
+    if (!projectId) throw new Error("open a project to save the mask: it is stored in the project's CAS");
     const png = await encodeMaskPng(layer);
-    const hash = await uploadMask(png);
+    const hash = await uploadMask(png, projectId);
     set({ maskHash: hash });
     setNote(`mask saved: ${(coverage(layer) * 100).toFixed(1)}% of the frame, ${short(hash)}`);
   }, errorMessage);
@@ -269,7 +280,7 @@ export function MaskEditor({ nodeId }: { nodeId: string }): ReactElement {
             >
               Clear paint
             </Button>
-            <Button onClick={() => void saveMask()} disabled={!layer || painted === 0 || saveState.pending} testId="mask-paint-save">
+            <Button onClick={() => void saveMask()} disabled={!layer || !projectId || painted === 0 || saveState.pending} testId="mask-paint-save">
               {saveState.pending ? "Saving" : "Save mask"}
             </Button>
           </div>
@@ -301,7 +312,8 @@ export function MaskEditor({ nodeId }: { nodeId: string }): ReactElement {
       {tab === "text" || textLock ? (
         <Section title="Text lock" testId="mask-text">
           <Toggle
-            label="lock text (OCR boxes are composited back from the plate)"
+            label="show OCR text-lock boxes"
+            title="signage is always locked by the packet policy"
             checked={textLock}
             onChange={(v) => {
               set({ textLock: v });
@@ -315,6 +327,31 @@ export function MaskEditor({ nodeId }: { nodeId: string }): ReactElement {
               {boxes.length > 0 ? `: ${boxes.slice(0, 4).map((b) => b.text || "(unreadable)").join(", ")}` : ""}
             </span>
           ) : null}
+        </Section>
+      ) : null}
+
+      {lastPick ? (
+        <Section title="Last pick" testId="mask-pick">
+          <div style={E.row}>
+            <span data-testid="mask-pick-name">
+              {lastPick.name} <span style={E.note}>{lastPick.class}</span>
+            </span>
+            {lastPick.locked !== null ? (
+              <Chip tone={lastPick.locked ? "fail" : "pass"} testId="mask-pick-locked" title="the packet policy's word on this id">
+                {lastPick.locked ? "locked" : "not locked"}
+              </Chip>
+            ) : null}
+            {lastPick.coverage !== null ? (
+              <Chip tone="muted" testId="mask-pick-coverage" title="how much of the pixel this id covers">
+                coverage {Math.round(lastPick.coverage * 100)}%
+              </Chip>
+            ) : null}
+            {lastPick.depthM !== null ? (
+              <Chip tone="muted" testId="mask-pick-depth" title="packet Z at the pixel">
+                depth {lastPick.depthM.toFixed(2)} m
+              </Chip>
+            ) : null}
+          </div>
         </Section>
       ) : null}
 

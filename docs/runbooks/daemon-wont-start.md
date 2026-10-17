@@ -38,7 +38,7 @@ Open the full URL the daemon printed: `http://127.0.0.1:4610/#token=...`. `scrip
 
 ## F. UI not built
 
-`npm run build` from the repo root (or `cd ui && npm run build`), then reload. For development, `npm run dev` serves on 5173 and needs the daemon started with `PLATE_DEV=1`.
+`scripts/start-daemon.sh` and `scripts\start-daemon.ps1` build the UI themselves when `ui/dist/index.html` is missing (they print `building ui/dist`), and `bootstrap` builds it once. If that build failed, the daemon still started (it printed a warning) and only the page is missing. Run `npm run build -w ui` from the repo root to see the error: the usual cause is that `npm ci` has not run (run bootstrap again). Then reload. For development, `npm run dev` serves on 5173 and needs the daemon started with `PLATE_DEV=1`.
 
 ## G. Plugin gets 401
 
@@ -46,7 +46,7 @@ Both read `config.json` (or the file named by `PLATE_TOKEN_FILE`). Compare the t
 
 ## H. 403 from the browser
 
-Use the `127.0.0.1` address exactly as printed. `localhost` is allowed only under `PLATE_DEV=1`. A Tailscale address works only if the daemon was started with `-Tailscale` (it then also binds the machine's Tailscale IPv4) and the scoped firewall rule exists (`docs/windows.md`).
+The daemon always accepts `127.0.0.1:<port>` and `localhost:<port>` (the port it printed) as the page's Host and Origin; anything else is a 403 `forbidden_host` or `forbidden_origin`, for example a numeric address of the box on the LAN, a machine name, or `localhost` on the wrong port. Only the Vite dev server's origins (`http://127.0.0.1:5173`, `http://localhost:5173`) need `PLATE_DEV=1`. A Tailscale address works only if the daemon was started with `-Tailscale` (it then also binds the machine's Tailscale IPv4) and the scoped firewall rule exists (`docs/windows.md`).
 
 ## I. Project locked
 

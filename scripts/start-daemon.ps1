@@ -8,13 +8,22 @@
   "PLATE daemon http://..." line in the log and echoes it as confirmation.
   -Tailscale additionally binds the machine's Tailscale address; that needs the inbound firewall rule
   printed by scripts\firewall-tailscale.ps1 (and docs\windows.md), scoped to the Tailscale interface only.
-  There is no Windows service in v1: register-daemon-task.ps1 starts this script at logon.
+  When ui\dist\index.html is missing the UI is built first; a failed build is a warning and the daemon
+  still starts. There is no Windows service in v1: register-daemon-task.ps1 starts this script at logon.
 #>
 param([switch]$Tailscale, [int]$Port = 4610)
 . "$PSScriptRoot\_common.ps1"
 Set-Location $RepoRoot
 $py = Get-VenvPython
 if (-not (Test-Path $py)) { throw 'No .venv: run scripts\bootstrap.ps1 first' }
+$uiIndex = Join-Path (Join-Path (Join-Path $RepoRoot 'ui') 'dist') 'index.html'
+if (-not (Test-Path -LiteralPath $uiIndex)) {
+    try {
+        Invoke-Step 'building ui/dist' { npm run build -w ui }
+    } catch {
+        Write-Warning "the UI build failed ($($_.Exception.Message)); the daemon starts without the UI (scripts\bootstrap.ps1 installs what the build needs)"
+    }
+}
 $homeDir = Get-PlateHome
 $logDir = Join-Path $homeDir 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null

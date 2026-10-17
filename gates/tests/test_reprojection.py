@@ -323,7 +323,7 @@ def test_video_gates_run_assembles_a_motion_report(clips, tm, dolly):
     }
     assert rep["verdict"] == "pass" and all(s == "pass" for s in ids.values())
     assert rep["engine"] == {"id": "kling-o3-4k", "version": "fx"} and rep["tier"] == "A"
-    assert rep["threshold_set_id"] == "ts-2026.10.17-draft" and rep["gate_version"] == "0.1.0"
+    assert rep["threshold_set_id"] == "ts-2026.10.18-draft" and rep["gate_version"] == "0.1.0"
     m = rep["metrics"]
     assert m["video.first_frame"] < 3 and m["video.last_frame"] < 3
     assert m["video.reproj_edge_recall"] >= 0.8 and m["video.duration_s"] == pytest.approx(0.5, abs=0.01)

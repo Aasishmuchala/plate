@@ -3,9 +3,15 @@
 Max's Python has no blake3 and plate_max is stdlib-only, while the schema keeps hash.algo
 "blake3". So every hash the manifest carries comes from POST /api/v0/hash: files by path (the
 daemon confines paths to its packets folders and streams them), in-memory bytes as base64 payloads
-(the scene digest, the view payload, the legend and camera_frames sidecars, legend node records,
-the OCIO config). The daemon rehashes everything again on ingest, so a wrong answer here can only
-make a packet fail ingest, never pass it.
+(the view payload, legend node records, the OCIO config). The daemon rehashes everything again on
+ingest, so a wrong answer here can only make a packet fail ingest, never pass it.
+
+Big payloads go by path. A payload is sent in memory only up to PAYLOAD_LIMIT (1 MiB; one over it
+is PayloadTooLarge, code PAYLOAD_TOO_LARGE, naming it and its size). The scene digest of a big scene
+and the legend of a dense frame pass that easily, so given the packet folder they are written into it
+first and hashed as files: scene_digest.txt (file role x_scene_digest, the canonical digest text),
+id_legend.json and camera_frames.json (the exact bytes write_packet writes). An oversize view payload
+is written to a temp file in the folder, hashed and removed.
 
   hash_packet_files(folder, config)       {rel: {hex, bytes}} for every file the packet references
   hash_payload_bytes({name: bytes}, cfg)  {name: {hex, bytes}}, batched under the daemon's 4 MiB cap
@@ -24,7 +30,8 @@ from typing import Any, TypeVar
 
 from .. import transport
 from ..digest import DIGEST_VERSION, SCENE_DIGEST_VERSION, scene_hash_payload
-from ..packet import legend_bytes
+from ..fsutil import atomic_write_bytes
+from ..packet import file_ref_from_hashes, legend_bytes
 
 T = TypeVar("T")
 
@@ -32,11 +39,48 @@ MANIFEST_NAME = "manifest.json"
 # Names never hashed when the folder is walked: the manifest itself and temp files mid-write.
 SKIP_SUFFIXES = (".tmp", ".partial")
 PLACEHOLDER_HEX = "0" * 64
+PAYLOAD_LIMIT = 1024 * 1024  # in-memory hashing stops here; bigger bytes are hashed as a file
+PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
+SCENE_DIGEST_NAME = "scene_digest.txt"
+SCENE_DIGEST_ROLE = "x_scene_digest"
+# The schema's file_ref.format enum has no text value (exr, tiff, png, jpeg, json); "json" is the
+# nearest. The file is the canonical digest text, not JSON: readers go by the role, never the format.
+SCENE_DIGEST_FORMAT = "json"
+VIEW_PAYLOAD_TEMP = "view_payload.tmp"
 
 
 class HashAnswerError(transport.TransportError):
     """The daemon's answer does not fit the request (a missing entry, a size that disagrees with
     the file on disk)."""
+
+
+class PayloadTooLarge(ValueError):
+    """An in-memory payload over the limit (code PAYLOAD_TOO_LARGE): write it into the packet
+    folder and hash it by path instead."""
+
+    code = PAYLOAD_TOO_LARGE
+
+    def __init__(self, name: str, size: int, limit: int):
+        super().__init__(
+            f"{PAYLOAD_TOO_LARGE}: payload {name!r} is {size} bytes, over the {limit}-byte cap for "
+            "in-memory hashing: hash it as a file inside the packet folder"
+        )
+        self.name = name
+        self.size = int(size)
+        self.limit = int(limit)
+
+
+def payload_limit() -> int:
+    """The largest payload hashed in memory: PAYLOAD_LIMIT, or the daemon's per-request cap when
+    that is smaller."""
+    return min(PAYLOAD_LIMIT, transport.HASH_PAYLOAD_LIMIT)
+
+
+def check_payload(name: str, size: int) -> None:
+    """PayloadTooLarge when a payload of size bytes may not be hashed in memory."""
+    limit = payload_limit()
+    if int(size) > limit:
+        raise PayloadTooLarge(name, int(size), limit)
 
 
 def _rel(root: Path, path: Path) -> str:
@@ -109,15 +153,16 @@ def hash_payload_bytes(
     timeout_s: float = transport.HASH_TIMEOUT_S,
 ) -> dict[str, dict[str, Any]]:
     """{name: {"hex", "bytes"}} for in-memory bytes, in as few requests as the daemon's payload cap
-    (transport.HASH_PAYLOAD_LIMIT) allows. One payload over the cap raises ValueError: hash it as a
-    file inside the packet folder instead."""
+    (transport.HASH_PAYLOAD_LIMIT) allows. Every payload is checked before anything is sent: one over
+    payload_limit() raises PayloadTooLarge (a ValueError): hash it as a file inside the packet
+    folder instead."""
+    for name, data in payloads.items():
+        check_payload(name, len(data))
     out: dict[str, dict[str, Any]] = {}
     batch: dict[str, bytes] = {}
     size = 0
     limit = transport.HASH_PAYLOAD_LIMIT
     for name, data in payloads.items():
-        if len(data) > limit:
-            raise ValueError(f"payload {name!r} is {len(data)} bytes, over the daemon's {limit}-byte cap")
         if batch and size + len(data) > limit:
             out.update(_payload_batch(batch, config, timeout_s))
             batch, size = {}, 0
@@ -135,18 +180,76 @@ def _payload_batch(
     return {name: {"hex": str(answer[name]["hex"]), "bytes": len(data)} for name, data in batch.items()}
 
 
-def hash_scene(scene_digest: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """The manifest's scene_hash block: BLAKE3 of digest.scene_hash_payload plus its digest_version."""
-    entry = hash_payload_bytes({"scene_digest": scene_hash_payload(scene_digest)}, config)["scene_digest"]
+def hash_file_bytes(
+    folder: Path | str, rel: str, data: bytes, config: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Write data to folder/rel (temp then replace) and hash it by path: {rel: {hex, bytes}}. The
+    folder must sit inside the daemon's packets folders."""
+    return hash_files_bytes(folder, {rel: data}, config)
+
+
+def hash_files_bytes(
+    folder: Path | str, files: Mapping[str, bytes], config: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """hash_file_bytes for several files, in one request."""
+    root = Path(folder)
+    for rel, data in files.items():
+        atomic_write_bytes(root.joinpath(*rel.split("/")), bytes(data))
+    return hash_packet_files(root, config, rels=list(files)) if files else {}
+
+
+def _scene_block(scene_digest: dict[str, Any], hex_value: str) -> dict[str, Any]:
     version = scene_digest.get("digest_version") or (
         SCENE_DIGEST_VERSION if scene_digest.get("lines") is not None else DIGEST_VERSION
     )
-    return {"algo": "blake3", "hex": entry["hex"], "digest_version": str(version)}
+    return {"algo": "blake3", "hex": str(hex_value), "digest_version": str(version)}
 
 
-def hash_view(view_payload: bytes, config: dict[str, Any]) -> dict[str, str]:
-    """The manifest's view_hash block: BLAKE3 of packet.view_hash_payload(...)."""
-    entry = hash_payload_bytes({"view": view_payload}, config)["view"]
+def hash_scene(
+    scene_digest: dict[str, Any],
+    config: dict[str, Any],
+    folder: Path | str | None = None,
+    hashes: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The manifest's scene_hash block: BLAKE3 of digest.scene_hash_payload plus its digest_version.
+
+    With the packet folder the canonical digest text is written into it as scene_digest.txt (file
+    role x_scene_digest, see scene_digest_ref) and hashed by path, whatever its size; its hash entry
+    lands in hashes when given (the manifest then references the file). Without a folder the bytes go
+    as a payload, which PayloadTooLarge refuses over payload_limit()."""
+    payload = scene_hash_payload(scene_digest)
+    if folder is not None:
+        entry = hash_file_bytes(folder, SCENE_DIGEST_NAME, payload, config)[SCENE_DIGEST_NAME]
+        if hashes is not None:
+            hashes[SCENE_DIGEST_NAME] = entry
+        return _scene_block(scene_digest, entry["hex"])
+    entry = hash_payload_bytes({"scene_digest": payload}, config)["scene_digest"]
+    return _scene_block(scene_digest, entry["hex"])
+
+
+def scene_digest_ref(hashes: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """The files.x_scene_digest entry for scene_digest.txt from a hash_scene(folder=, hashes=) answer."""
+    return file_ref_from_hashes(SCENE_DIGEST_NAME, dict(hashes), SCENE_DIGEST_FORMAT)
+
+
+def hash_view(
+    view_payload: bytes, config: dict[str, Any], folder: Path | str | None = None
+) -> dict[str, str]:
+    """The manifest's view_hash block: BLAKE3 of packet.view_hash_payload(...). A payload over
+    payload_limit() (a frame with tens of thousands of visible ids) is hashed by path through a temp
+    file in the packet folder when one is given (the file is removed afterwards), else
+    PayloadTooLarge."""
+    if len(view_payload) <= payload_limit() or folder is None:
+        entry = hash_payload_bytes({"view": view_payload}, config)["view"]
+        return {"algo": "blake3", "hex": entry["hex"]}
+    temp = Path(folder) / VIEW_PAYLOAD_TEMP
+    try:
+        entry = hash_file_bytes(folder, VIEW_PAYLOAD_TEMP, view_payload, config)[VIEW_PAYLOAD_TEMP]
+    finally:
+        try:
+            temp.unlink()
+        except OSError:  # a scanner holding it on Windows: a .tmp is never part of the packet
+            pass
     return {"algo": "blake3", "hex": entry["hex"]}
 
 
@@ -156,15 +259,22 @@ def sidecar_hashes(
     frames_bytes: bytes | None = None,
     legend_path: str = "id_legend.json",
     frames_path: str = "camera_frames.json",
+    folder: Path | str | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """{rel: {hex, bytes}} for the JSON sidecars write_packet will write, hashed before they exist:
-    the legend's exact bytes (packet.legend_bytes) and camera_frames' (packet.camera_frames_bytes)."""
-    payloads: dict[str, bytes] = {}
+    """{rel: {hex, bytes}} for the JSON sidecars write_packet writes: the legend's exact bytes
+    (packet.legend_bytes) and camera_frames' (packet.camera_frames_bytes). With the packet folder
+    they are written into it now (write_packet rewrites the same bytes) and hashed by path, so a
+    dense legend never meets the payload limit; without one they go as payloads."""
+    files: dict[str, bytes] = {}
     if legend is not None:
-        payloads[legend_path] = legend_bytes(legend)
+        files[legend_path] = legend_bytes(legend)
     if frames_bytes is not None:
-        payloads[frames_path] = frames_bytes
-    return hash_payload_bytes(payloads, config) if payloads else {}
+        files[frames_path] = bytes(frames_bytes)
+    if not files:
+        return {}
+    if folder is not None:
+        return hash_files_bytes(folder, files, config)
+    return hash_payload_bytes(files, config)
 
 
 def with_daemon_digests(build: Callable[[Callable[[bytes], str]], T], config: dict[str, Any]) -> T:

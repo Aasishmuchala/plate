@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Start the PLATE daemon in the foreground on 127.0.0.1:4610 (the Mac twin of scripts/start-daemon.ps1).
 # The daemon prints "PLATE daemon http://127.0.0.1:<port>/#token=<token>" itself; stdout is the terminal here.
+# When ui/dist/index.html is missing the UI is built first; a failed build is a warning, the daemon still starts.
 #   scripts/start-daemon.sh [--port N] [--tailscale]
 #   --tailscale   also bind this machine's Tailscale IPv4 (never 0.0.0.0)
 set -euo pipefail
@@ -21,6 +22,12 @@ py=".venv/bin/python"
 [ -x "$py" ] || { echo "No .venv: run scripts/bootstrap.sh first" >&2; exit 1; }
 export PYTHONUTF8=1
 export PYTHONPATH="spec:daemon:pixels:engines:gates:plugins/max:tools"
+if [ ! -f "ui/dist/index.html" ]; then
+    echo "building ui/dist"
+    if ! npm run build -w ui; then
+        echo "warning: the UI build failed; the daemon starts without the UI (scripts/bootstrap.sh installs what the build needs)" >&2
+    fi
+fi
 export PLATE_PORT="$port"
 bind="127.0.0.1"
 if [ "$tailscale" -eq 1 ]; then

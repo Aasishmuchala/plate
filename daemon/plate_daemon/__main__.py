@@ -9,7 +9,9 @@ the sockets are bound it prints `PLATE daemon http://127.0.0.1:4610/#token=<toke
 URL and the UI keeps the token (Decision 5). `PLATE_FAKE_ENGINE` (JSON of
 FakeEngine flags) scripts the in-process fake provider whose journal is `<home>/fake_engine.json`; a
 scripted SimulatedCrash exits the process hard, which is what the cross-process crash test relies on.
-Before serving, every project index gets `recover_on_boot` (re-poll, adopt or fail; never resubmit).
+Before serving, every project index gets `recover_on_boot` (re-poll, adopt or fail; never resubmit) for the
+seed runs the fake engine owns. Pipeline runs are skipped there: `Pipeline.resume` in the app lifespan drives
+them with their real engine (`StagedEngine` / `AdapterBridge`), so none is re-submitted to the FakeEngine.
 """
 
 from __future__ import annotations
@@ -88,6 +90,7 @@ def main() -> int:
     import uvicorn
 
     from .api import create_app
+    from .pipeline import is_pipeline_run
 
     with ExitStack() as stack:
         try:
@@ -98,7 +101,7 @@ def main() -> int:
         index = Index(settings.home)
         for project_id in index.project_ids():
             with index.project(project_id) as conn:
-                for action in recover_on_boot(conn, engine):
+                for action in recover_on_boot(conn, engine, skip=is_pipeline_run):
                     log.info("recovery %s: %s", project_id, action)
         app = create_app(settings, engine, crash_exits_process=True)
         try:

@@ -8,7 +8,10 @@ needs PACKET.md 6's colour block, and a packet whose mode cannot be established 
 The OCIO config hash is a BLAKE3 hash block, computed by the daemon (bridge.hashing) over the config
 file's bytes sent as a payload: the daemon's path form only hashes files inside the packets folders,
 and the config lives elsewhere. A built-in config (an ocio:// URI) has no file; its versioned URI
-is hashed instead and config_hash_source says so.
+is hashed instead and config_hash_source says so. A config file over the in-memory hash limit
+(hashing.PAYLOAD_LIMIT) stops the Send here, before anything renders, with PAYLOAD_TOO_LARGE. A
+daemon that rejects the token raises transport.Unauthorized; any other hashing failure leaves the
+config unhashed (and the mode unknown).
 """
 
 from __future__ import annotations
@@ -17,7 +20,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .hashing import hash_payload_bytes
+from .. import transport
+from .hashing import PAYLOAD_LIMIT, PAYLOAD_TOO_LARGE, hash_payload_bytes, payload_limit
 from .scene import rt_attr
 
 MANAGER = "ColorPipelineMgr"  # TODO-verify: the Max 2024+ colour pipeline interface
@@ -45,7 +49,7 @@ RAW_NAMES = tuple(
     )
 )
 BUILTIN_PREFIX = "ocio://"
-CONFIG_PAYLOAD_LIMIT = 4 * 1024 * 1024  # the daemon's payload cap (transport.HASH_PAYLOAD_LIMIT)
+CONFIG_PAYLOAD_LIMIT = PAYLOAD_LIMIT  # a config file is hashed in memory: hashing.PAYLOAD_LIMIT
 
 
 def _read(mgr: Any, names: tuple[str, ...]) -> tuple[str | None, Any]:
@@ -101,11 +105,27 @@ def _config_bytes(path_or_uri: str) -> tuple[bytes | None, str | None]:
         return path_or_uri.encode("utf-8"), "builtin_uri"
     try:
         path = Path(path_or_uri)
-        if path.is_file() and path.stat().st_size <= CONFIG_PAYLOAD_LIMIT:
+        if path.is_file() and path.stat().st_size <= _config_limit():
             return path.read_bytes(), "file"
     except OSError:
         pass
     return None, None
+
+
+def _config_limit() -> int:
+    return min(CONFIG_PAYLOAD_LIMIT, payload_limit())
+
+
+def _oversize(path_or_uri: str) -> int | None:
+    """The size of a config file too big to hash in memory, None otherwise."""
+    if path_or_uri.startswith(BUILTIN_PREFIX):
+        return None
+    try:
+        path = Path(path_or_uri)
+        size = path.stat().st_size if path.is_file() else None
+    except OSError:
+        return None
+    return size if size is not None and size > _config_limit() else None
 
 
 def detect_colour_pipeline(config: dict[str, Any] | None = None, hasher: Any = None) -> dict[str, Any]:
@@ -181,6 +201,12 @@ def detect_colour_pipeline(config: dict[str, Any] | None = None, hasher: Any = N
         if data is not None:
             out["config_hash"] = _hash(data, config, hasher)
             out["config_hash_source"] = source if out["config_hash"] else None
+        elif (size := _oversize(path_or_uri)) is not None:
+            out["reason"] = (
+                f"{PAYLOAD_TOO_LARGE}: the OCIO config {path_or_uri} is {size} bytes, over the "
+                f"{_config_limit()}-byte cap for in-memory hashing, so its BLAKE3 cannot be taken"
+            )
+            return out
     missing = [k for k in ("config_path", "display", "view", "config_hash") if not out[k]]
     if missing:
         out["reason"] = (
@@ -197,6 +223,8 @@ def _hash(data: bytes, config: dict[str, Any] | None, hasher: Any) -> dict[str, 
     elif config is not None:
         try:
             hex_value = hash_payload_bytes({"ocio_config": data}, config)["ocio_config"]["hex"]
+        except transport.Unauthorized:
+            raise  # a bad token is the preflight's to report, never an "unreadable" config
         except Exception:
             return None
     else:
