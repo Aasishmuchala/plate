@@ -150,6 +150,8 @@ export async function settleRun(runId: string, nodeId: string): Promise<void> {
   } catch {
     return; // the chip already shows the terminal state; the strip still works without outputs
   }
+  // A newer Make replaced this node's candidates while the read was in flight: drop it.
+  if (!useRunStore.getState().candidates[runId]) return;
   if (run.state === "GATE_FAIL" && !run.gate_report?.checks?.length) {
     try {
       run = { ...run, gate_report: await getGateReport(runId) };
@@ -157,7 +159,7 @@ export async function settleRun(runId: string, nodeId: string): Promise<void> {
       // no report route yet: the chip says GATE_FAIL without the failing metric
     }
   }
-  useRunStore.getState().upsertRun(run, nodeId);
+  if (useRunStore.getState().candidates[runId]) useRunStore.getState().upsertRun(run, nodeId);
 }
 
 /** Apply one bus record to the run store. Exposed for tests. */

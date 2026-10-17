@@ -35,6 +35,11 @@ gpu = [
     "torch>=2.14.1",
 ]
 
+[project.scripts]
+# `uv sync` installs the `plate` command (run, gate, export, reindex, gc, pack, smoke); scripts/plate and
+# scripts\plate.cmd run the same module from a checkout without installing anything.
+plate = "plate_daemon.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",

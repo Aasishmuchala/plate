@@ -1,0 +1,18 @@
+{
+ "request": {
+  "model": "claude-sonnet-5-5",
+  "purpose": "composer",
+  "key": "53813683890c",
+  "note": "composer ok: hand-authored reply in the documented Messages API shape; not a live capture"
+ },
+ "responses": [
+  {
+   "text": "{\"prompt\": \"This is an approved architectural render. Edit it by the change list below and change nothing else.\\nChange list:\\n1. Sky: late blue hour, deep indigo fading to a last warm band at the horizon, no sun disc.\\n2. Light: only the designed fixtures are on; interior lights glow 2700K warm through the glazing; the palm row stays dark against the sky.\\n3. Vegetation: lit by the fixtures and the sky only; species, positions and counts unchanged.\\n4. People: unchanged, lit by the nearest fixture; no one is added.\\n5. Shadows and reflections re-cast from the new sources.\\nNot on the list, so unchanged: architecture, hardscape, materials, signage and its text, camera position, framing, lens and perspective.\", \"negative_prompt\": \"new objects, changed architecture, re-framing, daylight cast\"}",
+   "usage": {
+    "input_tokens": 1500,
+    "output_tokens": 260
+   },
+   "stop_reason": "end_turn"
+  }
+ ]
+}

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# The `plate` command line from a checkout (the Mac twin of scripts\plate.cmd): run, gate, export, reindex,
+# gc, pack, smoke. `scripts/plate --help` lists them; the exit codes are in daemon/plate_daemon/cli.py
+# (0 ok, 1 error, 2 gate fail, 3 custody or budget refusal, 4 usage). It keeps the caller's working directory.
+set -euo pipefail
+
+src="$0"
+while [ -L "$src" ]; do  # a symlink on PATH still finds the checkout
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+done
+repo="$(cd -P "$(dirname "$src")/.." && pwd)"
+py="$repo/.venv/bin/python"
+[ -x "$py" ] || { echo "No .venv: run scripts/bootstrap.sh first" >&2; exit 1; }
+export PYTHONUTF8=1
+export PYTHONPATH="$repo/spec:$repo/daemon:$repo/pixels:$repo/engines:$repo/gates:$repo/plugins/max:$repo/tools${PYTHONPATH:+:$PYTHONPATH}"
+exec "$py" -m plate_daemon.cli "$@"

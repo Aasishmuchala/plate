@@ -1,0 +1,98 @@
+# Repair and tell tables: Lensbook ARCH_REPAIRS (A1 to A5, F2 to F12), VEG_TELLS (T1 to T10) and MAT_TELLS (M1 to M8),
+# ported verbatim. The judge and the repair step cite these codes. Lensbook's omega repair prompt also cites F5 and
+# F14, which do not exist here (scout 02).
+# Source: ~/Desktop/lensbook/lib/data.ts.
+schema: 1
+repairs:
+- code: A1
+  symptom: Geometry warps — walls bend, mullions swim as the camera moves
+  fix: Move exceeds the invention budget → shrink the move, shorten the clip, restate "straight lines stay straight; verticals stay vertical". Three failures = split the shot.
+- code: A2
+  symptom: Texture crawl — materials boil or shimmer frame to frame
+  fix: 'Material unnamed, motion budget too high → name it and its stillness: "the stone texture is static"; cut one moving element.'
+- code: A3
+  symptom: Scale drift — people or trees resize the building
+  fix: 'No ruler in the prompt → give one: "door height 2.1m; every figure at true scale to the doors".'
+- code: A4
+  symptom: Vegetation slop — planting turns generic, plastic, repeated
+  fix: Species unnamed → species-true language, wind as the only change; if the still is already slop, run the Vegetation Pass first and re-animate.
+- code: A5
+  symptom: Re-cladding drift — the same element wears a different material or pattern across generations
+  fix: 'Material named generically ("woven bamboo" is a license, not a lock) → lock the material block verbatim: pattern language + module dimension ("checkerboard panels, ~600 mm") + structural rhythm; regenerate the outlier.'
+- code: F2
+  symptom: Slideshow — nothing really moves
+  fix: No atmosphere claimed → name one atmosphere motion + one entourage motion, each with an end state, "for the full duration".
+- code: F4
+  symptom: Action ignored
+  fix: Over motion budget → ONE action + one camera behaviour + one environmental motion. Delete every second verb.
+- code: F6
+  symptom: Camera does its own thing
+  fix: 'Move contradicts the framing → one dominant move + "no other camera movement"; when in doubt, locked first — and set camera_fixed: true.'
+- code: F7
+  symptom: Doesn't match the previous shot
+  fix: 'A''s end ≠ B''s start → build B''s first frame from A''s last (return_last_frame: true); restate carried state in the prompt.'
+- code: F9
+  symptom: Extra people or objects appear
+  fix: 'Nothing claimed the space → positive lock: "the plaza stays empty; the sky stays clear".'
+- code: F11
+  symptom: Text, logos, captions render
+  fix: '"No on-screen text" in the prefix + blank the surfaces in the still: "the signage is blank".'
+- code: F12
+  symptom: Light shifts mid-clip
+  fix: Light unstated or clip too long → restate the light invariant in the cut, shorten; deliberate change belongs to the Light Sweep shot only.
+veg_tells:
+- code: T1
+  symptom: Cloned clusters — same clump stamped across one canopy, mirrored twins
+  fix: No variation demand → "every foliage cluster unique, asymmetric silhouettes, no two clusters alike".
+- code: T2
+  symptom: Uniform green — one hue across every species and leaf
+  fix: '"Lush greenery" language → name species; "leaf colour ranges olive-to-fresh-green within each tree".'
+- code: T3
+  symptom: Blossom smear — flowers as airbrushed colour blobs
+  fix: Colour named but not morphology → "five-petal blossoms in loose clusters", petal structure readable on the nearest flowers.
+- code: T4
+  symptom: Wrong botany — species wearing generic foliage
+  fix: Species unnamed or unanchored → name it WITH its anchor trait from the species library.
+- code: T5
+  symptom: Waxy sheen — every leaf plastic-glossy in dry weather
+  fix: '"Pristine" language → "matte dusty leaf tops, translucent backlit edges" (dry shots only — wet flips the rule).'
+- code: T6
+  symptom: Painterly edges — canopy dissolves into brushstrokes against sky
+  fix: Over-long mood language → cut adjectives; "canopy edges resolve into individual leaflets".
+- code: T7
+  symptom: Velvet grass — groundcover as carpet, zero blade definition
+  fix: '"Manicured lawn" phrasing → "grass blades and plantlets individually resolved in the foreground".'
+- code: T8
+  symptom: Glow-halo backlight — backlit leaves bloom radioactive
+  fix: '"Glowing / dreamy light" language → "translucent but no halo" (verified working line).'
+- code: T9
+  symptom: Sterile perfection — no dead leaf, no litter, no gap
+  fix: 'Nothing asked for imperfection → quantified decay quota: "a few fallen petals, scattered browned leaflets, dry seed pods".'
+- code: T10
+  symptom: Scale drift — shrub-sized leaves on a 12 m tree
+  fix: No scale anchor → name the species + keep the scale ruler (door height 2.1m) in frame.
+mat_tells:
+- code: M1
+  symptom: Re-cladding drift — different material per generation
+  fix: 'Generic name → pattern language + module: "checkerboard panels, ~600 mm".'
+- code: M2
+  symptom: Structure simplification — lattice becomes parallel ribs, members vanish
+  fix: 'Rhythm undescribed → name every member type: "crossing diagonal lattice, paired edge beams, lashed joints".'
+- code: M3
+  symptom: Texture stamping — one tile repeated with visible period
+  fix: No variation demand → "tonal clouding per slab, no repeated pattern stamps".
+- code: M4
+  symptom: Scale-free texture — modules resize between shots
+  fix: 'No dimension → quote the builder''s number: course 75 mm, plank 140 mm, joint 10 mm.'
+- code: M5
+  symptom: Plastic concrete — smooth grey acrylic, no formwork
+  fix: '"Clean minimal concrete" → board-shadow banding, tie holes, tonal pour variation, matte.'
+- code: M6
+  symptom: Resin water — pools read as poured acrylic
+  fix: '"Crystal-clear water" → meniscus at edges, edge wetting line, dust motes, broken specular if moving.'
+- code: M7
+  symptom: Jewelry metal — corten/brass polished like rings
+  fix: Metal named without finish → patina gradient, satin not mirror, finger-burnish at touch height.
+- code: M8
+  symptom: Joint drift — paving grid changes direction across shots
+  fix: Joints never locked → state the grid, width and direction once, verbatim in every shot.

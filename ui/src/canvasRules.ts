@@ -16,6 +16,7 @@ export interface GraphLike {
 
 export type RuleCode =
   | "CONCEPT_TO_DELIVERY"
+  | "PREVIS_NOT_DELIVERABLE"
   | "DEPTH_EXCEEDED"
   | "VIDEO_LOCKED"
   | "HIGH_RISK_MOVE"
@@ -37,6 +38,9 @@ export const MAX_GENERATION_DEPTH = 2;
 
 /** Rule 1: the concept tier may not reach any of these. (There is no separate Delivery node today.) */
 const DELIVERY_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>(["Export", "Review"]);
+
+/** T44: a previs output (watermarked PREVIS) never reaches delivery proper. A client Review may show it. */
+const EXPORT_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>(["Export"]);
 
 /** Rule 7: video nodes stay locked until the upstream still passed gates and a human approved it. */
 const VIDEO_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>(["Motion", "CropPair"]);
@@ -122,6 +126,16 @@ function isConceptTier(nodeMap: Map<string, GraphNode>, up: Map<string, string[]
   return [...reach(id, up)].some((a) => isConcept(nodeMap.get(a)));
 }
 
+/** A previs output: `previs: true` on the node (the previs run sets it) or in its params (the editor sets it). */
+export const isPrevis = (data: PlateNodeData | undefined): boolean =>
+  data !== undefined && (data.previs === true || data.params?.["previs"] === true);
+
+/** Previs is sticky like the concept tier: a node is previs if it, or anything feeding it, is previs. */
+function isPrevisTier(nodeMap: Map<string, GraphNode>, up: Map<string, string[]>, id: string): boolean {
+  if (isPrevis(nodeMap.get(id)?.data)) return true;
+  return [...reach(id, up)].some((a) => isPrevis(nodeMap.get(a)?.data));
+}
+
 const hasCameraOverride = (data: PlateNodeData): boolean => {
   const v = data.params?.["cameraOverride"];
   return v !== undefined && v !== null && v !== false;
@@ -137,8 +151,9 @@ const needsUnseenLabel = (data: PlateNodeData): boolean =>
 /**
  * Would `edge` be allowed in `graph`? The edge may or may not already be in `graph.edges` (it is ignored there), so
  * the same call vets a new connection and re-checks a loaded one. Checks, in order: unknown node, cycle,
- * CONCEPT_TO_DELIVERY (doctrine 1), NO_PLATE_ANCHOR (doctrine 2, source-view-only), DEPTH_EXCEEDED (doctrine 7),
- * VIDEO_LOCKED (doctrine 7: the source must be gateStatus pass and approved), HIGH_RISK_MOVE, INVENTED_ANGLE.
+ * CONCEPT_TO_DELIVERY (doctrine 1), PREVIS_NOT_DELIVERABLE (T44), NO_PLATE_ANCHOR (doctrine 2, source-view-only),
+ * DEPTH_EXCEEDED (doctrine 7), VIDEO_LOCKED (doctrine 7: the source must be gateStatus pass and approved),
+ * HIGH_RISK_MOVE, INVENTED_ANGLE.
  */
 export function validateEdge(graph: GraphLike, edge: EdgeLike): RuleResult {
   const nodeMap = byId(graph.nodes);
@@ -160,6 +175,11 @@ export function validateEdge(graph: GraphLike, edge: EdgeLike): RuleResult {
   // The concept tier never reaches Export (or Review), directly or through other nodes.
   if (DELIVERY_KINDS.has(tk) && isConceptTier(nodeMap, nextUp, edge.target)) {
     return refuse("CONCEPT_TO_DELIVERY", `concept tier cannot reach ${tk}`);
+  }
+
+  // Previs (Seedance clay-motion, watermarked PREVIS) never reaches Export, directly or through other nodes.
+  if (EXPORT_KINDS.has(tk) && isPrevisTier(nodeMap, nextUp, edge.target)) {
+    return refuse("PREVIS_NOT_DELIVERABLE", `previs output cannot reach ${tk}: PREVIS is not deliverable`);
   }
 
   // Source-view-only: a generator must hang off a Plate, so every generation is anchored to a packet camera.

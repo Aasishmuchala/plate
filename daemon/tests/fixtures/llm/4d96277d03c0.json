@@ -1,0 +1,26 @@
+{
+ "request": {
+  "model": "claude-opus-5-5",
+  "purpose": "judge",
+  "key": "4d96277d03c0",
+  "note": "judge gate_fail_forces_fix: hand-authored reply in the documented Messages API shape; not a live capture"
+ },
+ "responses": [
+  {
+   "text": "{\"score\": 9.2, \"verdict\": \"ship\", \"issues\": [], \"strongest_tell\": \"none\"}",
+   "usage": {
+    "input_tokens": 2400,
+    "output_tokens": 90
+   },
+   "stop_reason": "end_turn"
+  },
+  {
+   "text": "{\"score\": 9.0, \"verdict\": \"ship\", \"issues\": [\"Nothing visible\"], \"strongest_tell\": \"none\"}",
+   "usage": {
+    "input_tokens": 2400,
+    "output_tokens": 90
+   },
+   "stop_reason": "end_turn"
+  }
+ ]
+}

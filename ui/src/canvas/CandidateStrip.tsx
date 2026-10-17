@@ -1,15 +1,30 @@
 // The best-of-N strip under a node (T35): one row per sibling run with its live state chip, ranked by gate score
 // once every sibling is done. Click a row to compare it with the plate in the viewer; with the strip focused, keys
 // 1..6 pick that row as the node's output (the keys stay inside the strip, so they never reach the global verdict
-// keys or the viewer). A GATE_FAIL row shows its first failing check and an "Override (reason required)" button;
-// the override is ledgered by the daemon and only then shown here. Agents' runs show the envelope they spent from.
+// keys or the viewer; the strip is marked `data-plate-keys` for the panels' key scope). Comparing or picking a row
+// also selects that run in the panels (T36), so the gate panel, the scrub and the verdict keys follow the strip.
+// A GATE_FAIL row shows its first failing check and an "Override (reason required)" button; the override is
+// ledgered by the daemon and only then shown here. Agents' runs show the envelope they spent from.
 
 import { type FormEvent, type KeyboardEvent, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { StateChip } from "../nodes/badges";
+import { usePanelsStore } from "../panels/store";
 import { useThumb } from "./assets";
 import { overrideRun, UI_ACTOR } from "./runApi";
 import { type Candidate, MAX_CANDIDATES, nodeCandidates, useRunStore } from "./runStore";
+
+/** Show a candidate against its plate in the viewer and make it the panels' selected run. */
+export function compareCandidate(nodeId: string, runId: string): void {
+  useRunStore.getState().openCompare(nodeId, runId);
+  usePanelsStore.getState().selectRun(runId);
+}
+
+/** Make a candidate the node's output (and compare it). */
+export function pickCandidate(nodeId: string, runId: string): void {
+  useRunStore.getState().pick(nodeId, runId);
+  compareCandidate(nodeId, runId);
+}
 
 const fmtValue = (v: number | null): string => (v === null ? "n/a" : Number.isInteger(v) ? String(v) : v.toFixed(3));
 
@@ -68,7 +83,7 @@ function OverrideForm({ cand, onDone }: { cand: Candidate; onDone: () => void })
 
 function Row({ cand, rank, picked, comparing }: { cand: Candidate; rank: number; picked: boolean; comparing: boolean }) {
   const [overriding, setOverriding] = useState(false);
-  const open = () => useRunStore.getState().openCompare(cand.nodeId, cand.runId);
+  const open = () => compareCandidate(cand.nodeId, cand.runId);
   const fail = cand.state === "GATE_FAIL";
   return (
     <li
@@ -124,9 +139,7 @@ export function CandidateStrip({ nodeId }: { nodeId: string }) {
     e.preventDefault();
     e.stopPropagation();
     const cand = cands[n - 1];
-    if (!cand) return;
-    useRunStore.getState().pick(nodeId, cand.runId);
-    useRunStore.getState().openCompare(nodeId, cand.runId);
+    if (cand) pickCandidate(nodeId, cand.runId);
   };
   return (
     <section
@@ -134,6 +147,7 @@ export function CandidateStrip({ nodeId }: { nodeId: string }) {
       tabIndex={0}
       onKeyDown={onKeyDown}
       aria-label={`candidates: keys 1 to ${cands.length} pick`}
+      data-plate-keys=""
       data-testid="candidate-strip"
     >
       <ol>

@@ -18,8 +18,25 @@ shell use `PYTHONPATH=gates`, which is what `make selftest` does).
 | `cli.py`, `__main__.py` | `python -m plate_gates {selftest,pair,idmask,maskdiff,views}` | the `fidelity_bench.py` argparse driver |
 | `fidelity_bench.py` | shim | keeps `python -m plate_gates.fidelity_bench selftest` (Makefile, CI) working |
 
-The motion, texture, alignment, crop, composite and sheet gates live in the sibling modules owned by the
-motion/tools task (`video`, `motion`, `texture`, `align`, `crops`, `composite`, `sheets`, `tools_cli`).
+## Modules added after the core
+
+The gates the daemon wires into every run are in `daemon/plate_daemon/gating.py` (`run_gates`), which calls these. Per-gate notes with worked numbers are in `docs/gates/`.
+
+| module | what it measures | notes |
+|---|---|---|
+| `register.py`, `align.py` | registration shift and post-shift edge residual; edge agreement with a red/cyan overlay | |
+| `iddiff.py`, `masks.py`, `composite.py` | bit identity outside the editable mask; the feather band; the mask-locked 16-bit composite (feather inside the mask, ring tone match) | the old rectangle paste (`composite_region`) is kept only for the CLI |
+| `gbuffer.py`, `coc.py`, `invention.py` | structural edges from depth, normal and ID discontinuities; edge recall weighted by circle of confusion; invention flags on planar architecture | [gates/gbuffer.md](gates/gbuffer.md) |
+| `material_de.py`, `depth_agreement.py`, `textlock.py` | per-material ΔE00 by Cryptomatte ID; depth agreement for Tier C; OCR text lock | |
+| `texture.py`, `tone.py` | Laplacian variance and fine-detail ratio; luma, contrast and saturation band | valid at 3840 px wide; advisory below |
+| `router_math.py` | detail resolvability, disocclusion budget, orbit, crossings | [gates/render_it.md](gates/render_it.md) |
+| `timemap.py`, `reprojection.py`, `video.py`, `motion.py`, `video_gates.py` | the frame-rate time map, reprojection drift, camera lock, landing, flicker, duration, and one assembled video report | [gates/video.md](gates/video.md) |
+| `crossview.py`, `setgate.py` | cross-view correspondences at world positions and the Set-consistency gate | [gates/crossview.md](gates/crossview.md) |
+| `recolour.py`, `lightmix.py` | recolour by element recomposition; LightMix gains by non-negative least squares | [gates/recolour.md](gates/recolour.md) |
+| `croppair.py`, `crops.py`, `sheets.py`, `tools_cli.py` | push-in crop pairs, 100% inspection sheets, the landing gate and the command-line wrappers | |
+| `calibration.py` | AUC, threshold fitting and the report that scores the gates against human verdicts | [labeller.md](labeller.md) |
+
+Thresholds live in `thresholds.yaml` as data with a set id; a shipped report keeps pointing at the set it was scored against. Each entry says whether it is `hard` (blocks delivery), `advisory`, or `calibration_needed`, and where the number came from.
 
 ## Numerics
 

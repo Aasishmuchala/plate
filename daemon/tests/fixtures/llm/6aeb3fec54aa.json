@@ -1,0 +1,18 @@
+{
+ "request": {
+  "model": "claude-sonnet-5-5",
+  "purpose": "composer",
+  "key": "6aeb3fec54aa",
+  "note": "composer bad_json: hand-authored reply in the documented Messages API shape; not a live capture"
+ },
+ "responses": [
+  {
+   "text": "Sure! Here is a moodier prompt: make the whole scene dark and dramatic.",
+   "usage": {
+    "input_tokens": 1450,
+    "output_tokens": 30
+   },
+   "stop_reason": "end_turn"
+  }
+ ]
+}

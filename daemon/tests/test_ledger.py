@@ -429,6 +429,7 @@ def test_a_held_projects_lock_can_be_passed_in(led: Ledger):
 
 
 def test_kinds_are_the_spec_set():
+    # T38 added verdict (a human Ship/Fix/Render-it call), llm (a composer or judge call) and scrub.
     assert KINDS == {
         "quoted",
         "approved",
@@ -445,6 +446,9 @@ def test_kinds_are_the_spec_set():
         "human_minutes",
         "export",
         "override",
+        "verdict",
+        "llm",
+        "scrub",
     }
 
 

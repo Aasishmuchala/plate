@@ -1,0 +1,46 @@
+# Project Sheet: the 14 fields every film or shot set shares, and the 17 token rules that fill a recipe's
+# [BRACKETED TOKENS] from it. Ported from Lensbook lib/assemble.ts (ProjectSheet, EMPTY_SHEET, TOKEN_MAP).
+#
+# `key` is the Python field name on recipes.ProjectSheet, `lensbook_key` the camelCase name Lensbook stored
+# (ProjectSheet.from_dict accepts both). `default` is the EMPTY_SHEET value; a test pins this list to the
+# dataclass so the two cannot drift.
+#
+# Token rules run in order against the text inside the brackets, trimmed, case-insensitive; the first rule
+# whose sheet field is non-blank wins, and a token no rule can fill stays visible ([TOKEN]) so the artist,
+# a per-recipe override or the composer can fill it. Patterns are anchored with ^ on purpose.
+schema: 1
+
+fields:
+  - {key: name, lensbook_key: name, default: ""}
+  - {key: location, lensbook_key: location, default: ""}
+  - {key: format, lensbook_key: format, default: "4K architectural film, 16:9"}
+  - {key: light_logic, lensbook_key: lightLogic, default: ""}
+  - {key: palette_dominant, lensbook_key: paletteDominant, default: ""}
+  - {key: palette_secondary, lensbook_key: paletteSecondary, default: ""}
+  - {key: palette_accent, lensbook_key: paletteAccent, default: ""}
+  - {key: lens_character, lensbook_key: lensCharacter, default: ""}
+  - {key: depth_register, lensbook_key: depthRegister, default: "deep legible for exteriors"}
+  - {key: species, lensbook_key: species, default: ""}
+  - {key: materials, lensbook_key: materials, default: ""}
+  - {key: climate, lensbook_key: climate, default: ""}
+  - {key: audio_bed, lensbook_key: audioBed, default: ""}
+  - {key: scale_note, lensbook_key: scaleNote, default: "door height 2.1m"}
+
+tokens:
+  - {pattern: '^LOCATION\b', field: location}
+  - {pattern: '^(CITY|DESTINATION)\b', field: location}
+  - {pattern: '^FORMAT\b', field: format}
+  - {pattern: "^THIS FILM'S LIGHT LOGIC", field: light_logic}
+  - {pattern: '^DOMINANT$', field: palette_dominant}
+  - {pattern: '^SECONDARY$', field: palette_secondary}
+  - {pattern: '^ACCENT$', field: palette_accent}
+  - {pattern: '^LENS CHARACTER', field: lens_character}
+  - {pattern: '^DEPTH REGISTER', field: depth_register}
+  - {pattern: '^NAME THE SPECIES', field: species}
+  - {pattern: '^NAME EACH SPECIES', field: species}
+  - {pattern: '^EACH MAJOR PLANT', field: species}
+  - {pattern: '^THE RAIN TREES', field: species}
+  - {pattern: '^HERO MATERIALS', field: materials}
+  - {pattern: '^THE MATERIAL AND ITS PATTERN', field: materials}
+  - {pattern: '^CLIMATE / CULTURE', field: climate}
+  - {pattern: '^AUDIO BED', field: audio_bed}

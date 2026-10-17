@@ -1,0 +1,79 @@
+# Archviz still recipes: Lensbook ARCH_STILLS (af-a = the Scene Lock foundation, a01 to a11), ported verbatim.
+# Source: ~/Desktop/lensbook/lib/data.ts (doctrine verified against primary docs 2026-08-27).
+# [BRACKETED CAPS] are tokens: recipes/__init__.py fill_tokens() fills the ones the Project Sheet knows
+# (sheet.yaml) and leaves the rest visible for the artist, the composer or a per-recipe override.
+schema: 1
+kind: stills
+recipes:
+- id: af-a
+  num: A
+  title: The Scene Lock
+  foundation: true
+  use: The archviz identity contract. Paste before any recipe — still or motion — when the model starts redrawing.
+  prompt: 'This image is an approved architectural render and it is the ground truth. Do not change, redraw, restyle or reimagine any part of the architecture: every wall, edge, mullion, material, texture, reflection and proportion stays exactly as it is. Do not alter the camera framing unless the prompt names a move. Do not add, remove or relocate any object unless the prompt names it. Straight lines stay straight; verticals stay vertical; scale stays true. Whatever motion or change this prompt requests happens within the scene — the scene itself is never redrawn.'
+- id: a01
+  num: '01'
+  title: Same-Family Relight
+  use: Hour-to-hour within the same light family. Lands in 1–2 attempts.
+  prompt: 'This is an approved architectural render — geometry, materials, composition and framing are ground truth; change nothing except the light. Relight the scene from [CURRENT HOUR] to [TARGET HOUR — SAME FAMILY, E.G. MID-MORNING → LATE AFTERNOON]. The sun moves to [DIRECTION / ELEVATION]: every shadow re-casts correctly for the new angle, colour temperature shifts [WARMER / COOLER], glass reflects the new sky state, materials respond naturally — stone warming, metal cooling. No object, edge or texture changes; no reframing. Exposure balanced as a photographer would meter it.'
+  dial: Stay inside the family and this is cheap. Crossing families is recipe 02 — and a different budget.
+- id: a02
+  num: '02'
+  title: Cross-Family Relight
+  use: 'Day to dusk or night. Powerful, and honestly priced: 3–5 attempts, often wrong.'
+  prompt: 'This is an approved architectural render — every architectural pixel is ground truth; only the lighting regime changes. Convert the scene from [DAY] to [DUSK / NIGHT]: sky replaced with [STATE — DEEP BLUE HOUR / OVERCAST NIGHT], direct sun off, ambient level dropped accordingly, interior lights on and glowing warm through the glazing, landscape and facade fixtures lit, shadows dissolving into soft ambient darkness, reflections updated to the new sources. Every wall, edge, material and proportion stays exactly in place. No reframing, no new objects.'
+  dial: Budget 3–5 attempts — and if the light must be exact, light it in V-Ray and use AI only for recipe 08.
+- id: a03
+  num: '03'
+  title: Twilight Hero
+  use: The dusk money shot — the frame that sells the building.
+  prompt: 'This is an approved architectural render — geometry, materials and framing are ground truth; change only light and sky. Set the scene 20 minutes after sunset: deep ultramarine sky with a last warm band at the horizon, every interior light on — warm [2700K] glow washing through the glazing — facade lighting grazing the material texture, [THE POOL / WATER FEATURE] lit from beneath and glowing, first stars barely visible. The building becomes a lantern; exposure balanced between sky and interiors the way a twilight-photography specialist would bracket it. Every edge stays where it is.'
+  dial: The working rule of twilight — sky two stops darker than the interiors — say it if the balance comes back flat.
+- id: a04
+  num: '04'
+  title: Monsoon Pass
+  use: 'Weather as drama: rain, wet reflections, saturated planting.'
+  prompt: 'This is an approved architectural render — architecture, materials and framing are ground truth; add weather only. Heavy monsoon: rain falling in fine visible sheets, every hardscape surface wet and reflective with correct mirror reflections of the building, planting saturated deep green and bowing slightly under water, sky low and grey with soft even light, warm interior lights on against the gloom, mist softening the far background. Water behaves physically — pooling, streaking, dripping from edges. No architectural pixel changes; no reframing.'
+  dial: Wet ground is the gift here — name the reflection ("the facade mirrored in the wet plaza") to force it.
+- id: a05
+  num: '05'
+  title: Season Swap
+  use: Same hour, different season — vegetation and sky carry the whole change.
+  prompt: 'This is an approved architectural render — building, hardscape and framing are ground truth; change only vegetation, sky and atmosphere. Shift the season to [SEASON] at the same hour: deciduous trees [TURN AMBER / STAND BARE / FLUSH NEW GREEN], ground planting adjusted to match, sun angle correct for the season, sky character to match [CRISP / HAZY / STORM-WASHED]. Species stay recognisable — the same trees in a different month, not different trees. Architecture, materials and every edge untouched.'
+  dial: For marketing sets, run all four seasons off one frame — the locked architecture is what makes the series read as one project.
+- id: a06
+  num: '06'
+  title: Plaza Staffage
+  use: Life added at true scale — without touching one architectural pixel.
+  prompt: This is an approved architectural render — do not change any part of the architecture, hardscape, lighting or framing. Add [6–10] people at true human scale — the door height is the ruler — walking and pausing naturally across [THE PLAZA / PATH / STEPS], dressed for [CLIMATE / CULTURE — E.G. BENGALURU EVENING], in muted colours that don't compete with the building. Each person is grounded with correct contact shadows and reflections matching the scene's light direction; nobody occludes [THE ENTRANCE / KEY FACADE LINE]. A subtle motion blur on the walkers reads as a long exposure.
+  dial: Muted wardrobe, faces small or turned — staffage serves scale and life, never portraiture.
+- id: a07
+  num: '07'
+  title: Interior Occupants
+  use: The interior render, inhabited.
+  prompt: 'This is an approved interior render — architecture, furniture, materials, lighting and framing are ground truth; add people only. Place [2–3] occupants living naturally in the space: [ONE SEATED READING / ONE AT THE GLAZING LOOKING OUT / ONE CROSSING MID-STEP], at true scale to the furniture, dressed in quiet tones. Each is lit by the room''s existing light with correct shadows, and appears in reflections — glass, stone, polished surfaces — exactly where physics puts them. No furniture moves; no object is added or removed; no reframing.'
+  dial: One person mid-action (pouring, reaching, turning) makes the whole frame read candid instead of staged.
+- id: a08
+  num: 08
+  title: The Beauty Pass
+  use: Render → photograph. The de-CGI conversion that moves nothing.
+  prompt: 'Convert this approved architectural render into a photograph without moving a single edge. Keep geometry, materials, composition, lighting design and framing exactly as they are. Apply only photographic character: natural exposure with soft highlight roll-off, subtle film grain, gentle lens vignette, believable atmospheric haze increasing with depth, micro-imperfections — dust motes in the light, faint variation in material sheen, a touch of chromatic softness at the frame corners. No HDR glow, no over-sharpening, no colour-scheme change. The result reads as a photograph of the finished building, with every edge where V-Ray put it.'
+  dial: This is the pass that runs last, after relights and staffage — grain on top of everything, once.
+- id: a09
+  num: 09
+  title: Vegetation Pass
+  use: Planting upgraded to species-true realism; hardscape under oath. Calibrated language — species + numbers + imperfection.
+  prompt: 'This is an approved architectural render — building, hardscape, lighting and framing are ground truth; improve only the vegetation. Upgrade the planting to species-true realism: [NAME EACH SPECIES + ITS ANCHOR — E.G. RAIN TREE: FEATHERY BIPINNATE LEAFLETS, VAST UMBRELLA CANOPY]. Every foliage cluster unique — asymmetric canopy silhouettes with visible sky gaps, no cloned or mirrored clumps, leaf colour ranging olive-to-fresh-green within each tree. Leaf light follows the weather: [DRY — MATTE DUSTY TOPS, TRANSLUCENT BACKLIT EDGES / WET — GLOSSY LEAF TOPS, WATER BEADING, RAIN-DARKENED BARK]. Quantified imperfection: [A FEW BROWNED LEAFLETS, DRY SEED PODS, SPARSE CANOPY GAPS]. Petal structure readable on the nearest blossoms — never airbrushed colour blobs. The planting beds stay in their exact positions; hardscape untouched.'
+  dial: Name the species — "trees" gets AI-generic canopies; "rain trees and frangipani" gets Bengaluru. Grade the result at 100% crop, never fit-to-screen.
+- id: a10
+  num: '10'
+  title: Night Exterior
+  use: Full night — the building lit as designed, the world asleep.
+  prompt: 'This is an approved architectural render — geometry, materials and framing are ground truth; change only the time to full night. Moonlight provides a cool ambient base; the lighting design carries the frame: interior glow through glazing, facade grazers revealing texture, path and landscape fixtures on, [THE WATER FEATURE] softly lit. Sky deep and clear with faint stars, no clouds competing. Long-exposure calm — no people, no movement, every reflection still. Shadows deep but never crushed to black; the architecture stays legible in the darkness.'
+  dial: Night frames die from over-lighting — "only the designed fixtures are on" keeps it honest.
+- id: a11
+  num: '11'
+  title: Construction Progress
+  use: The same building, earlier in time — for phased marketing and timelines.
+  prompt: 'Show this exact building at the [STRUCTURE / FACADE / FINISHING] stage of construction, from the same camera and framing. The finished design governs every built element — same footprint, same grid, same proportions — rendered at its correct partial state: [EXPOSED CONCRETE FRAME WHERE WALLS WILL BE / FACADE PANELS PARTIALLY HUNG / INTERIORS LIT AND BEING FITTED]. Scaffolding on [ELEVATION], a tower crane behind, site hoarding at the boundary, materials stacked in the yard, workers at true scale. Honest construction-site light and dust. This is the same building, earlier in time — not a different design.'
+  dial: Pair with the finished render as a before/after diptych — same camera is what makes it land.

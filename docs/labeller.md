@@ -1,108 +1,56 @@
-# Labelling tool (`plate_label`)
+# Labelling tool (`plate_label`) and calibration
 
-A three-key verdict tool for rating takes: **Ship**, **Fix** or **Render it**, with reason codes. Every verdict is one line appended to `calib/labels.jsonl`. The file is the ground truth the P1 calibration scores the gates against. The labels are client-work data, so `calib/labels.jsonl` is gitignored and stays on the machine.
+A three-key verdict tool for rating takes: **Ship**, **Fix** or **Render it**, with reason codes. Every verdict is one line appended to `calib/labels.jsonl`. The file is the ground truth the P1 calibration scores the gates against (the bet: gate ensemble AUC at least 0.85 on at least 100 held-out takes with at least 60 rejects, false-pass at most 5%). The labels are client-work data, so `calib/labels.jsonl` is gitignored and stays on the machine. The canonical description, with the calibration report options and the record format, is [calib/README.md](../calib/README.md); this page is the operator's summary.
 
-Stdlib plus `blake3`. Runs on macOS and Windows 10/11, headless or with the loopback UI. No network beyond `127.0.0.1`.
+Stdlib plus PyYAML (for the code table). Runs on macOS and Windows 10/11, with a loopback page or headless. No network beyond `127.0.0.1`.
 
 ## Run it
 
 ```
-make label DIR=<folder of images>                    # same as: python -m plate_label serve <folder>
-python -m plate_label FOLDER --rater aasish          # terminal loop
-python -m plate_label FOLDER --serve [--port 4612] [--no-open]
-python -m plate_label --headless IMAGE --verdict fix --reasons G01,C01 [--note "..."]
-python -m plate_label --stats                        # counts per verdict and per reason code
+make label DIR=<folder>                              # same as: python -m plate_label serve <folder>
+python -m plate_label --pairs pairs.json --rater aasish    # then open http://127.0.0.1:4612/
+python -m plate_label <folder> --rater aasish
+python -m plate_label stats                          # counts per rater, verdict and reason code
+python -m plate_label --headless --take-id S3 --candidate out/a_ai.png --plate in/a.png --verdict fix --reasons P1,A2
 ```
 
-Common options: `--out PATH` (default `<repo>/calib/labels.jsonl`), `--rater NAME` (default `$USER`, then `%USERNAME%`, then `unknown`), `--take-id ID` (stored on every record). Images already in the labels file (matched by BLAKE3 of the file, so a renamed file still counts) are skipped; stop with `q` and resume later.
+Common options: `--out PATH` (default `<repo>/calib/labels.jsonl`), `--rater NAME` (default `$USER`), `--port` (default 4612), `--no-open`. `--headless` writes exactly one record and exits 0; a validation error prints on stderr and exits 2.
 
-`--headless` writes exactly one record and exits 0. A validation error (unknown code, fix without a reason, O99 without a note, missing image) prints the message on stderr and exits 2.
+**Input.** `--pairs` takes a JSON list of `{take_id, plate, candidate, gate_report, run_id?}` (relative paths resolve against the file). A folder scan understands `<take>/plate.png` with `<take>/candidate*.png`, and `<take>.plate.png` with `<take>.candidate*.png`; a folder with neither is labelled image by image with no plate to wipe against. Images are served from where they are, never copied, and only the files named by the pairs.
 
-Image types: png, jpg, jpeg, tif, tiff, webp, matched case-insensitively, found recursively, dot-files skipped, sorted case-insensitively by relative path. Chrome and Edge cannot display TIFF, so the UI re-encodes TIFF as PNG when Pillow can read it (8-bit and 16-bit grey, 8-bit RGB). A 16-bit RGB TIFF falls back to the raw file, which only Safari shows. The hash is always of the original file.
+## Keys (page)
 
-## Keys
+`1` Ship (saves and advances), `2` Fix, `3` Render it (then the reason picker: click chips, or type `A2 P4`, then Enter), `n` next (saves a pending verdict first, else skips), `u` undo the last label this session, `z` 100% view, `t` flip plate and candidate, `[` `]` move the wipe, arrows browse, `Esc` cancels. Reasons are optional on Fix and Render it; a Ship carries none. The page never shows a gate score or verdict, so a label is independent of the gates it will be used to calibrate.
 
-Terminal loop (prints `n/N <image>` then prompts):
+## Reason codes
 
-| input | meaning |
+One table, `calib/reason_codes.yaml`, shared by the page, the headless flag, the canvas verdict panel and the calibration report. A code is never renumbered or reused.
+
+| group | codes |
 |---|---|
-| `s` | ship |
-| `f G01,C01` | fix, with reason codes (comma or space separated, any case) |
-| `r G03` | render it, with reason codes |
-| `n` | prompt for a note on this image (kept until you give a verdict) |
-| `?` | help and the code table |
-| `q` | quit |
+| A (Lensbook, stills) | `A1` geometry warp, `A2` texture crawl, `A3` scale drift, `A4` vegetation slop, `A5` re-cladding drift |
+| F (Lensbook, film) | `F2` slideshow, `F4` action ignored, `F6` camera improvises, `F7` continuity, `F9` extra people or objects, `F11` text or logos, `F12` light shift |
+| P (PLATE gates) | `P1` registration, `P2` invented edge, `P3` colour shift, `P4` texture band, `P5` tone band, `P6` outside-mask leak, `P7` people implausible |
 
-Browser UI (`http://127.0.0.1:4612/`):
+## Record
 
-| key | action |
-|---|---|
-| `S` / `F` / `R` | select Ship / Fix / Render it |
-| reason checkboxes | grouped by prefix: Geometry, Colour, Texture, People, Motion, Lettering, Other |
-| `Enter` | save and jump to the next unlabelled image (also works inside the note box) |
-| `Left` / `Right` | previous / next image (labelled or not) |
-| click image, or `Z` | toggle a 100% crop at the clicked point (true device pixels, so 100% on a Retina screen is not blurred by CSS scaling); `Esc` or another click returns to fit |
-
-Re-labelling an image appends a second record; the later record wins in analysis.
-
-## Rules
-
-- `fix` and `render_it` need at least one reason code. `ship` needs none (reasons are allowed and kept).
-- `O99` needs a non-empty note.
-- Unknown codes are rejected (terminal message, `--headless` exit 2, HTTP 400).
-
-## Reason codes (fixed)
-
-| code | meaning |
-|---|---|
-| G01 | camera shift / registration |
-| G02 | invented edges or openings on architecture |
-| G03 | unseen geometry guessed |
-| G04 | aspect or preset drift |
-| C01 | material restyled |
-| C02 | cross-view colour drift |
-| C03 | tone or exposure off |
-| T01 | AI over-texture (fails texture band) |
-| T02 | soft / mushy detail |
-| T03 | flicker |
-| P01 | implausible people |
-| P02 | people scale wrong |
-| M01 | camera not locked |
-| M02 | first/last frame mismatch |
-| M03 | drift or invention over time |
-| X01 | lettering or logo changed |
-| O01 | moderation refused |
-| O99 | other (note required) |
-
-The table lives in `tools/plate_label/codes.py`. Do not renumber or reword a code once labels exist.
-
-## Record schema
-
-One JSON object per line, UTF-8, LF line endings, keys in this order:
+One JSON object per line, UTF-8, LF line endings:
 
 ```json
-{"ts":"2026-10-17T14:41:07Z","image":"sub/shot_03.png","image_blake3":"<64 hex>","verdict":"fix","reasons":["G01","C01"],"note":"","rater":"aasish","take_id":null,"tool_version":"0.1.0"}
+{"v":1,"at":"2026-10-17T09:41:07Z","rater":"aasish","take_id":"S3","plate":"in/a.png","candidate":"out/a_ai.png","run_id":"r12","verdict":"fix","reasons":["P1","A2"],"seconds":14.2,"gate_report":"gates/r12.1.json"}
 ```
 
-- `ts`: UTC, ISO-8601 with a trailing `Z` (colons are fine inside the content; no generated file name ever contains one).
-- `image`: path relative to the labelled folder, forward slashes on both OSes.
-- `image_blake3`: BLAKE3 hex of the image file; the join key to everything else.
-- `verdict`: `ship`, `fix` or `render_it`. `reasons`: codes from the table. `note`: free text. `rater`, `take_id`, `tool_version`: provenance.
+`run_id` and `gate_report` are left out when unknown; `plate` is null for a candidate-only label. An image already labelled by this rater is skipped on the next session; if the same take is labelled twice the calibration keeps the latest record per rater and take. A torn last line (a crash) is skipped with a warning and the next append starts on a fresh line.
 
-Appends are a single `write` of one line opened with `encoding="utf-8", newline="\n"`, so they behave the same on Windows. If a crash left a torn last line, the next append starts on a fresh line and the reader skips the torn one with a warning.
+## From labels to a threshold
 
-## How the labels feed the P1 calibration
+```
+python -m plate_gates.calibration report --reports <project>/gates --labels calib/labels.jsonl --rater aasish
+python -m plate_gates.calibration report --reports <dir> --threshold 0.93 --strict    # held-out run, exit 1 if the bet fails
+```
 
-The P1 bet is: the gate ensemble's ROC AUC against these verdicts is at least 0.85 on at least 100 held-out takes containing at least 60 rejects, with false-pass at or under 5% at the chosen operating point.
+Positive class (reject) is Fix or Render it; scores are goodness from the gate ensemble; the operating point is the highest recall of Ships with false-pass at most 5%. Fit the point once, freeze the number, then evaluate held-out takes with `--threshold`: a point fitted and scored on the same takes is optimistic, and the report says so. A second rater double-labelling about 100 takes gives the agreement figure (`--rater` another name). Use the reason codes to check that the right gate fires: P1 against registration, P2 against invention flags, P3 against material colour, P4 and P5 against the texture and tone bands, P6 against the outside-mask check, F codes against the video gates. A reject whose reason no gate flags is a gate gap, not noise.
 
-1. Take the latest record per `image_blake3`. The positive class (reject) is `fix` or `render_it`; `ship` is negative. Join to the gate reports on the hash of the image each report scored.
-2. Compute AUC per gate score and for the ensemble against that label, and pick the operating point from the false-pass bound.
-3. Use the reason codes to check that the right gate fires: G codes against the registration, shift and invention-flag gates; C codes against the colour and tone gates; T codes against the texture band; M codes against the video gates; P and X codes against the people and text-lock checks. A reject whose reason no gate flags is a gate gap, not noise.
-4. `O01` (moderation refused) is not an image-quality verdict and `O99` is judged from its note; both are left out of the per-gate AUC.
-5. A second rater double-labelling 100 takes gives inter-rater agreement; `rater` is on every record for that.
+## Security
 
-`python -m plate_label --stats` gives the running counts per verdict and code while the set grows.
-
-## Security notes
-
-The server binds `127.0.0.1` only. It serves nothing outside the labelled folder (path resolved, then `is_relative_to` check, otherwise 403) and only image files. Requests whose `Host` is not a loopback name or whose `Origin` is a different site are refused, so a web page elsewhere cannot write labels through your browser. The page loads no script or style from anywhere else (CSP with a per-request nonce).
+The server binds `127.0.0.1` only, serves images by pair index and role from the pair roots only, and refuses requests whose `Host` is not a loopback name or whose `Origin` is another site, so a web page elsewhere cannot drive it through your browser.

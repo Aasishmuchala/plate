@@ -10,7 +10,12 @@ const enc = encodeURIComponent;
 
 export const getRun = (runId: string): Promise<RunWire> => fetchJson<RunWire>(`/runs/${enc(runId)}`);
 
-export const getGateReport = (runId: string): Promise<GateReportWire> => fetchJson<GateReportWire>(`/runs/${enc(runId)}/gate`);
+/** The latest gate report: the report itself, or `{report, n, shipped, versions}` (both shapes are accepted). */
+export async function getGateReport(runId: string): Promise<GateReportWire> {
+  const body = await fetchJson<unknown>(`/runs/${enc(runId)}/gate`);
+  if (body && typeof body === "object" && "report" in body) return (body as { report: GateReportWire }).report;
+  return body as GateReportWire;
+}
 
 /** `POST /runs/{id}/override {reason, by}`: a GATE_FAIL becomes exportable, with the reason in the ledger. */
 export function overrideRun(runId: string, reason: string, by: string = UI_ACTOR): Promise<RunWire | null> {

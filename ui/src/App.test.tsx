@@ -86,8 +86,12 @@ describe("status bar", () => {
   });
 });
 
-describe("placeholders for later tasks", () => {
-  it("editorFor returns null for every kind until T47 replaces it", () => {
-    for (const kind of NODE_KINDS) expect(editorFor(kind)).toBeNull();
+describe("node editors (T47)", () => {
+  it("editorFor returns an editor for the nine kinds that have one and null for the rest", () => {
+    const withEditor = ["Mask", "CropPair", "Motion", "People", "Set", "LightMix", "Recolour", "Light", "Scout"];
+    for (const kind of NODE_KINDS) {
+      if (withEditor.includes(kind)) expect(editorFor(kind)).not.toBeNull();
+      else expect(editorFor(kind)).toBeNull();
+    }
   });
 });

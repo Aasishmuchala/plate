@@ -24,7 +24,9 @@ export function isTextEntry(el: Element | null): boolean {
   const tag = el.tagName;
   if (tag === "TEXTAREA" || tag === "SELECT") return true;
   if (tag === "INPUT") return !NON_TEXT_INPUTS.has((el as HTMLInputElement).type);
-  return el instanceof HTMLElement && el.isContentEditable;
+  // jsdom has no isContentEditable, so the attribute is read as well
+  const attr = el.getAttribute("contenteditable");
+  return (el as HTMLElement).isContentEditable === true || attr === "" || attr === "true" || attr === "plaintext-only";
 }
 
 /** Which verdict a key event asks for, or null. `inViewer`: the event came from inside the viewer or a key-owning widget. */

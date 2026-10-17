@@ -1,0 +1,72 @@
+# Move risk ladder: Lensbook RISK_LADDER. `risk` is the normalised level (none, low, med, high, highest) that the
+# Move policy (T43) keys on; `label` keeps Lensbook's wording; `repair_codes` index repairs.yaml.
+# Per-recipe risk lives on the shots in arch_shots.yaml. Source: ~/Desktop/lensbook/lib/data.ts RISK_LADDER.
+schema: 1
+moves:
+- key: locked_tripod
+  move: Locked tripod
+  risk: none
+  label: None
+  invents: Nothing. The default, and the reason it's shot 01.
+  repair_codes: []
+- key: push_in
+  move: Push-in
+  risk: low
+  label: Low
+  invents: Existing pixels enlarge; edges crop away. Minimal invention.
+  repair_codes:
+  - F6
+- key: slider_drift
+  move: Slider drift
+  risk: low
+  label: Low
+  invents: A thin slice of parallax at one frame edge.
+  repair_codes:
+  - F6
+- key: crane_rise
+  move: Crane rise
+  risk: med
+  label: Medium
+  invents: Upper-storey continuation, new ground-plane angle.
+  repair_codes:
+  - A1
+- key: light_sweep
+  move: Light sweep
+  risk: med
+  label: Medium
+  invents: Every shadow, redrawn per frame.
+  repair_codes:
+  - F12
+- key: orbit_le_30
+  move: Orbit ≤30°
+  risk: high
+  label: High
+  invents: The elevation rotating into view.
+  repair_codes:
+  - A1
+- key: aerial_drift
+  move: Aerial drift
+  risk: high
+  label: High
+  invents: The roofscape and the entire context.
+  repair_codes:
+  - A1
+  - A3
+- key: threshold_cross
+  move: Threshold cross
+  risk: highest
+  label: Highest
+  invents: An entire unseen room. Split the shot at the doorway — always.
+  repair_codes:
+  - A1
+  - F7
+dials:
+- move: crane_rise
+  rule: +3 m reveals, +10 m invents
+  source: as04 dial
+- move: orbit_le_30
+  rule: past 30 degrees the model is drawing the unseen elevation
+  source: as05 dial
+- move: slider_drift
+  rule: travel stays under ten centimetres
+  source: as03 SCENE LOCKS

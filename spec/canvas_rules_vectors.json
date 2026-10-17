@@ -1,0 +1,308 @@
+{
+ "about": "Shared canvas-rule vectors: ui/src/canvasRules.ts (vitest, canvasRules.vectors.test.ts) and daemon/plate_daemon/canvas_rules.py (pytest, daemon/tests/test_routes_packets.py) must both agree with every one. Shapes: edge {name, graph, edge, expect}; accept {name, node, scrub_log, expect}; depth {name, graph, node, depth}. Nested keys (params, scrub_log) are camelCase.",
+ "vectors": [
+  {
+   "name": "plate to edit is allowed",
+   "graph": {"nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit"}], "edges": []},
+   "edge": {"source": "p", "target": "e"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "an edge to a node that does not exist",
+   "graph": {"nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}], "edges": []},
+   "edge": {"source": "p", "target": "ghost"},
+   "expect": {"ok": false, "code": "UNKNOWN_NODE"}
+  },
+  {
+   "name": "a self-loop is a cycle",
+   "graph": {"nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "c", "kind": "Comp"}], "edges": [{"id": "p->c", "source": "p", "target": "c"}]},
+   "edge": {"source": "c", "target": "c"},
+   "expect": {"ok": false, "code": "CYCLE"}
+  },
+  {
+   "name": "closing a loop is a cycle",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e1", "kind": "Edit"}, {"id": "c", "kind": "Comp"}],
+    "edges": [{"id": "p->e1", "source": "p", "target": "e1"}, {"id": "e1->c", "source": "e1", "target": "c"}]
+   },
+   "edge": {"source": "c", "target": "e1"},
+   "expect": {"ok": false, "code": "CYCLE"}
+  },
+  {
+   "name": "concept never reaches export",
+   "graph": {"nodes": [{"id": "k", "kind": "Concept"}, {"id": "x", "kind": "Export"}], "edges": []},
+   "edge": {"source": "k", "target": "x"},
+   "expect": {"ok": false, "code": "CONCEPT_TO_DELIVERY"}
+  },
+  {
+   "name": "concept never reaches review through another node",
+   "graph": {
+    "nodes": [{"id": "k", "kind": "Concept"}, {"id": "c", "kind": "Comp"}, {"id": "r", "kind": "Review"}],
+    "edges": [{"id": "k->c", "source": "k", "target": "c"}]
+   },
+   "edge": {"source": "c", "target": "r"},
+   "expect": {"ok": false, "code": "CONCEPT_TO_DELIVERY"}
+  },
+  {
+   "name": "an unmeasured output tier is concept tier too",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit", "outputTier": "concept_unmeasured"}, {"id": "x", "kind": "Export"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}]
+   },
+   "edge": {"source": "e", "target": "x"},
+   "expect": {"ok": false, "code": "CONCEPT_TO_DELIVERY"}
+  },
+  {
+   "name": "a measured edit may reach export",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit"}, {"id": "x", "kind": "Export"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}]
+   },
+   "edge": {"source": "e", "target": "x"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "a generator must hang off a plate",
+   "graph": {"nodes": [{"id": "m", "kind": "Mask"}, {"id": "e", "kind": "Edit"}], "edges": []},
+   "edge": {"source": "m", "target": "e"},
+   "expect": {"ok": false, "code": "NO_PLATE_ANCHOR"}
+  },
+  {
+   "name": "a mask under a plate anchors the edit",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "m", "kind": "Mask"}, {"id": "e", "kind": "Edit"}],
+    "edges": [{"id": "p->m", "source": "p", "target": "m"}]
+   },
+   "edge": {"source": "m", "target": "e"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "two generations from the plate are allowed",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e1", "kind": "Edit"}, {"id": "e2", "kind": "Edit"}],
+    "edges": [{"id": "p->e1", "source": "p", "target": "e1"}]
+   },
+   "edge": {"source": "e1", "target": "e2"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "a third generation exceeds the depth",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e1", "kind": "Edit"}, {"id": "e2", "kind": "People"}, {"id": "e3", "kind": "Edit"}],
+    "edges": [{"id": "p->e1", "source": "p", "target": "e1"}, {"id": "e1->e2", "source": "e1", "target": "e2"}]
+   },
+   "edge": {"source": "e2", "target": "e3"},
+   "expect": {"ok": false, "code": "DEPTH_EXCEEDED"}
+  },
+  {
+   "name": "inserting a generator upstream pushes the chain below past the depth",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e0", "kind": "Edit"}, {"id": "e1", "kind": "Edit"}, {"id": "e2", "kind": "Edit"}],
+    "edges": [{"id": "p->e0", "source": "p", "target": "e0"}, {"id": "e1->e2", "source": "e1", "target": "e2"}]
+   },
+   "edge": {"source": "e0", "target": "e1"},
+   "expect": {"ok": false, "code": "DEPTH_EXCEEDED"}
+  },
+  {
+   "name": "video stays locked until the still is approved",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit", "gateStatus": "pass", "approved": false}, {"id": "m", "kind": "Motion", "riskLabel": "low"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}]
+   },
+   "edge": {"source": "e", "target": "m"},
+   "expect": {"ok": false, "code": "VIDEO_LOCKED"}
+  },
+  {
+   "name": "a crop pair stays locked after a gate failure",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit", "gateStatus": "fail", "approved": true}, {"id": "cp", "kind": "CropPair"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}]
+   },
+   "edge": {"source": "e", "target": "cp"},
+   "expect": {"ok": false, "code": "VIDEO_LOCKED"}
+  },
+  {
+   "name": "a low-risk move after a passed and approved still is allowed",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit", "gateStatus": "pass", "approved": true}, {"id": "m", "kind": "Motion", "riskLabel": "low"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}]
+   },
+   "edge": {"source": "e", "target": "m"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "a high-risk move needs an override",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit", "gateStatus": "pass", "approved": true}, {"id": "m", "kind": "Motion", "riskLabel": "high"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}]
+   },
+   "edge": {"source": "e", "target": "m"},
+   "expect": {"ok": false, "code": "HIGH_RISK_MOVE"}
+  },
+  {
+   "name": "an overridden highest-risk move is allowed",
+   "graph": {
+    "nodes": [
+     {"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"},
+     {"id": "e", "kind": "Edit", "gateStatus": "pass", "approved": true},
+     {"id": "m", "kind": "Motion", "riskLabel": "highest", "overrides": [{"reason": "client asked for the orbit", "by": "human", "at": "2026-10-17T00:00:00Z"}], "labels": ["unseen geometry guessed"]}
+    ],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}]
+   },
+   "edge": {"source": "e", "target": "m"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "a camera override on an edit needs the override and the label",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit", "params": {"cameraOverride": {"yaw_deg": 15}}}],
+    "edges": []
+   },
+   "edge": {"source": "p", "target": "e"},
+   "expect": {"ok": false, "code": "INVENTED_ANGLE"}
+  },
+  {
+   "name": "an override without the label is still an invented angle",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit", "params": {"cameraOverride": true}, "overrides": [{"reason": "art direction", "by": "human", "at": "2026-10-17T00:00:00Z"}]}],
+    "edges": []
+   },
+   "edge": {"source": "p", "target": "e"},
+   "expect": {"ok": false, "code": "INVENTED_ANGLE"}
+  },
+  {
+   "name": "a labelled, overridden camera change is allowed",
+   "graph": {
+    "nodes": [
+     {"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"},
+     {"id": "e", "kind": "Edit", "params": {"cameraOverride": true}, "overrides": [{"reason": "art direction", "by": "human", "at": "2026-10-17T00:00:00Z"}], "labels": ["unseen geometry guessed"]}
+    ],
+    "edges": []
+   },
+   "edge": {"source": "p", "target": "e"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "a false camera override is no override",
+   "graph": {"nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit", "params": {"cameraOverride": false}}], "edges": []},
+   "edge": {"source": "p", "target": "e"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "a loaded edge is re-checked without counting itself",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}]
+   },
+   "edge": {"id": "p->e", "source": "p", "target": "e"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "a previs motion never reaches export",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit", "gateStatus": "pass", "approved": true}, {"id": "m", "kind": "Motion", "riskLabel": "low", "previs": true}, {"id": "x", "kind": "Export"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}, {"id": "e->m", "source": "e", "target": "m"}]
+   },
+   "edge": {"source": "m", "target": "x"},
+   "expect": {"ok": false, "code": "PREVIS_NOT_DELIVERABLE"}
+  },
+  {
+   "name": "previs stays previs through a comp",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit", "gateStatus": "pass", "approved": true}, {"id": "m", "kind": "Motion", "riskLabel": "low", "previs": true}, {"id": "c", "kind": "Comp"}, {"id": "x", "kind": "Export"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}, {"id": "e->m", "source": "e", "target": "m"}, {"id": "m->c", "source": "m", "target": "c"}]
+   },
+   "edge": {"source": "c", "target": "x"},
+   "expect": {"ok": false, "code": "PREVIS_NOT_DELIVERABLE"}
+  },
+  {
+   "name": "params.previs marks a motion previs too",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit", "gateStatus": "pass", "approved": true}, {"id": "m", "kind": "Motion", "riskLabel": "low", "params": {"previs": true}}, {"id": "x", "kind": "Export"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}, {"id": "e->m", "source": "e", "target": "m"}]
+   },
+   "edge": {"source": "m", "target": "x"},
+   "expect": {"ok": false, "code": "PREVIS_NOT_DELIVERABLE"}
+  },
+  {
+   "name": "a previs motion may be shown in a review",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit", "gateStatus": "pass", "approved": true}, {"id": "m", "kind": "Motion", "riskLabel": "low", "previs": true}, {"id": "r", "kind": "Review"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}, {"id": "e->m", "source": "e", "target": "m"}]
+   },
+   "edge": {"source": "m", "target": "r"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "a final motion may reach export",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit", "gateStatus": "pass", "approved": true}, {"id": "m", "kind": "Motion", "riskLabel": "low", "previs": false}, {"id": "x", "kind": "Export"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}, {"id": "e->m", "source": "e", "target": "m"}]
+   },
+   "edge": {"source": "m", "target": "x"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "accept needs a logged scrub",
+   "node": {"id": "e", "kind": "Edit", "label": "Edit 1"},
+   "scrub_log": null,
+   "expect": {"ok": false, "code": "SCRUB_REQUIRED"}
+  },
+  {
+   "name": "a partial scrub does not accept",
+   "node": {"id": "e", "kind": "Edit"},
+   "scrub_log": {"fullScrub": false},
+   "expect": {"ok": false, "code": "SCRUB_REQUIRED"}
+  },
+  {
+   "name": "a full scrub accepts",
+   "node": {"id": "e", "kind": "Edit"},
+   "scrub_log": {"id": "scrub_1", "fullScrub": true},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "a plate has depth zero",
+   "graph": {"nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}], "edges": []},
+   "node": "p",
+   "depth": 0
+  },
+  {
+   "name": "depth counts generators from the plate",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e", "kind": "Edit"}, {"id": "g", "kind": "Gate"}],
+    "edges": [{"source": "p", "target": "e"}, {"source": "e", "target": "g"}]
+   },
+   "node": "g",
+   "depth": 1
+  },
+  {
+   "name": "an unanchored generator has depth zero",
+   "graph": {"nodes": [{"id": "m", "kind": "Mask"}, {"id": "e", "kind": "Edit"}], "edges": [{"source": "m", "target": "e"}]},
+   "node": "e",
+   "depth": 0
+  },
+  {
+   "name": "depth takes the longest path from a plate",
+   "graph": {
+    "nodes": [
+     {"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"},
+     {"id": "e1", "kind": "Edit"},
+     {"id": "e2", "kind": "People"},
+     {"id": "c", "kind": "Comp"}
+    ],
+    "edges": [{"source": "p", "target": "e1"}, {"source": "e1", "target": "e2"}, {"source": "e2", "target": "c"}, {"source": "p", "target": "c"}]
+   },
+   "node": "c",
+   "depth": 2
+  },
+  {
+   "name": "a cycle does not loop the depth walk",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e1", "kind": "Edit"}, {"id": "c", "kind": "Comp"}],
+    "edges": [{"source": "p", "target": "e1"}, {"source": "e1", "target": "c"}, {"source": "c", "target": "e1"}]
+   },
+   "node": "c",
+   "depth": 1
+  }
+ ]
+}

@@ -1,0 +1,32 @@
+# P1 recipe 1: night relight as a CHANGE-LIST edit on Nano Banana 2.1 (library family a01, Same-Family Relight).
+# Lesson (2026-10-16/17 night reveals): a list of what changes beats a "keep everything" paragraph. The engine gets the
+# whole frame (region none); the composite then keeps every locked pixel from the plate, so the engine only has to be
+# right inside sky + vegetation + people. Source view only: the plate is relit in place, never re-angled.
+schema: 1
+id: night_relight_changelist
+title: Night relight, change-list edit
+kind: still_edit
+library: a01
+engine: nano-banana-2.1
+shot_class: wide
+mask:
+  editable_classes: [sky, vegetation, people]
+  region: none
+  lock_rest: true
+params:
+  n: 1
+  size: native
+overrides:
+  "[SKY STATE: LATE BLUE HOUR, DEEP INDIGO FADING TO A LAST WARM BAND AT THE HORIZON]": "late blue hour, deep indigo fading to a last warm band at the horizon"
+  "[LIGHTING DESIGN: RECESSED WARM THIN LINES ON THE STEPS, FACADE GRAZERS, UPLIGHTS ON THE TREES]": "recessed warm thin lines on the steps, facade grazers, uplights on the trees"
+  "[2700K]": "2700K"
+prompt: |-
+  This is an approved architectural render. Edit it by the change list below and change nothing else.
+  Change list:
+  1. Sky: replace the sky with [SKY STATE: LATE BLUE HOUR, DEEP INDIGO FADING TO A LAST WARM BAND AT THE HORIZON]. No sun disc, no stars brighter than faint pinpricks.
+  2. Light: the scene is now lit by its designed fixtures only: [LIGHTING DESIGN: RECESSED WARM THIN LINES ON THE STEPS, FACADE GRAZERS, UPLIGHTS ON THE TREES]. Interior lights are on and glow [2700K] warm through the glazing. Daylight is gone.
+  3. Vegetation: foliage is lit only by those fixtures and the sky; species, positions and counts stay as they are; structure stays readable in the shadows.
+  4. People: same people in the same places, lit by the nearest fixture. No one is added.
+  5. Shadows and reflections: re-cast from the new sources; glass and any wet surface reflect the new sky and lights.
+  Not on the list, so unchanged: architecture, hardscape, materials, signage and its text, camera position, framing, lens and perspective.
+negative_prompt: new objects, removed objects, changed architecture, re-framing, altered perspective, rewritten signage text, daylight cast, HDR glow, over-lit foliage, cartoon sky

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' file: blob: data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'none'; base-uri 'none'">
+<title>{{TITLE}}</title>
+<style>
+<!--PLATE:CSS-->
+</style>
+</head>
+<body>
+<a class="skip" href="#viewer">Skip to the image</a>
+<header class="top">
+  <div>
+    <p class="eyebrow">Review</p>
+    <h1>{{TITLE}}</h1>
+  </div>
+  <p class="meta" id="meta"></p>
+</header>
+<noscript><p class="nojs">This page needs JavaScript to show the before and after images. Open it in a current browser (Chrome, Edge, Safari or Firefox); nothing is sent anywhere.</p></noscript>
+<main class="layout" id="app">
+  <nav class="rail" id="takes" aria-label="Takes"></nav>
+  <section class="stage" aria-label="Image viewer">
+    <div class="toolbar" role="toolbar" aria-label="Viewer controls">
+      <div class="seg" role="group" aria-label="View mode">
+        <button type="button" data-mode="wipe" aria-pressed="true">Wipe</button>
+        <button type="button" data-mode="a" aria-pressed="false">Before</button>
+        <button type="button" data-mode="b" aria-pressed="false">After</button>
+      </div>
+      <button type="button" id="btn-toggle" title="Swap before and after (T)">Toggle <kbd>T</kbd></button>
+      <button type="button" id="btn-zoom" aria-pressed="false" title="Show the proxy at 100% (Z)">100% <kbd>Z</kbd></button>
+    </div>
+    <div class="viewport" id="viewport">
+      <div class="pair" id="pair" data-mode="wipe">
+        <img id="img-a" alt="Before: the original plate" draggable="false">
+        <img id="img-b" alt="After: the finished candidate" draggable="false">
+        <div class="divider" id="divider" aria-hidden="true"><span class="grip"></span></div>
+        <span class="tag tag-a">Before</span>
+        <span class="tag tag-b">After</span>
+      </div>
+    </div>
+    <div class="wipebar">
+      <label for="wipe">Wipe</label>
+      <input id="wipe" type="range" min="0" max="100" step="0.1" value="50" aria-label="Wipe position, before on the left, after on the right">
+    </div>
+    <p class="mismatch" id="mismatch" hidden>The before and after images are not the same size, so they will not line up exactly.</p>
+    <div class="gate" id="gate" aria-live="polite"></div>
+    <p class="keys">Keys: <kbd>&larr;</kbd> <kbd>&rarr;</kbd> move the wipe (hold <kbd>Shift</kbd> for bigger steps) &middot; <kbd>T</kbd> toggle &middot; <kbd>Z</kbd> 100% &middot; <kbd>[</kbd> <kbd>]</kbd> previous or next take</p>
+  </section>
+  <aside class="notes" aria-label="Comments">
+    <form id="comments" autocomplete="off">
+      <h2>Your comments</h2>
+      <label class="field"><span>Your name</span><input type="text" id="reviewer" maxlength="120"></label>
+      <fieldset class="decision" id="decision">
+        <legend id="take-legend">This take</legend>
+        <label><input type="radio" name="decision" value="approved"> Looks right</label>
+        <label><input type="radio" name="decision" value="changes"> Needs changes</label>
+        <label><input type="radio" name="decision" value="unsure"> Not sure</label>
+      </fieldset>
+      <label class="field"><span>Note on this take</span><textarea id="take-note" rows="4" maxlength="4000"></textarea></label>
+      <label class="field"><span>Overall note</span><textarea id="overall" rows="3" maxlength="4000"></textarea></label>
+      <p class="tally" id="tally"></p>
+      <div class="actions">
+        <a class="btn primary" id="mail" href="mailto:" rel="noopener">Send by email</a>
+        <button type="button" class="btn" id="download">Download comments.json</button>
+      </div>
+      <p class="hint" id="mail-hint">Send by email opens a new message in your mail program. If it does not open, or your notes are long, download comments.json and attach it to an email.</p>
+    </form>
+  </aside>
+</main>
+<footer class="foot"><p id="foot"></p></footer>
+<script id="plate-review-data" type="application/json"><!--PLATE:DATA--></script>
+<script>
+<!--PLATE:JS-->
+</script>
+</body>
+</html>

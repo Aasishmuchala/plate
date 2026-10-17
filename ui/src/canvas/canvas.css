@@ -1,0 +1,870 @@
+/* PLATE canvas theme (T35): one dark theme, the MaxGaffer palette. Flat surfaces, one hairline border, one accent;
+   status colours only where they carry meaning (custody grade, gate verdict, risk, concept tier). Handle types are
+   told apart by shape, not by colour: image16 filled circle, mask hollow circle, packet square, video diamond,
+   report bar. Loaded after index.css, so equal-specificity rules here win. */
+
+.plate-app {
+  --bg: #1c1c1e;
+  --panel: #2c2c2e;
+  --inset: #1c1c1e;
+  --fill: #3a3a3c;
+  --fill-hover: #48484a;
+  --hair: rgba(255, 255, 255, 0.1);
+  --text: #f2f2f7;
+  --dim: #98989d;
+  --faint: #636366;
+  --accent: #0a84ff;
+  --accent-hover: #2f95ff;
+  --green: #30d158;
+  --blue: #0a84ff;
+  --amber: #ff9f0a;
+  --red: #ff453a;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "SF Pro Text", "Segoe UI Variable", "Segoe UI", Inter, system-ui, sans-serif;
+  font-size: 13px;
+}
+
+/* ---------------------------------------------------------------- frame */
+
+.plate-app .status-bar {
+  align-items: center;
+  border-bottom: 1px solid var(--hair);
+  color: var(--dim);
+}
+
+.plate-app .status-bar .status-brand {
+  color: var(--text);
+  font-weight: 600;
+  letter-spacing: 0.3em;
+}
+
+.plate-app .status-bar [data-state="up"] {
+  color: var(--green);
+}
+
+.plate-app .status-bar [data-state="down"],
+.plate-app .status-bar [data-present="false"] {
+  color: var(--red);
+}
+
+.plate-app .plate-canvas {
+  position: relative;
+}
+
+.plate-app .plate-side {
+  width: 320px;
+  background: var(--bg);
+  border-left: 1px solid var(--hair);
+}
+
+.plate-app .node-list h2 {
+  color: var(--dim);
+}
+
+.plate-app .refusal {
+  border: 1px solid rgba(255, 69, 58, 0.45);
+  border-radius: 8px;
+  color: var(--red);
+}
+
+/* ---------------------------------------------------------------- xyflow surface */
+
+.plate-app .react-flow {
+  --xy-background-color: var(--bg);
+  --xy-background-pattern-color: #2c2c2e;
+  --xy-edge-stroke: #636366;
+  --xy-edge-stroke-selected: var(--accent);
+  --xy-connectionline-stroke: var(--accent);
+  --xy-handle-background-color: var(--text);
+  --xy-handle-border-color: var(--bg);
+  --xy-controls-button-background-color: var(--panel);
+  --xy-controls-button-background-color-hover: var(--fill);
+  --xy-controls-button-color: var(--text);
+  --xy-controls-button-border-color: var(--hair);
+  --xy-attribution-background-color: transparent;
+}
+
+/* The store creates xyflow "default" nodes; our component draws the whole node, so reset xyflow's box. */
+.plate-app .react-flow__node-default,
+.plate-app .react-flow__node {
+  padding: 0;
+  width: auto;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font-size: 12px;
+  border-radius: 12px;
+  box-shadow: none;
+}
+
+.plate-app .react-flow__node-default.selectable:hover,
+.plate-app .react-flow__node-default.selectable.selected,
+.plate-app .react-flow__node-default.selectable:focus,
+.plate-app .react-flow__node-default.selectable:focus-visible {
+  box-shadow: none;
+}
+
+.plate-app .react-flow__edge.edge-mask .react-flow__edge-path {
+  stroke-dasharray: 2 4;
+}
+
+.plate-app .react-flow__edge.edge-packet .react-flow__edge-path {
+  stroke: #8e8e93;
+}
+
+.plate-app .react-flow__edge.edge-video .react-flow__edge-path {
+  stroke-width: 2;
+}
+
+.plate-app .react-flow__edge.edge-report .react-flow__edge-path {
+  stroke-dasharray: 6 3;
+}
+
+.plate-app .react-flow__edge.edge-violation .react-flow__edge-path {
+  stroke: var(--red);
+  stroke-dasharray: 4 4;
+}
+
+/* ---------------------------------------------------------------- nodes */
+
+.plate-node {
+  position: relative;
+  width: 232px;
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: 12px;
+}
+
+.plate-node.is-selected {
+  border-color: var(--accent);
+}
+
+.plate-node.is-concept {
+  border-color: rgba(255, 159, 10, 0.55);
+}
+
+.node-head {
+  padding: 8px 10px 6px;
+  border-bottom: 1px solid var(--hair);
+}
+
+.node-head-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 20px;
+}
+
+.node-head-row + .node-head-row {
+  margin-top: 4px;
+}
+
+.node-head-spacer {
+  flex: 1;
+}
+
+.node-label {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--dim);
+}
+
+.node-badges {
+  flex-wrap: wrap;
+}
+
+.badge,
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 16px;
+  white-space: nowrap;
+  border: 1px solid var(--hair);
+  color: var(--dim);
+}
+
+.badge-kind {
+  color: var(--text);
+  background: var(--fill);
+  border-color: transparent;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.badge-tier.tier-concept {
+  color: var(--amber);
+  border-color: rgba(255, 159, 10, 0.6);
+}
+
+.gate-pass {
+  color: var(--green);
+  border-color: rgba(48, 209, 88, 0.5);
+}
+
+.gate-fail {
+  color: var(--red);
+  border-color: rgba(255, 69, 58, 0.55);
+}
+
+.gate-advisory {
+  color: var(--amber);
+  border-color: rgba(255, 159, 10, 0.5);
+}
+
+.badge-approved {
+  color: var(--accent);
+  border-color: rgba(10, 132, 255, 0.55);
+}
+
+.risk-low {
+  color: var(--dim);
+}
+
+.risk-med {
+  color: var(--text);
+}
+
+.risk-high,
+.risk-highest {
+  color: var(--red);
+  border-color: rgba(255, 69, 58, 0.55);
+}
+
+.risk-highest {
+  font-weight: 600;
+}
+
+.chip-state.tone-live {
+  color: var(--accent);
+  border-color: rgba(10, 132, 255, 0.55);
+}
+
+.chip-state.tone-ok {
+  color: var(--green);
+  border-color: rgba(48, 209, 88, 0.5);
+}
+
+.chip-state.tone-bad {
+  color: var(--red);
+  border-color: rgba(255, 69, 58, 0.55);
+}
+
+.chip-state.tone-dim,
+.chip-dim {
+  color: var(--faint);
+}
+
+.tone-green {
+  color: var(--green);
+  border-color: rgba(48, 209, 88, 0.55);
+}
+
+.tone-blue {
+  color: var(--blue);
+  border-color: rgba(10, 132, 255, 0.55);
+}
+
+.tone-amber {
+  color: var(--amber);
+  border-color: rgba(255, 159, 10, 0.55);
+}
+
+.tone-red {
+  color: var(--red);
+  border-color: rgba(255, 69, 58, 0.55);
+}
+
+.chip-label.is-warn {
+  color: var(--amber);
+  border-color: rgba(255, 159, 10, 0.55);
+}
+
+.chip-envelope {
+  color: var(--text);
+}
+
+.icon-watermark {
+  flex: none;
+}
+
+.node-body {
+  padding: 8px 10px;
+}
+
+.node-preview {
+  position: relative;
+  overflow: hidden;
+  border-radius: 8px;
+  background: var(--inset);
+}
+
+.node-thumb {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+}
+
+.node-thumb-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.node-watermark {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--amber);
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  background: repeating-linear-gradient(-30deg, rgba(255, 159, 10, 0.1) 0 8px, transparent 8px 16px);
+  pointer-events: none;
+}
+
+.node-summary,
+.node-depth {
+  margin-top: 6px;
+  color: var(--dim);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.node-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.node-violation {
+  margin-top: 6px;
+  color: var(--red);
+  font-size: 11px;
+}
+
+/* ---------------------------------------------------------------- typed handles */
+
+.node-ports {
+  padding: 4px 0 8px;
+}
+
+.node-port-row {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 20px;
+  padding: 0 12px;
+  font-size: 10.5px;
+  color: var(--dim);
+}
+
+.port-out {
+  margin-left: auto;
+}
+
+.plate-app .react-flow__handle.handle {
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--panel);
+  background: var(--text);
+}
+
+.plate-app .react-flow__handle.handle-mask {
+  background: var(--panel);
+  border-color: var(--text);
+}
+
+.plate-app .react-flow__handle.handle-packet {
+  border-radius: 2px;
+  background: #8e8e93;
+}
+
+.plate-app .react-flow__handle.handle-video {
+  border-radius: 2px;
+  transform: translate(-50%, -50%) rotate(45deg);
+}
+
+.plate-app .react-flow__handle-right.handle-video {
+  transform: translate(50%, -50%) rotate(45deg);
+}
+
+.plate-app .react-flow__handle.handle-report {
+  width: 6px;
+  height: 12px;
+  border-radius: 2px;
+}
+
+.plate-app .react-flow__handle.handle-concept {
+  background: var(--amber);
+}
+
+.plate-app .react-flow__handle.connectingto.valid,
+.plate-app .react-flow__handle.valid {
+  background: var(--green);
+}
+
+.plate-app .react-flow__handle.connectingto:not(.valid) {
+  background: var(--red);
+}
+
+/* ---------------------------------------------------------------- refusals */
+
+@keyframes plate-refusal-life {
+  0% {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  6%,
+  88% {
+    opacity: 1;
+    transform: none;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.node-refusal,
+.canvas-toast {
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: #3a1d1b;
+  border: 1px solid rgba(255, 69, 58, 0.6);
+  color: #ffd7d4;
+  font-size: 11.5px;
+  line-height: 1.35;
+  animation: plate-refusal-life 4s ease forwards;
+}
+
+.node-refusal strong,
+.canvas-toast strong {
+  margin-right: 4px;
+  color: var(--red);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
+.node-refusal {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 5;
+}
+
+.canvas-toast {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  max-width: 60%;
+}
+
+/* ---------------------------------------------------------------- candidate strip */
+
+.cand-strip {
+  border-top: 1px solid var(--hair);
+  padding: 6px 8px 8px;
+  outline: none;
+}
+
+.cand-strip:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--accent);
+  border-radius: 0 0 12px 12px;
+}
+
+.cand-strip ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cand {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: var(--inset);
+}
+
+.cand.is-picked {
+  border-color: var(--accent);
+}
+
+.cand.is-comparing {
+  background: #232326;
+}
+
+.cand-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 3px 6px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.cand-rank {
+  width: 12px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.cand-thumb {
+  width: 36px;
+  height: 20px;
+  border-radius: 4px;
+  object-fit: cover;
+  background: var(--fill);
+}
+
+.cand-score,
+.cand-picked {
+  color: var(--dim);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.cand-picked {
+  margin-left: auto;
+  color: var(--accent);
+}
+
+.cand-fail,
+.cand-override {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 6px 4px 24px;
+  font-size: 10.5px;
+}
+
+.cand-check {
+  color: var(--red);
+}
+
+.cand-error {
+  padding: 0 6px 4px 24px;
+  color: var(--red);
+  font-size: 10.5px;
+}
+
+.cand-override input {
+  flex: 1;
+  min-width: 0;
+}
+
+.plate-node .chip-envelope {
+  margin: 0 6px 4px 24px;
+}
+
+/* ---------------------------------------------------------------- controls */
+
+.plate-app .btn {
+  padding: 5px 12px;
+  border: none;
+  border-radius: 8px;
+  background: var(--fill);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.plate-app .btn:hover:not(:disabled) {
+  background: var(--fill-hover);
+}
+
+.plate-app .btn:disabled {
+  background: var(--panel);
+  color: var(--faint);
+  cursor: default;
+}
+
+.plate-app .btn-primary {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.plate-app .btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.plate-app .btn-ghost {
+  background: transparent;
+  color: var(--accent);
+  padding: 3px 6px;
+}
+
+.plate-app .btn-ghost:hover:not(:disabled) {
+  background: transparent;
+  color: #66b3ff;
+}
+
+.plate-app .btn-chip {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
+.plate-app .btn-chip.kind-concept {
+  color: var(--amber);
+}
+
+.plate-app input[type="text"],
+.plate-app input[type="number"],
+.plate-app input:not([type]),
+.plate-app select {
+  padding: 4px 8px;
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+  background: var(--inset);
+  color: var(--text);
+  font: inherit;
+}
+
+.plate-app input[type="number"] {
+  width: 56px;
+}
+
+.plate-app input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+/* ---------------------------------------------------------------- add palette */
+
+.add-palette details {
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: 10px;
+  padding: 6px 10px;
+}
+
+.add-palette summary {
+  cursor: pointer;
+  color: var(--accent);
+  list-style: none;
+}
+
+.add-palette-grid {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  gap: 4px;
+  margin-top: 6px;
+}
+
+/* ---------------------------------------------------------------- Make bar */
+
+.plate-app .make-bar {
+  padding: 8px 16px 10px;
+  border-top: 1px solid var(--hair);
+  border-bottom: none;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 13px;
+  letter-spacing: normal;
+}
+
+.make-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-height: 30px;
+}
+
+.make-row + .make-row {
+  margin-top: 4px;
+}
+
+.make-target {
+  font-weight: 600;
+}
+
+.make-target-id {
+  color: var(--dim);
+  font-weight: 400;
+}
+
+.make-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dim);
+}
+
+.make-check {
+  color: var(--text);
+}
+
+.make-field select {
+  max-width: 280px;
+}
+
+.make-spacer {
+  flex: 1;
+}
+
+.quote-line {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.quote-line.is-pending {
+  color: var(--dim);
+}
+
+.quote-line.is-pending em {
+  margin-left: 8px;
+  color: var(--text);
+}
+
+.quote-line.is-expired {
+  color: var(--faint);
+}
+
+.quote-countdown {
+  margin-left: 10px;
+  color: var(--dim);
+}
+
+.quote-line.is-expired .quote-countdown {
+  color: var(--amber);
+}
+
+.make-note {
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.make-error {
+  color: var(--red);
+  font-size: 12px;
+}
+
+.make-drawer {
+  margin-top: 8px;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--hair);
+  border-radius: 10px;
+  background: var(--inset);
+}
+
+.make-drawer table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.make-drawer th,
+.make-drawer td {
+  padding: 3px 8px;
+  text-align: left;
+  font-weight: 400;
+  vertical-align: middle;
+}
+
+.make-drawer th {
+  white-space: nowrap;
+}
+
+.make-param-type {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+/* ---------------------------------------------------------------- approval dialog */
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.dialog {
+  width: min(440px, 92vw);
+  padding: 18px 20px;
+  border: 1px solid var(--hair);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.dialog h2 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+.dialog p {
+  margin: 0 0 12px;
+  color: var(--dim);
+  line-height: 1.45;
+}
+
+.dialog-terms {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 14px;
+  margin: 0 0 16px;
+}
+
+.dialog-terms dt {
+  color: var(--dim);
+}
+
+.dialog-terms dd {
+  margin: 0;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* ---------------------------------------------------------------- compare */
+
+.compare-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  color: var(--dim);
+  font-size: 12px;
+  border-top: 1px solid var(--hair);
+}

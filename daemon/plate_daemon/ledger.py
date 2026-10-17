@@ -22,8 +22,9 @@ that line can be torn). Readers skip it and report it; the next `append` moves t
 `runs.jsonl.torn` and truncates them away so a new record never glues onto them. A middle line that does
 not parse, or a last line that ends in `\\n` but does not parse, is damage and fails `verify()`.
 
-`kind` is a closed set (`KINDS`); later tasks extend it here (T38 adds verdict, llm and scrub). Fields
-outside the shape go under `data`.
+`kind` is a closed set (`KINDS`); later tasks extend it here (T38 added `verdict`, `llm` and `scrub`: a human
+Ship/Fix/Render-it call, a Claude composer or judge call, and a logged scrub of a take). Fields outside the
+shape go under `data`.
 """
 
 from __future__ import annotations
@@ -71,6 +72,9 @@ KINDS = frozenset(
         "human_minutes",
         "export",
         "override",
+        "verdict",
+        "llm",
+        "scrub",
     }
 )
 

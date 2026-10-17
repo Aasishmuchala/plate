@@ -216,7 +216,9 @@ def _frames_list(camera_frames: Any) -> list[Mapping[str, Any]]:
     return out
 
 
-def _bracket(frames: Sequence[Mapping[str, Any]], k: float) -> tuple[Mapping[str, Any], Mapping[str, Any], float]:
+def _bracket(
+    frames: Sequence[Mapping[str, Any]], k: float
+) -> tuple[Mapping[str, Any], Mapping[str, Any], float]:
     """(lo, hi, t): the keyed frames around k and the blend weight toward hi; clamped at both ends."""
     numbers = [int(f["frame"]) for f in frames]
     if k <= numbers[0]:

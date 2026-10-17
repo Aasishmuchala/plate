@@ -24,7 +24,6 @@ export function orderChecks(checks: readonly GateCheck[]): GateCheck[] {
 function Lock(): ReactElement {
   return (
     <svg width="10" height="12" viewBox="0 0 10 12" role="img" aria-label="shipped" data-testid="shipped-lock">
-      <title>shipped: this report is frozen</title>
       <rect x="1" y="5" width="8" height="6" rx="1" fill="currentColor" />
       <path d="M3 5V3.5a2 2 0 0 1 4 0V5" fill="none" stroke="currentColor" strokeWidth="1.2" />
     </svg>
@@ -100,6 +99,7 @@ export function GatePanel(): ReactElement {
                 type="button"
                 style={{ ...S.btn, ...(v.n === data.n ? { borderColor: C.accent, color: C.accent } : {}), display: "inline-flex", gap: 4, alignItems: "center" }}
                 aria-pressed={v.n === data.n}
+                title={v.shipped ? "shipped: this report is frozen" : undefined}
                 data-testid="gate-version"
                 data-shipped={v.shipped}
                 onClick={() => setPick({ runId, n: v.n })}

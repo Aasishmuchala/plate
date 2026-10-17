@@ -1,0 +1,11 @@
+# Anthropic API prices, USD per million tokens, used only to ESTIMATE the cost of a composer or judge call from
+# the `usage` the API returns (the ledger's billing reconciliation owns the billed truth).
+#
+# as_of 2026-10-17 and NOT yet confirmed against the Anthropic console (router PLAN open question 7). Until
+# someone confirms them, every figure here is an estimate; update the numbers and `as_of` together.
+schema: 1
+as_of: "2026-10-17"
+confirmed_against_console: false
+per_mtok_usd:
+  claude-sonnet-5-5: {input: 3.00, output: 15.00}
+  claude-opus-5-5: {input: 5.00, output: 25.00}

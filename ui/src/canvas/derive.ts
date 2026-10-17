@@ -67,3 +67,27 @@ const FALLBACK: NodeInfo = { tier: "measured", labels: [], plateId: null, violat
 export function useNodeInfo(id: string): NodeInfo {
   return useContext(NodeInfoContext).get(id) ?? FALLBACK;
 }
+
+/** The nearest upstream Plate of `id` (itself for a Plate), breadth first; null when not anchored. */
+export function plateAncestor(nodes: GraphNode[], edges: EdgeLike[], id: string): GraphNode | null {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const up = new Map<string, string[]>();
+  for (const e of edges) up.set(e.target, [...(up.get(e.target) ?? []), e.source]);
+  const seen = new Set<string>([id]);
+  let queue = [id];
+  while (queue.length) {
+    const next: string[] = [];
+    for (const cur of queue) {
+      const n = byId.get(cur);
+      if (n?.data.kind === "Plate") return n;
+      for (const src of up.get(cur) ?? []) {
+        if (!seen.has(src)) {
+          seen.add(src);
+          next.push(src);
+        }
+      }
+    }
+    queue = next;
+  }
+  return null;
+}

@@ -1,6 +1,6 @@
 # Engines: manifests, router, Atlas contract
 
-Code lives in `engines/plate_engines/`, data in `engines/plate_engines/manifests/<id>.yaml` (13 files), tests in `engines/tests/`. Everything is pure Python and runs the same on Windows and macOS. No test opens a socket: `engines/tests/conftest.py` makes `socket.socket`, `socket.create_connection` and `socket.getaddrinfo` raise `RuntimeError("network disabled in engines tests")`.
+Code lives in `engines/plate_engines/`, data in `engines/plate_engines/manifests/<id>.yaml` (14 files, plus `_*.yaml` overlays such as the price overlay), recorded request and response fixtures in `engines/plate_engines/contract/<vendor>/`, tests in `engines/tests/`. Everything is pure Python and runs the same on Windows and macOS. No test opens a socket: `engines/tests/conftest.py` makes `socket.socket`, `socket.create_connection` and `socket.getaddrinfo` raise `RuntimeError("network disabled in engines tests")`.
 
 | module | what it does |
 |---|---|
@@ -9,6 +9,11 @@ Code lives in `engines/plate_engines/`, data in `engines/plate_engines/manifests
 | `loader.py` | `load_manifests(dir)` and `ManifestError` |
 | `router.py` | pure routing: `custody_filter`, `doctrine_filter`, `rank`, `route`, `estimate_price` |
 | `atlas.py` | `AtlasClient` over an injected `Transport`, plus `FakeTransport` for tests |
+| `adapters/` | one adapter per vendor route (Gemini, OpenAI Images, Atlas image and video, BFL, Vertex Veo, BytePlus and WaveSpeed Seedance fallbacks, local Qwen and Wan stubs, upscalers) over a `Transport`; every outbound request goes through the daemon's egress guard, and the tests use recorded fixtures only |
+| `router.py` (`choose`) | the full policy used by the daemon: custody, then doctrine, then pins, then health, then engine cards (Wilson lower bound once n >= 20), price, latency, region. `next_same_model` returns only routes of the same model and sets `requote` |
+| `health.py` | health entries (ok, degraded, down, suspended) and the `alerts.jsonl` writer (`schema_change`, `price_change`, `requote`, `unit_mismatch`, `retired_pin`, `canary_drift`, `engine_suspended`, `engine_resumed`) |
+| `prices.py`, `schema_diff.py`, `retire.py` | nightly price refresh into an overlay (a move over 5% forces a requote), vendor schema diff, retired-pin check |
+| `cards.py`, `canaries.py` | per engine, task and shot class pass rates with Wilson bounds; the weekly canary run and the drift that suspends an engine |
 
 ## Manifest field reference
 
@@ -74,4 +79,4 @@ Atlas uploads return public OSS URLs, so every Atlas route is `D / public` and i
 | download sends no Authorization header (the key never goes to the OSS host) | 66 |
 | download of a non-2xx response fails with `download failed: <status>`; parents are created | 67-68 |
 
-Differences from the TypeScript, all deliberate: the key is read once before polling (a missing key fails before any sleep); the prediction id is URL-quoted into the path; downloads are written to a temp file and moved with `os.replace` (retry 5 times, 50 ms doubling) so a failed write never leaves a partial result. The module ships a `Transport` protocol and a `FakeTransport`; the real httpx transport arrives with the adapters.
+Differences from the TypeScript, all deliberate: the key is read once before polling (a missing key fails before any sleep); the prediction id is URL-quoted into the path; downloads are written to a temp file and moved with `os.replace` (retry 5 times, 50 ms doubling) so a failed write never leaves a partial result. The module ships a `Transport` protocol and a `FakeTransport`; the adapters build on them, and live traffic only ever leaves through the daemon's egress guard.

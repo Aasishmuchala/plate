@@ -1,0 +1,161 @@
+# Archviz shot recipes: Lensbook ARCH_SHOTS (as01 to as14) with their motion risk, and ARCH_PREFIX, the Style
+# Prefix every `prefixed: true` shot gets on top once the Project Sheet has filled it. Ported verbatim.
+# Source: ~/Desktop/lensbook/lib/data.ts (doctrine verified against primary docs 2026-08-27).
+schema: 1
+kind: shots
+prefix: |-
+  Style: [FORMAT — E.G. 4K ARCHITECTURAL FILM, 16:9]. Photorealistic — no 3D-render look, no game engine, no CGI gloss.
+  Source: The input image is an approved render. Its geometry, materials, composition and framing are ground truth — never redraw, restyle or reimagine any of it.
+  Lighting: [THIS FILM'S LIGHT LOGIC — SOURCE, QUALITY, HAZE, WHAT IS FORBIDDEN].
+  Color: 60:30:10 — [DOMINANT] / [SECONDARY] / [ACCENT].
+  Camera: [LENS CHARACTER — E.G. COOKE-WARM HIGH CONTRAST]. 180° shutter. [DEPTH REGISTER — DEEP LEGIBLE FOR EXTERIORS / SHALLOW ISOLATING FOR DETAILS].
+  Materials: [HERO MATERIALS — PATTERN + MODULE ANCHORS, LOCKED VERBATIM ACROSS EVERY SHOT].
+  Physics: Gravity and inertia respected — water, cloth and vegetation move with real mass; correct contact shadows; nothing floats.
+  Continuity: Architecture, materials and framing identical across every shot. Zero drift.
+  Technical: 24fps smooth motion. No jitter. No on-screen text, no logos, no captions.
+  Audio: Environmental SFX only — [AUDIO BED — WIND / BIRDS / WATER / DISTANT CITY]. No music. No subtitles.
+recipes:
+- id: as01
+  num: '01'
+  title: Living Render
+  risk: low
+  prefixed: true
+  use: The tier-zero shot. Run it first on every new frame — it exposes drift before you spend on moves.
+  prompt: |-
+    Shot 1 — wide shot, eye level, locked-off camera:
+    The approved frame, alive. A light breeze moves the [TREES / PLANTING] with natural mass; the [POOL / WATER FEATURE] ripples slowly; clouds drift almost imperceptibly; a bird crosses the far sky. Light constant throughout. Nothing else moves, for the full duration.
+    SCENE LOCKS: architecture, materials and framing identical to the source image in every frame; straight lines stay straight; no people enter; no objects appear; no camera movement of any kind.
+- id: as02
+  num: '02'
+  title: Facade Push-In
+  risk: low
+  prefixed: true
+  use: The workhorse move — existing pixels enlarge, almost nothing is invented.
+  prompt: |-
+    Shot 1 — wide shot, 35mm lens, eye level, slow push-in at constant speed:
+    Starting on the full facade, the camera advances steadily toward [THE ENTRANCE / A FACADE BAY], ending framed on [THE DETAIL]. Planting sways gently at the frame edges; reflections travel naturally across the glazing as the angle tightens; shadows hold their angle.
+    SCENE LOCKS: mullions and facade lines stay straight and true through the entire move; no new geometry appears at the edges; light and materials constant; no other camera movement.
+- id: as03
+  num: '03'
+  title: Interior Slider Drift
+  risk: low
+  prefixed: true
+  use: Centimetres of lateral travel; layered parallax does the cinema.
+  prompt: |-
+    Shot 1 — medium shot, 50mm lens, chest height, lateral slider drift left to right, a few centimetres of travel:
+    The camera drifts slowly across [THE LIVING SPACE], foreground furniture sliding gently against the deeper room — parallax in quiet layers. Sheer curtains breathe at the glazing; dust motes drift in the window light; nothing else stirs.
+    SCENE LOCKS: furniture, materials and architecture identical to the source; travel stays under ten centimetres; verticals stay vertical; no reframe beyond the drift; light constant.
+- id: as04
+  num: '04'
+  title: Crane Rise
+  risk: med
+  prefixed: true
+  use: Vertical reveal — the upper storeys arrive; watch the roofline.
+  prompt: |-
+    Shot 1 — wide shot, rising slowly from eye level to +[3] metres, smooth crane:
+    The camera rises at constant speed, the facade revealing its upper storeys as the ground plane tilts gently away. Vegetation sways below; entourage continues walking, unbothered; light holds.
+    SCENE LOCKS: the revealed upper facade continues the exact bay rhythm, materials and proportions of the source; the roofline stays true; verticals stay vertical; one move only, no drift or pan added.
+  dial: Cap the rise — +3m reveals, +10m invents.
+- id: as05
+  num: '05'
+  title: The Orbit
+  risk: high
+  prefixed: true
+  use: Parallax proof of depth — and the model inventing whatever rotates into view.
+  prompt: |-
+    Shot 1 — wide shot, constant height and radius, slow [25]° arc around [THE PAVILION / BUILDING CORNER]:
+    The building rotates slowly in frame as foreground planting slides across the facade — smooth, even orbital speed, depth proven by parallax. Atmosphere alive: leaves moving, water catching light.
+    SCENE LOCKS: the facade rotating into view keeps the exact geometry, bay rhythm and materials of the source; straight lines stay straight; the arc never exceeds 30 degrees; constant speed; no other movement.
+  dial: Past 30° the model is drawing the unseen elevation — if you need the far side, render its own still and cut.
+- id: as06
+  num: '06'
+  title: Threshold Cross
+  risk: high
+  prefixed: true
+  use: The walk-through — split at the doorway, always. One shot per side.
+  prompt: |-
+    Shot 1 — wide shot, 24mm lens, chest height, steady forward glide at walking pace toward the open [DOOR / PORTAL]:
+    The camera approaches the threshold smoothly, the interior glowing beyond the opening, anticipation building — and the shot ENDS at the doorway plane. Do not pass through.
+    SCENE LOCKS: the door frame stays true and straight through the approach; the glimpsed interior stays consistent with [THE INTERIOR RENDER]; light constant; no other camera movement.
+  dial: 'Shoot the interior as its own shot from its own still, first frame built from this shot''s last (return_last_frame: true hands you that frame) — join at the threshold in the edit.'
+- id: as07
+  num: '07'
+  title: Entourage Life
+  risk: low
+  prefixed: true
+  use: The architecture stands still; the city moves through it.
+  prompt: |-
+    Shot 1 — wide shot, eye level, locked-off camera:
+    Life crosses the approved frame: [TWO PEOPLE] walk unhurried across [THE PLAZA] in conversation, a [CYCLIST / CAR] passes on the far road, birds lift from the trees and resettle. Every figure at true scale to the doors, grounded with correct contact shadows. The building does not move; the light does not change.
+    SCENE LOCKS: architecture, materials and framing identical to the source in every frame; the walkers never occlude [THE ENTRANCE]; no one approaches the camera; no camera movement.
+- id: as08
+  num: 08
+  title: Light Sweep
+  risk: med
+  prefixed: true
+  use: Time-lapse light — the day crossing the facade in fifteen seconds.
+  prompt: |-
+    Shot 1 — wide shot, locked-off camera, time-lapse light:
+    Over the full clip, sunlight sweeps across the facade from [EAST] to [WEST]: shadows lengthen and rotate in one continuous motion, the colour temperature deepening toward [GOLDEN HOUR], clouds accelerating gently overhead. The building receives the day; nothing else happens.
+    SCENE LOCKS: geometry and framing frozen; the ONLY change is light and sky; shadow edges stay crisp and correctly cast throughout; no flicker; no camera movement.
+- id: as09
+  num: 09
+  title: Weather Pass
+  risk: med
+  prefixed: true
+  use: Weather arrives on camera — mist or monsoon as the event.
+  prompt: |-
+    Shot 1 — wide shot, locked-off camera:
+    Weather arrives over the clip: [MIST ROLLS IN FROM THE LEFT, SOFTENING THE SCENE DEPTH-LAYER BY DEPTH-LAYER / FIRST RAINDROPS STIPPLE THE POOL, THEN RAIN ARRIVES IN VISIBLE SHEETS]. Surfaces darken as they wet; reflections bloom on the hardscape; planting bows and recovers. The building stands constant through the change.
+    SCENE LOCKS: architecture, materials and framing identical to the source; the weather is the only event; light shifts only as the weather dictates; no camera movement.
+- id: as10
+  num: '10'
+  title: Material Macro
+  risk: low
+  prefixed: true
+  use: The texture insert — breathing room for the edit, tactility for the film.
+  prompt: |-
+    Shot 1 — extreme close-up, macro framing on [THE BRASS EDGE / STONE JOINT / TIMBER GRAIN], locked-off camera with near-imperceptible drift:
+    Razor-thin depth of field on the material. Light plays slowly across the texture as clouds pass unseen; [WATER BEADS TRACE THE JOINT / DUST DRIFTS THROUGH THE SLIVER OF LIGHT]. Hypnotic, tactile, slow.
+    SCENE LOCKS: the material and its texture identical to the source — no boiling, no crawl; the drift stays under two centimetres; nothing enters frame.
+- id: as11
+  num: '11'
+  title: Water Study
+  risk: low
+  prefixed: true
+  use: The pool as protagonist; the building lives in its reflection.
+  prompt: |-
+    Shot 1 — medium shot, low over the water, locked-off camera:
+    The [POOL / POND] carries the shot: the facade's reflection wobbling slowly on the surface, fine ripples travelling with the breeze, caustic light dancing on the underside of [THE CANTILEVER / SOFFIT], a leaf landing and sending one ring outward. The real building above stays perfectly still.
+    SCENE LOCKS: architecture, materials and framing identical to the source; the reflection distorts only with the water's physics; water level constant; no camera movement.
+- id: as12
+  num: '12'
+  title: Night Glow
+  risk: med
+  prefixed: true
+  use: Dusk deepens on camera; the building switches itself on.
+  prompt: |-
+    Shot 1 — wide shot, locked-off camera, dusk time-lapse:
+    Over the clip the sky falls from [BLUE HOUR] into night, and the building answers: interior lights coming on [ROOM BY ROOM / STOREY BY STOREY], facade grazers fading up, the [POOL] beginning to glow. The lit windows warm as the sky cools — the building becoming a lantern in real time.
+    SCENE LOCKS: geometry, materials and framing frozen; only sky and lighting change; lights come on in the named order, nothing flickers; no camera movement.
+- id: as13
+  num: '13'
+  title: Aerial Drift
+  risk: high
+  prefixed: true
+  use: The drone establishing shot — accepted invention, managed tightly.
+  prompt: |-
+    Shot 1 — wide shot from [30] metres elevation, slow lateral aerial drift:
+    Drone-calm movement across the site, the building holding centre frame while the context parallaxes gently below — roads, planting, neighbouring roofs. Constant altitude, constant speed, horizon level. Atmosphere alive: haze in the distance, birds far below.
+    SCENE LOCKS: the building's geometry, roofscape and materials stay exact and constant; context stays plausible and does not morph; no gain or loss in altitude; one linear drift, no other movement.
+  dial: The model is drawing your roof — generate an aerial still first (or export one from V-Ray) and animate that instead.
+- id: as14
+  num: '14'
+  title: Vegetation Breeze
+  risk: low
+  prefixed: true
+  use: The gardens as hero; the architecture as the calm behind them.
+  prompt: |-
+    Shot 1 — medium shot, through the planting toward the building, locked-off camera:
+    Wind crosses the gardens in visible waves: [THE RAIN TREES / GRASSES / PALMS] moving with real mass and lag, leaves flickering light and dark as they turn, a gust arriving, peaking and settling. Behind the moving green, the building stands perfectly calm and sharp.
+    SCENE LOCKS: architecture, materials and framing identical to the source; plants sway in place and never change shape or species; the wind is the only event; no camera movement.

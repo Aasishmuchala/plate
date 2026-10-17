@@ -1,0 +1,34 @@
+{
+ "request": {
+  "model": "claude-opus-5-5",
+  "purpose": "judge",
+  "key": "7aefb9503946",
+  "note": "judge disagree_third: hand-authored reply in the documented Messages API shape; not a live capture"
+ },
+ "responses": [
+  {
+   "text": "{\"score\": 9.0, \"verdict\": \"ship\", \"issues\": [\"Clean edges\"], \"strongest_tell\": \"none\"}",
+   "usage": {
+    "input_tokens": 2400,
+    "output_tokens": 90
+   },
+   "stop_reason": "end_turn"
+  },
+  {
+   "text": "{\"score\": 6.0, \"verdict\": \"fix\", \"issues\": [\"Glazing grid shifted\", \"Sky banding\"], \"strongest_tell\": \"glazing grid shifted by one bay\"}",
+   "usage": {
+    "input_tokens": 2400,
+    "output_tokens": 90
+   },
+   "stop_reason": "end_turn"
+  },
+  {
+   "text": "{\"score\": 8.7, \"verdict\": \"ship\", \"issues\": [\"Minor sky banding\"], \"strongest_tell\": \"faint sky banding\"}",
+   "usage": {
+    "input_tokens": 2400,
+    "output_tokens": 90
+   },
+   "stop_reason": "end_turn"
+  }
+ ]
+}
