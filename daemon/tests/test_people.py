@@ -604,7 +604,8 @@ def test_run_places_a_person_behind_the_box_and_keeps_every_other_pixel(tmp_path
     changed = np.any(res.rgb16 != base, axis=-1)
     assert changed.any() and not (changed & ~res.footprint).any() and res.footprint.sum() < 0.1 * changed.size
     checks = {c.metric_id: c.status for c in res.report.checks}
-    assert checks["outside_mask.de00"] == "pass" and checks["feather_band.de00_p99"] == "pass"
+    # Wave 8 decision 35 (T60): the feather band is advisory on every in-mask edit until calibration.
+    assert checks["outside_mask.de00"] == "pass" and checks["feather_band.de00_p99"] == "advisory"
     assert checks["registration.residual_px"] == "pass" and res.registration["registered"]
     assert res.report.engine.id == "staffage" and res.verdict in {"pass", "advisory", "fail"}
     # the shadow STAFFAGE drew survived the composite

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import cv2
@@ -359,7 +359,12 @@ def test_model_slot_refuses_before_loading_when_admission_says_no():
 def test_model_slot_admits_and_uses_the_backends_model_id_for_windows():
     backend = Recorder()
     backend.model_id = "wan2.2"
-    adm = Admission(nvml=FakeNvml(30000), windows="01:00-06:00", env={})
+    # A window that starts 2 h from now and ends 3 h from now never contains "now" (the old fixed
+    # 01:00-06:00 window failed whenever the suite ran in the small hours).
+    now = datetime.now()
+    start, end = now + timedelta(hours=2), now + timedelta(hours=3)
+    adm = Admission(nvml=FakeNvml(30000), windows=f"{start:%H:%M}-{end:%H:%M}", env={})
+    assert not adm.in_window(now)
     with (
         pytest.raises(AdmissionDenied, match="scheduled GPU window"),
         ModelSlot(backend, adm, required_mb=8000),
