@@ -74,6 +74,8 @@ Material is processed only to produce the project's deliverables:
 
 Material is not used to make anything for another client. Apart from the internal quality calibration the client may allow in section 6, Sthyra does not use it to train or tune any model.
 
+**Disclosure on social platforms.** Where a deliverable or a social cutdown (a 9:16, 4:5, 1:1 or 16:9 crop of an approved image or clip) is posted, it is described as AI-assisted finishing, and the platform's own AI-content label is switched on where the platform has one. Every file that an AI model touched carries a machine-readable marker in its metadata (the IPTC digital source type `compositeWithTrainedAlgorithmicMedia`), so a platform or a person who checks the file can read that it is AI-assisted. A file that no AI model touched (a measured colour grade, a render, a hand-made retouch) does not carry it. `counsel to review`: whether the platforms' rules, or advertising rules in the client's market, require more than this.
+
 ## 8. Retention and deletion
 
 - **On Sthyra's machines:** project material is kept until [N] months after final delivery, then deleted from Sthyra's machines and backups, unless the client asks in writing for it to be kept longer.

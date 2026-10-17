@@ -1,5 +1,5 @@
 {
- "about": "Shared canvas-rule vectors: ui/src/canvasRules.ts (vitest, canvasRules.vectors.test.ts) and daemon/plate_daemon/canvas_rules.py (pytest, daemon/tests/test_routes_packets.py) must both agree with every one. Shapes: edge {name, graph, edge, expect}; accept {name, node, scrub_log, expect}; depth {name, graph, node, depth}. Nested keys (params, scrub_log) are camelCase.",
+ "about": "Shared canvas-rule vectors: ui/src/canvasRules.ts (vitest, canvasRules.vectors.test.ts) and daemon/plate_daemon/canvas_rules.py (pytest, daemon/tests/test_routes_packets.py) must both agree with every one. Shapes: edge {name, graph, edge, expect}; accept {name, node, scrub_log, expect}; depth {name, graph, node, depth}. Nested keys (params, scrub_log) are camelCase. Edges may name sourceHandle/targetHandle (T81: REFERENCE_ONLY and VIDEO_LOCKED read them); the Python suite passes them, the vitest harness drops them, so every vector must also hold with the handles resolved as null (first output; first input taking the edge type).",
  "vectors": [
   {
    "name": "plate to edit is allowed",
@@ -302,6 +302,165 @@
     "edges": [{"source": "p", "target": "e1"}, {"source": "e1", "target": "c"}, {"source": "c", "target": "e1"}]
    },
    "node": "c",
+   "depth": 1
+  },
+  {
+   "name": "reference to edit refs is allowed",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "r", "kind": "Reference", "params": {"referenceHash": "b3_ref_1", "role": "style"}}, {"id": "e", "kind": "Edit"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e", "sourceHandle": "image", "targetHandle": "image"}]
+   },
+   "edge": {"source": "r", "target": "e", "sourceHandle": "ref", "targetHandle": "refs"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "reference to export is REFERENCE_ONLY",
+   "graph": {"nodes": [{"id": "r", "kind": "Reference", "params": {"referenceHash": "b3_ref_1", "role": "style"}}, {"id": "x", "kind": "Export"}], "edges": []},
+   "edge": {"source": "r", "target": "x", "sourceHandle": "ref", "targetHandle": "media"},
+   "expect": {"ok": false, "code": "REFERENCE_ONLY"}
+  },
+  {
+   "name": "reference to comp base is REFERENCE_ONLY",
+   "graph": {"nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "r", "kind": "Reference", "params": {"referenceHash": "b3_ref_1", "role": "style"}}, {"id": "c", "kind": "Comp"}], "edges": []},
+   "edge": {"source": "r", "target": "c", "sourceHandle": "ref", "targetHandle": "base"},
+   "expect": {"ok": false, "code": "REFERENCE_ONLY"}
+  },
+  {
+   "name": "reference alone does not anchor an edit",
+   "graph": {"nodes": [{"id": "r", "kind": "Reference", "params": {"referenceHash": "b3_ref_1", "role": "style"}}, {"id": "e", "kind": "Edit"}], "edges": []},
+   "edge": {"source": "r", "target": "e", "sourceHandle": "ref", "targetHandle": "refs"},
+   "expect": {"ok": false, "code": "NO_PLATE_ANCHOR"}
+  },
+  {
+   "name": "frame takes no edges",
+   "graph": {"nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "f", "kind": "Frame", "params": {"title": "terrace set", "w": 640, "h": 360}}], "edges": []},
+   "edge": {"source": "p", "target": "f"},
+   "expect": {"ok": false, "code": "ANNOTATION"}
+  },
+  {
+   "name": "motion end from an unapproved still is VIDEO_LOCKED",
+   "graph": {
+    "nodes": [
+     {"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"},
+     {"id": "e1", "kind": "Edit", "gateStatus": "pass", "approved": true},
+     {"id": "e2", "kind": "Edit", "gateStatus": "pass", "approved": false},
+     {"id": "m", "kind": "Motion", "riskLabel": "low"}
+    ],
+    "edges": [
+     {"id": "p->e1", "source": "p", "target": "e1"},
+     {"id": "p->e2", "source": "p", "target": "e2"},
+     {"id": "e1->m", "source": "e1", "target": "m", "sourceHandle": "image", "targetHandle": "image"}
+    ]
+   },
+   "edge": {"source": "e2", "target": "m", "sourceHandle": "image", "targetHandle": "end"},
+   "expect": {"ok": false, "code": "VIDEO_LOCKED"}
+  },
+  {
+   "name": "motion end from an approved still is allowed",
+   "graph": {
+    "nodes": [
+     {"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"},
+     {"id": "e1", "kind": "Edit", "gateStatus": "pass", "approved": true},
+     {"id": "e2", "kind": "Edit", "gateStatus": "pass", "approved": true},
+     {"id": "m", "kind": "Motion", "riskLabel": "low"}
+    ],
+    "edges": [
+     {"id": "p->e1", "source": "p", "target": "e1"},
+     {"id": "p->e2", "source": "p", "target": "e2"},
+     {"id": "e1->m", "source": "e1", "target": "m", "sourceHandle": "image", "targetHandle": "image"}
+    ]
+   },
+   "edge": {"source": "e2", "target": "m", "sourceHandle": "image", "targetHandle": "end"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "comp with two approved layers at depth 2 is allowed",
+   "graph": {
+    "nodes": [
+     {"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"},
+     {"id": "e1", "kind": "Edit", "gateStatus": "pass", "approved": true},
+     {"id": "e2", "kind": "People", "gateStatus": "pass", "approved": true},
+     {"id": "e3", "kind": "Edit", "gateStatus": "pass", "approved": true},
+     {"id": "c", "kind": "Comp"}
+    ],
+    "edges": [
+     {"id": "p->e1", "source": "p", "target": "e1"},
+     {"id": "e1->e2", "source": "e1", "target": "e2"},
+     {"id": "p->e3", "source": "p", "target": "e3"},
+     {"id": "p->c", "source": "p", "target": "c", "sourceHandle": "image", "targetHandle": "base"},
+     {"id": "e2->c", "source": "e2", "target": "c", "sourceHandle": "image", "targetHandle": "layers"}
+    ]
+   },
+   "edge": {"source": "e3", "target": "c", "sourceHandle": "image", "targetHandle": "layers"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "edit after edit after edit is DEPTH_EXCEEDED",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "e1", "kind": "Edit"}, {"id": "e2", "kind": "Edit"}, {"id": "e3", "kind": "Edit"}],
+    "edges": [{"id": "p->e1", "source": "p", "target": "e1"}, {"id": "e1->e2", "source": "e1", "target": "e2"}]
+   },
+   "edge": {"source": "e2", "target": "e3"},
+   "expect": {"ok": false, "code": "DEPTH_EXCEEDED"}
+  },
+  {
+   "name": "sky node needs a packet",
+   "graph": {"nodes": [{"id": "s", "kind": "Sky"}, {"id": "x", "kind": "Export"}], "edges": []},
+   "edge": {"source": "s", "target": "x", "sourceHandle": "image", "targetHandle": "media"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "a frame is never a source",
+   "graph": {"nodes": [{"id": "f", "kind": "Frame"}, {"id": "x", "kind": "Export"}], "edges": []},
+   "edge": {"source": "f", "target": "x"},
+   "expect": {"ok": false, "code": "ANNOTATION"}
+  },
+  {
+   "name": "a reference into a frame is an annotation edge first",
+   "graph": {"nodes": [{"id": "r", "kind": "Reference", "params": {"referenceHash": "b3_ref_1", "role": "style"}}, {"id": "f", "kind": "Frame"}], "edges": []},
+   "edge": {"source": "r", "target": "f"},
+   "expect": {"ok": false, "code": "ANNOTATION"}
+  },
+  {
+   "name": "reference to motion elements is allowed",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "r", "kind": "Reference", "params": {"referenceHash": "b3_ref_1", "role": "style"}}, {"id": "e", "kind": "Edit", "gateStatus": "pass", "approved": true}, {"id": "m", "kind": "Motion", "riskLabel": "low"}],
+    "edges": [{"id": "p->e", "source": "p", "target": "e"}, {"id": "e->m", "source": "e", "target": "m", "sourceHandle": "image", "targetHandle": "image"}]
+   },
+   "edge": {"source": "r", "target": "m", "sourceHandle": "ref", "targetHandle": "elements"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "a reference never anchors a motion",
+   "graph": {"nodes": [{"id": "r", "kind": "Reference", "params": {"referenceHash": "b3_ref_1", "role": "style"}}, {"id": "m", "kind": "Motion", "riskLabel": "low"}], "edges": []},
+   "edge": {"source": "r", "target": "m", "targetHandle": "elements"},
+   "expect": {"ok": false, "code": "NO_PLATE_ANCHOR"}
+  },
+  {
+   "name": "reference to sky is allowed",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "r", "kind": "Reference", "params": {"referenceHash": "b3_ref_1", "role": "style"}}, {"id": "s", "kind": "Sky", "params": {"tone_match": true}}],
+    "edges": [{"id": "p->s", "source": "p", "target": "s", "sourceHandle": "packet", "targetHandle": "packet"}]
+   },
+   "edge": {"source": "r", "target": "s", "sourceHandle": "ref", "targetHandle": "sky"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "reference to people refs is allowed",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "r", "kind": "Reference", "params": {"referenceHash": "b3_ref_1", "role": "style"}}, {"id": "pp", "kind": "People"}],
+    "edges": [{"id": "p->pp", "source": "p", "target": "pp"}]
+   },
+   "edge": {"source": "r", "target": "pp", "targetHandle": "refs"},
+   "expect": {"ok": true}
+  },
+  {
+   "name": "a reference adds no depth",
+   "graph": {
+    "nodes": [{"id": "p", "kind": "Plate", "packetId": "pkt_a", "tier": "A"}, {"id": "r", "kind": "Reference", "params": {"referenceHash": "b3_ref_1", "role": "style"}}, {"id": "e", "kind": "Edit"}],
+    "edges": [{"source": "p", "target": "e"}, {"source": "r", "target": "e", "targetHandle": "refs"}]
+   },
+   "node": "e",
    "depth": 1
   }
  ]

@@ -39,6 +39,11 @@ price:
   model: per_image
   usd: 0.034
   by: {"1K": 0.034}
+  # T84: priced by the image_size param. Only 1K has a reading; 2K and 4K are estimates (open question 19).
+  tiers:
+    - {match: {image_size: "1K"}, usd: 0.034}
+    - {match: {image_size: "2K"}, usd: 0.068, status: estimated, note: "2x the 1K figure per tier step (not by pixel count) until the P0 smoke test bills it"}
+    - {match: {image_size: "4K"}, usd: 0.136, status: estimated, note: "4x the 1K figure (2x per tier step, not by pixel count) until the P0 smoke test bills it"}
   status: unconfirmed
   source: "VIZMAKER.md section 4: Google vendor list for a 1K NB 2.1 edit (read beside the in-app price). 2K and 4K are not priced anywhere we hold."
   as_of: 2026-10-17

@@ -10,9 +10,14 @@ costs a re-queue and never a result (the run it belongs to keeps its own state i
     list_jobs(since=0, claim=False)                             -> [Job]  queued jobs after `since`
     finish(job_id, ok=True, result={...})                       -> Job    queued/claimed -> done/failed
     cancel(job_id)                                              -> Job    queued/claimed -> cancelled
+    last_poll_utc() / counts()                                  -> when a dock last claimed, jobs waiting
 
 States: `queued -> claimed -> done | failed`, or `-> cancelled`. `seq` is the cursor a dock keeps: it only
-grows. A job that carries a `run_id` belongs to a node run, whose engine polls the job (nodes/runner.py).
+grows. A job that carries a `run_id` belongs to a node run, whose engine polls the job (nodes/runner.py); a
+`receive` job (push a take into Max) also carries the run it shows, but no engine waits for it.
+
+Every `claim=True` listing stamps `last_poll_utc`, even when it finds nothing: that is how the UI knows a dock is
+alive (`GET /plugin/status`). The stamp lives in the same file, so it survives a daemon restart.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ __all__ = [
     "Job",
     "MAX_PAYLOAD_BYTES",
     "MAX_RESULT_BYTES",
+    "RECEIVE_MODES",
     "JobStateError",
     "PluginQueue",
     "UnknownAction",
@@ -43,7 +49,9 @@ __all__ = [
 
 FILE_NAME = "plugin_queue.sqlite"
 # What the dock knows how to do. A new action is a new entry here and a handler in plate_max.
-ACTIONS = ("light.match", "light.vantage_preview", "scout")
+ACTIONS = ("light.match", "light.vantage_preview", "scout", "receive")
+RECEIVE_MODES = ("vfb_history", "viewport_background")  # where a `receive` job shows the take in Max
+POLL_KEY = "last_poll_utc"
 ACTIVE_STATES = ("queued", "claimed")
 STATES = ("queued", "claimed", "done", "failed", "cancelled")
 MAX_LIST = 200
@@ -69,6 +77,7 @@ SCHEMA = (
     )""",
     "CREATE INDEX IF NOT EXISTS plugin_queue_state ON plugin_queue(state, seq)",
     "CREATE INDEX IF NOT EXISTS plugin_queue_run ON plugin_queue(run_id)",
+    "CREATE TABLE IF NOT EXISTS plugin_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 )
 
 
@@ -280,6 +289,11 @@ class PluginQueue:
                 ).fetchall()
                 if claim:
                     stamp = self._now(now)
+                    conn.execute(
+                        """INSERT INTO plugin_meta (key, value) VALUES (?, ?)
+                           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                        (POLL_KEY, stamp),
+                    )
                     for r in rows:
                         if r["state"] == "queued":
                             conn.execute(
@@ -293,3 +307,24 @@ class PluginQueue:
         finally:
             conn.close()
         return [Job.from_row(r) for r in rows]
+
+    def last_poll_utc(self) -> str | None:
+        """When a dock last listed with `claim=True` (ISO-8601 UTC), or None when none ever has."""
+        conn = self._conn()
+        try:
+            row = conn.execute("SELECT value FROM plugin_meta WHERE key = ?", (POLL_KEY,)).fetchone()
+        finally:
+            conn.close()
+        return str(row["value"]) if row else None
+
+    def counts(self) -> dict[str, int]:
+        """`{queued, claimed}`: the jobs waiting for a dock and the ones a dock has taken and not answered."""
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                "SELECT state, COUNT(*) AS n FROM plugin_queue WHERE state IN ('queued', 'claimed') GROUP BY state"
+            ).fetchall()
+        finally:
+            conn.close()
+        found = {r["state"]: int(r["n"]) for r in rows}
+        return {"queued": found.get("queued", 0), "claimed": found.get("claimed", 0)}

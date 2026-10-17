@@ -230,6 +230,11 @@ describe("node components", () => {
     mountCanvas();
     for (const kind of NODE_KINDS) {
       const node = screen.getByTestId(`node-${kind}`);
+      // A Frame (T81) is an annotation box, not the shared shell: no badges, no ports (canvasWave9.test.tsx).
+      if (kind === "Frame") {
+        expect(within(node).queryByTestId("badge-kind")).toBeNull();
+        continue;
+      }
       expect(within(node).getByTestId("badge-kind")).toHaveTextContent(kind);
       expect(within(node).getByTestId("badge-tier")).toHaveAttribute(
         "data-tier",
@@ -238,7 +243,7 @@ describe("node components", () => {
       for (const p of PORTS[kind].inputs) expect(within(node).getByTestId(`handle-in-${p.id}`)).toHaveAttribute("data-type", p.type);
       for (const p of PORTS[kind].outputs) expect(within(node).getByTestId(`handle-out-${p.id}`)).toHaveAttribute("data-type", p.type);
     }
-    expect(NODE_KINDS).toHaveLength(19);
+    expect(NODE_KINDS).toHaveLength(23);
   });
 
   it("shows gate, approval and risk badges and the inherited 'unseen geometry guessed' label", () => {

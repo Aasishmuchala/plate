@@ -1,0 +1,29 @@
+# Lensbook a06, Plaza Staffage, as a runnable recipe on Nano Banana 2.1 (T83): life added at true scale without touching
+# one architectural pixel. Muted wardrobe, faces small or turned: staffage serves scale and life, never portraiture.
+# Needs people-class ids in the packet's policy to land (the mask is the people class only).
+schema: 1
+id: staffage_walkers
+title: Plaza staffage
+kind: still_edit
+group: people
+task: people
+library: a06
+engine: nano-banana-2.1
+shot_class: wide
+prefixed: false
+mask:
+  editable_classes: [people]
+  region: none
+  lock_rest: true
+params:
+  n: 1
+  size: native
+overrides:
+  "[PEOPLE COUNT]": "6 to 10"
+  "[WALKING AREA]": "the plaza, the paths and the steps"
+  "[WARDROBE]": "everyday clothing suited to the local climate and the time of day"
+  "[KEY LINE]": "the entrance and the key facade line"
+prompt: |-
+  This is an approved architectural render. Do not change any part of the architecture, hardscape, lighting or framing.
+  Add [PEOPLE COUNT] people at true human scale (the door height is the ruler), walking and pausing naturally across [WALKING AREA], dressed in [WARDROBE], in muted colours that do not compete with the building. Each person is grounded with correct contact shadows and reflections matching the scene's light direction; nobody occludes [KEY LINE]. A subtle motion blur on the walkers reads as a long exposure.
+negative_prompt: new buildings, removed objects, changed architecture, re-framing, altered perspective, crowds, close-up faces, text, logos, floating people

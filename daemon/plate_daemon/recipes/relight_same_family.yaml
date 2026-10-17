@@ -1,0 +1,31 @@
+# Lensbook a01, Same-Family Relight, as a runnable recipe on Nano Banana 2.1 (T83). Hour to hour inside one light family
+# lands in 1-2 attempts; crossing families is relight_cross_family and a different budget.
+# The engine gets the whole frame (region none) and the composite keeps every locked pixel from the plate, so the engine
+# only has to be right inside sky, vegetation, water and people. Every [TOKEN] has a default in `overrides`; change one
+# per run with params.tokens. The sun position and the colour shift follow [TARGET HOUR] in the prompt, so one token
+# moves the whole relight.
+schema: 1
+id: relight_same_family
+title: Same-family relight
+kind: still_edit
+group: lighting
+task: relight
+library: a01
+engine: nano-banana-2.1
+shot_class: wide
+prefixed: false
+mask:
+  editable_classes: [sky, vegetation, water, people]
+  region: none
+  lock_rest: true
+params:
+  n: 1
+  size: native
+overrides:
+  "[CURRENT HOUR]": "mid-morning"
+  "[TARGET HOUR]": "late afternoon"
+prompt: |-
+  This is an approved architectural render. Geometry, materials, composition and framing are ground truth; change nothing except the light.
+  Relight the scene from [CURRENT HOUR] to [TARGET HOUR]. The sun moves to where it stands at that hour: every shadow re-casts correctly for the new angle, and the colour temperature of the light follows the hour. Glass reflects the new sky state; materials respond naturally, stone warming and metal cooling as the light changes.
+  No object, edge or texture changes; no reframing. Exposure balanced as a photographer would meter it.
+negative_prompt: new objects, removed objects, changed architecture, re-framing, altered perspective, rewritten signage text, HDR glow, cartoon sky

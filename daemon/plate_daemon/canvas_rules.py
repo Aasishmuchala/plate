@@ -11,16 +11,22 @@ A graph is `project.json.graph`: `{nodes, edges}`. A node is either the wire for
 shallowly, as the vitest harness does), and missing fields take `makeNodeData`'s defaults. An edge is
 `{"id"?, "source", "target"}`; a missing id is `"<source>-><target>"`.
 
-`validate_edge(graph, edge)` checks, in order: UNKNOWN_NODE, CYCLE, CONCEPT_TO_DELIVERY (the concept tier
-never reaches Export or Review), PREVIS_NOT_DELIVERABLE (a previs output, `previs: true` on a node or in its
-params, never reaches Export, directly or through other nodes; a Review may show it, it is watermarked PREVIS),
-NO_PLATE_ANCHOR (a generator hangs off a Plate: source-view-only),
-DEPTH_EXCEEDED (at most two generations from the plate, the target and everything below it), VIDEO_LOCKED
-(Motion and CropPair wait for a still that passed gates and was approved), HIGH_RISK_MOVE (a high or highest
-risk move needs an override) and INVENTED_ANGLE (a camera override on an Edit needs an override and the
-`unseen geometry guessed` label). `can_accept` refuses a take without a logged full scrub (SCRUB_REQUIRED).
-`check_nodes` adds what the TypeScript types make impossible but JSON allows: an unknown kind or a repeated
-id (UNKNOWN_NODE).
+An edge may also carry `sourceHandle` / `targetHandle` (or `source_handle` / `target_handle`); a missing or
+null one resolves as the UI's `checkHandles` does (the first output; the first input that takes the edge's
+type), through `PORTS`, the mirror of `ui/src/nodes/ports.ts`.
+
+`validate_edge(graph, edge)` checks, in order: UNKNOWN_NODE, CYCLE, ANNOTATION (T81: a Frame is an annotation
+and takes no edges), REFERENCE_ONLY (T81: a Reference feeds an engine's `refs`, `elements` or `sky` input only,
+never a compositing input), CONCEPT_TO_DELIVERY (the concept tier never reaches Export or Review),
+PREVIS_NOT_DELIVERABLE (a previs output, `previs: true` on a node or in its params, never reaches Export,
+directly or through other nodes; a Review may show it, it is watermarked PREVIS), NO_PLATE_ANCHOR (a generator
+hangs off a Plate: source-view-only; a Reference anchors nothing, so an engine fed one must be anchored through
+its other inputs), DEPTH_EXCEEDED (at most two generations from the plate, the target and everything below it),
+VIDEO_LOCKED (every still into Motion or CropPair, the end still included, must have passed gates and been
+approved; a packet or reference edge is not a still), HIGH_RISK_MOVE (a high or highest risk move needs an
+override) and INVENTED_ANGLE (a camera override on an Edit needs an override and the `unseen geometry guessed`
+label). `can_accept` refuses a take without a logged full scrub (SCRUB_REQUIRED). `check_nodes` adds what the
+TypeScript types make impossible but JSON allows: an unknown kind or a repeated id (UNKNOWN_NODE).
 """
 
 from __future__ import annotations
@@ -31,11 +37,14 @@ from dataclasses import dataclass
 from typing import Any
 
 __all__ = [
+    "ANNOTATION_KINDS",
     "DELIVERY_KINDS",
     "EXPORT_KINDS",
     "GENERATING_KINDS",
     "MAX_GENERATION_DEPTH",
     "NODE_KINDS",
+    "PORTS",
+    "REFERENCE_HANDLES",
     "RULE_CODES",
     "UNSEEN_GEOMETRY_LABEL",
     "VIDEO_KINDS",
@@ -76,6 +85,11 @@ NODE_KINDS = (
     "Light",
     "Scout",
     "Concept",
+    # Wave 9 (T81): a Reference image for an engine, a Frame annotation, the numeric Atmosphere and Sky.
+    "Reference",
+    "Frame",
+    "Atmosphere",
+    "Sky",
 )
 RULE_CODES = (
     "CONCEPT_TO_DELIVERY",
@@ -88,6 +102,8 @@ RULE_CODES = (
     "CYCLE",
     "UNKNOWN_NODE",
     "SCRUB_REQUIRED",
+    "REFERENCE_ONLY",
+    "ANNOTATION",
 )
 # Nodes that make new pixels; each costs a generation of depth.
 GENERATING_KINDS = frozenset({"Edit", "Motion", "People", "CropPair"})
@@ -97,6 +113,78 @@ DELIVERY_KINDS = frozenset({"Export", "Review"})
 EXPORT_KINDS = frozenset({"Export"})
 VIDEO_KINDS = frozenset({"Motion", "CropPair"})
 UNSEEN_GEOMETRY_LABEL = "unseen geometry guessed"
+# Decision 46: the only inputs a Reference may feed. Decision 57: annotation kinds take no edges.
+REFERENCE_HANDLES = frozenset({"refs", "elements", "sky"})
+ANNOTATION_KINDS = frozenset({"Frame"})
+_REFERENCE_ONLY = "a reference feeds an engine's reference input only; it is never composited"
+_ANNOTATION = "a Frame is an annotation; it takes no edges"
+
+_Port = tuple[str, str, tuple[str, ...]]  # (handle id, type, accepted types)
+
+
+def _in(pid: str, ptype: str, *accepts: str) -> _Port:
+    return (pid, ptype, accepts or (ptype,))
+
+
+_IMAGE_OUT = (("image", "image16"),)
+# ui/src/nodes/ports.ts PORTS, reduced to what the rules read: per kind, the inputs as (id, type, accepts) and
+# the outputs as (id, type), in the TypeScript order. daemon/tests/test_canvas_rules_wave9.py diffs the two.
+PORTS: dict[str, dict[str, tuple[Any, ...]]] = {
+    "Plate": {"inputs": (), "outputs": (("image", "image16"), ("packet", "packet"))},
+    "Edit": {
+        "inputs": (_in("image", "image16"), _in("mask", "mask"), _in("refs", "reference")),
+        "outputs": _IMAGE_OUT,
+    },
+    "Mask": {"inputs": (_in("source", "packet", "packet", "image16"),), "outputs": (("mask", "mask"),)},
+    "Comp": {"inputs": (_in("base", "image16"), _in("layers", "image16")), "outputs": _IMAGE_OUT},
+    "Colour": {"inputs": (_in("image", "image16"), _in("mask", "mask")), "outputs": _IMAGE_OUT},
+    "LightMix": {"inputs": (_in("packet", "packet"),), "outputs": _IMAGE_OUT},
+    "Recolour": {"inputs": (_in("packet", "packet"), _in("mask", "mask")), "outputs": _IMAGE_OUT},
+    "Gate": {
+        "inputs": (
+            _in("candidate", "image16", "image16", "video"),
+            _in("reference", "packet", "packet", "image16"),
+        ),
+        "outputs": (("report", "report"),),
+    },
+    "Judge": {
+        "inputs": (_in("candidate", "image16", "image16", "video"),),
+        "outputs": (("report", "report"),),
+    },
+    "CropPair": {"inputs": (_in("image", "image16"),), "outputs": (("pair", "image16"),)},
+    "Motion": {
+        "inputs": (
+            _in("image", "image16"),
+            _in("end", "image16"),
+            _in("packet", "packet"),
+            _in("elements", "reference"),
+        ),
+        "outputs": (("video", "video"),),
+    },
+    "People": {
+        "inputs": (
+            _in("image", "image16"),
+            _in("packet", "packet"),
+            _in("refs", "reference"),
+            _in("clip", "video"),
+        ),
+        "outputs": _IMAGE_OUT,
+    },
+    "Set": {"inputs": (_in("views", "image16"),), "outputs": (("image", "image16"), ("report", "report"))},
+    "Compare": {
+        "inputs": (_in("a", "image16", "image16", "video"), _in("b", "image16", "image16", "video")),
+        "outputs": (("report", "report"),),
+    },
+    "Export": {"inputs": (_in("media", "image16", "image16", "video"),), "outputs": ()},
+    "Review": {"inputs": (_in("media", "image16", "image16", "video", "report"),), "outputs": ()},
+    "Light": {"inputs": (_in("packet", "packet"),), "outputs": (("packet", "packet"),)},
+    "Scout": {"inputs": (_in("packet", "packet"),), "outputs": (("packet", "packet"),)},
+    "Concept": {"inputs": (_in("image", "image16"),), "outputs": (("image", "image16"),)},
+    "Reference": {"inputs": (), "outputs": (("ref", "reference"),)},
+    "Frame": {"inputs": (), "outputs": ()},
+    "Atmosphere": {"inputs": (_in("packet", "packet"),), "outputs": _IMAGE_OUT},
+    "Sky": {"inputs": (_in("packet", "packet"), _in("sky", "reference")), "outputs": _IMAGE_OUT},
+}
 
 _CAMEL = re.compile(r"_([a-z])")
 
@@ -164,7 +252,13 @@ def as_edge(raw: Any) -> dict[str, Any]:
         isinstance(raw, Mapping) and isinstance(raw.get("source"), str) and isinstance(raw.get("target"), str)
     ):
         eid = raw.get("id") if isinstance(raw.get("id"), str) else f"{raw['source']}->{raw['target']}"
-        return {"id": eid, "source": raw["source"], "target": raw["target"]}
+        out = {"id": eid, "source": raw["source"], "target": raw["target"]}
+        # The handle ids ride along when the edge names them (a null or empty one resolves like a missing one).
+        for key, alias in (("sourceHandle", "source_handle"), ("targetHandle", "target_handle")):
+            handle = raw.get(key, raw.get(alias))
+            if isinstance(handle, str) and handle:
+                out[key] = handle
+        return out
     raise ValueError(f"an edge needs a source and a target: {raw!r}")
 
 
@@ -328,6 +422,31 @@ def _count(v: Any) -> int:
     return len(v) if isinstance(v, (list, tuple)) else 0
 
 
+def _input_for(kind: Any, handle: Any, edge_type: str | None) -> _Port | None:
+    """The input port an edge lands on: the named one, or for a missing handle the first input taking
+    `edge_type` (else the first input), as `checkHandles` resolves it. None when the kind has no such input."""
+    inputs = (PORTS.get(kind) or {}).get("inputs", ()) if isinstance(kind, str) else ()
+    if not isinstance(handle, str) or not handle:
+        if edge_type is not None:
+            for p in inputs:
+                if edge_type in p[2]:
+                    return p
+        return inputs[0] if inputs else None
+    return next((p for p in inputs if p[0] == handle), None)
+
+
+def _edge_ports(source_kind: Any, target_kind: Any, e: Mapping[str, Any]) -> tuple[str | None, _Port | None]:
+    """What an edge carries (its source port's type; None when the port is unknown) and the input it lands on."""
+    outputs = (PORTS.get(source_kind) or {}).get("outputs", ()) if isinstance(source_kind, str) else ()
+    handle = e.get("sourceHandle")
+    if not isinstance(handle, str) or not handle:
+        out = outputs[0] if outputs else None
+    else:
+        out = next((p for p in outputs if p[0] == handle), None)
+    edge_type = out[1] if out is not None else None
+    return edge_type, _input_for(target_kind, e.get("targetHandle"), edge_type)
+
+
 # ---------------------------------------------------------------------------- the rules
 
 
@@ -345,9 +464,19 @@ def validate_edge(graph: Any, edge: Any) -> RuleResult:
     if e["source"] == e["target"] or e["source"] in _reach(e["target"], _downstream(others)):
         return _refuse("CYCLE", "cycle")
 
+    sk = source.get("kind")
+    tk = target.get("kind")
+
+    if sk in ANNOTATION_KINDS or tk in ANNOTATION_KINDS:
+        return _refuse("ANNOTATION", _ANNOTATION)
+
+    if sk == "Reference":
+        port = _input_for(tk, e.get("targetHandle"), "reference")
+        if port is None or port[0] not in REFERENCE_HANDLES or "reference" not in port[2]:
+            return _refuse("REFERENCE_ONLY", _REFERENCE_ONLY)
+
     nxt = [*others, e]
     next_up = _upstream(nxt)
-    tk = target.get("kind")
 
     if tk in DELIVERY_KINDS and _concept_tier(node_map, next_up, e["target"]):
         return _refuse("CONCEPT_TO_DELIVERY", f"concept tier cannot reach {tk}")
@@ -357,7 +486,9 @@ def validate_edge(graph: Any, edge: Any) -> RuleResult:
             "PREVIS_NOT_DELIVERABLE", f"previs output cannot reach {tk}: PREVIS is not deliverable"
         )
 
-    if tk in GENERATING_KINDS and not anchored_to_plate(node_map, next_up, e["source"]):
+    # A Reference anchors nothing: an edge from one needs the generator itself anchored through its other inputs.
+    anchor = e["target"] if sk == "Reference" else e["source"]
+    if tk in GENERATING_KINDS and not anchored_to_plate(node_map, next_up, anchor):
         return _refuse("NO_PLATE_ANCHOR", "generation must be anchored to a plate camera (source-view-only)")
 
     affected = [e["target"], *_reach(e["target"], _downstream(nxt))]
@@ -365,10 +496,12 @@ def validate_edge(graph: Any, edge: Any) -> RuleResult:
         return _refuse("DEPTH_EXCEEDED", "generation depth > 2 from the plate")
 
     if tk in VIDEO_KINDS and not (source.get("gateStatus") == "pass" and source.get("approved") is True):
-        what = "motion" if tk == "Motion" else "crop pair"
-        return _refuse(
-            "VIDEO_LOCKED", f"{what} is locked until the upstream still passes gates and is approved"
-        )
+        # Only a still is locked; an edge whose ports cannot be resolved is treated as one (fail closed).
+        edge_type, port = _edge_ports(sk, tk, e)
+        if edge_type is None or port is None or edge_type == "image16" or port[1] == "image16":
+            what = "motion" if tk == "Motion" else "crop pair"
+            which = "the end still" if port is not None and port[0] == "end" else "the upstream still"
+            return _refuse("VIDEO_LOCKED", f"{what} is locked until {which} passes gates and is approved")
 
     if tk == "Motion" and _high_risk(target) and _count(target.get("overrides")) == 0:
         return _refuse(

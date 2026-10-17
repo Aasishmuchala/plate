@@ -1,6 +1,6 @@
 // Pure pieces of the Mask editor: the ID classes with their colours and lock state, pointer-to-pixel mapping, the
-// paint raster (brush add / erase on an 8-bit layer at a working size) and the PNG it is exported as. No DOM here, so
-// the vitest drives all of it directly.
+// paint raster (brush add / erase, filled rectangles and even-odd polygons on an 8-bit layer at a working size) and
+// the PNG it is exported as. No DOM here, so the vitest drives all of it directly.
 
 import type { ImageSize } from "../nodeTypes";
 
@@ -87,8 +87,12 @@ export interface MaskLayer {
   data: Uint8Array<ArrayBuffer>;
 }
 
-/** Longest side of the painting raster: painting at plate size (5504 x 3072) would be 17 MB per layer. */
-export const MAX_RASTER_SIDE = 1024;
+/**
+ * Longest side of the painting raster: painting at plate size (5504 x 3072) would be 17 MB per layer. 2048 keeps an
+ * edge within about 3 plate pixels on a 5.5K plate; the daemon scales the saved mask to the packet's plate size
+ * (nearest neighbour, then 0/255) when the upload names the packet (T82).
+ */
+export const MAX_RASTER_SIDE = 2048;
 
 /** The raster size for a plate: aspect kept, longest side at most `maxSide`, never upscaled. */
 export function workSize(size: ImageSize, maxSide: number = MAX_RASTER_SIDE): ImageSize {
@@ -135,6 +139,90 @@ export function strokeLine(layer: MaskLayer, x0: number, y0: number, x1: number,
     const t = i / n;
     stampDisc(layer, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, r, value);
   }
+}
+
+/**
+ * Fill the box between raster edges (x0, y0) and (x1, y1) (either corner order) with `value`: every pixel whose centre
+ * lies inside it. Returns the number of pixels written.
+ */
+export function fillRect(layer: MaskLayer, x0: number, y0: number, x1: number, y1: number, value: 0 | 255): number {
+  const xa = Math.max(0, Math.ceil(Math.min(x0, x1) - 0.5));
+  const xb = Math.min(layer.width - 1, Math.ceil(Math.max(x0, x1) - 0.5) - 1);
+  const ya = Math.max(0, Math.ceil(Math.min(y0, y1) - 0.5));
+  const yb = Math.min(layer.height - 1, Math.ceil(Math.max(y0, y1) - 0.5) - 1);
+  if (xb < xa || yb < ya) return 0;
+  for (let y = ya; y <= yb; y += 1) layer.data.fill(value, y * layer.width + xa, y * layer.width + xb + 1);
+  return (xb - xa + 1) * (yb - ya + 1);
+}
+
+/**
+ * The raster box of a drag between two plate pixels: both end pixels are inside it (the box runs from the smaller
+ * pixel's left/top edge to the larger one's right/bottom edge), mapped to the layer's working size.
+ */
+export function plateBoxToRaster(layer: MaskLayer, plate: ImageSize, a: Point, b: Point): { x0: number; y0: number; x1: number; y1: number } {
+  const sx = layer.width / plate.width;
+  const sy = layer.height / plate.height;
+  return {
+    x0: Math.min(a.x, b.x) * sx,
+    y0: Math.min(a.y, b.y) * sy,
+    x1: (Math.max(a.x, b.x) + 1) * sx,
+    y1: (Math.max(a.y, b.y) + 1) * sy,
+  };
+}
+
+/** Consecutive vertices closer than `eps` merged (a double-click lands two clicks on one corner), and the closing one. */
+export function dedupeVertices(points: readonly Point[], eps = 0.5): Point[] {
+  const out: Point[] = [];
+  for (const p of points) {
+    const prev = out[out.length - 1];
+    if (!prev || Math.hypot(p.x - prev.x, p.y - prev.y) >= eps) out.push(p);
+  }
+  while (out.length > 1) {
+    const first = out[0] as Point;
+    const lastP = out[out.length - 1] as Point;
+    if (Math.hypot(first.x - lastP.x, first.y - lastP.y) >= eps) break;
+    out.pop();
+  }
+  return out;
+}
+
+/**
+ * Fill a closed polygon (raster coordinates, implicitly closed) with `value` by even-odd scanlines through pixel
+ * centres: a self-crossing outline leaves its doubly covered parts open, as a vector editor's even-odd rule does.
+ * Fewer than three vertices fill nothing. Returns the number of pixels written.
+ */
+export function fillPolygon(layer: MaskLayer, points: readonly Point[], value: 0 | 255): number {
+  const n = points.length;
+  if (n < 3) return 0;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const p of points) {
+    minY = Math.min(minY, p.y);
+    maxY = Math.max(maxY, p.y);
+  }
+  const y0 = Math.max(0, Math.ceil(minY - 0.5));
+  const y1 = Math.min(layer.height - 1, Math.floor(maxY - 0.5));
+  const xs: number[] = [];
+  let written = 0;
+  for (let y = y0; y <= y1; y += 1) {
+    const cy = y + 0.5;
+    xs.length = 0;
+    for (let i = 0; i < n; i += 1) {
+      const a = points[i] as Point;
+      const b = points[(i + 1) % n] as Point;
+      // half-open in y, so a vertex on the scanline is counted once and horizontal edges never
+      if ((a.y <= cy) !== (b.y <= cy)) xs.push(a.x + ((cy - a.y) / (b.y - a.y)) * (b.x - a.x));
+    }
+    xs.sort((p, q) => p - q);
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      const xa = Math.max(0, Math.ceil((xs[k] as number) - 0.5));
+      const xb = Math.min(layer.width - 1, Math.ceil((xs[k + 1] as number) - 0.5) - 1);
+      if (xb < xa) continue;
+      layer.data.fill(value, y * layer.width + xa, y * layer.width + xb + 1);
+      written += xb - xa + 1;
+    }
+  }
+  return written;
 }
 
 /** Fraction of the layer that is set. */

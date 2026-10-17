@@ -24,6 +24,13 @@ export const NODE_KINDS = [
   "Light",
   "Scout",
   "Concept",
+  // Wave 9 (T81, decisions 46-48 and 57). A Reference holds an image an engine reads (never composited, never a
+  // plate anchor); a Frame is an annotation box with no ports; Atmosphere and Sky are numeric nodes. None of the four
+  // generates, so each adds 0 to the generation depth. Appended so saved graphs and the Python mirror keep their order.
+  "Reference",
+  "Frame",
+  "Atmosphere",
+  "Sky",
 ] as const;
 
 export type NodeKind = (typeof NODE_KINDS)[number];
@@ -46,8 +53,9 @@ export interface Override {
   at: string;
 }
 
-/** What a handle carries (T35). Edges join an output to an input that accepts its type; see `nodes/ports.ts`. */
-export const HANDLE_TYPES = ["image16", "mask", "packet", "video", "report"] as const;
+/** What a handle carries (T35). Edges join an output to an input that accepts its type; see `nodes/ports.ts`.
+ * `reference` (T81) is a Reference node's image: it feeds an engine's reference input only and is never composited. */
+export const HANDLE_TYPES = ["image16", "mask", "packet", "video", "report", "reference"] as const;
 export type HandleType = (typeof HANDLE_TYPES)[number];
 
 /** Custody grades of an engine route (docs/custody.md): C0 local, C1/C2 private vendor, D public or unconfirmed. */

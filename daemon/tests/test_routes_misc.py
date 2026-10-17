@@ -572,9 +572,9 @@ def test_label_lines_and_reason_codes(tmp_path, monkeypatch):
         verdicts.check_reasons("ship", ["P1"])
     with pytest.raises(verdicts.VerdictError):
         verdicts.check_reasons("fix", "P1")
-    # the labels path: settings first, then PLATE_LABELS, then the repo's calib folder
+    # the labels path: settings first, then PLATE_LABELS, then the data folder (PLATE_HOME), never the repo (T110)
     monkeypatch.delenv("PLATE_LABELS", raising=False)
-    assert verdicts.labels_path() == ROOT / "calib" / "labels.jsonl"
+    assert verdicts.labels_path() == tmp_path / "calib" / "labels.jsonl"
     monkeypatch.setenv("PLATE_LABELS", str(out))
     assert verdicts.labels_path() == out
 

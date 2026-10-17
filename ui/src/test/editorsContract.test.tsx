@@ -138,7 +138,7 @@ describe("Mask upload carries the project (T56)", () => {
     fireEvent.click(screen.getByTestId("mask-paint-save"));
     await waitFor(() => expect(paramsOf().maskHash).toBe("mask_hash_0123456789"));
     const up = calls.find((c) => c.method === "POST" && c.path === "/assets");
-    expect(up?.search).toBe("?kind=mask&project_id=proj_42");
+    expect(up?.search).toBe("?kind=mask&project_id=proj_42&packet_id=room_a"); // T82: the plate's packet rides along
     expect(Array.from((up?.body as Uint8Array).subarray(0, 4))).toEqual([0x89, 0x50, 0x4e, 0x47]);
   });
 

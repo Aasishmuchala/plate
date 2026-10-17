@@ -4,11 +4,17 @@
 // a `message` that the UI shows verbatim.
 
 import type { Edge, Node } from "@xyflow/react";
-import { type NodeKind, type PlateNodeData, UNSEEN_GEOMETRY_LABEL } from "./nodeTypes";
+import { type HandleType, type NodeKind, type PlateNodeData, UNSEEN_GEOMETRY_LABEL } from "./nodeTypes";
+import { acceptsOf, type KindPorts, PORTS, type PortSpec, portOf } from "./nodes/ports";
 
 export type GraphNode = Node<PlateNodeData>;
-/** The part of an edge the rules read. xyflow's `Edge` and the wire `GraphEdge` both satisfy it. */
-export type EdgeLike = Pick<Edge, "id" | "source" | "target">;
+/** The part of an edge the rules read. xyflow's `Edge` and the wire `GraphEdge` both satisfy it. The handle ids are
+ * optional (T81): REFERENCE_ONLY and VIDEO_LOCKED read them, and a null or missing one resolves as `checkHandles`
+ * does (the first output; the first input that takes the edge's type). */
+export type EdgeLike = Pick<Edge, "id" | "source" | "target"> & {
+  sourceHandle?: string | null;
+  targetHandle?: string | null;
+};
 export interface GraphLike {
   nodes: GraphNode[];
   edges: EdgeLike[];
@@ -24,13 +30,15 @@ export type RuleCode =
   | "INVENTED_ANGLE"
   | "CYCLE"
   | "UNKNOWN_NODE"
-  | "SCRUB_REQUIRED";
+  | "SCRUB_REQUIRED"
+  | "REFERENCE_ONLY"
+  | "ANNOTATION";
 
 export type RuleResult = { ok: true } | { ok: false; code: RuleCode; message: string };
 export type ConnectResult = { ok: true } | { ok: false; reason: string };
 
-/** Nodes that make new pixels. Each one costs a generation of depth. Mask/Comp/Colour/Gate/Compare and the numeric
- * nodes (LightMix, Recolour, Set, Light) do not. */
+/** Nodes that make new pixels. Each one costs a generation of depth. Mask/Comp/Colour/Gate/Compare, the numeric
+ * nodes (LightMix, Recolour, Set, Light, Atmosphere, Sky), Reference and Frame do not. */
 export const GENERATING_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>(["Edit", "Motion", "People", "CropPair"]);
 
 /** Rule 7: generation depth is at most 2 from the original plate. */
@@ -45,7 +53,34 @@ const EXPORT_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>(["Export"]);
 /** Rule 7: video nodes stay locked until the upstream still passed gates and a human approved it. */
 const VIDEO_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>(["Motion", "CropPair"]);
 
+/** Decision 46: the only inputs a Reference may feed (Edit/People `refs`, Motion `elements`, Sky `sky`). */
+export const REFERENCE_HANDLES: ReadonlySet<string> = new Set<string>(["refs", "elements", "sky"]);
+
+/** Decision 57: annotation kinds take no edges and are ignored by every other rule. */
+const ANNOTATION_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>(["Frame"]);
+
+const REFERENCE_ONLY_MESSAGE = "a reference feeds an engine's reference input only; it is never composited";
+const ANNOTATION_MESSAGE = "a Frame is an annotation; it takes no edges";
+
 const refuse = (code: RuleCode, message: string): RuleResult => ({ ok: false, code, message });
+
+const portsOf = (kind: NodeKind): KindPorts | undefined => (PORTS as Partial<Record<NodeKind, KindPorts>>)[kind];
+
+/** The input port an edge lands on: the named one, or for a null handle the first input taking `type` (else the first
+ * input), the way `checkHandles` resolves it. Null when the kind has no such input. */
+function inputFor(kind: NodeKind, handle: string | null | undefined, type: HandleType | null): PortSpec | null {
+  const inputs = portsOf(kind)?.inputs ?? [];
+  if (handle === null || handle === undefined || handle === "") {
+    return (type ? inputs.find((p) => acceptsOf(p).includes(type)) : undefined) ?? inputs[0] ?? null;
+  }
+  return inputs.find((p) => p.id === handle) ?? null;
+}
+
+/** What an edge carries (its source port's type; null when the port is unknown) and the input it lands on. */
+function edgePorts(sourceKind: NodeKind, targetKind: NodeKind, edge: EdgeLike): { type: HandleType | null; input: PortSpec | null } {
+  const type = portsOf(sourceKind) ? (portOf(sourceKind, "outputs", edge.sourceHandle)?.type ?? null) : null;
+  return { type, input: inputFor(targetKind, edge.targetHandle, type) };
+}
 
 const byId = (nodes: GraphNode[]): Map<string, GraphNode> => new Map(nodes.map((n) => [n.id, n]));
 
@@ -151,9 +186,12 @@ const needsUnseenLabel = (data: PlateNodeData): boolean =>
 /**
  * Would `edge` be allowed in `graph`? The edge may or may not already be in `graph.edges` (it is ignored there), so
  * the same call vets a new connection and re-checks a loaded one. Checks, in order: unknown node, cycle,
- * CONCEPT_TO_DELIVERY (doctrine 1), PREVIS_NOT_DELIVERABLE (T44), NO_PLATE_ANCHOR (doctrine 2, source-view-only),
- * DEPTH_EXCEEDED (doctrine 7), VIDEO_LOCKED (doctrine 7: the source must be gateStatus pass and approved),
- * HIGH_RISK_MOVE, INVENTED_ANGLE.
+ * ANNOTATION (T81: an edge touching a Frame), REFERENCE_ONLY (T81: a Reference feeds `refs`, `elements` or `sky`
+ * only; a null target handle resolves to the first input taking a reference), CONCEPT_TO_DELIVERY (doctrine 1),
+ * PREVIS_NOT_DELIVERABLE (T44), NO_PLATE_ANCHOR (doctrine 2, source-view-only; a reference never anchors, so an
+ * engine fed one must hang off a Plate through its other inputs), DEPTH_EXCEEDED (doctrine 7), VIDEO_LOCKED
+ * (doctrine 7: every still into Motion or CropPair, the end still included, must be gateStatus pass and approved; a
+ * packet or reference edge is not a still), HIGH_RISK_MOVE, INVENTED_ANGLE.
  */
 export function validateEdge(graph: GraphLike, edge: EdgeLike): RuleResult {
   const nodeMap = byId(graph.nodes);
@@ -168,9 +206,22 @@ export function validateEdge(graph: GraphLike, edge: EdgeLike): RuleResult {
     return refuse("CYCLE", "cycle");
   }
 
+  const sk = source.data.kind;
+  const tk = target.data.kind;
+
+  // A Frame is an annotation: it takes no edges, in or out.
+  if (ANNOTATION_KINDS.has(sk) || ANNOTATION_KINDS.has(tk)) return refuse("ANNOTATION", ANNOTATION_MESSAGE);
+
+  // A reference is an engine input, never pixels of the output: it may land on a reference input only.
+  if (sk === "Reference") {
+    const input = inputFor(tk, edge.targetHandle, "reference");
+    if (!input || !REFERENCE_HANDLES.has(input.id) || !acceptsOf(input).includes("reference")) {
+      return refuse("REFERENCE_ONLY", REFERENCE_ONLY_MESSAGE);
+    }
+  }
+
   const next: EdgeLike[] = [...others, edge];
   const nextUp = upstreamMap(next);
-  const tk = target.data.kind;
 
   // The concept tier never reaches Export (or Review), directly or through other nodes.
   if (DELIVERY_KINDS.has(tk) && isConceptTier(nodeMap, nextUp, edge.target)) {
@@ -182,8 +233,10 @@ export function validateEdge(graph: GraphLike, edge: EdgeLike): RuleResult {
     return refuse("PREVIS_NOT_DELIVERABLE", `previs output cannot reach ${tk}: PREVIS is not deliverable`);
   }
 
-  // Source-view-only: a generator must hang off a Plate, so every generation is anchored to a packet camera.
-  if (GENERATING_KINDS.has(tk) && !anchoredToPlate(nodeMap, nextUp, edge.source)) {
+  // Source-view-only: a generator must hang off a Plate, so every generation is anchored to a packet camera. A
+  // Reference anchors nothing: an edge from one needs the generator itself anchored through its other inputs.
+  const anchor = sk === "Reference" ? edge.target : edge.source;
+  if (GENERATING_KINDS.has(tk) && !anchoredToPlate(nodeMap, nextUp, anchor)) {
     return refuse("NO_PLATE_ANCHOR", "generation must be anchored to a plate camera (source-view-only)");
   }
 
@@ -193,9 +246,14 @@ export function validateEdge(graph: GraphLike, edge: EdgeLike): RuleResult {
     return refuse("DEPTH_EXCEEDED", "generation depth > 2 from the plate");
   }
 
-  // Video stays locked until the upstream still passed gates and a human approved it.
+  // Video stays locked until every still feeding it (start or end) passed gates and a human approved it. A packet or
+  // a reference edge is not a still; an edge whose ports cannot be resolved is treated as one (fail closed).
   if (VIDEO_KINDS.has(tk) && !(source.data.gateStatus === "pass" && source.data.approved === true)) {
-    return refuse("VIDEO_LOCKED", `${tk === "Motion" ? "motion" : "crop pair"} is locked until the upstream still passes gates and is approved`);
+    const { type, input } = edgePorts(sk, tk, edge);
+    if (type === null || input === null || type === "image16" || input.type === "image16") {
+      const which = input?.id === "end" ? `the ${input.label}` : "the upstream still";
+      return refuse("VIDEO_LOCKED", `${tk === "Motion" ? "motion" : "crop pair"} is locked until ${which} passes gates and is approved`);
+    }
   }
 
   // High-risk moves are blocked unless overridden (and then labelled, see applyOverride).

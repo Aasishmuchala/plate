@@ -1,7 +1,8 @@
 /* PLATE canvas theme (T35): one dark theme, the MaxGaffer palette. Flat surfaces, one hairline border, one accent;
    status colours only where they carry meaning (custody grade, gate verdict, risk, concept tier). Handle types are
    told apart by shape, not by colour: image16 filled circle, mask hollow circle, packet square, video diamond,
-   report bar. Loaded after index.css, so equal-specificity rules here win. */
+   report bar, reference hollow square (T81; its edge is the one dashed violet line, an engine input never
+   composited). Loaded after index.css, so equal-specificity rules here win. */
 
 .plate-app {
   --bg: #1c1c1e;
@@ -120,6 +121,11 @@
 
 .plate-app .react-flow__edge.edge-report .react-flow__edge-path {
   stroke-dasharray: 6 3;
+}
+
+.plate-app .react-flow__edge.edge-reference .react-flow__edge-path {
+  stroke: #bf5af2;
+  stroke-dasharray: 5 4;
 }
 
 .plate-app .react-flow__edge.edge-violation .react-flow__edge-path {
@@ -357,6 +363,40 @@
   font-size: 11px;
 }
 
+/* A Frame (T81) is an annotation box behind the nodes: translucent, one hairline, the title top-left. xyflow puts
+   its own stacking order on the wrapper (which the store also classes `kind-frame`), so the wrapper is sent back
+   here and the box itself is drawn by the inner `.plate-frame`. */
+.plate-app .react-flow__node.kind-frame,
+.plate-app .react-flow__node:has(> .plate-frame) {
+  z-index: -1 !important;
+}
+
+.plate-frame.kind-frame {
+  position: relative;
+  box-sizing: border-box;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid var(--hair);
+  border-radius: 12px;
+}
+
+.plate-frame.kind-frame.is-selected {
+  border-color: var(--accent);
+}
+
+.plate-frame .frame-title {
+  position: absolute;
+  top: 8px;
+  left: 12px;
+  color: var(--dim);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: calc(100% - 24px);
+}
+
 /* ---------------------------------------------------------------- typed handles */
 
 .node-ports {
@@ -408,6 +448,12 @@
   width: 6px;
   height: 12px;
   border-radius: 2px;
+}
+
+.plate-app .react-flow__handle.handle-reference {
+  border-radius: 2px;
+  background: var(--panel);
+  border-color: #bf5af2;
 }
 
 .plate-app .react-flow__handle.handle-concept {

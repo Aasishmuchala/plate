@@ -121,7 +121,7 @@ def test_plugin_queue_lifecycle(tmp_path):
     with pytest.raises(ValueError):
         q.finish(live.id, result={"poses": "x" * 1_100_000})
     assert q.get(live.id).state == "queued"  # a refused answer leaves the job open
-    assert set(ACTIONS) == {"light.match", "light.vantage_preview", "scout"}
+    assert set(ACTIONS) == {"light.match", "light.vantage_preview", "scout", "receive"}  # receive: T96
 
 
 # ---------------------------------------------------------------------------- the daemon around the nodes

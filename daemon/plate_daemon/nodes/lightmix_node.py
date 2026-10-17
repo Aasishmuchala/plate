@@ -3,17 +3,22 @@
     light selects   one linear RGB pass per light: the `light_select` elements of the beauty EXR (one entry per
                     light, `light_name` required) and `x_light_<name>` extension files (an opt-in pass written
                     to its own EXR next to the packet; PACKET.md 4.1). A name found twice is an error.
-    prepare         the lights (all of them, in a fixed order), the gains the artist set (`params.gains`), a mood
-                    preset (`params.preset`, initial guesses only) or a target picture (`params.targetHash` /
-                    `target_hash`, a CAS PNG: the display picture to match) the gains are solved for
+    prepare         the lights (all of them, in a fixed order), the gains the artist set (`params.gains`: a number
+                    or an `[r, g, b]` vector per light, each >= 0), a mood preset (`params.preset`, initial
+                    guesses only) or a target picture (`params.targetHash` / `target_hash`, a CAS PNG: the
+                    display picture to match) the gains are solved for
     normalize       gains: solved by lightmix.solve against the target in linear light (the packet's own colour
-                    pipeline undoes the display transform when it can, the sRGB curve otherwise), else the given
-                    gains (a light with no entry keeps gain 1.0), else the preset, else 1.0 each. The frame is
+                    pipeline undoes the display transform when it can, the sRGB curve otherwise; the solver
+                    returns one number per light), else the given gains (a light with no entry keeps the preset's
+                    gain, else 1.0), else the preset, else 1.0 each. A vector gain scales that light's red,
+                    green and blue separately; `max_gain` clips each channel. The frame is
                     sum_i g_i L_i (`keep_base: true` adds the part of the beauty the selects do not carry:
                     beauty - sum_i L_i, e.g. emissives and reflections of the environment), out through the
                     colour pipeline to a PNG16
     gate            on the stored PNG: right size, finite, in range; gains non-negative by construction; the
                     NNLS residual and any gain that hit `max_gain` are advisory numbers, not failures
+    preview         the lights, the gains the spec would use and, per light, whether the gain is a `scalar` or
+                    an `rgb` vector (`channels`)
 
 Lighting changes come from the render's own light selects or a V-Ray re-render, never from an image model.
 `verify-on-box`: whether V-Ray 7's light selects sum to the beauty minus a base (so `keep_base` is the right
@@ -95,25 +100,41 @@ def load_light_selects(pv: PacketView) -> dict[str, np.ndarray]:
     return out
 
 
-def _gains_in(raw: Any, names: list[str]) -> dict[str, float] | None:
+def _gain_in(name: str, g: Any) -> float | list[float]:
+    """One gain from params: a finite number >= 0, or an `[r, g, b]` list of three of them."""
+    bad = PipelineError(
+        f"LightMix gain for {name!r} must be a finite number >= 0 or an [r, g, b] vector of three, got {g!r}",
+        code="bad_params",
+    )
+    if isinstance(g, (list, tuple)):
+        if len(g) != 3:
+            raise bad
+        parts: list[float] = []
+        for c in g:
+            f = finite_or_none(c)
+            if f is None or f < 0:
+                raise bad
+            parts.append(f)
+        return parts
+    f = finite_or_none(g)
+    if f is None or f < 0:
+        raise bad
+    return f
+
+
+def _gains_in(raw: Any, names: list[str]) -> dict[str, float | list[float]] | None:
     if raw is None:
         return None
     if not isinstance(raw, Mapping):
-        raise PipelineError("LightMix params.gains must map light names to numbers", code="bad_params")
+        raise PipelineError(
+            "LightMix params.gains must map light names to numbers or [r, g, b] vectors", code="bad_params"
+        )
     unknown = sorted(set(raw) - set(names))
     if unknown:
         raise PipelineError(
             f"LightMix params.gains names unknown lights {unknown}; the packet has {names}", code="bad_params"
         )
-    out: dict[str, float] = {}
-    for name, g in raw.items():
-        f = finite_or_none(g)
-        if f is None or f < 0:
-            raise PipelineError(
-                f"LightMix gain for {name!r} must be a finite number >= 0, got {g!r}", code="bad_params"
-            )
-        out[str(name)] = f
-    return out
+    return {str(name): _gain_in(str(name), g) for name, g in raw.items()}
 
 
 def prepare(q: QuoteContext) -> Prepared:
@@ -171,6 +192,24 @@ def target_linear(c_pipeline: Any, png16: np.ndarray) -> np.ndarray:
     return np.asarray(srgb_eotf(display8 / 255.0), dtype=np.float32)
 
 
+def _components(g: float | list[float]) -> list[float]:
+    return [float(c) for c in g] if isinstance(g, (list, tuple)) else [float(g)]
+
+
+def _clip(g: float | list[float], max_gain: float) -> float | list[float]:
+    """The gain held to `max_gain`, each channel of a vector on its own."""
+    if isinstance(g, (list, tuple)):
+        return [float(min(c, max_gain)) for c in g]
+    return float(min(g, max_gain))
+
+
+def gain_channels(gains: Mapping[str, Any]) -> dict[str, str]:
+    """{light: "scalar" | "rgb"}: whether each gain is one number or a per-channel vector."""
+    from plate_gates import lightmix
+
+    return {n: lightmix.gain_channels(g) for n, g in gains.items()}
+
+
 def resolve_gains(
     spec: Mapping[str, Any], selects: Mapping[str, np.ndarray], target_lin: np.ndarray | None
 ) -> dict[str, Any]:
@@ -193,8 +232,9 @@ def resolve_gains(
     if spec.get("gains"):
         base.update(spec["gains"])
         mode = "explicit"
-    clipped = [n for n, g in base.items() if g > spec["max_gain"]]
-    gains = {n: float(min(g, spec["max_gain"])) for n, g in base.items()}
+    max_gain = spec["max_gain"]
+    clipped = [n for n, g in base.items() if max(_components(g)) > max_gain]
+    gains = {n: _clip(g, max_gain) for n, g in base.items()}
     return {"gains": gains, "mode": mode, "residual_rms": None, "clipped": clipped}
 
 
@@ -239,6 +279,7 @@ def preview(c: RunContext) -> dict[str, Any]:
     return {
         "lights": list(c.spec["lights"]),
         "gains": chosen["gains"],
+        "channels": gain_channels(chosen["gains"]),
         "mode": chosen["mode"],
         "residual_rms": finite_or_none(chosen["residual_rms"]),
         "clipped": chosen["clipped"],
@@ -268,6 +309,7 @@ def normalize(c: RunContext) -> dict[str, Any]:
         "outputs": [c.put_png16(to_display_png16(display))],
         "lightmix": {
             "gains": chosen["gains"],
+            "channels": gain_channels(chosen["gains"]),
             "mode": chosen["mode"],
             "residual_rms": finite_or_none(chosen["residual_rms"]),
             "clipped": chosen["clipped"],
@@ -290,7 +332,7 @@ def gate(c: RunContext) -> Any:
     plate = pv.plate16()
     same_size = out.shape == plate.shape
     in_range = bool(np.isfinite(out.astype(np.float64)).all())
-    negative = [n for n, g in info["gains"].items() if g < 0]
+    negative = [n for n, g in info["gains"].items() if min(_components(g)) < 0]
     residual = info.get("residual_rms")
     checks = [
         Check(
@@ -332,6 +374,7 @@ def score(report: Any) -> float:
 
 __all__ = [
     "KIND",
+    "gain_channels",
     "gate",
     "light_names",
     "load_light_selects",

@@ -8,6 +8,9 @@ Unknown facts are marked unknown (price status, "unknown" terms hash / region / 
 T7 additions, all optional with defaults so older manifests still load: model_id, routes[].route_id / model_slug /
 allowed_hosts / max_inflight / status, price.by / source / as_of, Param.advanced, IOField.max_items, Sizes,
 plate_upscale_forbidden and flags. EngineSize is the runtime "this size was chosen" record adapters put on a Quote.
+
+T84 additions, optional with defaults: PriceSpec.tiers (PriceTier rows that price a request by the params it
+carries: quality, image_size, resolution, audio) and EngineManifest.limits (Limits: input and output megapixel caps).
 """
 
 from __future__ import annotations
@@ -114,6 +117,24 @@ class Route(_Strict):
         return self
 
 
+class PriceTier(_Strict):
+    """One price row: `usd` per billed unit (image, megapixel or second, as price.model says) for a request whose
+    params equal every `match` entry. Values compare as lower-cased strings; `status` is this row's own price status
+    ("estimated" = derived from another row, not a reading)."""
+
+    match: dict[str, str | int | float | bool]
+    usd: float = Field(ge=0)
+    status: Literal["unconfirmed", "confirmed", "estimated"] = "unconfirmed"
+    note: str = ""
+
+    @model_validator(mode="after")
+    def _check(self) -> PriceTier:
+        # An empty match would win for every request and hide the rows after it.
+        if not self.match or any(not key for key in self.match):
+            raise ValueError("price tier: match needs at least one non-empty param name")
+        return self
+
+
 class PriceSpec(_Strict):
     model: Literal["flat", "per_megapixel", "per_second", "per_image"]
     usd: float = Field(ge=0)
@@ -125,6 +146,9 @@ class PriceSpec(_Strict):
     by: dict[str, float] = Field(default_factory=dict)
     source: str = ""
     as_of: date | None = None
+    # Param-keyed price rows, tried in order: the first whose every match key equals the request's value wins
+    # (see daemon quotes.build_quote). Not matched = by[<size label>], then usd.
+    tiers: list[PriceTier] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check(self) -> PriceSpec:
@@ -132,6 +156,13 @@ class PriceSpec(_Strict):
             if not key or value < 0:
                 raise ValueError(f"price.by[{key!r}]: key must be non-empty and usd >= 0")
         return self
+
+
+class Limits(_Strict):
+    """Vendor megapixel caps on what the engine takes in and hands back (None = not established)."""
+
+    max_input_mp: float | None = Field(default=None, gt=0)
+    max_output_mp: float | None = Field(default=None, gt=0)
 
 
 class IOField(_Strict):
@@ -266,6 +297,7 @@ class EngineManifest(_Strict):
     # Vendor model string (None = not established yet, which a flag should say).
     model_id: str | None = None
     sizes: Sizes | None = None
+    limits: Limits | None = None
     # Doctrine rule 5 in data: an upscaler never touches the plate. Required on every `upscale` engine.
     plate_upscale_forbidden: bool = False
     # Free-form markers such as "unverified_p0" (a fact here has not survived the P0 smoke test).

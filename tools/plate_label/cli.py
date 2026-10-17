@@ -18,7 +18,7 @@ from plate_label import __version__
 from plate_label.codes import VERDICTS, reason_codes
 from plate_label.pairs import PairsError, load_manifest, pair_from_entry, scan_folder
 from plate_label.server import DEFAULT_PORT, serve
-from plate_label.store import DEFAULT_OUT, LabelRecord, append_label, read_labels
+from plate_label.store import LabelRecord, append_label, default_labels_path, read_labels
 
 # First-word shorthands: `serve DIR` is the default action, `stats` is --stats.
 ALIASES = {"serve": [], "stats": ["--stats"]}
@@ -83,7 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m plate_label",
         description="Three-key labelling of plate-vs-candidate pairs: 1 Ship, 2 Fix, 3 Render-it, then "
         "reason codes. Serves a page on 127.0.0.1 and appends one JSON line per verdict to "
-        "calib/labels.jsonl. Give FOLDER or --pairs FILE. (`serve FOLDER` = FOLDER, `stats` = --stats.)",
+        "labels.jsonl in the data folder (see --out). Give FOLDER or --pairs FILE. "
+        "(`serve FOLDER` = FOLDER, `stats` = --stats.)",
     )
     p.add_argument(
         "folder",
@@ -99,7 +100,11 @@ def build_parser() -> argparse.ArgumentParser:
         "relative to the file",
     )
     p.add_argument(
-        "--out", type=Path, default=DEFAULT_OUT, help="labels file (default: <repo>/calib/labels.jsonl)"
+        "--out",
+        type=Path,
+        default=None,
+        help="labels file (default: $PLATE_LABELS, else <data home>/calib/labels.jsonl; the data home is "
+        "$PLATE_HOME or the OS app-data folder, the file the daemon writes canvas verdicts to)",
     )
     p.add_argument("--rater", default=default_rater(), help="rater name (default: $USER)")
     p.add_argument(
@@ -127,6 +132,8 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] in ALIASES:
         argv[0:1] = ALIASES[argv[0]]
     args = build_parser().parse_args(argv)
+    if args.out is None:
+        args.out = default_labels_path()
 
     if args.stats:
         return print_stats(args.out)

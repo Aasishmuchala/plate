@@ -3,9 +3,11 @@
 //
 //   POST /api/v0/pixels/idpick   {packet_id, x, y, kind?}      -> {id, name, class, kind, editable, locked, coverage, depth_m}
 //                                                                                                                     (T62 route)
-//   POST /api/v0/pixels/segment  {packet_id, points}           -> {mask_hash?, segments}                           (T47 spec: pixels /segment)
+//   POST /api/v0/pixels/segment  {packet_id, points}           -> {mask_hash, labels_hash, segments, selected}     (T82: mask_hash is
+//                                                                    the plate-sized 0/255 mask of the clicked segments; null without points)
 //   POST /api/v0/pixels/ocr      {packet_id}                   -> {boxes: [{bbox, text, conf}], shape}             (pixels /ocr)
-//   POST /api/v0/assets?kind=mask&project_id=<id>  body = PNG bytes -> {hash}                  (T56: a mask to the project's CAS)
+//   POST /api/v0/assets?kind=mask&project_id=<id>[&packet_id=<id>]  body = PNG bytes -> {hash, width, height, scaled_from}
+//                                                                    (T56: a mask to the project's CAS; T82: with the packet, scaled to its plate)
 //   POST /api/v0/projects/{pid}/nodes/{node}/preview {what, params}  -> router | set | lightmix | recolour numbers
 //                                                                       (numeric, no spend, no engine; T48, router: T73)
 //   POST /api/v0/plugin/jobs     {action, ...}                 -> {id, state}     (T48 queue; the Max dock polls it)
@@ -66,9 +68,13 @@ export async function idPick(body: { packet_id: string; x: number; y: number; ki
 }
 
 export interface SegmentResult {
-  /** CAS hash of the binary mask of the clicked regions, when the daemon stored one. */
+  /** CAS hash of the plate-sized 0/255 mask of the clicked segments, when the daemon stored one. */
   maskHash: string | null;
+  /** CAS hash of the 16-bit label map the clicks were looked up in (never a mask). */
+  labelsHash: string | null;
   regions: number;
+  /** The segment ids under the clicked points, as the daemon picked them. */
+  selected: number[];
 }
 
 /** `POST /pixels/segment`: SAM-style click segmentation (the stub returns k-means labels). */
@@ -77,8 +83,10 @@ export async function segment(body: { packet_id: string; points: [number, number
   const o = isRecord(r) ? r : {};
   const segs = o.segments;
   return {
-    maskHash: str(o.mask_hash) ?? str(o.segments_hash) ?? null,
+    maskHash: str(o.mask_hash) ?? null,
+    labelsHash: str(o.labels_hash) ?? str(o.segments_hash) ?? null,
     regions: Array.isArray(segs) ? segs.length : (num(segs) ?? 0),
+    selected: Array.isArray(o.selected) ? o.selected.filter((v): v is number => typeof v === "number" && Number.isInteger(v)) : [],
   };
 }
 
@@ -118,17 +126,39 @@ export async function ocr(body: { packet_id: string }): Promise<OcrResult> {
   };
 }
 
-/** `POST /assets?kind=mask&project_id=<id>`: store a PNG mask in that project's CAS; returns its hash. */
-export async function uploadMask(png: Uint8Array<ArrayBuffer>, projectId: string): Promise<string> {
-  const r = await fetchJson<unknown>(`/assets?kind=mask&project_id=${enc(projectId)}`, {
+export interface StoredMask {
+  hash: string;
+  /** The stored size (the plate's when the upload named the packet); null when the daemon does not say. */
+  width: number | null;
+  height: number | null;
+  /** The uploaded size when the daemon scaled the mask to the plate, else null. */
+  scaledFrom: [number, number] | null;
+}
+
+const pair = (v: unknown): [number, number] | null =>
+  Array.isArray(v) && v.length === 2 && v.every((x) => typeof x === "number" && Number.isFinite(x)) ? [v[0] as number, v[1] as number] : null;
+
+/**
+ * `POST /assets?kind=mask&project_id=<id>[&packet_id=<id>]`: store a mask image in that project's CAS. With the packet
+ * the daemon scales it to that packet's plate (nearest neighbour, then 0/255), so a mask painted or made at another
+ * size still lands where the quote checks it.
+ */
+export async function storeMask(bytes: Uint8Array<ArrayBuffer>, projectId: string, packetId?: string | null, contentType = "image/png"): Promise<StoredMask> {
+  const packet = packetId ? `&packet_id=${enc(packetId)}` : "";
+  const r = await fetchJson<unknown>(`/assets?kind=mask&project_id=${enc(projectId)}${packet}`, {
     method: "POST",
-    body: png,
-    headers: { "Content-Type": "image/png" },
+    body: bytes,
+    headers: { "Content-Type": contentType },
   });
   const o = isRecord(r) ? r : {};
   const hash = str(o.hash) ?? str(o.content_hash);
   if (!hash) throw new Error("the daemon stored the mask but returned no hash");
-  return hash;
+  return { hash, width: num(o.width), height: num(o.height), scaledFrom: pair(o.scaled_from) };
+}
+
+/** `storeMask` answering the hash only (the T56 call shape; `packetId` adds the T82 scaling). */
+export async function uploadMask(png: Uint8Array<ArrayBuffer>, projectId: string, packetId?: string | null): Promise<string> {
+  return (await storeMask(png, projectId, packetId)).hash;
 }
 
 // ---------------------------------------------------------------------------------------------------- previews

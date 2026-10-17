@@ -30,6 +30,7 @@ LIN = L.Lineage(
 )
 SHIP_TIME = datetime(2026, 10, 17, 9, 41, 7, tzinfo=UTC)
 LIN_B = L.Lineage("p2", "n2", "run_2", "pkt_2", "gpt-image-2.5", None, {"verdict": "pass", "n": 2})
+NON_AI = L.Lineage("p3", "n3", "run_3", "pkt_3", "plate-numeric", None, None)
 
 
 def _ffmpeg() -> str | None:
@@ -135,7 +136,8 @@ def test_png_round_trip_keeps_icc_and_pixels(tmp_path):
     assert L.read(p) == LIN
     after = _png_chunks(p)
     kinds = [c for c, _ in after]
-    assert kinds.count(b"iTXt") == 1 and kinds.index(b"iTXt") < kinds.index(b"IDAT")
+    # the lineage chunk, and (nano-banana is a generative engine) the XMP chunk with the IPTC marker (T86)
+    assert kinds.count(b"iTXt") == 2 and kinds.index(b"iTXt") < kinds.index(b"IDAT")
     assert [c for c in after if c[0] != b"iTXt"] == before  # iCCP, pHYs, IDAT, IEND: byte for byte
     assert b"iCCP" in kinds
     with Image.open(p) as im:
@@ -154,7 +156,10 @@ def test_png_16bit_embed_twice_replaces_the_first(tmp_path):
     L.embed(p, LIN)
     L.embed(p, LIN_B)
     assert L.read(p) == LIN_B
-    assert [c for c, _ in _png_chunks(p)].count(b"iTXt") == 1
+    assert [c for c, _ in _png_chunks(p)].count(b"iTXt") == 2  # lineage + XMP marker, each replaced not added
+    L.embed(p, NON_AI)
+    assert L.read(p) == NON_AI and not L.ai_marker(p)
+    assert [c for c, _ in _png_chunks(p)].count(b"iTXt") == 1  # a take no model touched drops the marker
     assert np.array_equal(cv2.imread(str(p), cv2.IMREAD_UNCHANGED), arr)
 
 
@@ -544,12 +549,18 @@ def test_video_boxes_with_a_foreign_comment_read_as_none(tmp_path):
 
 
 def test_unsupported_extension_and_missing_files(tmp_path):
+    gif = tmp_path / "derivative.gif"  # a JPEG has a carrier since T86 (APP1 XMP); a GIF does not
+    gif.write_bytes(b"GIF89a not really")
+    with pytest.raises(L.UnsupportedFormat, match="no lineage carrier"):
+        L.embed(gif, LIN)
+    assert L.read(gif) is None and not L.supported(gif)
     jpg = tmp_path / "derivative.jpg"
     jpg.write_bytes(b"\xff\xd8\xff\xe0 not really")
-    with pytest.raises(L.UnsupportedFormat, match="no lineage carrier"):
+    with pytest.raises(L.LineageError, match="JPEG"):
         L.embed(jpg, LIN)
-    assert L.read(jpg) is None and not L.supported(jpg)
+    assert jpg.read_bytes() == b"\xff\xd8\xff\xe0 not really" and L.read(jpg) is None
     assert L.supported("A.PNG") and L.supported("b.Exr") and L.supported("c.tiff") and L.supported("d.mov")
+    assert L.supported("e.JPG") and L.supported("f.jpeg")
     with pytest.raises(FileNotFoundError):
         L.embed(tmp_path / "gone.png", LIN)
     assert L.read(tmp_path / "gone.png") is None

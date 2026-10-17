@@ -1,6 +1,14 @@
-"""Label records and the calib/labels.jsonl store: the record schema, a Windows-safe one-line append,
+"""Label records and the labels.jsonl store: the record schema, a Windows-safe one-line append,
 a tolerant reader, the per-rater "already labelled" key set and the atomic line removal behind undo.
 New code for PLATE. Files are UTF-8 with LF newlines on both OSes.
+
+Where the file lives: labels are calibration data made from client work, so by default they are in the app-data
+folder, never in the repo: `<data home>/calib/labels.jsonl`, where the data home is `PLATE_HOME`, else
+`platformdirs.user_data_dir("Plate", appauthor=False)` (the daemon's `config.app_home`, mirrored here so the
+labeller stays free of daemon imports). `PLATE_LABELS` names the exact file instead. The daemon's verdict route
+resolves the same way (`plate_daemon.verdicts.labels_path`), so a canvas verdict and a three-key label land in
+one file. A repo-local `calib/labels.jsonl` left by an older build is read once (see `legacy_labels`) with a
+printed warning and is never written.
 
 One line per verdict:
     {"v":1,"at":"2026-10-17T09:41:07Z","rater":"aasish","take_id":"S3","plate":"...","candidate":"...",
@@ -12,11 +20,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import threading
 import time
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+
+import platformdirs
 
 from plate_label.codes import validate_reasons
 from plate_label.pairs import Pair
@@ -24,8 +37,28 @@ from plate_label.pairs import Pair
 SCHEMA_VERSION = 1
 MAX_SECONDS = 86_400.0
 
-# <repo>/calib/labels.jsonl (tools/plate_label/store.py -> parents[2] is the repo root). Gitignored.
-DEFAULT_OUT = Path(__file__).resolve().parents[2] / "calib" / "labels.jsonl"
+HOME_ENV = "PLATE_HOME"
+LABELS_ENV = "PLATE_LABELS"
+LABELS_NAME = "labels.jsonl"
+# tools/plate_label/store.py -> parents[2] is the repo root. A calib/labels.jsonl there was written by an older
+# build: it is only ever read (legacy_labels), never written.
+LEGACY_OUT = Path(__file__).resolve().parents[2] / "calib" / LABELS_NAME
+
+
+def data_home(env: Mapping[str, str] | None = None) -> Path:
+    """`PLATE_HOME`, else the OS app-data folder (`%LOCALAPPDATA%\\Plate` on Windows, Application Support on Mac)."""
+    env = os.environ if env is None else env
+    if env.get(HOME_ENV):
+        return Path(env[HOME_ENV])
+    return Path(platformdirs.user_data_dir("Plate", appauthor=False))
+
+
+def default_labels_path(env: Mapping[str, str] | None = None) -> Path:
+    """`PLATE_LABELS`, else `<data home>/calib/labels.jsonl`: the file the daemon's verdict route writes too."""
+    env = os.environ if env is None else env
+    if env.get(LABELS_ENV):
+        return Path(env[LABELS_ENV])
+    return data_home(env) / "calib" / LABELS_NAME
 
 
 def utc_now_iso() -> str:
@@ -129,11 +162,17 @@ def append_label(path: Path, rec: LabelRecord) -> str:
     return line
 
 
-def read_labels(path: Path) -> list[dict]:
-    """All records in file order. A missing file is empty; an unreadable line warns and is skipped."""
-    path = Path(path)
-    if not path.exists():
-        return []
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        if a.exists() and b.exists():
+            return os.path.samefile(a, b)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _read_file(path: Path) -> list[dict]:
+    """The records of one labels file in file order; an unreadable line warns and is skipped."""
     out: list[dict] = []
     with open(path, encoding="utf-8", newline="") as f:
         for n, line in enumerate(f, start=1):
@@ -143,10 +182,58 @@ def read_labels(path: Path) -> list[dict]:
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
-                warnings.warn(f"{path}:{n}: skipped an unreadable label line", stacklevel=2)
+                warnings.warn(f"{path}:{n}: skipped an unreadable label line", stacklevel=3)
                 continue
             if isinstance(rec, dict):
                 out.append(rec)
+    return out
+
+
+_LEGACY_LOCK = threading.Lock()
+# legacy file (normalised path) -> its records, filled by the first read in this process.
+_LEGACY_SEEN: dict[str, list[dict]] = {}
+
+
+def legacy_labels(target: Path) -> list[dict]:
+    """Records of a repo-local `calib/labels.jsonl` left by an older build, else `[]`.
+
+    Read once per process (the records are cached) with one printed warning that says where labels live now.
+    The file is never written, truncated or removed. `[]` when it does not exist or when it is `target` itself
+    (the data folder or `PLATE_LABELS` was pointed at the repo on purpose)."""
+    legacy = Path(LEGACY_OUT)
+    target = Path(target)
+    if not legacy.is_file() or _same_file(legacy, target):
+        return []
+    key = os.path.normcase(os.path.abspath(legacy))
+    with _LEGACY_LOCK:
+        if key in _LEGACY_SEEN:
+            return list(_LEGACY_SEEN[key])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # a torn tail is not worth a second warning
+            records = _read_file(legacy)
+        _LEGACY_SEEN[key] = records
+    print(
+        f"warning: found {legacy} left by an older build ({len(records)} label(s)). It is read, never "
+        f"written: labels now go to {target}. Move it there to keep them, or delete it.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return list(records)
+
+
+def read_labels(path: Path, legacy: bool | None = None) -> list[dict]:
+    """All records in file order. A missing file is empty; an unreadable line warns and is skipped.
+
+    Reading the default labels file (`default_labels_path()`) also returns the records of a repo-local legacy
+    file first (`legacy_labels`); `legacy=True` or `False` forces that either way."""
+    path = Path(path)
+    out: list[dict] = []
+    if legacy is None:
+        legacy = _same_file(path, default_labels_path())
+    if legacy:
+        out.extend(legacy_labels(path))
+    if path.exists():
+        out.extend(_read_file(path))
     return out
 
 

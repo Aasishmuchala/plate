@@ -9,6 +9,9 @@
 <title>{{TITLE}}</title>
 <style>
 <!--PLATE:CSS-->
+.top .subtitle, .top .author { margin: 6px 0 0; font-size: 13px; letter-spacing: 0.06em; color: var(--ink-2); }
+.top .author { font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; }
+.top .subtitle:empty, .top .author:empty { display: none; }
 </style>
 </head>
 <body>
@@ -17,6 +20,8 @@
   <div>
     <p class="eyebrow">Review</p>
     <h1>{{TITLE}}</h1>
+    <p class="subtitle">{{SUBTITLE}}</p>
+    <p class="author">{{AUTHOR}}</p>
   </div>
   <p class="meta" id="meta"></p>
 </header>

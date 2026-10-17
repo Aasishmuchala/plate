@@ -1,0 +1,26 @@
+# Lensbook a05, Season Swap, as a runnable recipe on Nano Banana 2.1 (T83): same hour, different season; vegetation and
+# sky carry the whole change. For marketing sets run all four seasons off one frame: the locked architecture is what
+# makes the series read as one project. One token, [SEASON]; the prompt adapts the trees and the sky to whatever it says.
+schema: 1
+id: season_swap
+title: Season swap
+kind: still_edit
+group: season
+task: vegetation
+library: a05
+engine: nano-banana-2.1
+shot_class: wide
+prefixed: false
+mask:
+  editable_classes: [vegetation, sky, water]
+  region: none
+  lock_rest: true
+params:
+  n: 1
+  size: native
+overrides:
+  "[SEASON]": "autumn"
+prompt: |-
+  This is an approved architectural render. The building, hardscape and framing are ground truth; change only vegetation, sky and atmosphere.
+  Shift the season to [SEASON] at the same hour: deciduous trees take that season's colour and density (amber leaves in autumn, bare branches in winter, new green in spring), ground planting is adjusted to match, the sun angle is correct for the season, and the sky character matches it (crisp, hazy or storm-washed as that season is). Species stay recognisable: the same trees in a different month, not different trees. Architecture, materials and every edge untouched.
+negative_prompt: new objects, removed objects, changed architecture, re-framing, altered perspective, different tree species, rewritten signage text, HDR glow

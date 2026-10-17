@@ -1,0 +1,25 @@
+# Lensbook a04, Monsoon Pass, as a runnable recipe on Nano Banana 2.1 (T83): weather as drama. Wet ground is the gift in
+# the library text; here the ground is locked by policy (only sky, vegetation, water and people change), so name the
+# reflection only where the packet marks that surface editable.
+schema: 1
+id: monsoon_pass
+title: Monsoon pass
+kind: still_edit
+group: weather
+task: relight
+library: a04
+engine: nano-banana-2.1
+shot_class: wide
+prefixed: false
+mask:
+  editable_classes: [sky, vegetation, water, people]
+  region: none
+  lock_rest: true
+params:
+  n: 1
+  size: native
+overrides: {}
+prompt: |-
+  This is an approved architectural render. Architecture, materials and framing are ground truth; add weather only.
+  Heavy monsoon: rain falling in fine visible sheets, planting saturated a deep green and bowing slightly under the water, the sky low and grey with soft even light, mist softening the far background, and the building's own warm interior lights reading against the gloom. Water behaves physically: pooling, streaking and dripping from edges, with correct mirror reflections where a surface is wet. No architectural pixel changes; no reframing.
+negative_prompt: new objects, removed objects, changed architecture, re-framing, altered perspective, rewritten signage text, sunshine, HDR glow, cartoon sky

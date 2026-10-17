@@ -1,0 +1,27 @@
+# Festive dress (T83), built on the season family of the library (a05): the scene dressed for an occasion, the architecture
+# untouched. Editable classes are the ones a dressing can land on: vegetation (garlands, string lights), people (clothing),
+# sky (distant festive lights) and furniture (the ENT_ layers: lanterns, lamps, cushions). Ground and glazing stay locked.
+schema: 1
+id: festive_dress
+title: Festive dress
+kind: still_edit
+group: season
+task: vegetation
+library: a05
+engine: nano-banana-2.1
+shot_class: wide
+prefixed: false
+mask:
+  editable_classes: [vegetation, people, sky, furniture]
+  region: none
+  lock_rest: true
+params:
+  n: 1
+  size: native
+overrides:
+  "[OCCASION]": "Diwali"
+prompt: |-
+  This is an approved architectural render. Architecture, hardscape, materials and framing are ground truth; dress the scene for [OCCASION] and change nothing else.
+  Add the decoration that [OCCASION] calls for, only where this render already has planting, furniture or people: string lights and flower garlands woven into the planting, lanterns, lamps and festive cushions on the existing furniture, and festive clothing on the people already in the scene. Any sky decoration the occasion traditionally has (distant fireworks, lanterns, kites) stays small and far away. Decoration is lit by its own small light and casts correct soft shadows.
+  No new people, no new furniture, no text or signage, and every edge of the architecture stays where it is.
+negative_prompt: new people, new furniture, removed objects, changed architecture, re-framing, altered perspective, text, signage, logos, cluttered decoration, HDR glow

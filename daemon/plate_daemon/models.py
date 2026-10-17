@@ -82,6 +82,8 @@ class Quote(BaseModel):
     size: dict[str, Any] | None = None
     route_id: str | None = None
     price_status: str = "unconfirmed"
+    # The manifest price tier that set the price, "quality=high"-style (None = the plain by[size] / usd price).
+    price_tier: str | None = None
     sibling_group: str | None = None
     sibling_index: int | None = Field(default=None, ge=0)
     siblings: int = Field(default=1, ge=1)

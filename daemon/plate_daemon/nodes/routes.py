@@ -7,6 +7,9 @@
     POST /plugin/jobs         {action, packet_id, ...arguments}: queue a job without a run (the Light editor's
                               "Match in Max" and "Vantage preview" buttons). The project is the packet's.
     GET  /plugin/jobs/{id}    one job, its state and result.
+    GET  /plugin/status       {last_poll_utc, queued, claimed}: when a dock last polled with claim=1 (null: never),
+                              how many jobs wait for one and how many a dock has taken and not answered. The status
+                              bar's "Max dock" chip reads it.
     POST /plugin/jobs/{id}/result
                               the dock's answer {ok, detail?, packet_id?, metrics?, poses?, previews?, packets?}:
                               queued or claimed -> done (ok) or failed; 409 when the job is already finished.
@@ -22,6 +25,10 @@ result, ...arguments}` with these arguments per action:
                            parameter keys), deep, supersedes (= packet_id: the re-render must say so)
     light.vantage_preview  camera
     scout                  count, keep, scene_hash
+    receive                run_id, mode (`vfb_history` | `viewport_background`): the dock reads `GET /runs/{run_id}`,
+                           saves `outputs[0]` from `GET /assets/{hash}` and shows it in Max (display only). Queued
+                           by `POST /plugin/jobs {action: "receive", run_id, mode?}`, which needs no `packet_id`
+                           (the run's is used) and refuses a run with no output (409 `no_output`).
 
 and its answer is `{ok, detail?, packet_id?, metrics?, poses?, previews?, packets?}`: `packet_id` the re-rendered
 packet (Light; the run also finds it by `supersedes`), `metrics` e.g. {de00}, `poses` the scout cameras, `previews`
@@ -41,9 +48,10 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..machine import get_run
 from ..pipeline import PipelineError
 from ..routes import API, ApiError, ctx, pipeline_error, require_token
-from .plugin_queue import ACTIONS, JobStateError, UnknownAction
+from .plugin_queue import ACTIONS, RECEIVE_MODES, JobStateError, UnknownAction
 from .runner import NodeRunner, install
 
 router = APIRouter(prefix=API, dependencies=[Depends(require_token)])
@@ -54,7 +62,7 @@ class JobBody(BaseModel):
 
     model_config = ConfigDict(extra="allow")
     action: str = Field(min_length=1)
-    packet_id: str = Field(min_length=1)
+    packet_id: str | None = Field(default=None, min_length=1)  # every action but `receive` names its packet
 
 
 class ResultBody(BaseModel):
@@ -89,12 +97,56 @@ def list_jobs(
     return {"jobs": [j.to_dict() for j in jobs], "next": max([j.seq for j in jobs], default=max(since, 0))}
 
 
+def _create_receive(request: Request, body: JobBody) -> dict[str, Any]:
+    """Queue a `receive` job: show a run's take in Max. The job belongs to the run (its `run_id`), not to a node run
+    the dock has to answer, so nothing waits on it."""
+    c = ctx(request)
+    runner = runner_of(request)
+    extra = body.model_extra or {}
+    run_id, mode = extra.get("run_id"), extra.get("mode", RECEIVE_MODES[0])
+    if not isinstance(run_id, str) or not run_id:
+        raise ApiError(422, {"errors": ["receive needs a run_id"]})
+    if mode not in RECEIVE_MODES:
+        raise ApiError(422, {"errors": [f"mode must be one of {', '.join(RECEIVE_MODES)}, got {mode!r}"]})
+    project_id = c.index.locate_run(run_id)
+    if project_id is None:
+        raise ApiError(404, {"error": "not_found", "run_id": run_id})
+    with c.index.project(project_id) as conn:
+        run = get_run(conn, run_id)
+    if not run.outputs:
+        raise ApiError(
+            409,
+            {
+                "error": "no_output",
+                "run_id": run_id,
+                "state": run.state.value,
+                "detail": "the run has no take",
+            },
+        )
+    if body.packet_id and body.packet_id != run.packet_id:
+        raise ApiError(422, {"errors": [f"run {run_id} is on packet {run.packet_id}, not {body.packet_id}"]})
+    job = runner.queue.enqueue(
+        action="receive",
+        project_id=project_id,
+        payload={"run_id": run_id, "mode": mode},
+        packet_id=run.packet_id,
+        run_id=run_id,
+        node_id=run.node_id,
+        now=c.now(),
+    )
+    return {"id": job.id, "state": job.state, "seq": job.seq}
+
+
 @router.post("/plugin/jobs", status_code=201)
 def create_job(request: Request, body: JobBody) -> dict[str, Any]:
     c = ctx(request)
     runner = runner_of(request)
     if body.action not in ACTIONS:
         raise ApiError(422, {"error": "unknown_action", "detail": f"the dock handles {', '.join(ACTIONS)}"})
+    if body.action == "receive":
+        return _create_receive(request, body)
+    if not body.packet_id:
+        raise ApiError(422, {"errors": [f"{body.action} needs a packet_id"]})
     project_id = c.index.locate_packet(body.packet_id)
     if project_id is None:
         raise ApiError(404, {"error": "not_found", "packet_id": body.packet_id})
@@ -107,6 +159,12 @@ def create_job(request: Request, body: JobBody) -> dict[str, Any]:
     except (UnknownAction, ValueError) as e:
         raise ApiError(422, {"errors": [str(e)]}) from e
     return {"id": job.id, "state": job.state, "seq": job.seq}
+
+
+@router.get("/plugin/status")
+def plugin_status(request: Request) -> dict[str, Any]:
+    queue = runner_of(request).queue
+    return {"last_poll_utc": queue.last_poll_utc(), **queue.counts()}
 
 
 @router.get("/plugin/jobs/{job_id}")

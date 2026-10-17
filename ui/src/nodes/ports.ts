@@ -1,8 +1,11 @@
 // Typed handles (T35). Every node kind declares its input and output ports and the data each one carries
-// (`image16`, `mask`, `packet`, `video`, `report`); an edge may only join an output to an input that accepts its
-// type. This is the plumbing check that runs before the doctrine rules in canvasRules: a mask never feeds an image
-// input, a report never reaches Export. Handle ids are unique per side of a node, so `image` can be both an input
-// and an output id. An edge with a null handle id uses the first port on that side (xyflow does the same).
+// (`image16`, `mask`, `packet`, `video`, `report`, `reference`); an edge may only join an output to an input that
+// accepts its type. This is the plumbing check that runs before the doctrine rules in canvasRules: a mask never feeds
+// an image input, a report never reaches Export, a reference reaches only an engine's reference input (`refs`,
+// `elements`, `sky`). Handle ids are unique per side of a node, so `image` can be both an input and an output id. An
+// edge with a null handle id uses the first port on that side (xyflow does the same). A Frame (T81) has no ports, so
+// every edge to or from one is refused here as well as by the ANNOTATION rule.
+// The Python mirror of the parts the rules read is `daemon/plate_daemon/canvas_rules.py` PORTS; change both.
 
 import type { HandleType, NodeKind } from "../nodeTypes";
 
@@ -29,14 +32,15 @@ const IMAGE_OUT = [port("image", "image16", "image")] as const;
 export const PORTS: Readonly<Record<NodeKind, KindPorts>> = {
   // The packet's beauty and the packet itself (Z, normals, Cryptomatte, camera) for nodes that read elements.
   Plate: { inputs: [], outputs: [port("image", "image16", "beauty"), port("packet", "packet")] },
-  Edit: { inputs: [port("image", "image16"), port("mask", "mask")], outputs: IMAGE_OUT },
-  // Cryptomatte pick from a packet, or SAM/paint on a Tier C image.
-  Mask: { inputs: [port("source", "packet", "source", ["packet", "image16"])], outputs: [port("mask", "mask")] },
-  Comp: {
-    inputs: [port("base", "image16", "base"), port("layer", "image16", "layer"), port("mask", "mask")],
+  Edit: {
+    inputs: [port("image", "image16"), port("mask", "mask"), port("refs", "reference", "references")],
     outputs: IMAGE_OUT,
   },
-  Colour: { inputs: [port("image", "image16")], outputs: IMAGE_OUT },
+  // Cryptomatte pick from a packet, or SAM/paint on a Tier C image.
+  Mask: { inputs: [port("source", "packet", "source", ["packet", "image16"])], outputs: [port("mask", "mask")] },
+  // Approved mask-locked layers stacked over the base in order (decision 48); each layer carries its own stored mask.
+  Comp: { inputs: [port("base", "image16", "base"), port("layers", "image16", "layers")], outputs: IMAGE_OUT },
+  Colour: { inputs: [port("image", "image16"), port("mask", "mask")], outputs: IMAGE_OUT },
   LightMix: { inputs: [port("packet", "packet", "light selects")], outputs: IMAGE_OUT },
   Recolour: { inputs: [port("packet", "packet", "elements"), port("mask", "mask")], outputs: IMAGE_OUT },
   Gate: {
@@ -49,8 +53,25 @@ export const PORTS: Readonly<Record<NodeKind, KindPorts>> = {
   Judge: { inputs: [port("candidate", "image16", "candidate", ["image16", "video"])], outputs: [port("report", "report")] },
   // Start and end crops of the approved still, the input of a push-in.
   CropPair: { inputs: [port("image", "image16", "still")], outputs: [port("pair", "image16", "start/end")] },
-  Motion: { inputs: [port("image", "image16", "start"), port("packet", "packet")], outputs: [port("video", "video")] },
-  People: { inputs: [port("image", "image16"), port("packet", "packet", "packet Z")], outputs: IMAGE_OUT },
+  // Both stills are VIDEO_LOCKED until gated and approved (decision 49); `elements` are Reference images.
+  Motion: {
+    inputs: [
+      port("image", "image16", "start"),
+      port("end", "image16", "end still"),
+      port("packet", "packet"),
+      port("elements", "reference", "elements"),
+    ],
+    outputs: [port("video", "video")],
+  },
+  People: {
+    inputs: [
+      port("image", "image16"),
+      port("packet", "packet", "packet Z"),
+      port("refs", "reference", "references"),
+      port("clip", "video", "base clip"),
+    ],
+    outputs: IMAGE_OUT,
+  },
   Set: { inputs: [port("views", "image16", "views")], outputs: [port("image", "image16"), port("report", "report")] },
   Compare: {
     inputs: [port("a", "image16", "A", ["image16", "video"]), port("b", "image16", "B", ["image16", "video"])],
@@ -63,6 +84,13 @@ export const PORTS: Readonly<Record<NodeKind, KindPorts>> = {
   Scout: { inputs: [port("packet", "packet")], outputs: [port("packet", "packet")] },
   // Unmeasured: its output exists for looking and comparing; canvasRules keeps it from Export/Review.
   Concept: { inputs: [port("image", "image16", "reference")], outputs: [port("image", "image16", "concept")] },
+  // An image an engine reads (decision 46): feeds `refs`, `elements` or `sky` only; never composited.
+  Reference: { inputs: [], outputs: [port("ref", "reference", "reference")] },
+  // An annotation box (decision 57): no ports, ignored by every rule.
+  Frame: { inputs: [], outputs: [] },
+  // Numeric (decision 48): Koschmieder fog from the packet Z; a reference sky inside the SKY Cryptomatte coverage.
+  Atmosphere: { inputs: [port("packet", "packet")], outputs: IMAGE_OUT },
+  Sky: { inputs: [port("packet", "packet"), port("sky", "reference", "sky")], outputs: IMAGE_OUT },
 };
 
 /** The port a handle id names on one side of a kind; a null id means the first port. */

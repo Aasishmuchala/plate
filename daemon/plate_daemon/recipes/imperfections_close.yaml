@@ -1,0 +1,31 @@
+# Lensbook a08, The Beauty Pass, as a runnable recipe on GPT Image 2.5 (T83): render to photograph, the de-CGI conversion
+# that moves nothing. It runs last, after relights and staffage: grain on top of everything, once. Same doctrine as
+# sunburst_rephotograph_close: AI re-photography of wide or elevated plates was rejected (movie-grade is a render), so the
+# render-it router must call this a close shot or the recipe refuses.
+schema: 1
+id: imperfections_close
+title: Photographic imperfections, close shot
+kind: still_rephotograph
+group: beauty
+task: rephotograph_close
+library: a08
+engine: gpt-image-2.5
+shot_class: close
+prefixed: false
+mask:
+  editable_classes: []
+  region: none
+  lock_rest: false
+router_check:
+  require_shot_class: close
+  refuse_verdicts: [render_it, render_move]
+  note: the render-it router (detail resolvability, disocclusion budget) decides; a close shot that still needs a render is refused
+params:
+  n: 1
+  size: native
+overrides: {}
+prompt: |-
+  Convert this approved architectural render into a photograph without moving a single edge. Keep geometry, materials, composition, lighting design and framing exactly as they are.
+  Apply only photographic character: natural exposure with soft highlight roll-off, subtle film grain, a gentle lens vignette, believable atmospheric haze increasing with depth, and micro-imperfections such as dust motes in the light, faint variation in material sheen and a touch of chromatic softness at the frame corners.
+  No HDR glow, no over-sharpening, no colour-scheme change. The result reads as a photograph of the finished building, with every edge where the render put it.
+negative_prompt: HDR glow, over-sharpening, plastic sheen, repeated stone pattern, added objects, added people, changed geometry, re-framing, text, logos

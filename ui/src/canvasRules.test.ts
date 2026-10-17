@@ -140,7 +140,7 @@ describe("concept tier (doctrine 1)", () => {
   });
 
   it("has no text-to-image or image-creator node kind", () => {
-    expect(NODE_KINDS).toHaveLength(19);
+    expect(NODE_KINDS).toHaveLength(23); // T81 appended Reference, Frame, Atmosphere, Sky
     for (const kind of NODE_KINDS) expect(kind).not.toMatch(/text|creator|prompt|imagine|txt2img/i);
   });
 });

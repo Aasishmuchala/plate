@@ -7,8 +7,44 @@ point. This folder holds the human side of that measurement.
 | file | what | in git |
 |---|---|---|
 | `reason_codes.yaml` | the reason-code table (Lensbook A/F codes plus PLATE P codes); the one source for the labeller and the report | yes |
-| `labels.jsonl` | one JSON line per Ship / Fix / Render-it verdict, written by `tools/plate_label` | no (client-work data, gitignored) |
+| `labels.jsonl` | one JSON line per Ship / Fix / Render-it verdict, written by `tools/plate_label` and by the daemon's verdict route | no: it lives in the data folder, not here (see below) |
 | `report_<date>.md` | calibration report written by `gates/plate_gates/calibration.py` | review first: it names takes and candidate paths |
+
+## Where labels live
+
+Labels are calibration data made from client work, so they never land inside the repo by default. The
+file is `<data home>/calib/labels.jsonl`:
+
+| OS | default path |
+|---|---|
+| Windows | `%LOCALAPPDATA%\Plate\calib\labels.jsonl` |
+| macOS | `~/Library/Application Support/Plate/calib/labels.jsonl` |
+
+`PLATE_HOME` moves the data home (the daemon's `config.Settings.home`, the same folder as `config.json` and
+`index/`). The folder is created on the first label. The labelling tool and the daemon's verdict route
+(`POST /runs/{id}/verdict`, the `1` / `2` / `3` keys on the canvas) resolve the same file, so a canvas verdict
+and a three-key label are lines of one file. The override order, for both, is:
+
+1. `--out FILE` (labelling tool only) or `settings.labels_path` (daemon only),
+2. `PLATE_LABELS` (the exact file),
+3. `<data home>/calib/labels.jsonl`.
+
+`python -m plate_label stats` prints the file it read (`N label(s) in <path>`), which is the path to hand to
+the calibration report:
+
+```
+python -m plate_label stats
+python -m plate_gates.calibration report --reports <project>/gates --labels "<that path>"
+```
+
+Pass `--labels` every time: the calibration CLI is pointed at the file, not at a default location.
+
+An older build wrote `calib/labels.jsonl` inside the repo. If one is still there it is read once per process
+(the labelling tool counts it with the default file; the daemon only notices it) with a printed warning that
+names where labels go now, and it is never written. Move it into the data folder to keep the labels, or delete
+it; lines from audit and smoke runs do not belong in a calibration set. Pointing `PLATE_LABELS` or `--out` at a
+repo path on purpose is still allowed: that is an explicit choice, and the file then counts as the target, not
+as a legacy file.
 
 ## Labelling
 
@@ -43,7 +79,7 @@ A second rater double-labels about 100 takes (`--rater` another name) for the ag
 ## Calibration report
 
 ```
-python -m plate_gates.calibration report --reports <project>/gates [--labels calib/labels.jsonl] [--rater aasish] [--out FILE]
+python -m plate_gates.calibration report --reports <project>/gates --labels <labels.jsonl, see above> [--rater aasish] [--out FILE]
 python -m plate_gates.calibration report --reports <dir> --threshold 0.93 --strict    # held-out run, exit 1 if the bet fails
 ```
 

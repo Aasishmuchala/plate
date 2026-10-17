@@ -378,7 +378,7 @@ describe("maskMath: pointer mapping, the paint raster and the PNG", () => {
   });
 
   it("works at a size that keeps the aspect, never upscaled", () => {
-    expect(workSize(PLATE)).toEqual({ width: 1024, height: 572 });
+    expect(workSize(PLATE)).toEqual({ width: 2048, height: 1143 }); // T82: MAX_RASTER_SIDE 2048
     expect(workSize({ width: 640, height: 360 })).toEqual({ width: 640, height: 360 });
     expect(workSize({ width: 100, height: 4000 }, 1000)).toEqual({ width: 25, height: 1000 });
   });
@@ -821,7 +821,7 @@ describe("MaskEditor", () => {
     openGraph("Mask");
     mount(<MaskEditor nodeId="n1" />);
     fireEvent.click(screen.getByTestId("mask-tab-paint"));
-    expect(screen.getByTestId("mask-paint-coverage")).toHaveTextContent("painted 0.0% of the frame at 1024x572");
+    expect(screen.getByTestId("mask-paint-coverage")).toHaveTextContent("painted 0.0% of the frame at 2048x1143");
     expect(screen.getByTestId("mask-paint-save")).toBeDisabled();
 
     const stage = screen.getByTestId("mask-stage");
@@ -831,8 +831,8 @@ describe("MaskEditor", () => {
     pointerAt(stage, 0.75, 0.5, "pointerUp");
     const covText = screen.getByTestId("mask-paint-coverage").textContent ?? "";
     const pct = parseFloat(/painted ([\d.]+)%/.exec(covText)?.[1] ?? "0");
-    // a 12 px brush along half the frame width: about 2.2% of a 1024x572 raster
-    expect(pct).toBeGreaterThan(2);
+    // a 12 px brush along half the frame width: about 1.1% of a 2048x1143 raster
+    expect(pct).toBeGreaterThan(1);
     expect(drawn.putImageData).toHaveBeenCalled();
     const lastImage = drawn.putImageData.mock.calls.at(-1)?.[0] as { data: Uint8ClampedArray };
     expect(lastImage.data.some((v) => v > 0)).toBe(true);
@@ -852,11 +852,11 @@ describe("MaskEditor", () => {
     fireEvent.click(screen.getByTestId("mask-paint-save"));
     await waitFor(() => expect(paramsOf().maskHash).toBe("mask_hash_0123456789abcdef"));
     const up = calls.find((c) => c.method === "POST" && c.path === "/assets");
-    expect(up?.search).toBe("?kind=mask&project_id=p1");
+    expect(up?.search).toBe("?kind=mask&project_id=p1&packet_id=room_a"); // T82: the daemon scales it to the plate
     const png = up?.body as Uint8Array;
     expect(Array.from(png.subarray(0, 4))).toEqual([0x89, 0x50, 0x4e, 0x47]);
     const view = new DataView(png.buffer, png.byteOffset, png.byteLength);
-    expect([view.getUint32(16), view.getUint32(20)]).toEqual([1024, 572]);
+    expect([view.getUint32(16), view.getUint32(20)]).toEqual([2048, 1143]);
     expect(screen.getByTestId("mask-output-chip")).toHaveTextContent("mask mask_hash_");
   });
 

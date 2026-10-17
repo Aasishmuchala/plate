@@ -1,0 +1,26 @@
+# Lensbook a03, Twilight Hero, as a runnable recipe on Nano Banana 2.1 (T83): the dusk money shot. The working rule of
+# twilight is a sky two stops darker than the interiors; say so in a second pass if the balance comes back flat.
+schema: 1
+id: twilight_hero
+title: Twilight hero
+kind: still_edit
+group: lighting
+task: relight
+library: a03
+engine: nano-banana-2.1
+shot_class: wide
+prefixed: false
+mask:
+  editable_classes: [sky, vegetation, water, people]
+  region: none
+  lock_rest: true
+params:
+  n: 1
+  size: native
+overrides:
+  "[2700K]": "2700K"
+  "[WATER FEATURE]": "any pool or water feature in the scene"
+prompt: |-
+  This is an approved architectural render. Geometry, materials and framing are ground truth; change only light and sky.
+  Set the scene 20 minutes after sunset: a deep ultramarine sky with a last warm band at the horizon, every interior light on with a warm [2700K] glow washing through the glazing, facade lighting grazing the material texture, [WATER FEATURE] lit from beneath and glowing, and the first stars barely visible. The building becomes a lantern; exposure is balanced between sky and interiors the way a twilight photographer would bracket it. Every edge stays where it is.
+negative_prompt: new objects, removed objects, changed architecture, re-framing, altered perspective, rewritten signage text, HDR glow, daylight cast, cartoon sky

@@ -181,7 +181,7 @@ def test_assemble_prepends_the_filled_style_prefix_to_shots_only():
 
 def test_three_p1_recipes_are_shipped_and_load():
     names = recipes.list_runnable()
-    assert names == ["croppair_pushin", "night_relight_changelist", "sunburst_rephotograph_close"]
+    assert {"croppair_pushin", "night_relight_changelist", "sunburst_rephotograph_close"} <= set(names)
     assert len(list(recipes.RECIPES_DIR.glob("*.yaml"))) >= 3
     by = {n: recipes.load_runnable(n) for n in names}
     night, sun, push = (

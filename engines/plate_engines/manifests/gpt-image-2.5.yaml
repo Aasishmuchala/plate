@@ -41,6 +41,11 @@ price:
   model: per_image
   usd: 0.16
   by: {"1K_high": 0.16, "1K_medium": 0.07}
+  # T84: priced by the quality param (first matching row wins; the params default is medium).
+  tiers:
+    - {match: {quality: high}, usd: 0.16}
+    - {match: {quality: medium}, usd: 0.07}
+    - {match: {quality: low}, usd: 0.03, status: estimated, note: "no reading; half of medium"}
   status: unconfirmed
   source: "VIZMAKER.md section 4: in-app readings at USD 0.12 per credit (1K high create 1.35 credits, 1K medium edit 0.56). They carry reseller markup (0.8 to 3.1x OpenAI list), so treat them as a rough ceiling, not the OpenAI price."
   as_of: 2026-10-17

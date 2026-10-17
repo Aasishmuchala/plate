@@ -1,7 +1,10 @@
 // Colour helpers for the Recolour and Set editors: the built-in RAL table, target parsing (RAL code or hex), and sRGB
 // <-> Lab for swatches. The RAL values are the published sRGB approximations `plate_gates.recolour.RAL_SRGB` carries
 // (the official RAL Lab values are licensed, so a job enters the swatch's measured Lab or the hex the material was
-// built from). Display only: the daemon owns the recolour math.
+// built from). `RAL_SRGB` is those 15 codes; the whole RAL Classic table for the picker is `ralTable.ts`, and
+// `parseTarget` reads any of its codes. Display only: the daemon owns the recolour math.
+
+import { RAL_BY_CODE } from "./ralTable";
 
 export const RAL_SRGB: Readonly<Record<string, string>> = {
   "1015": "#E6D2B5",
@@ -42,7 +45,7 @@ export function parseTarget(text: string): TargetResult {
   const ral = /^(?:ral)?\s*(\d{4})$/i.exec(raw);
   if (ral && ral[1] !== undefined) {
     const code = ral[1];
-    const hex = RAL_SRGB[code];
+    const hex = RAL_SRGB[code] ?? RAL_BY_CODE.get(code)?.hex;
     if (hex) return { ok: true, target: { kind: "ral", code, hex, label: `RAL ${code}` } };
     // four hex digits are not a colour, so a four-digit number that is not in the table is an unknown RAL code
     return { ok: false, reason: `RAL ${code} is not in the built-in table: enter its hex or a measured swatch` };
@@ -94,6 +97,100 @@ export function labToHex(lab: readonly [number, number, number]): string {
 
 /** `L 54.2  a 3.1  b -2.0`. */
 export const labText = (lab: readonly [number, number, number]): string => `L ${lab[0].toFixed(1)}  a ${lab[1].toFixed(1)}  b ${lab[2].toFixed(1)}`;
+
+// ------------------------------------------------------------------------------------------------ project swatches
+
+/** A colour the project measured or was given, kept in this browser: a hex or a Lab (or both) plus where it came from. */
+export interface Swatch {
+  name: string;
+  hex?: string;
+  lab?: [number, number, number];
+  /** How it was measured (instrument, date, light), free text. */
+  note?: string;
+}
+
+/** Where a project's swatches live: `localStorage["plate.swatches.<projectId>"]`, a JSON list of `Swatch`. */
+export const swatchStorageKey = (projectId: string): string => `plate.swatches.${projectId}`;
+
+/** The colour to show for a swatch: its hex, else its Lab converted. */
+export const swatchHex = (s: Swatch): string => (s.hex ? s.hex : s.lab ? labToHex(s.lab) : "#000000");
+
+const isLab = (v: unknown): v is [number, number, number] => Array.isArray(v) && v.length === 3 && v.every((n) => typeof n === "number" && Number.isFinite(n));
+
+function toSwatch(v: unknown): Swatch | null {
+  if (typeof v !== "object" || v === null) return null;
+  const o = v as Record<string, unknown>;
+  if (typeof o.name !== "string" || o.name.trim() === "") return null;
+  const hex = typeof o.hex === "string" ? normalizeHex(o.hex) : null;
+  const lab = isLab(o.lab) ? ([o.lab[0], o.lab[1], o.lab[2]] as [number, number, number]) : null;
+  if (!hex && !lab) return null;
+  const out: Swatch = { name: o.name.trim() };
+  if (hex) out.hex = hex;
+  if (lab) out.lab = lab;
+  if (typeof o.note === "string" && o.note.trim() !== "") out.note = o.note.trim();
+  return out;
+}
+
+/** The project's swatches; an unreadable or blocked store is an empty list, and an entry that is not a swatch is dropped. */
+export function loadSwatches(projectId: string | null): Swatch[] {
+  if (!projectId) return [];
+  try {
+    const raw = window.localStorage.getItem(swatchStorageKey(projectId));
+    const data: unknown = raw === null ? [] : JSON.parse(raw);
+    if (!Array.isArray(data)) return [];
+    return data.map(toSwatch).filter((s): s is Swatch => s !== null);
+  } catch {
+    return [];
+  }
+}
+
+/** Write the list; false when the browser refuses (storage blocked or full). */
+export function saveSwatches(projectId: string, swatches: readonly Swatch[]): boolean {
+  try {
+    window.localStorage.setItem(swatchStorageKey(projectId), JSON.stringify(swatches));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export type SwatchResult = { ok: true; swatch: Swatch } | { ok: false; reason: string };
+
+/**
+ * A swatch from the add form. `value` is a hex (`#383E42`) or a Lab: three numbers, with or without the letters
+ * (`54.2 3.1 -2.0`, `L 54.2 a 3.1 b -2.0`, `54.2, 3.1, -2.0`). A Lab keeps its exact numbers; its hex is only for display.
+ */
+export function readSwatchInput(name: string, value: string, note: string): SwatchResult {
+  const label = name.trim();
+  if (label === "") return { ok: false, reason: "name the swatch" };
+  const out: Swatch = { name: label };
+  const hex = normalizeHex(value);
+  if (hex) out.hex = hex;
+  else {
+    const nums = value.match(/[-+]?\d+(?:\.\d+)?/g)?.map(Number) ?? [];
+    const [L, a, b] = nums;
+    if (nums.length !== 3 || L === undefined || a === undefined || b === undefined || !nums.every(Number.isFinite)) {
+      return { ok: false, reason: "enter a hex (#383E42) or a Lab as three numbers (L a b)" };
+    }
+    if (L < 0 || L > 100) return { ok: false, reason: "L is between 0 and 100" };
+    if (Math.abs(a) > 160 || Math.abs(b) > 160) return { ok: false, reason: "a and b are between -160 and 160" };
+    out.lab = [L, a, b];
+  }
+  const n = note.trim();
+  if (n !== "") out.note = n;
+  return { ok: true, swatch: out };
+}
+
+/** What a picked swatch writes to `params.target`: its hex, or for a Lab the `{lab, label}` form the daemon reads. */
+export const swatchTarget = (s: Swatch): string | { lab: [number, number, number]; label: string } =>
+  s.lab ? { lab: s.lab, label: s.name } : swatchHex(s);
+
+/** `{lab, label}` as `swatchTarget` wrote it, else null. */
+export function labTargetOf(v: unknown): { lab: [number, number, number]; label: string } | null {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return null;
+  const o = v as Record<string, unknown>;
+  return isLab(o.lab) ? { lab: [o.lab[0], o.lab[1], o.lab[2]], label: typeof o.label === "string" ? o.label : "lab" } : null;
+}
 
 /** Mood presets for the LightMix gain sliders (`plate_gates.lightmix.mood_presets`): initial guesses, never a solution. */
 export const MOOD_PRESETS: Readonly<Record<string, Readonly<Record<string, number>>>> = {

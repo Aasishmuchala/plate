@@ -8,8 +8,12 @@
   a Tier C packet has no Cryptomatte and answers 422 `{"error": "no_cryptomatte"}`). A pixel nothing covers
   answers with `id: null`.
 - `segment {packet_id, points?: [[x, y], ...]}` runs the pixels worker's segmenter on the packet's display
-  master and stores the 16-bit label PNG in the project CAS: `{mask_hash, segments, shape, stub}`. `stub` is
-  true when the answer came from a stub backend, which is never a measurement.
+  master and stores the 16-bit label PNG in the project CAS as `labels_hash`. The clicked segments are the
+  labels under the points (`selected`, label 0 is no segment and a point off the plate selects nothing); their
+  union is an 8-bit grey 0/255 PNG at the plate's size, stored as `mask_hash`, which is what a Mask node's
+  `samHash` names (router plan T82). `{mask_hash, labels_hash, segments, selected, shape, stub}`; with no
+  points, or none on a segment, `mask_hash` is null. `stub` is true when the answer came from a stub backend,
+  which is never a measurement.
 - `ocr {packet_id}` runs the worker's text detector on the display master: `{boxes: [{bbox: [x0, y0, x1, y1],
   text, conf}], shape: [h, w], stub}`.
 
@@ -24,6 +28,7 @@ import math
 from pathlib import Path
 from typing import Any, Literal
 
+import cv2
 import numpy as np
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -104,6 +109,16 @@ def plate_path(pv: PacketView) -> Path:
             {"error": "packet_unreadable", "packet_id": pv.packet_id, "detail": f"{path.name} is missing"},
         )
     return path
+
+
+def plate_size(pv: PacketView) -> tuple[int, int]:
+    """(H, W) of the packet's display master: the manifest's own numbers, else the decoded plate's shape."""
+    entry = pv.files.get(pv.plate_role) or {}
+    w, h = entry.get("width"), entry.get("height")
+    if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+        return h, w
+    shape = pv.plate16().shape
+    return int(shape[0]), int(shape[1])
 
 
 def pixels_failure(e: PixelsError) -> ApiError:
@@ -238,6 +253,47 @@ def post_idpick(request: Request, body: IdpickBody) -> dict[str, Any]:
 # ---------------------------------------------------------------------------- segment and ocr
 
 
+def decode_labels(png: bytes) -> np.ndarray | None:
+    """The worker's label map as a 2-D integer array (16-bit grey PNG); None when it is not one."""
+    try:
+        labels = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_UNCHANGED) if png else None
+    except cv2.error:
+        return None
+    if labels is None or labels.ndim != 2 or labels.dtype not in (np.uint8, np.uint16):
+        return None
+    return labels
+
+
+def selected_labels(labels: np.ndarray, points: list[tuple[float, float]]) -> list[int]:
+    """The segment ids under the points (pixel = floor of the point), ascending; 0 and off-plate points skipped."""
+    height, width = labels.shape[:2]
+    out: set[int] = set()
+    for x, y in points:
+        px, py = math.floor(x), math.floor(y)
+        if 0 <= px < width and 0 <= py < height:
+            value = int(labels[py, px])
+            if value:
+                out.add(value)
+    return sorted(out)
+
+
+def at_plate_size(labels: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """The label map on the plate's (H, W) pixel grid. A worker that answered at another size (a real model's own
+    input size) is brought to the plate nearest-neighbour, so points and the mask land where the quote checks."""
+    if labels.shape[:2] == size:
+        return labels
+    return cv2.resize(labels, (size[1], size[0]), interpolation=cv2.INTER_NEAREST)
+
+
+def selection_mask_png(labels: np.ndarray, selected: list[int]) -> bytes:
+    """8-bit grey PNG of the label map's size, 255 where the label is one of `selected`, else 0."""
+    mask = np.where(np.isin(labels, np.asarray(selected, dtype=labels.dtype)), 255, 0).astype(np.uint8)
+    ok, buf = cv2.imencode(".png", np.ascontiguousarray(mask))
+    if not ok:
+        raise ApiError(502, {"error": "pixels_failed", "detail": "cv2 could not encode the segment mask"})
+    return bytes(buf)
+
+
 @router.post("/pixels/segment")
 def post_segment(request: Request, body: SegmentBody) -> dict[str, Any]:
     c = ctx(request)
@@ -253,10 +309,35 @@ def post_segment(request: Request, body: SegmentBody) -> dict[str, Any]:
         raise pixels_failure(e) from e
     except OSError as e:
         raise ApiError(502, {"error": "pixels_failed", "detail": f"cannot read the label map: {e}"}) from e
-    mask_hash = c.cas_for(project_id).put_bytes(png, "png")
+    labels = decode_labels(png)
+    if labels is None:
+        raise ApiError(502, {"error": "pixels_failed", "detail": "the label map is not a grey PNG"})
+    cas = c.cas_for(project_id)
+    labels_hash = cas.put_bytes(png, "png")
+    mask_hash, selected = None, []
+    if body.points:
+        try:
+            size = plate_size(pv)
+        except PipelineError as e:
+            raise pipeline_error(e) from e
+        except (OSError, ValueError) as e:
+            raise ApiError(
+                409,
+                {
+                    "error": "packet_unreadable",
+                    "packet_id": body.packet_id,
+                    "detail": f"{type(e).__name__}: {e}",
+                },
+            ) from e
+        on_plate = at_plate_size(labels, size)
+        selected = selected_labels(on_plate, body.points)
+        if selected:
+            mask_hash = cas.put_bytes(selection_mask_png(on_plate, selected), "png")
     return {
         "mask_hash": mask_hash,
+        "labels_hash": labels_hash,
         "segments": result["segments"],
+        "selected": selected,
         "shape": result["shape"],
         "stub": result["stub"],
     }

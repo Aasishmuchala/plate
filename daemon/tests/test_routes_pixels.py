@@ -259,15 +259,17 @@ def test_segment_stores_the_label_map_in_the_project_cas(client, auth):
     body = r.json()
     assert body["shape"] == list(SHAPE) and body["stub"] is True
     assert body["segments"] and {"id", "bbox", "area"} <= set(body["segments"][0])
-    got = client.get(f"/api/v0/assets/{body['mask_hash']}", headers=auth)
+    got = client.get(f"/api/v0/assets/{body['labels_hash']}", headers=auth)
     assert got.status_code == 200 and got.headers["content-type"] == "image/png"
     labels = cv2.imdecode(np.frombuffer(got.content, np.uint8), cv2.IMREAD_UNCHANGED)
     assert labels.shape == SHAPE and labels.dtype == np.uint16
     assert sorted(int(v) for v in np.unique(labels) if v) == sorted(s["id"] for s in body["segments"])
-    # the same call again lands on the same content-named object
+    assert body["selected"] == [int(labels[180, 320])]  # T82: the clicked segment, as a plate-sized mask
+    # the same call again lands on the same content-named objects
     again = client.post(
         "/api/v0/pixels/segment", json={"packet_id": client.packet_id, "points": [[320, 180]]}, headers=auth
     )
+    assert again.json()["labels_hash"] == body["labels_hash"]
     assert again.json()["mask_hash"] == body["mask_hash"]
 
 

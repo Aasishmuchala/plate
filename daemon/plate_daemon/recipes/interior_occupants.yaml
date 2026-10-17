@@ -1,0 +1,26 @@
+# Lensbook a07, Interior Occupants, as a runnable recipe on Nano Banana 2.1 (T83): the interior render, inhabited. One
+# person mid-action (pouring, reaching, turning) makes the frame read candid instead of staged.
+schema: 1
+id: interior_occupants
+title: Interior occupants
+kind: still_edit
+group: people
+library: a07
+engine: nano-banana-2.1
+shot_class: wide
+prefixed: false
+task: people
+mask:
+  editable_classes: [people]
+  region: none
+  lock_rest: true
+params:
+  n: 1
+  size: native
+overrides:
+  "[OCCUPANT COUNT]": "two"
+  "[OCCUPANT ACTIONS]": "one seated reading, one at the glazing looking out"
+prompt: |-
+  This is an approved interior render. Architecture, furniture, materials, lighting and framing are ground truth; add people only.
+  Place [OCCUPANT COUNT] occupants living naturally in the space: [OCCUPANT ACTIONS]. They are at true scale to the furniture and dressed in quiet tones. Each is lit by the room's existing light with correct shadows, and appears in reflections (glass, stone, polished surfaces) exactly where physics puts them. No furniture moves; no object is added or removed; no reframing.
+negative_prompt: moved furniture, new furniture, removed objects, changed architecture, re-framing, altered perspective, crowds, text, logos, floating people

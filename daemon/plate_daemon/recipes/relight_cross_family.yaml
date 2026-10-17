@@ -1,0 +1,29 @@
+# Lensbook a02, Cross-Family Relight, as a runnable recipe on Nano Banana 2.1 (T83). Day to dusk or night is powerful and
+# honestly priced: budget 3-5 attempts, often wrong. If the light must be exact, light it in V-Ray and use the AI only for
+# the close re-photograph (imperfections_close). Source view only: the plate is relit in place, never re-angled.
+schema: 1
+id: relight_cross_family
+title: Cross-family relight
+kind: still_edit
+group: lighting
+task: relight
+library: a02
+engine: nano-banana-2.1
+shot_class: wide
+prefixed: false
+mask:
+  editable_classes: [sky, vegetation, water, people]
+  region: none
+  lock_rest: true
+params:
+  n: 1
+  size: native
+overrides:
+  "[FROM LIGHT]": "midday daylight"
+  "[TO LIGHT]": "dusk"
+  "[SKY STATE]": "a deep blue-hour sky with a last warm band at the horizon"
+prompt: |-
+  This is an approved architectural render. Every architectural pixel is ground truth; only the lighting regime changes.
+  Convert the scene from [FROM LIGHT] to [TO LIGHT]: the sky is replaced with [SKY STATE], direct sun is off and the ambient level drops accordingly, interior lights are on and glow warm through the glazing, landscape and facade fixtures are lit, shadows dissolve into soft ambient darkness, and reflections update to the new sources.
+  Every wall, edge, material and proportion stays exactly in place. No reframing, no new objects.
+negative_prompt: new objects, removed objects, changed architecture, re-framing, altered perspective, rewritten signage text, daylight cast, HDR glow, cartoon sky

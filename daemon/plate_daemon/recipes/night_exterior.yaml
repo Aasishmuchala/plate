@@ -1,0 +1,26 @@
+# Lensbook a10, Night Exterior, as a runnable recipe on Nano Banana 2.1 (T83): full night, the building lit as designed,
+# the world asleep. Night frames die from over-lighting: "only the designed fixtures are on" keeps it honest. The
+# change-list form of the same job, tuned on real night reveals, is night_relight_changelist.
+schema: 1
+id: night_exterior
+title: Night exterior
+kind: still_edit
+group: lighting
+task: relight
+library: a10
+engine: nano-banana-2.1
+shot_class: wide
+prefixed: false
+mask:
+  editable_classes: [sky, vegetation, water, people]
+  region: none
+  lock_rest: true
+params:
+  n: 1
+  size: native
+overrides:
+  "[WATER FEATURE]": "any water feature in the scene"
+prompt: |-
+  This is an approved architectural render. Geometry, materials and framing are ground truth; change only the time to full night.
+  Moonlight provides a cool ambient base; the lighting design carries the frame: interior glow through the glazing, facade grazers revealing texture, path and landscape fixtures on, and [WATER FEATURE] softly lit. Only the designed fixtures are on. The sky is deep and clear with faint stars and no clouds competing. Long-exposure calm: no people, no movement, every reflection still. Shadows are deep but never crushed to black; the architecture stays legible in the darkness.
+negative_prompt: over-lit scene, daylight cast, HDR glow, new objects, removed objects, changed architecture, re-framing, altered perspective, cartoon sky, text

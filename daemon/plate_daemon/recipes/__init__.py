@@ -9,8 +9,10 @@ Library (ported verbatim from ~/Desktop/lensbook/lib/data.ts and assemble.ts):
 * `repairs.yaml`: repair codes A1 to A5 and F2 to F12, vegetation tells T1 to T10, material tells M1 to M8.
 * `project_sheet.yaml`: the 14 Project Sheet fields and the 17 token rules behind `fill_tokens`.
 
-Runnable (`RunnableRecipe`, what `plate run <recipe.yaml>` takes): `night_relight_changelist`,
-`sunburst_rephotograph_close`, `croppair_pushin`. The schema is in README.md.
+Runnable (`RunnableRecipe`, what `plate run <recipe.yaml>` takes) come from three folders, a later one
+shadowing an earlier id: `shipped` (this package: the three P1 recipes and Lensbook's a01 to a10 promoted to
+runnable), `studio` (`<app-data>/recipes/`) and `project` (`<project>/recipes/`). `save_runnable` writes the
+second and third; the shipped folder is never written. The schema is in README.md.
 
 Nothing here talks to a vendor or a model: the composer (`plate_daemon.llm.composer`) calls `assemble` for its
 template-only path and for the text it hands the model.
@@ -18,7 +20,10 @@ template-only path and for the text it hands the model.
 
 from __future__ import annotations
 
+import copy
+import logging
 import re
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
@@ -27,12 +32,18 @@ from typing import Any
 
 import yaml
 
+from ..config import app_home
+from ..fsutil import write_bytes_atomic
+
 __all__ = [
     "DEFAULT_NEGATIVE_PROMPT",
+    "KINDS",
+    "ORIGINS",
     "RECIPES_DIR",
     "RISKS",
     "Recipe",
     "RecipeError",
+    "RecipeExists",
     "RepairRow",
     "RiskRow",
     "RunnableRecipe",
@@ -43,21 +54,31 @@ __all__ = [
     "assemble_runnable",
     "fill_tokens",
     "get_recipe",
+    "is_recipe_id",
     "list_runnable",
     "load_runnable",
     "mat_tells",
+    "parse_runnable",
+    "project_recipes_dir",
     "repair",
     "repairs",
     "risk_for",
     "risk_ladder",
+    "runnable_entries",
+    "save_runnable",
     "shots",
     "stills",
+    "studio_dir",
     "token_rules",
     "unfilled_count",
+    "unfilled_tokens",
     "veg_tells",
 ]
 
+log = logging.getLogger("plate_daemon")
+
 RECIPES_DIR = Path(__file__).resolve().parent
+ORIGINS = ("shipped", "studio", "project")  # the order of the folders; a later one shadows an earlier id
 RISKS = ("none", "low", "med", "high", "highest")
 KINDS = ("still_edit", "still_rephotograph", "motion_croppair")
 REGIONS = ("none", "mask_bbox")
@@ -69,10 +90,19 @@ DEFAULT_NEGATIVE_PROMPT = (
 )
 _BRACKET = re.compile(r"\[([^\]]+)\]")
 _ID = re.compile(r"^[a-z][a-z0-9_]*$")
+# A recipe id is a file name; these are device names on Windows whatever the extension.
+_RESERVED_IDS = frozenset(
+    {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+)
+_CAS_HASH = re.compile(r"^[0-9a-f]{16,128}$")
 
 
 class RecipeError(ValueError):
     """A recipe file or lookup that does not fit the schema."""
+
+
+class RecipeExists(RecipeError):
+    """`save_runnable` found the id already taken (in this folder or another) and `overwrite` was off."""
 
 
 # ---------------------------------------------------------------------------- loading
@@ -357,6 +387,11 @@ def unfilled_count(text: str) -> int:
     return len(_BRACKET.findall(text))
 
 
+def unfilled_tokens(text: str) -> list[str]:
+    """The [TOKEN] texts the text still carries, each once, in order of appearance (what an override is keyed by)."""
+    return list(dict.fromkeys(m.group(0) for m in _BRACKET.finditer(text)))
+
+
 def assemble(recipe: Any, sheet: ProjectSheet, overrides: Mapping[str, str] | None = None) -> str:
     """Copy-ready text for a recipe: `prefixed` recipes get the filled Style Prefix on top. Works for a library
     `Recipe` and a `RunnableRecipe` (anything with `.prompt` and `.prefixed`)."""
@@ -374,7 +409,9 @@ class RunnableRecipe:
     """A recipe `plate run` can execute: which engine, what the mask allows, how the router checks it.
 
     `overrides` are the recipe's own token defaults (literal "[TOKEN]" keys) so it runs without a composer;
-    `library` names the Lensbook recipe whose doctrine it applies."""
+    `library` names the Lensbook recipe whose doctrine it applies. `origin` is derived from the folder the file
+    was found in (never written), `group` heads the recipe in a grouped select, `thumbnail` is a CAS hash and
+    `task` the engine-card task (`plate_engines.tasks`) the recipe's runs belong to (None = the node decides)."""
 
     id: str
     title: str
@@ -392,6 +429,10 @@ class RunnableRecipe:
     negative_prompt: str | None = None
     prefixed: bool = False
     source: str = ""
+    origin: str = "shipped"
+    group: str | None = None
+    thumbnail: str | None = None
+    task: str | None = None
 
 
 def _mapping(
@@ -407,12 +448,14 @@ def _mapping(
     return dict(v)
 
 
-def _runnable_from(doc: Any, where: str) -> RunnableRecipe:
+def _runnable_from(doc: Any, where: str, origin: str = "shipped") -> RunnableRecipe:
     if not isinstance(doc, dict) or doc.get("schema") != 1:
         raise RecipeError(f"{where}: expected a mapping with schema: 1")
     rid = str(_text(doc, "id", where))
     if not _ID.match(rid):
         raise RecipeError(f"{where}: id {rid!r} must be lower_snake_case")
+    if rid in _RESERVED_IDS:
+        raise RecipeError(f"{where}: id {rid!r} is a reserved device name on Windows; pick another")
     kind = doc.get("kind")
     if kind not in KINDS:
         raise RecipeError(f"{where}: kind must be one of {list(KINDS)}, got {kind!r}")
@@ -442,6 +485,16 @@ def _runnable_from(doc: Any, where: str) -> RunnableRecipe:
     ]
     if bad:
         raise RecipeError(f"{where}: overrides keys must be literal [TOKEN] text with a text value: {bad}")
+    group = _text(doc, "group", where, required=False)
+    thumbnail = _text(doc, "thumbnail", where, required=False)
+    if thumbnail is not None and not _CAS_HASH.match(thumbnail):
+        raise RecipeError(f"{where}: thumbnail must be a CAS hash (lower-case hex), got {thumbnail!r}")
+    task = _text(doc, "task", where, required=False)
+    if task is not None:
+        from plate_engines.tasks import TASKS
+
+        if task not in TASKS:
+            raise RecipeError(f"{where}: task must be one of {sorted(TASKS)}, got {task!r}")
     return RunnableRecipe(
         id=rid,
         title=str(_text(doc, "title", where)),
@@ -459,34 +512,184 @@ def _runnable_from(doc: Any, where: str) -> RunnableRecipe:
         negative_prompt=_text(doc, "negative_prompt", where, required=False),
         prefixed=bool(doc.get("prefixed", False)),
         source=where,
+        origin=origin,
+        group=group,
+        thumbnail=thumbnail,
+        task=task,
     )
 
 
-def list_runnable() -> list[str]:
-    """Ids of the runnable recipes shipped beside this module (the files with a `kind:` key)."""
-    out = []
-    for path in sorted(RECIPES_DIR.glob("*.yaml")):
+def is_recipe_id(name: str) -> bool:
+    """True for a string that can name a runnable recipe (and so a file `<id>.yaml`): lower_snake_case, not a
+    Windows device name. A caller that takes an id from outside checks this before `load_runnable`, which would
+    treat anything ending in `.yaml` as a file path."""
+    return bool(_ID.match(name)) and name not in _RESERVED_IDS
+
+
+def parse_runnable(doc: Any, origin: str = "project") -> RunnableRecipe:
+    """Validate a schema-1 recipe doc (what `save_runnable` checks first) without writing anything."""
+    if not isinstance(doc, Mapping):
+        raise RecipeError("a recipe must be a mapping")
+    return _runnable_from({k: v for k, v in doc.items() if k != "origin"}, "recipe", origin)
+
+
+def studio_dir() -> Path:
+    """`<app-data>/recipes`: the studio's own recipes (`PLATE_HOME` moves it, as it moves the rest of app data)."""
+    return app_home() / "recipes"
+
+
+def project_recipes_dir(project_dir: Path | str) -> Path:
+    """`<project>/recipes`: recipes that travel with one project."""
+    return Path(project_dir) / "recipes"
+
+
+def _folders(project_dir: Path | str | None) -> list[tuple[str, Path]]:
+    folders = [("shipped", RECIPES_DIR), ("studio", studio_dir())]
+    if project_dir is not None:
+        folders.append(("project", project_recipes_dir(project_dir)))
+    return folders
+
+
+_DOCS: dict[str, tuple[int, int, Any]] = {}
+_DOCS_LOCK = threading.Lock()
+
+
+def _read_doc(path: Path) -> Any:
+    """`yaml.safe_load` of a recipe file, kept until the file's mtime or size changes: listing the recipes
+    parses every file in three folders and loading one asks for the list again, so without this a catalogue
+    request is quadratic in the number of recipes. Callers must not mutate what they get back."""
+    st = path.stat()
+    stamp = (st.st_mtime_ns, st.st_size)
+    key = str(path)
+    with _DOCS_LOCK:
+        hit = _DOCS.get(key)
+    if hit is not None and hit[:2] == stamp:
+        return hit[2]
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    with _DOCS_LOCK:
+        _DOCS[key] = (*stamp, doc)
+    return doc
+
+
+def _scan(origin: str, folder: Path) -> dict[str, Path]:
+    """{id: path} of the runnable recipe files in `folder` (a `kind:` key from `KINDS`; the id is the file
+    stem, which is also how `load_runnable` finds it). A file that cannot be read is left out."""
+    found: dict[str, Path] = {}
+    if not folder.is_dir():
+        return found
+    for path in sorted(folder.glob("*.yaml")):
         try:
-            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError):
+            doc = _read_doc(path)
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
             continue
-        if isinstance(doc, dict) and doc.get("kind") in KINDS:
-            out.append(str(doc.get("id", path.stem)))
+        if not (isinstance(doc, dict) and doc.get("kind") in KINDS):
+            continue
+        if str(doc.get("id", path.stem)) != path.stem:
+            log.warning(
+                "%s recipe %s: id %r differs from the file name; left out", origin, path, doc.get("id")
+            )
+            continue
+        found[path.stem] = path
+    return found
+
+
+def _index(project_dir: Path | str | None) -> dict[str, tuple[str, Path]]:
+    """{id: (origin, path)}: shipped, then studio, then project; a later folder shadows an earlier id but the
+    id keeps the position it first appeared at."""
+    out: dict[str, tuple[str, Path]] = {}
+    for origin, folder in _folders(project_dir):
+        for rid, path in _scan(origin, folder).items():
+            out[rid] = (origin, path)
     return out
 
 
-def load_runnable(name_or_path: str | Path) -> RunnableRecipe:
-    """A runnable recipe by id (`night_relight_changelist`) or by file path (`plate run my.yaml`)."""
+def list_runnable(project_dir: Path | str | None = None) -> list[str]:
+    """Ids of the runnable recipes: shipped, studio and (with `project_dir`) that project's own."""
+    return list(_index(project_dir))
+
+
+def _origin_of(path: Path) -> str:
+    """Which folder a recipe loaded by file path belongs to; a file anywhere else is the artist's own, so it
+    counts as project."""
+    here = path.resolve().parent
+    for origin, folder in (("shipped", RECIPES_DIR), ("studio", studio_dir())):
+        if here == folder.resolve():
+            return origin
+    return "project"
+
+
+def load_runnable(name_or_path: str | Path, project_dir: Path | str | None = None) -> RunnableRecipe:
+    """A runnable recipe by id (`night_relight_changelist`: project folder, then studio, then shipped) or by
+    file path (`plate run my.yaml`)."""
     p = Path(name_or_path)
-    if not (p.suffix in (".yaml", ".yml") or p.exists()):
-        p = RECIPES_DIR / f"{name_or_path}.yaml"
+    if p.suffix in (".yaml", ".yml") or p.is_file():
+        origin = _origin_of(p)
+    else:
+        name = str(name_or_path)
+        hit = _index(project_dir).get(name) if is_recipe_id(name) else None
+        if hit is None:
+            raise RecipeError(f"no runnable recipe {name!r}; known: {list_runnable(project_dir)}")
+        origin, p = hit
     try:
-        doc = yaml.safe_load(p.read_text(encoding="utf-8"))
-    except OSError as e:
+        doc = copy.deepcopy(_read_doc(p))
+    except (OSError, UnicodeDecodeError) as e:
         raise RecipeError(f"{p}: cannot read recipe ({e})") from e
     except yaml.YAMLError as e:
         raise RecipeError(f"{p}: not valid YAML ({e})") from e
-    return _runnable_from(doc, p.name)
+    return _runnable_from(doc, p.name, origin)
+
+
+def runnable_entries(project_dir: Path | str | None = None) -> list[RunnableRecipe]:
+    """Every runnable recipe in `list_runnable` order. One that fails to load is logged and left out."""
+    out = []
+    for rid in list_runnable(project_dir):
+        try:
+            out.append(load_runnable(rid, project_dir))
+        except RecipeError as e:
+            log.warning("recipe %s left out: %s", rid, e)
+    return out
+
+
+class _Dumper(yaml.SafeDumper):
+    """safe_dump that writes a multi-line string (a prompt) as a block scalar, so a saved recipe reads like the
+    shipped ones and diffs line by line."""
+
+
+def _str_repr(dumper: yaml.SafeDumper, data: str) -> yaml.ScalarNode:
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|" if "\n" in data else None)
+
+
+_Dumper.add_representer(str, _str_repr)
+
+
+def save_runnable(
+    doc: Mapping[str, Any],
+    scope: str,
+    project_dir: Path | str | None = None,
+    overwrite: bool = False,
+) -> Path:
+    """Write a schema-1 recipe to the studio folder (`scope="studio"`) or the project's (`scope="project"`,
+    needs `project_dir`) and return its path. The doc is validated first, exactly as a file on disk would be.
+    An id that already exists in any folder is refused (`RecipeExists`) unless `overwrite`; the shipped folder
+    is never written, so a shipped id can only be shadowed."""
+    if scope not in ("studio", "project"):
+        raise RecipeError(f"scope must be studio or project, got {scope!r}")
+    if scope == "project" and project_dir is None:
+        raise RecipeError("a project recipe needs its project folder")
+    recipe = parse_runnable(doc, scope)
+    body = {k: v for k, v in doc.items() if k != "origin"}  # origin is derived from the folder, never written
+    folder = studio_dir() if scope == "studio" else project_recipes_dir(project_dir)  # type: ignore[arg-type]
+    held = _index(project_dir).get(recipe.id)
+    if held is not None and not overwrite:
+        raise RecipeExists(
+            f"recipe {recipe.id!r} already exists ({held[0]}: {held[1]}); pass overwrite to replace it"
+        )
+    target = folder / f"{recipe.id}.yaml"
+    text = yaml.dump(body, Dumper=_Dumper, sort_keys=False, allow_unicode=True)
+    write_bytes_atomic(target, text.encode("utf-8"))
+    with _DOCS_LOCK:
+        _DOCS.pop(str(target), None)  # a rewrite inside one mtime tick must not be read back stale
+    return target
 
 
 def assemble_runnable(

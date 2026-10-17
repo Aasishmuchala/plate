@@ -25,6 +25,7 @@ ENGINE_KEYS = {
     "price",
     "sizes",
     "flags",
+    "capabilities",
 }
 ROUTE_KEYS = {
     "route_id",
@@ -35,6 +36,23 @@ ROUTE_KEYS = {
     "effective_grade",
     "status",
     "upload_visibility",
+    "health",
+}
+RECIPE_KEYS = {
+    "id",
+    "title",
+    "kind",
+    "engine",
+    "shot_class",
+    "library",
+    "mask",
+    "params",
+    "origin",
+    "group",
+    "thumbnail",
+    "task",
+    "tokens",
+    "overrides",
 }
 LOCAL_ENGINES = {"qwen-image-edit-2509", "real-esrgan", "wan-2.2-vace", "fake"}
 
@@ -93,6 +111,7 @@ def test_the_fake_engine_entry_is_the_daemons_own(client, auth):
             "effective_grade": "C0",
             "status": "active",
             "upload_visibility": "local",
+            "health": "ok",
         }
     ]
     assert fake["params"] == [] and fake["presets"] == ["default"]
@@ -169,8 +188,16 @@ def test_flux_3_declares_its_sizes(client, auth):
 
 def test_presets_are_default_plus_the_recipes_naming_the_engine(client, auth):
     got = engines(client, auth)
-    assert got["nano-banana-2.1"]["presets"] == ["default", "night_relight_changelist"]
-    assert got["gpt-image-2.5"]["presets"] == ["default", "sunburst_rephotograph_close"]
+    by_engine: dict[str, list[str]] = {}
+    for rid in recipes.list_runnable():
+        by_engine.setdefault(recipes.load_runnable(rid).engine, []).append(rid)
+    assert got["nano-banana-2.1"]["presets"] == ["default", *by_engine["nano-banana-2.1"]]
+    assert "night_relight_changelist" in got["nano-banana-2.1"]["presets"]
+    assert got["gpt-image-2.5"]["presets"] == [
+        "default",
+        "imperfections_close",
+        "sunburst_rephotograph_close",
+    ]
     assert got["kling-o3-4k"]["presets"] == ["default", "croppair_pushin"]
     assert got["flux-3-image"]["presets"] == ["default"]
     named = {recipes.load_runnable(r).engine for r in recipes.list_runnable()}
@@ -237,7 +264,7 @@ def test_recipes_lists_the_runnable_ones(client, auth, manifests):
     by_id = {x["id"]: x for x in rows}
     assert "night_relight_changelist" in by_id
     for row in rows:
-        assert set(row) == {"id", "title", "kind", "engine", "shot_class", "library", "mask", "params"}
+        assert set(row) == RECIPE_KEYS
         assert (
             row["engine"] in manifests and isinstance(row["mask"], dict) and isinstance(row["params"], dict)
         )
@@ -252,10 +279,10 @@ def test_recipes_lists_the_runnable_ones(client, auth, manifests):
 def test_a_recipe_that_does_not_load_is_left_out(client, auth, monkeypatch):
     real = recipes.load_runnable
 
-    def flaky(name):
+    def flaky(name, *args, **kwargs):
         if name == "croppair_pushin":
             raise recipes.RecipeError("broken on purpose")
-        return real(name)
+        return real(name, *args, **kwargs)
 
     monkeypatch.setattr(recipes, "load_runnable", flaky)
     ids = [x["id"] for x in client.get("/api/v0/recipes", headers=auth).json()]

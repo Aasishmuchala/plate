@@ -4,22 +4,31 @@
 the same run (the same rule `POST /runs/{id}/accept` applies), carries reason codes from
 `calib/reason_codes.yaml` (Fix and Render-it only; a Ship carries none) and goes two places:
 
-- `calib/labels.jsonl`, one line per verdict in the labelling tool's schema (`tools/plate_label/store.py`, v1:
-  `at`, `rater`, `take_id`, `plate`, `candidate`, `run_id`, `verdict`, `reasons`, `gate_report`), so
-  `plate_gates.calibration` reads daemon verdicts and labeller verdicts alike. A relabel of one take by one
-  rater is a later line: the calibration report keeps the last. The file is client-work data (gitignored).
+- `<data home>/calib/labels.jsonl`, one line per verdict in the labelling tool's schema
+  (`tools/plate_label/store.py`, v1: `at`, `rater`, `take_id`, `plate`, `candidate`, `run_id`, `verdict`,
+  `reasons`, `gate_report`), so `plate_gates.calibration` reads daemon verdicts and labeller verdicts alike.
+  A relabel of one take by one rater is a later line: the calibration report keeps the last. Labels are
+  calibration data made from client work, so by default they live in the app-data folder (`PLATE_HOME`,
+  else `platformdirs`: `%LOCALAPPDATA%\\Plate` on Windows, `~/Library/Application Support/Plate` on macOS),
+  never inside the repo.
 - the project's hash-chained `runs.jsonl` as kind `verdict`, with `data.decision` set to `accepted` for a
   Ship and `rerolled` for a Fix or Render-it, which is what `ledger.summarize_records` counts per engine.
 
 `labels_path(settings)` is `settings.labels_path` when the settings carry one, else `PLATE_LABELS`, else
-`<repo>/calib/labels.jsonl` (the file the labeller writes by default). Appends are one `write` per line under a
-thread lock, and a line that follows a torn tail starts on a fresh line, like the labeller's own appender.
+`<settings.home>/calib/labels.jsonl` (`config.app_home()` when there are no settings): the file the labeller
+writes by default too, so a canvas verdict and a three-key label land in one file.
+
+A repo-local `calib/labels.jsonl` left by an older build is a legacy file: `legacy_labels` reads it once per
+process, prints one warning naming where labels go now, and nothing ever writes to it. Appends are one `write`
+per line under a thread lock, and a line that follows a torn tail starts on a fresh line, like the labeller's
+own appender.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from datetime import datetime
 from functools import lru_cache
@@ -27,6 +36,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from .config import app_home
 
 __all__ = [
     "DECISION",
@@ -36,7 +47,9 @@ __all__ = [
     "append_label",
     "build_label",
     "check_reasons",
+    "default_labels_path",
     "labels_path",
+    "legacy_labels",
     "reason_codes",
 ]
 
@@ -47,26 +60,91 @@ DECISION = {"ship": "accepted", "fix": "rerolled", "render_it": "rerolled"}
 LABEL_VERSION = 1
 MAX_SECONDS = 86_400.0
 
-# daemon/plate_daemon/verdicts.py -> parents[2] is the repo root (the labeller's DEFAULT_OUT does the same).
+# daemon/plate_daemon/verdicts.py -> parents[2] is the repo root: home of the reason-code table, and of the
+# labels file an older build wrote there (read-only now).
 REPO = Path(__file__).resolve().parents[2]
-DEFAULT_LABELS = REPO / "calib" / "labels.jsonl"
+LABELS_NAME = "labels.jsonl"
+LEGACY_LABELS = REPO / "calib" / LABELS_NAME
 DEFAULT_CODES = REPO / "calib" / "reason_codes.yaml"
 LABELS_ENV = "PLATE_LABELS"
 CODES_ENV = "PLATE_REASON_CODES"
 
 _APPEND_LOCK = threading.Lock()
+_LEGACY_LOCK = threading.Lock()
+# legacy file (normalised path) -> its records, filled by the first read in this process.
+_LEGACY_SEEN: dict[str, list[dict[str, Any]]] = {}
 
 
 class VerdictError(ValueError):
     """A verdict the daemon refuses (bad verdict name, unknown reason code, unusable labels file)."""
 
 
+def default_labels_path(settings: Any = None) -> Path:
+    """`<settings.home>/calib/labels.jsonl`, or under `config.app_home()` (PLATE_HOME, else the OS data dir)."""
+    home = getattr(settings, "home", None)
+    return (Path(home) if home else app_home()) / "calib" / LABELS_NAME
+
+
 def labels_path(settings: Any = None) -> Path:
+    """Where verdict labels go: `settings.labels_path`, else `PLATE_LABELS`, else the data-folder default."""
     declared = getattr(settings, "labels_path", None)
     if declared:
         return Path(declared)
     env = os.environ.get(LABELS_ENV)
-    return Path(env) if env else DEFAULT_LABELS
+    if env:
+        return Path(env)
+    target = default_labels_path(settings)
+    legacy_labels(target)  # an old repo-local file is noticed (one warning), never lost and never written
+    return target
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        if a.exists() and b.exists():
+            return os.path.samefile(a, b)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def legacy_labels(target: Path | str) -> list[dict[str, Any]]:
+    """Records of a repo-local `calib/labels.jsonl` left by an older build, else `[]`.
+
+    The file is read once per process (the records are cached) with one printed warning that says where labels
+    live now. It is never written, truncated or removed. `[]` when it does not exist or when it is `target`
+    itself (someone pointed the data folder, or `PLATE_LABELS`, at the repo on purpose).
+    """
+    legacy = Path(LEGACY_LABELS)
+    target = Path(target)
+    if not legacy.is_file() or _same_file(legacy, target):
+        return []
+    key = os.path.normcase(os.path.abspath(legacy))
+    with _LEGACY_LOCK:
+        if key in _LEGACY_SEEN:
+            return list(_LEGACY_SEEN[key])
+        records: list[dict[str, Any]] = []
+        try:
+            text = legacy.read_text(encoding="utf-8-sig")
+        except OSError:
+            text = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # a torn tail from a crash: not a label
+            if isinstance(rec, dict):
+                records.append(rec)
+        _LEGACY_SEEN[key] = records
+    print(
+        f"PLATE: found {legacy} left by an older build ({len(records)} label(s)). It is read, never written: "
+        f"labels now go to {target}. Move it there to keep them, or delete it.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return list(records)
 
 
 def _codes_file() -> Path:

@@ -69,9 +69,13 @@ function, quoted-run source, ledger factory) are injectable, so tests never slee
 
 Wiring (daemon lifespan, a three-line change in api.py that this task does not own):
 
-    nightly = Nightly(settings, ledger_factory=...)   # pass a factory that reuses the open projects.Lock
-    nightly.start()                                   # on startup
-    nightly.stop()                                    # on shutdown
+    nightly = Nightly(settings, ledger_factory=..., on_alert=...)   # a factory that reuses the open projects.Lock
+    nightly.start()                                                 # on startup
+    nightly.stop()                                                  # on shutdown
+
+`on_alert(line)` (also settable as `nightly.on_alert`) is called with a copy of every alert line the nightly
+appends to `alerts.jsonl`, engine kinds and nightly kinds alike, so the daemon can put it on the bus for the
+artist (router plan T85). A callback that raises is logged and never stops a job.
 """
 
 from __future__ import annotations
@@ -79,6 +83,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import logging
 import math
 import os
 import re
@@ -106,6 +111,8 @@ from .ledger import Ledger
 from .projects import PROJECT_JSON, Project
 from .reconcile import load_billing, reconcile, record_billed
 from .timeutil import iso, stamp
+
+log = logging.getLogger(__name__)
 
 JOB_ORDER = ("prices_refresh", "retire_check", "contract_tests", "reconcile", "canaries", "backup")
 NIGHTLY_ALERT_KINDS = frozenset({"job_error", "contract_test_failed", "reconcile_failed", "backup_failed"})
@@ -306,14 +313,31 @@ class _Alerts(AlertLog):
     """The engines AlertLog, plus nightly-kind lines in the same shape, plus a copy of every line a job wrote
     (`captured`) so the job's record can say what it raised."""
 
-    def __init__(self, path: Path, clock: Callable[[], datetime]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        clock: Callable[[], datetime],
+        on_alert: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         super().__init__(path, clock)
         self._now = clock
+        self._on_alert = on_alert
         self.captured: list[dict[str, Any]] = []
+
+    def _emit(self, line: Mapping[str, Any]) -> None:
+        """Hand a copy of a line that is now in the file to `on_alert`; its failure is logged, never raised."""
+        if self._on_alert is None:
+            return
+        try:
+            self._on_alert(_jsonable(dict(line)))
+        except Exception as exc:  # the file is the record; a listener that breaks must not break a job
+            log.warning("on_alert failed for %s alert: %s: %s", line.get("kind"), type(exc).__name__, exc)
 
     def append(self, alert: Alert) -> Alert:
         stamped = super().append(alert)
-        self.captured.append(stamped.to_dict())
+        line = stamped.to_dict()
+        self.captured.append(line)
+        self._emit(line)
         return stamped
 
     def nightly(
@@ -342,6 +366,7 @@ class _Alerts(AlertLog):
         }
         _append_alert_line(self.path, line)
         self.captured.append(line)
+        self._emit(line)
         return line
 
 
@@ -535,8 +560,10 @@ class Nightly:
         canary_set: Callable[[], CanarySet] | None = None,
         schema_pairs: Callable[[], Iterable[SchemaPair]] | None = None,
         backup_fn: Callable[..., Any] | None = None,
+        on_alert: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.settings = settings
+        self.on_alert = on_alert
         self.home = Path(settings.home)
         self.env = os.environ if env is None else env
         self.config = config or NightlyConfig.load(settings, self.env)
@@ -567,6 +594,15 @@ class Nightly:
         self._started = False
         self._stopping = False
         self.last_error: str | None = None
+
+    def _alerts(self) -> _Alerts:
+        return _Alerts(self.alerts_path, self._clock, self._forward_alert)
+
+    def _forward_alert(self, line: dict[str, Any]) -> None:
+        """Read `on_alert` at call time, so the daemon can attach the bus after the Nightly was built."""
+        callback = self.on_alert
+        if callback is not None:
+            callback(line)
 
     # ------------------------------------------------------------------ records
 
@@ -649,7 +685,7 @@ class Nightly:
             return None
         try:
             rec = self.read_record(day) or self._new_record(day, now)
-            alerts = _Alerts(self.alerts_path, self._clock)
+            alerts = self._alerts()
             ctx = JobContext(
                 now=now, day=day, alerts=alerts, live=self.env.get("PLATE_LIVE") == "1", force=force
             )
@@ -712,7 +748,7 @@ class Nightly:
         except Exception as exc:  # a timer thread must survive: say so and try again next time
             self.last_error = f"{type(exc).__name__}: {exc}"
             try:
-                _Alerts(self.alerts_path, self._clock).nightly(
+                self._alerts().nightly(
                     "job_error", f"scheduler: {self.last_error}", data={"job": "scheduler"}
                 )
             except OSError:

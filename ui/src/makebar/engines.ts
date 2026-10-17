@@ -47,10 +47,11 @@ export interface ProjectCustody {
 }
 
 /** How a node kind runs. `engine`: a vendor or local model, chosen in the Make bar. `inprocess`: a numeric node or
- * a Max round trip (T48): still quoted and approved, at 0 USD and C0; the Judge (decision 41) is quoted the same way
- * but priced and graded by its LLM route (custody D until the Anthropic terms are filed, so NDA projects get
- * `unavailable: custody`). `none`: nothing to make (the pipeline runs Comp/Colour/Gate itself; Export, Review and
- * Concept have their own flows; a Concept is never generated). */
+ * a Max round trip (T48; Comp, Colour, Atmosphere and Sky join them in T81, decision 48): still quoted and approved,
+ * at 0 USD and C0; the Judge (decision 41) is quoted the same way but priced and graded by its LLM route (custody D
+ * until the Anthropic terms are filed, so NDA projects get `unavailable: custody`). `none`: nothing to make (the
+ * pipeline runs Gate itself; Export, Review and Concept have their own flows; a Concept is never generated; a
+ * Reference is an uploaded image and a Frame an annotation). */
 export type MakeMode =
   | { mode: "engine"; engineKinds: readonly string[]; tasks: readonly string[] }
   | { mode: "inprocess" }
@@ -73,15 +74,19 @@ export const MAKE_MODES: Readonly<Record<NodeKind, MakeMode>> = {
   Light: { mode: "inprocess" },
   Scout: { mode: "inprocess" },
   Judge: { mode: "inprocess" },
+  Comp: { mode: "inprocess" },
+  Colour: { mode: "inprocess" },
+  Atmosphere: { mode: "inprocess" },
+  Sky: { mode: "inprocess" },
   Plate: { mode: "none" },
   Mask: { mode: "none" },
-  Comp: { mode: "none" },
-  Colour: { mode: "none" },
   Gate: { mode: "none" },
   Compare: { mode: "none" },
   Export: { mode: "none" },
   Review: { mode: "none" },
   Concept: { mode: "none" },
+  Reference: { mode: "none" },
+  Frame: { mode: "none" },
 };
 
 export const ALL_GRADES: readonly CustodyGrade[] = ["C0", "C1", "C2", "D"];

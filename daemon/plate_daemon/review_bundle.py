@@ -404,7 +404,8 @@ def _crop_to_safe_frame(
 # ---------------------------------------------------------------------------- the page
 
 
-_SLOT = re.compile(r"<!--PLATE:(CSS|JS|DATA)-->|\{\{TITLE\}\}")
+_SLOT = re.compile(r"<!--PLATE:(CSS|JS|DATA)-->|\{\{(TITLE|SUBTITLE|AUTHOR)\}\}")
+COVER_MAX_CHARS = 120  # title, subtitle and author
 
 
 def _json_for_script(obj: Any) -> str:
@@ -412,14 +413,17 @@ def _json_for_script(obj: Any) -> str:
     return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 
-def _render_index(title: str, data: dict[str, Any]) -> str:
+def _render_index(
+    title: str, data: dict[str, Any], subtitle: str | None = None, author: str | None = None
+) -> str:
     skeleton = (TEMPLATE_DIR / "index.html").read_text(encoding="utf-8")
     css = (TEMPLATE_DIR / "review.css").read_text(encoding="utf-8")
     js = (TEMPLATE_DIR / "review.js").read_text(encoding="utf-8")
     slots = {"CSS": css, "JS": js, "DATA": _json_for_script(data)}
+    cover = {"TITLE": title, "SUBTITLE": subtitle or "", "AUTHOR": author or ""}
 
     def fill(m: re.Match[str]) -> str:
-        return html.escape(title) if m.group(0) == "{{TITLE}}" else slots[m.group(1)]
+        return html.escape(cover[m.group(2)]) if m.group(2) else slots[m.group(1)]
 
     return _SLOT.sub(fill, skeleton)
 
@@ -466,6 +470,15 @@ def _file_hash(path: Path) -> str:
     return blake3(path.read_bytes()).hexdigest()
 
 
+def _cover_text(name: str, value: str | None) -> str | None:
+    """A cover line (subtitle, author): None or at most COVER_MAX_CHARS printable characters; blank is None."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > COVER_MAX_CHARS or not value.isprintable():
+        raise ValueError(f"{name} must be at most {COVER_MAX_CHARS} printable characters")
+    return value.strip() or None
+
+
 def build_review(
     project: Project | str | Path,
     run_ids: Sequence[str],
@@ -478,14 +491,21 @@ def build_review(
     sources: Mapping[str, TakeSource] | None = None,
     keep_lineage: bool = True,
     clock=utcnow,
+    subtitle: str | None = None,
+    author: str | None = None,
 ) -> ReviewBundle:
-    """Build the bundle and return what was written. `export_review` is this, reduced to the zip path."""
+    """Build the bundle and return what was written. `export_review` is this, reduced to the zip path.
+    `subtitle` and `author` (120 characters at most) fill the cover header under the title; both are empty
+    (and hidden) when None."""
     proj = _as_project(project)
     order = _check_args(run_ids, max_width, reply_to)
     watermark = check_watermark(watermark)
     if not isinstance(title, str) or not title.strip() or len(title) > 120:
         raise ValueError("title must be 1 to 120 characters")
     title = title.strip()
+    subtitle, author = (
+        _cover_text(name, value) for name, value in (("subtitle", subtitle), ("author", author))
+    )
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     gates = GateReports(proj.root)
@@ -559,6 +579,10 @@ def build_review(
             "watermark": watermark,
             "title": title,
             "max_width": max_width,
+            **(
+                {"subtitle": subtitle} if subtitle else {}
+            ),  # absent when unset: older bundle ids stay as they were
+            **({"author": author} if author else {}),
         }
         bundle_id = blake3(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -573,8 +597,12 @@ def build_review(
             "watermark": watermark,
             "created_utc": created,
             "takes": page_takes,
+            **({"subtitle": subtitle} if subtitle else {}),
+            **({"author": author} if author else {}),
         }
-        (stage / "index.html").write_text(_render_index(title, page), encoding="utf-8", newline="\n")
+        (stage / "index.html").write_text(
+            _render_index(title, page, subtitle, author), encoding="utf-8", newline="\n"
+        )
         (stage / "README.txt").write_text(
             _render_readme(title, reply_to, watermark, len(takes)), encoding="utf-8", newline="\n"
         )
@@ -664,5 +692,5 @@ def export_review(
     """Write the review bundle for `run_ids` into `out_dir` and return the zip's path.
 
     `options` are `build_review`'s keyword-only arguments: `title`, `reply_to`, `sources`, `keep_lineage`,
-    `clock`. Use `build_review` when the size, bundle id or per-take detail is wanted."""
+    `clock`, `subtitle`, `author`. Use `build_review` when the size, bundle id or per-take detail is wanted."""
     return build_review(project, run_ids, out_dir, watermark, max_width, **options).zip_path

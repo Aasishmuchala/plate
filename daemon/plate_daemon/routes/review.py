@@ -1,10 +1,12 @@
 """The client review route (router plan T74; BUILD_PLAN decisions 21 and 39).
 
-- `POST /projects/{id}/review {run_ids: [...], watermark?: "REVIEW", max_width?: 2048, title?, reply_to?}` ->
+- `POST /projects/{id}/review {run_ids: [...], watermark?: "REVIEW", max_width?: 2048, title?, subtitle?, author?,
+  reply_to?}` ->
   `{zip_path, bytes, takes}`: `review_bundle.export_review` writes the bundle (a zip of one static HTML page
   with an A/B wipe per take, watermarked 8-bit proxies no wider than `max_width` (2048 at most) and gate
   badges) into the project's `review/` folder. A take's images are the run's gated output (`outputs[0]` in
-  the project's CAS) against its packet's display master, so the client sees what the gates scored.
+  the project's CAS) against its packet's display master, so the client sees what the gates scored. `subtitle`
+  and `author` (120 characters at most each) fill the cover header under the title.
 - Refused before anything is written: 404 unknown project, or a run that is not in it; 409 `not_reviewable`
   for a take a client must not see, as `delivery.guard.authorize` decides it (`code`): previs
   (PREVIS_NOT_DELIVERABLE, a draft; `motion.previs.is_previs` on the run as `GET /runs/{id}` answers it, and
@@ -30,7 +32,14 @@ from ..machine import RunNotFound, get_run
 from ..models import Run
 from ..motion.previs import is_previs
 from ..pipeline import PipelineError
-from ..review_bundle import DEFAULT_WATERMARK, MAX_WIDTH_LIMIT, ReviewError, TakeSource, export_review
+from ..review_bundle import (
+    COVER_MAX_CHARS,
+    DEFAULT_WATERMARK,
+    MAX_WIDTH_LIMIT,
+    ReviewError,
+    TakeSource,
+    export_review,
+)
 from . import API, ApiError, Ctx, ctx, pipeline_error, require_token
 from .runs import run_view
 
@@ -45,6 +54,8 @@ class ReviewBody(BaseModel):
     watermark: str = DEFAULT_WATERMARK
     max_width: int = MAX_WIDTH_LIMIT
     title: str | None = None
+    subtitle: str | None = Field(default=None, max_length=COVER_MAX_CHARS)
+    author: str | None = Field(default=None, max_length=COVER_MAX_CHARS)
     reply_to: str | None = None
 
 
@@ -104,6 +115,7 @@ def review_route(request: Request, project_id: str, body: ReviewBody) -> dict[st
         options: dict[str, Any] = {"reply_to": body.reply_to, "sources": sources, "clock": c.now}
         if body.title is not None:
             options["title"] = body.title
+        options["subtitle"], options["author"] = body.subtitle, body.author
         zip_path = export_review(
             project, run_ids, project.review_dir, body.watermark, body.max_width, **options
         )

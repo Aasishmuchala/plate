@@ -34,6 +34,12 @@ price:
   model: per_second
   usd: 0.10
   by: {"base": 0.134, "atlas_discounted": 0.0268}
+  # T84: priced per second by the resolution param. 480P is the staffage estimate in `usd`; 720P and 1080P are the
+  # WaveSpeed list figures quoted in `notes`. All three stay unconfirmed until the P0 smoke test reads a bill.
+  tiers:
+    - {match: {resolution: "480P"}, usd: 0.10, note: "staffage estimate per second (price.usd)"}
+    - {match: {resolution: "720P"}, usd: 0.36, note: "WaveSpeed list per second (see price.notes)"}
+    - {match: {resolution: "1080P"}, usd: 0.90, note: "WaveSpeed list per second (see price.notes)"}
   status: unconfirmed
   source: "usd: staffage 0.10 per second estimate (scout 02). by.base: Atlas list for Seedance 2.5 image-to-video, 0.134 per second (VIZMAKER.md section 4). by.atlas_discounted: that list with the stated 80 percent discount, derived here as 0.134 x 0.2."
   as_of: 2026-10-17

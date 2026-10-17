@@ -1,0 +1,29 @@
+# Lensbook a09, Vegetation Pass, as a runnable recipe on Nano Banana 2.1 (T83): planting upgraded to species-true realism
+# with the hardscape under oath. Calibrated language is species + numbers + imperfection. Name the species in
+# params.tokens["[PLANT SPECIES]"] ("rain tree: feathery bipinnate leaflets, vast umbrella canopy; frangipani") for a
+# result that reads as the place; "trees" gets generic canopies. Grade the result at 100% crop, never fit-to-screen.
+schema: 1
+id: planting_refresh
+title: Planting refresh
+kind: still_edit
+group: vegetation
+task: vegetation
+library: a09
+engine: nano-banana-2.1
+shot_class: wide
+prefixed: false
+mask:
+  editable_classes: [vegetation]
+  region: none
+  lock_rest: true
+params:
+  n: 1
+  size: native
+overrides:
+  "[PLANT SPECIES]": "keep the species already planted in the render and draw each true to its kind (leaf shape, bark, canopy habit)"
+  "[LEAF CONDITION]": "dry: matte dusty tops with translucent backlit edges"
+  "[IMPERFECTIONS]": "a few browned leaflets, dry seed pods, sparse canopy gaps"
+prompt: |-
+  This is an approved architectural render. Building, hardscape, lighting and framing are ground truth; improve only the vegetation.
+  Upgrade the planting to species-true realism: [PLANT SPECIES]. Every foliage cluster is unique, with asymmetric canopy silhouettes and visible sky gaps, no cloned or mirrored clumps, and leaf colour ranging from olive to fresh green within each tree. Leaf light follows the weather: [LEAF CONDITION]. Quantified imperfection: [IMPERFECTIONS]. Petal structure is readable on the nearest blossoms, never airbrushed colour blobs. The planting beds stay in their exact positions; hardscape untouched.
+negative_prompt: cloned foliage, mirrored clumps, airbrushed blossoms, plastic leaves, moved planting beds, changed hardscape, new objects, changed architecture, re-framing, text

@@ -28,6 +28,13 @@ never reached the provider and simply submits on its next step; an expired QUOTE
 `recover_on_boot` leaves pipeline runs (`skip=is_pipeline_run`) to `Pipeline.resume`, which knows their real engine.
 Steps on one run are serialised by an in-process lock (the API's step and cancel routes run on a thread
 pool), and the daemon's app-data lock keeps a second process away.
+
+Route health (router plan T85): a failed submit and a poll that raises are provider failures, a fetch that
+returns bytes is a success; each is noted on a `route_health.Tracker` (`tracker.note_failure(engine_id,
+route_id, reason_code)` / `note_success(engine_id, route_id)`). The tracker is the `route_tracker=` argument of
+`step` / `run_to_completion` / `Runner`, else `engine.route_tracker`, else `engine.pipeline.route_tracker` (the
+pipeline's `StagedEngine` carries its pipeline), else none: with no tracker nothing is noted. A tracker fault is
+logged and never touches the run.
 """
 
 from __future__ import annotations
@@ -157,6 +164,32 @@ class _Ctx:
     actor: str
     normalize_fn: NormalizeFn | None = None
     gate_fn: GateFn | None = None
+    route_tracker: Any = None
+
+
+def tracker_of(engine: Any, explicit: Any = None) -> Any:
+    """The route-health tracker for a step: the one passed in, else the engine's own, else its pipeline's."""
+    if explicit is not None:
+        return explicit
+    own = getattr(engine, "route_tracker", None)
+    if own is not None:
+        return own
+    return getattr(getattr(engine, "pipeline", None), "route_tracker", None)
+
+
+def _note_provider(c: _Ctx, run: Run, ok: bool, code: str = "") -> None:
+    """Tell the tracker how the provider just behaved on this run's route. Never raises."""
+    tracker = c.route_tracker
+    if tracker is None:
+        return
+    try:
+        engine_id, route_id = run.route.engine_id, run.route_dict.get("route_id")
+        if ok:
+            tracker.note_success(engine_id, route_id)
+        else:
+            tracker.note_failure(engine_id, route_id, code)
+    except Exception as e:  # route health is advice for the Make bar; it must never fail a run
+        log.warning("route health not updated for run %s: %s: %s", run.id, type(e).__name__, e)
 
 
 def _timed_out(run: Run, now: datetime, poll_timeout_s: float) -> bool:
@@ -188,8 +221,10 @@ def _submit(c: _Ctx, run: Run, note: str = "") -> RunState:
     try:
         job_id = c.engine.submit(payload, run.idempotency_key)
     except Exception as e:  # recorded as the failure reason
+        _note_provider(c, run, False, "submit_error")
         return _fail(c, run, "submit_error", f"submit raised {type(e).__name__}: {e}")
     if not isinstance(job_id, str) or not job_id.strip():
+        _note_provider(c, run, False, "submit_error")
         return _fail(c, run, "submit_error", f"submit returned no job id ({job_id!r})")
     _fault(c.engine, S.STAGING, "after_effect")
     # Phase one: the id is durable the moment the provider has answered...
@@ -280,6 +315,7 @@ def _polling(c: _Ctx, run: Run) -> RunState:
         res: PollResult = c.engine.poll(run.provider_job_id)
     except Exception as e:  # an unknown job or a transport fault ends the run; it never unwinds the worker
         # FAILED with the provider id kept: a job may exist, so the spend settles instead of refunding.
+        _note_provider(c, run, False, "provider_poll_error")
         return _fail(c, run, "provider_poll_error", f"{type(e).__name__}: {e}"[:500])
     _fault(c.engine, st, "after_effect")
     if res.status == "refused":
@@ -316,6 +352,7 @@ def _fetching(c: _Ctx, run: Run) -> RunState:
         return _fail(c, run, "result_url_expired", str(e))
     except Exception as e:  # recorded as the failure reason
         return _fail(c, run, "fetch_error", f"fetch raised {type(e).__name__}: {e}")
+    _note_provider(c, run, True)  # the route delivered a result: its run of failures is over
     key = cas.put_bytes(data, "png" if data[:8] == PNG_MAGIC else "bin")
     _fault(c.engine, S.FETCHING, "after_effect")
     transition(
@@ -396,6 +433,7 @@ def step(
     actor: str = "worker",
     normalize_fn: NormalizeFn | None = None,
     gate_fn: GateFn | None = None,
+    route_tracker: Any = None,
 ) -> RunState:
     """Advance one run by at most one transition and return its state. Never sleeps (`sleep` is taken
     for signature parity with `run_to_completion`). Runs waiting on a human are returned unchanged."""
@@ -405,7 +443,17 @@ def step(
         st = run.state
         if st in TERMINAL or st not in WORKER_STATES:
             return st
-        c = _Ctx(conn, engine, clock, cas, poll_timeout_s, actor, normalize_fn, gate_fn)
+        c = _Ctx(
+            conn,
+            engine,
+            clock,
+            cas,
+            poll_timeout_s,
+            actor,
+            normalize_fn,
+            gate_fn,
+            tracker_of(engine, route_tracker),
+        )
         _fault(engine, st, "before")
         new = _HANDLERS[st](c, run)
         if new is not st:
@@ -426,6 +474,7 @@ def run_to_completion(
     max_steps: int = 100_000,
     normalize_fn: NormalizeFn | None = None,
     gate_fn: GateFn | None = None,
+    route_tracker: Any = None,
 ) -> RunState:
     cas = _require_cas(cas)
     for _ in range(max_steps):
@@ -446,6 +495,7 @@ def run_to_completion(
             poll_timeout_s=poll_timeout_s,
             normalize_fn=normalize_fn,
             gate_fn=gate_fn,
+            route_tracker=route_tracker,
         )
         if after in TERMINAL:
             return after
@@ -478,6 +528,7 @@ def _recover(
     clock: Clock,
     cas: CAS | None,
     skip: Callable[[Run], bool] | None = None,
+    route_tracker: Any = None,
 ) -> list[dict[str, str]]:
     actions: list[dict[str, str]] = []
     for rid in _non_terminal_ids(conn):
@@ -488,7 +539,15 @@ def _recover(
             if run.provider_job_id:
                 if run.state is S.STAGING:
                     engine = adapter_for(run)
-                    c = _Ctx(conn, engine, clock, cas, DEFAULT_POLL_TIMEOUT_S, "recovery")
+                    c = _Ctx(
+                        conn,
+                        engine,
+                        clock,
+                        cas,
+                        DEFAULT_POLL_TIMEOUT_S,
+                        "recovery",
+                        route_tracker=tracker_of(engine, route_tracker),
+                    )
                     new = _staging(c, run)
                     actions.append({"run_id": rid, "state": new.value, "action": "promoted"})
                 else:
@@ -498,7 +557,15 @@ def _recover(
                 if engine is None:
                     actions.append({"run_id": rid, "state": run.state.value, "action": "no_adapter"})
                     continue
-                c = _Ctx(conn, engine, clock, cas, DEFAULT_POLL_TIMEOUT_S, "recovery")
+                c = _Ctx(
+                    conn,
+                    engine,
+                    clock,
+                    cas,
+                    DEFAULT_POLL_TIMEOUT_S,
+                    "recovery",
+                    route_tracker=tracker_of(engine, route_tracker),
+                )
                 new, how = _resolve_unknown_submit(c, run)
                 actions.append({"run_id": rid, "state": new.value, "action": how})
             elif run.state is S.STAGING:
@@ -515,6 +582,7 @@ def recover_on_boot(
     *,
     cas: CAS | None = None,
     skip: Callable[[Run], bool] | None = is_pipeline_run,
+    route_tracker: Any = None,
 ) -> list[dict[str, str]]:
     """Reconcile every non-terminal run after a restart. Returns one action record per run touched.
 
@@ -522,7 +590,7 @@ def recover_on_boot(
     in-process fake). A run for which `skip(run)` is true is left alone: by default pipeline runs, which the
     pipeline resumes with their real engine (`Pipeline.resume` through `StagedEngine` / `AdapterBridge`), so
     boot never resubmits one to the wrong provider. Pass `skip=None` to reconcile every run."""
-    return _recover(conn, lambda run: engine, clock, cas, skip)
+    return _recover(conn, lambda run: engine, clock, cas, skip, route_tracker)
 
 
 def cancel_run(
@@ -658,6 +726,7 @@ class Runner:
         clock: Clock = utcnow,
         poll_timeout_s: float = DEFAULT_POLL_TIMEOUT_S,
         default_max_inflight: int = DEFAULT_MAX_INFLIGHT,
+        route_tracker: Any = None,
     ):
         self.index = index
         self.bus = bus
@@ -668,6 +737,7 @@ class Runner:
         self.clock = clock
         self.poll_timeout_s = poll_timeout_s
         self.default_max_inflight = default_max_inflight
+        self.route_tracker = route_tracker
         self._cas_for = cas_for
         self._cas: dict[str, CAS] = {}
         self._ranked: set[str] = set()
@@ -741,6 +811,7 @@ class Runner:
                 poll_timeout_s=self.poll_timeout_s,
                 normalize_fn=self.normalize_fn,
                 gate_fn=self.gate_fn,
+                route_tracker=self.route_tracker,
             )
             if new is st:
                 actions.append(
@@ -829,7 +900,7 @@ class Runner:
         for pid in self.index.project_ids():
             cas = self.cas(pid)
             with self.index.project(pid) as conn:
-                for a in _recover(conn, self.adapter_for, self.clock, cas):
+                for a in _recover(conn, self.adapter_for, self.clock, cas, None, self.route_tracker):
                     actions.append({"project_id": pid, **a})
                 for rid in _non_terminal_ids(conn):
                     run = get_run(conn, rid)

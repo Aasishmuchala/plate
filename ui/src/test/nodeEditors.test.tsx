@@ -287,7 +287,7 @@ describe("nodeApi parsers", () => {
     expect(exportCandidates(runs).map((r) => r.id)).toEqual(["d1", "o1", "f1"]);
   });
 
-  it("finds the producing node upstream, passing through Comp, Gate and Mask", () => {
+  it("finds the producing node upstream, passing through Gate and Mask; a Comp makes its own take (T81)", () => {
     const { nodes, edges } = {
       nodes: [
         { id: "p", data: makeNodeData("Plate") },
@@ -299,8 +299,12 @@ describe("nodeApi parsers", () => {
       ] as never,
       edges: [edge("p", "m"), edge("m", "e"), edge("p", "e"), edge("e", "c"), edge("c", "g"), edge("g", "x")],
     };
-    expect(producingNodes(nodes, edges, "x")).toEqual(["e"]);
+    // Comp is a numeric node now (decision 48, MAKE_MODES inprocess): Export exports the Comp's run.
+    expect(producingNodes(nodes, edges, "x")).toEqual(["c"]);
+    expect(producingNodes(nodes, edges, "c")).toEqual(["e"]);
     expect(producingNodes(nodes, edges, "e")).toEqual([]);
+    const direct = [edge("p", "m"), edge("m", "e"), edge("p", "e"), edge("e", "g"), edge("g", "x")];
+    expect(producingNodes(nodes, direct, "x")).toEqual(["e"]);
   });
 
   it("names the prompt source: explicit beats recipe", () => {

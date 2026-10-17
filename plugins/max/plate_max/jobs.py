@@ -1,4 +1,4 @@
-"""The dock's job poller: the work the canvas asks Max to do (Light match, Vantage preview, Scout).
+"""The dock's job poller: the work the canvas asks Max to do (Light match, Vantage preview, Scout, Receive).
 
 A Light or Scout node cannot run in the daemon: it queues a plugin job (daemon nodes/plugin_queue.py)
 and this poller, on the dock's timer, picks it up, does the work in the open scene and answers:
@@ -11,6 +11,10 @@ and this poller, on the dock's timer, picks it up, does the work in the open sce
     light.vantage_preview  actions.light.vantage_preview(camera)
     scout                  actions.scout.run with views 0..count-1 and keep; the kept cameras are also
                            sent as full packets (scout_poses: real V-Ray cameras in the real scene)
+    receive                a take pushed into Max: GET /api/v0/runs/{run_id} -> outputs[0], that picture from
+                           GET /api/v0/assets/{hash} into <app-data>/cache/receive/<hash>.png, then
+                           actions.receive.load_result(path, mode) (VFB history or the viewport background);
+                           display only, the scene is not touched
     POST /api/v0/plugin/jobs/{id}/result   {ok, detail?, packet_id?, metrics?, poses?, packets?}
 
 Rules: one job at a time (a tick that finds a job running, or the dock busy, does nothing); an action
@@ -43,6 +47,7 @@ CLAIM_LIMIT = 1  # one job at a time: the others stay queued for the next tick (
 JOBS_PATH = "/api/v0/plugin/jobs"
 POLL_TIMEOUT_S = 3.0
 RESULT_TIMEOUT_S = 10.0
+RUN_TIMEOUT_S = 10.0
 ASSET_TIMEOUT_S = 120.0
 DETAIL_MAX = 1900  # the daemon caps detail at 2000 characters
 MAX_BACKOFF_TICKS = 12  # 12 x 5 s: a dead daemon is asked about once a minute
@@ -56,7 +61,9 @@ ESSENTIAL_KEYS = ("ok", "detail", "packet_id")
 ACTION_LIGHT = "light.match"
 ACTION_VANTAGE = "light.vantage_preview"
 ACTION_SCOUT = "scout"
-ACTIONS = (ACTION_LIGHT, ACTION_VANTAGE, ACTION_SCOUT)
+ACTION_RECEIVE = "receive"
+ACTIONS = (ACTION_LIGHT, ACTION_VANTAGE, ACTION_SCOUT, ACTION_RECEIVE)
+DEFAULT_RECEIVE_MODE = "vfb_history"
 
 # Content-Type of GET /assets/{hash} -> the extension MaxGaffer reads the reference by.
 _EXTENSIONS = {
@@ -199,6 +206,7 @@ class Poller:
             ACTION_LIGHT: self._light_match,
             ACTION_VANTAGE: self._vantage_preview,
             ACTION_SCOUT: self._scout,
+            ACTION_RECEIVE: self._receive,
         }
 
     # ------------------------------------------------------------------ the timer
@@ -391,7 +399,27 @@ class Poller:
         from GET /api/v0/assets/{hash} once (a hash names immutable bytes, so a cached file is reused)."""
         if not ASSET_KEY_RE.match(str(key or "")):
             raise JobFailed(f"reference_hash {key!r} is not a BLAKE3 key")
-        folder = (self.cache_dir or app_data_dir() / "cache") / "references"
+        return self._download(key, cfg, project_id, "references", "reference picture")
+
+    def fetch_take(self, key: str, cfg: Mapping[str, Any], project_id: Any = None) -> Path:
+        """The take a receive job shows as a local file: <cache>/receive/<hash>.png (the extension follows the
+        daemon's Content-Type; a take is a PNG), downloaded from GET /api/v0/assets/{hash} once."""
+        if not ASSET_KEY_RE.match(str(key or "")):
+            raise JobFailed(f"the run's output {key!r} is not a BLAKE3 key")
+        return self._download(key, cfg, project_id, "receive", "take", fallback_ext=".png")
+
+    def _download(
+        self,
+        key: str,
+        cfg: Mapping[str, Any],
+        project_id: Any,
+        folder_name: str,
+        what: str,
+        fallback_ext: str | None = None,
+    ) -> Path:
+        """GET /api/v0/assets/{key} into <cache>/<folder_name>/<key>.<ext>; a cached file is reused (a hash
+        names immutable bytes)."""
+        folder = (self.cache_dir or app_data_dir() / "cache") / folder_name
         for cached in sorted(folder.glob(f"{key}.*")) if folder.is_dir() else []:
             if cached.is_file() and cached.stat().st_size > 0:
                 return cached
@@ -401,10 +429,13 @@ class Poller:
                 lambda: transport.get_bytes(f"/api/v0/assets/{key}", cfg, ASSET_TIMEOUT_S, params)
             )
         except transport.TransportError as exc:
-            raise JobFailed(f"reference picture {key[:12]}: {exc}") from exc
+            raise JobFailed(f"{what} {key[:12]}: {exc}") from exc
         if not data:
-            raise JobFailed(f"reference picture {key[:12]}: the daemon sent no bytes")
-        return atomic_write_bytes(folder / f"{key}{extension_for(content_type, data)}", data)
+            raise JobFailed(f"{what} {key[:12]}: the daemon sent no bytes")
+        ext = extension_for(content_type, data)
+        if ext == ".bin" and fallback_ext:
+            ext = fallback_ext
+        return atomic_write_bytes(folder / f"{key}{ext}", data)
 
     # ------------------------------------------------------------------ the actions
     def _send_options(self, cameras: list[str], job: Mapping[str, Any], cfg: Mapping[str, Any]) -> dict:
@@ -554,6 +585,29 @@ class Poller:
         for view in poses:
             if view.get("packet_id"):
                 self._note_packet(str(view.get("camera")), view["packet_id"])
+
+    def _receive(self, job: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+        from .actions import receive
+
+        run_id = str(job.get("run_id") or "")
+        if not run_id:
+            raise JobFailed("the job names no run")
+        mode = str(job.get("mode") or DEFAULT_RECEIVE_MODE)
+        if mode not in receive.MODES:
+            raise JobFailed(f"unknown receive mode {mode!r}: use {' or '.join(receive.MODES)}")
+        path = f"/api/v0/runs/{urllib.parse.quote(run_id, safe='')}"
+        try:
+            run = self._call(lambda: transport.get_json(path, cfg, RUN_TIMEOUT_S))
+        except transport.TransportError as exc:
+            raise JobFailed(f"run {run_id}: {exc}") from exc
+        outputs = run.get("outputs") if isinstance(run, Mapping) else None
+        if not isinstance(outputs, list) or not outputs:
+            raise JobFailed(f"run {run_id} has no take to show")
+        project_id = job.get("project_id") or (run.get("project_id") if isinstance(run, Mapping) else None)
+        take = self.fetch_take(str(outputs[0]), cfg, project_id)
+        self._log(f"receive {run_id}: {take.name} into {mode}")
+        ok, detail = receive.load_result(take, mode)
+        return {"ok": bool(ok), "detail": str(detail)}
 
     # ------------------------------------------------------------------ hooks
     def _hook(self, fn: Callable[..., Any] | None, *args: Any) -> None:
