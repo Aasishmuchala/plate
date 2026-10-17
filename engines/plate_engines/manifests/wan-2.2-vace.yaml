@@ -1,0 +1,39 @@
+# wan-2.2-vace -- local previs video (C0, scheduled GPU windows).
+# PLACEHOLDERS (BUILD_PLAN decisions 9 and 13): version is unpinned until the P0 smoke test; price.usd is
+# NOT a vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
+# endpoints are the vendors' public base URLs as understood on 2026-10-17 and stay unverified until the
+# adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
+id: wan-2.2-vace
+name: Wan 2.2 VACE
+version: unpinned
+pinned: false
+kind: video_r2v
+inputs:
+  - {name: reference_images, type: images, required: true}
+  - {name: reference_video, type: video, required: false}
+  - {name: prompt, type: text, required: true}
+outputs:
+  - {name: video, type: video, required: true}
+params:
+  - {name: duration_s, type: float, default: null, range: null, enum: null}
+  - {name: seed, type: int, default: null, range: null, enum: null}
+price:
+  model: per_second
+  usd: 0.0
+  status: confirmed
+  notes: "Local compute on owned hardware; no vendor fee. Power and amortisation are not modelled."
+determinism: best_effort
+licence:
+  vendor_terms_url: unknown
+  training_opt_out: null
+allowed_tasks: [previs]
+routes:
+  - provider: local
+    endpoint: local
+    region: local
+    custody_grade: C0
+    custody_status: confirmed
+    terms_hash: unknown
+    upload_visibility: local
+    same_model_fallback_of: null
+    note: "Runs on the render box; nothing leaves it."

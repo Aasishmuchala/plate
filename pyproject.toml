@@ -1,0 +1,98 @@
+[project]
+name = "plate-monorepo"
+version = "0.0.1"
+description = "PLATE: scene-owning AI finishing pipeline for 3ds Max + V-Ray (Sthyra). See README.md."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "jsonschema>=4.23",
+    "blake3>=0.4",
+    "numpy>=1.26",
+    "opencv-python-headless>=4.10",
+    "pillow>=10.4",
+    "platformdirs>=4.2",
+    "portalocker>=2.10",
+    "openimageio>=3.0",
+    "opencolorio>=2.4",
+    "openexr>=3.3",
+    "tifffile>=2026.10.15",
+    "imagehash>=4.3.2",
+    "sse-starlette>=3.5.0",
+    "mcp>=1.0",
+    "scipy>=1.18.1",
+    "anthropic>=1.15.0",
+]
+
+[project.optional-dependencies]
+# Never installed by tests, CI or bootstrap (uv sync installs no extras). On the render box the CUDA 12.8+
+# torch build for the RTX 5090 (sm_120) comes from pixels/requirements-cuda.txt, not from this extra.
+gpu = [
+    "pynvml>=13.0.1",
+    "torch>=2.14.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "hypothesis>=6.112",
+    "ruff>=0.6",
+    "pytest-asyncio>=1.4.0",
+    "pyside6>=6.12.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+# The repo is one editable install: dev-mode-dirs puts every package root on sys.path (a .pth file),
+# so `uv run python -m plate_daemon` works on Windows and macOS without PYTHONPATH.
+[tool.hatch.build]
+dev-mode-dirs = ["spec", "daemon", "pixels", "engines", "gates", "plugins/max", "tools"]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "spec/plate_spec",
+    "daemon/plate_daemon",
+    "pixels/plate_pixels",
+    "engines/plate_engines",
+    "gates/plate_gates",
+    "plugins/max/plate_max",
+    "tools/plate_label",
+]
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib -q"
+# "." makes the repo-root fixtures package importable in tests (from fixtures.synthetic import make_pair).
+pythonpath = ["spec", "daemon", "pixels", "engines", "gates", "plugins/max", "tools", "."]
+testpaths = [
+    "gates/tests",
+    "spec/tests",
+    "daemon/tests",
+    "pixels/tests",
+    "engines/tests",
+    "plugins/max/tests",
+    "tools/plate_label/tests",
+    "fixtures/tests",
+    "tests",
+]
+
+[tool.ruff]
+line-length = 110
+src = ["spec", "daemon", "pixels", "engines", "gates", "plugins/max", "tools", "tests"]
+target-version = "py312"
+extend-exclude = ["ui", "node_modules", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# plugins/max runs inside Max's own Python 3.11: keep it 3.11-compatible.
+"plugins/max/**" = ["UP"]

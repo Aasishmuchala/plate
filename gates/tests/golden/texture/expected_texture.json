@@ -1,0 +1,30 @@
+{
+ "g_tex_vantage_v1_t493_plaque.png": {
+  "source": "car-entry/refs/vantage_shot1/V1_t493.png",
+  "crop_xyxy": [
+   2360,
+   1080,
+   3128,
+   1512
+  ],
+  "lapvar": 923.489014,
+  "fine_ratio": 0.473792,
+  "luma_mean": 178.783081,
+  "luma_std": 56.48497,
+  "sat_mean": 63.592089
+ },
+ "g_tex_gpt_s1a_plaque.png": {
+  "source": "car-entry/stills/S1_GPT_a.png",
+  "crop_xyxy": [
+   2360,
+   1080,
+   3128,
+   1512
+  ],
+  "lapvar": 3527.535889,
+  "fine_ratio": 0.63559,
+  "luma_mean": 183.411499,
+  "luma_std": 58.313148,
+  "sat_mean": 67.440749
+ }
+}

@@ -1,0 +1,172 @@
+{
+  "packet_id": "pkt_01JA7Q3M8Z4X6V2C9D5E1F0GHK",
+  "entries": [
+    {
+      "id": "o:3d8800df",
+      "kind": "object",
+      "name": "ARCH_clubhouse_facade",
+      "layer": "ARCH_facade",
+      "material": "MAT_brick_wirecut",
+      "tags": [],
+      "class": "architecture",
+      "class_source": "rule",
+      "pixel_share": 0.312,
+      "digest": "74946f22be6aceed72bc9f326e7108ee0d79eccdf27193942079ce87de992a9b",
+      "planar": true
+    },
+    {
+      "id": "o:3c888322",
+      "kind": "object",
+      "name": "ARCH_roof_slab",
+      "layer": "ARCH_roof",
+      "material": "MAT_concrete_board",
+      "tags": [],
+      "class": "architecture",
+      "class_source": "rule",
+      "pixel_share": 0.061,
+      "digest": "b461406b855ba1ec760825e68989bf6b74a9fe99b3ae53c1412db8c22a03e59c",
+      "planar": true
+    },
+    {
+      "id": "o:c529faaf",
+      "kind": "object",
+      "name": "GLZ_curtainwall_south",
+      "layer": "GLZ_curtainwall",
+      "material": "MAT_glass_clear",
+      "tags": [],
+      "class": "glazing",
+      "class_source": "rule",
+      "pixel_share": 0.088,
+      "digest": "32659eae8da61b47d4e17d56ca7e052038cb2d3355c587246ec761f94c5981b8",
+      "planar": true
+    },
+    {
+      "id": "o:aaafb81b",
+      "kind": "object",
+      "name": "SIGN_clubhouse_name",
+      "layer": "SIGN_entry",
+      "material": "MAT_brass_brushed",
+      "tags": [],
+      "class": "signage",
+      "class_source": "rule",
+      "pixel_share": 0.006,
+      "digest": "f9d55d97376fb53cd8e1a629accf58f95cd3de4154f0a0ac291929efc9bb174f"
+    },
+    {
+      "id": "o:dfa3b500",
+      "kind": "object",
+      "name": "HARD_sett_paving",
+      "layer": "HARD_paving",
+      "material": "MAT_granite_sett_100",
+      "tags": [],
+      "class": "ground",
+      "class_source": "rule",
+      "pixel_share": 0.142,
+      "digest": "e6c4bff075fb6706793fd62020fef5465774c4494da083c8be0937740a332625",
+      "planar": true,
+      "detail_size_m": 0.1
+    },
+    {
+      "id": "o:dc37ac5e",
+      "kind": "object",
+      "name": "VEG_palm_row_A",
+      "layer": "VEG_palms",
+      "material": "MAT_leaf_palm",
+      "tags": [],
+      "class": "vegetation",
+      "class_source": "rule",
+      "pixel_share": 0.095,
+      "digest": "aad7905ad02a9da8d3eb98eebcd3cb5ef244a44b811ce5f65ff9cbc254b6bfa7",
+      "detail_size_m": 0.06
+    },
+    {
+      "id": "o:f8b5b85a",
+      "kind": "object",
+      "name": "VEG_groundcover_bed",
+      "layer": "VEG_groundcover",
+      "material": "MAT_leaf_groundcover",
+      "tags": [],
+      "class": "vegetation",
+      "class_source": "rule",
+      "pixel_share": 0.041,
+      "digest": "014b4fe58feae1b40b58ee260d5268d6a4de05b1fbef9fb123b29a622797efcf",
+      "detail_size_m": 0.06
+    },
+    {
+      "id": "o:3669b67c",
+      "kind": "object",
+      "name": "WATER_reflecting_pool",
+      "layer": "WATER_pool",
+      "material": "MAT_water_still",
+      "tags": [],
+      "class": "water",
+      "class_source": "rule",
+      "pixel_share": 0.053,
+      "digest": "b799ce58f60470b936ea985bcf595f93409c597c1e123fd629711f24264f7def"
+    },
+    {
+      "id": "o:1fda1ac3",
+      "kind": "object",
+      "name": "SKY_dome_proxy",
+      "layer": "SKY_dome",
+      "material": "MAT_sky_hdri",
+      "tags": [],
+      "class": "sky",
+      "class_source": "rule",
+      "pixel_share": 0.189,
+      "digest": "7f01f87f7750243ecfa63608b1abee0a1917446abe17c1aec50a6aa609b577a7"
+    },
+    {
+      "id": "o:ba30a04a",
+      "kind": "object",
+      "name": "Box042",
+      "layer": "0",
+      "material": "MAT_default_grey",
+      "tags": [],
+      "class": "other",
+      "class_source": "unlabelled",
+      "pixel_share": 0.004,
+      "digest": "2a5ca18b1759c8ed8b33fc92ddcadd759ca7d3aa164b43793681e026f51b088d"
+    },
+    {
+      "id": "m:c546b4c9",
+      "kind": "material",
+      "name": "MAT_brick_wirecut",
+      "tags": [],
+      "class": "architecture",
+      "class_source": "autotag",
+      "pixel_share": 0.312,
+      "digest": "1e342e6fdbafaa0a6c2422723874efd968fdfdfb1c581a4fdee433433c0772a1"
+    },
+    {
+      "id": "m:6cc62725",
+      "kind": "material",
+      "name": "MAT_glass_clear",
+      "tags": [],
+      "class": "glazing",
+      "class_source": "autotag",
+      "pixel_share": 0.088,
+      "digest": "eb3a1acb95b3aa8046fe114a0b01b8d7df43cb8482f26a503f3a271750947d37"
+    },
+    {
+      "id": "m:9ead9309",
+      "kind": "material",
+      "name": "MAT_leaf_palm",
+      "tags": [],
+      "class": "vegetation",
+      "class_source": "autotag",
+      "pixel_share": 0.095,
+      "digest": "91a7607e73c5ae1d4ac19439c578c50e6573c95f65697ad672d01516604fb669"
+    },
+    {
+      "id": "m:4ad8f76e",
+      "kind": "material",
+      "name": "MAT_water_still",
+      "tags": [],
+      "class": "water",
+      "class_source": "autotag",
+      "pixel_share": 0.053,
+      "digest": "c495f19fba65231d7676e9a91e0e8356c3fc53c37fc92ce2a554368dd3d8a9f3"
+    }
+  ]
+}

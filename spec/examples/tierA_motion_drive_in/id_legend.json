@@ -1,0 +1,126 @@
+{
+  "packet_id": "pkt_01JA7R0B2N6T8W4Y1A3C5E7G9J",
+  "entries": [
+    {
+      "id": "o:4b40a620",
+      "kind": "object",
+      "name": "ARCH_gatehouse",
+      "layer": "ARCH_gate",
+      "material": "MAT_stone_ashlar",
+      "tags": [],
+      "class": "architecture",
+      "class_source": "rule",
+      "pixel_share": 0.221,
+      "digest": "6f1a94977e838cd9cd897f867935137a0dbd9c08b170586061c4f2c3743b599c",
+      "planar": true
+    },
+    {
+      "id": "o:54ed7ac7",
+      "kind": "object",
+      "name": "ARCH_boundary_wall",
+      "layer": "ARCH_wall",
+      "material": "MAT_stone_ashlar",
+      "tags": [],
+      "class": "architecture",
+      "class_source": "rule",
+      "pixel_share": 0.118,
+      "digest": "14f0bdc578ce6574d8a21eea35ae06e683ad32683eaa6ca9cdbba6af9dfaeedc",
+      "planar": true
+    },
+    {
+      "id": "o:e4a42d94",
+      "kind": "object",
+      "name": "SIGN_wot_plaque",
+      "layer": "SIGN_plaque",
+      "material": "MAT_brass_brushed",
+      "tags": [],
+      "class": "signage",
+      "class_source": "rule",
+      "pixel_share": 0.009,
+      "digest": "35cb12fd2c1cdcca298aec4747e55da562589c0745acf9cfe7dc812d1b3f004c"
+    },
+    {
+      "id": "o:2dd0d99d",
+      "kind": "object",
+      "name": "HARD_drive_cobble",
+      "layer": "HARD_drive",
+      "material": "MAT_cobble_80",
+      "tags": [],
+      "class": "ground",
+      "class_source": "rule",
+      "pixel_share": 0.244,
+      "digest": "e3bbec2ca58f7cdb4060b92d3dc6ea5df5cbdb4ca375fa0782ea45f7db699269",
+      "planar": true,
+      "detail_size_m": 0.1
+    },
+    {
+      "id": "o:1a76f14e",
+      "kind": "object",
+      "name": "VEG_avenue_trees",
+      "layer": "VEG_avenue",
+      "material": "MAT_leaf_rain_tree",
+      "tags": [],
+      "class": "vegetation",
+      "class_source": "rule",
+      "pixel_share": 0.173,
+      "digest": "b6ddd4067dce9278e8f311e781a57428e143d1bd31b9217f14e2b55b20d964ba",
+      "detail_size_m": 0.06
+    },
+    {
+      "id": "o:b4085595",
+      "kind": "object",
+      "name": "VEH_hero_car",
+      "layer": "VEH_cars",
+      "material": "MAT_car_paint_black",
+      "tags": [],
+      "class": "vehicle",
+      "class_source": "rule",
+      "pixel_share": 0.051,
+      "digest": "1dea653af575c6333ee36f4fc02848438c4b8bb1bc1a7c579ae3e89f675d9473"
+    },
+    {
+      "id": "o:1fda1ac3",
+      "kind": "object",
+      "name": "SKY_dome_proxy",
+      "layer": "SKY_dome",
+      "material": "MAT_sky_hdri",
+      "tags": [],
+      "class": "sky",
+      "class_source": "rule",
+      "pixel_share": 0.172,
+      "digest": "7f01f87f7750243ecfa63608b1abee0a1917446abe17c1aec50a6aa609b577a7"
+    },
+    {
+      "id": "o:5cc1eab4",
+      "kind": "object",
+      "name": "Line017",
+      "layer": "0",
+      "material": "MAT_default_grey",
+      "tags": [],
+      "class": "other",
+      "class_source": "unlabelled",
+      "pixel_share": 0.006,
+      "digest": "d5c8d9299a35c5b0ac18e89747aee4ad2567b16ea0bf83275d6d99fe5630d7de"
+    },
+    {
+      "id": "m:a03ee288",
+      "kind": "material",
+      "name": "MAT_stone_ashlar",
+      "tags": [],
+      "class": "architecture",
+      "class_source": "autotag",
+      "pixel_share": 0.339,
+      "digest": "2a0a104919e10a1c5f17ac96765a1572a86fe3248d1c27d864a8f65b5a4d8e79"
+    },
+    {
+      "id": "m:b9c290d5",
+      "kind": "material",
+      "name": "MAT_leaf_rain_tree",
+      "tags": [],
+      "class": "vegetation",
+      "class_source": "autotag",
+      "pixel_share": 0.173,
+      "digest": "149ebcb9024ae96eef76f1c23ddd20b80b53ae9e95aa2525772d64e5cf34d08e"
+    }
+  ]
+}

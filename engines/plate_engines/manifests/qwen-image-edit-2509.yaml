@@ -1,0 +1,39 @@
+# qwen-image-edit-2509 -- local image edit (C0).
+# PLACEHOLDERS (BUILD_PLAN decisions 9 and 13): version is unpinned until the P0 smoke test; price.usd is
+# NOT a vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
+# endpoints are the vendors' public base URLs as understood on 2026-10-17 and stay unverified until the
+# adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
+id: qwen-image-edit-2509
+name: Qwen-Image-Edit-2509 (ControlNet depth and edge)
+version: unpinned
+pinned: false
+kind: image_edit
+inputs:
+  - {name: image, type: image, required: true}
+  - {name: prompt, type: text, required: true}
+  - {name: mask, type: mask, required: false}
+  - {name: reference_images, type: images, required: false}
+outputs:
+  - {name: image, type: image, required: true}
+params:
+  - {name: seed, type: int, default: null, range: null, enum: null}
+price:
+  model: per_image
+  usd: 0.0
+  status: confirmed
+  notes: "Local compute on owned hardware; no vendor fee. Power and amortisation are not modelled."
+determinism: best_effort
+licence:
+  vendor_terms_url: unknown
+  training_opt_out: null
+allowed_tasks: [relight, people, vegetation, sky, rephotograph_close]
+routes:
+  - provider: local
+    endpoint: local
+    region: local
+    custody_grade: C0
+    custody_status: confirmed
+    terms_hash: unknown
+    upload_visibility: local
+    same_model_fallback_of: null
+    note: "Runs on the render box; nothing leaves it."

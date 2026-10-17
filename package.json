@@ -1,0 +1,15 @@
+{
+  "name": "plate-monorepo",
+  "private": true,
+  "workspaces": [
+    "ui"
+  ],
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  },
+  "scripts": {
+    "test": "npm run test --workspace ui",
+    "build": "npm run build --workspace ui",
+    "dev": "npm run dev --workspace ui"
+  }
+}

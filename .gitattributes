@@ -1,0 +1,27 @@
+# Line endings are pinned in the repo, not left to each machine's core.autocrlf (BUILD_PLAN decision 30).
+# One pattern per line: gitattributes takes a single pattern followed by attributes.
+* text=auto eol=lf
+
+# Windows-native scripts check out CRLF (Windows PowerShell 5.1, cmd, the MAXScript editor)
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ms text eol=crlf
+
+# Never touch bytes
+*.exr binary
+*.tif binary
+*.tiff binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.mp4 binary
+*.mov binary
+*.blend binary
+*.sqlite binary
+*.npz binary
+*.npy binary
+*.zip binary
+*.gz binary

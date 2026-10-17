@@ -1,0 +1,26 @@
+# PLATE pixels: the `cuda` extra. RENDER BOX ONLY.
+#
+# RTX 5090 = sm_120, needs torch built for CUDA 12.8+; install only on the box, never in tests or bootstrap.
+# Nothing in this repo installs this file (tests, scripts/bootstrap.ps1 and `make setup` all skip it), and
+# the service runs in stub mode without any of it. On the box, from the repo root, in two steps:
+#
+#   1. torch + torchvision from the CUDA 12.8 wheel index (the default PyPI wheel on Windows is CPU-only):
+#        uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#   2. the rest of this file from PyPI:
+#        uv pip install -r pixels/requirements-cuda.txt
+#
+# A later plain `uv sync` removes these packages again; use `uv sync --inexact` to keep them.
+torch>=2.7          # cu128 build, see step 1
+torchvision>=0.22   # cu128 build, see step 1; also provides RAFT (BSD-3-Clause)
+
+# Allowed model packages only (commercial-safe; see pixels/plate_pixels/licences.py). Blocked models are
+# never listed here: CI fails if one appears (pixels/tests/test_no_blocked_identifiers.py).
+transformers        # Depth Anything V2 Small (Apache-2.0), loaded from the Small checkpoint only
+diffusers           # Qwen-Image-Edit-2509 and Wan 2.2 VACE (Apache-2.0)
+open-clip-torch     # OpenCLIP (MIT)
+lpips               # LPIPS (BSD-2-Clause)
+realesrgan          # Real-ESRGAN (BSD-3-Clause); AI layers only, never the plate
+basicsr             # Real-ESRGAN dependency
+paddleocr           # PaddleOCR (Apache-2.0); install paddlepaddle per the Paddle docs for the box's CUDA
+# geocalib          # GeoCalib: install from github.com/cvg/GeoCalib (Apache-2.0 code, CC-BY-4.0 weights)
+# sam2              # SAM 2.1: install from github.com/facebookresearch/sam2 (Apache-2.0)

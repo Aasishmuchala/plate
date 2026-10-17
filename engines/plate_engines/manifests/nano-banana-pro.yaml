@@ -1,0 +1,39 @@
+# nano-banana-pro -- Google image edit, direct Gemini (C1 candidate).
+# PLACEHOLDERS (BUILD_PLAN decisions 9 and 13): version is unpinned until the P0 smoke test; price.usd is
+# NOT a vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
+# endpoints are the vendors' public base URLs as understood on 2026-10-17 and stay unverified until the
+# adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
+id: nano-banana-pro
+name: Nano Banana Pro
+version: unpinned
+pinned: false
+kind: image_edit
+inputs:
+  - {name: image, type: image, required: true}
+  - {name: prompt, type: text, required: true}
+  - {name: mask, type: mask, required: false}
+  - {name: reference_images, type: images, required: false}
+outputs:
+  - {name: image, type: image, required: true}
+params:
+  - {name: seed, type: int, default: null, range: null, enum: null}
+price:
+  model: per_image
+  usd: 0.0
+  status: unconfirmed
+  notes: "UNCONFIRMED placeholder: usd is not a vendor price; refresh from the vendor catalogue at P0. Pricing unit (per image) is also assumed."
+determinism: nondeterministic
+licence:
+  vendor_terms_url: unknown
+  training_opt_out: null
+allowed_tasks: [relight, people, vegetation, sky, rephotograph_close]
+routes:
+  - provider: gemini
+    endpoint: https://generativelanguage.googleapis.com
+    region: unknown
+    custody_grade: C1
+    custody_status: pending_written_terms
+    terms_hash: unknown
+    upload_visibility: private
+    same_model_fallback_of: null
+    note: "Gemini direct is a C1 candidate only: written no-training and zero-retention terms not yet held."

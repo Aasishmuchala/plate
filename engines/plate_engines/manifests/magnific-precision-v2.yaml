@@ -1,0 +1,36 @@
+# magnific-precision-v2 -- upscaler for AI layers only (D).
+# PLACEHOLDERS (BUILD_PLAN decisions 9 and 13): version is unpinned until the P0 smoke test; price.usd is
+# NOT a vendor price while status is unconfirmed; "unknown" means not yet established in writing. Other
+# endpoints are the vendors' public base URLs as understood on 2026-10-17 and stay unverified until the
+# adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
+id: magnific-precision-v2
+name: Magnific Precision v2
+version: unpinned
+pinned: false
+kind: upscale
+inputs:
+  - {name: image, type: image, required: true}
+outputs:
+  - {name: image, type: image, required: true}
+params:
+  - {name: scale, type: int, default: null, range: null, enum: null}
+price:
+  model: per_image
+  usd: 0.0
+  status: unconfirmed
+  notes: "UNCONFIRMED placeholder: usd is not a vendor price; refresh from the vendor catalogue at P0. Pricing unit (per image) is also assumed."
+determinism: nondeterministic
+licence:
+  vendor_terms_url: unknown
+  training_opt_out: null
+allowed_tasks: [upscale_ai_layers]
+routes:
+  - provider: magnific
+    endpoint: unknown
+    region: unknown
+    custody_grade: D
+    custody_status: pending_written_terms
+    terms_hash: unknown
+    upload_visibility: unknown
+    same_model_fallback_of: null
+    note: "Terms and upload behaviour not yet established; AI layers only, never the plate."

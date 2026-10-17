@@ -1,0 +1,276 @@
+{
+  "packet_version": "0.1.1",
+  "packet_id": "pkt_01JA7S4D6F8H0K2M4P6R8T0V2X",
+  "kind": "still",
+  "tier": "C",
+  "project_id": "client-amphi",
+  "shot_id": "plaza-dusk",
+  "created_utc": "2026-10-17T11:03:19Z",
+  "supersedes": null,
+  "host": {
+    "app": "none",
+    "version": "n/a",
+    "plugin": {
+      "name": "plate_daemon.tier_c",
+      "version": "0.1.0"
+    }
+  },
+  "renderer": {
+    "name": "client",
+    "version": "unknown"
+  },
+  "units": {
+    "system_unit": "relative",
+    "meters_per_unit": null,
+    "up_axis": "Z"
+  },
+  "camera": {
+    "name": "client_plate",
+    "source": "estimated",
+    "projection": "perspective",
+    "convention": {
+      "id": "plate-cam-v0",
+      "handedness": "right",
+      "world_up": "+Z",
+      "camera_forward": "-Z",
+      "camera_up": "+Y",
+      "camera_right": "+X",
+      "matrix": "world_from_camera",
+      "layout": "row_major",
+      "vectors": "column",
+      "length_unit": "scene",
+      "pixel_origin": "top_left_corner",
+      "pixel_center": 0.5
+    },
+    "world_from_camera": [
+      [
+        1,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        1
+      ]
+    ],
+    "focal_length_mm": 27.994186,
+    "film_width_mm": 36.0,
+    "zoom_factor": 1.0,
+    "fov_deg": {
+      "horizontal": 65.4813,
+      "vertical": 39.4839
+    },
+    "lens_shift": {
+      "horizontal": 0.0,
+      "vertical": 0.0,
+      "raw_unit": "none"
+    },
+    "distortion": "none",
+    "intrinsics_px": {
+      "fx": 4280.0,
+      "fy": 4280.0,
+      "principal_point": [
+        2752.0,
+        1536.0
+      ],
+      "K": [
+        [
+          4280.0,
+          0,
+          2752.0
+        ],
+        [
+          0,
+          4280.0,
+          1536.0
+        ],
+        [
+          0,
+          0,
+          1
+        ]
+      ]
+    },
+    "resolution": {
+      "width": 5504,
+      "height": 3072,
+      "pixel_aspect": 1.0
+    },
+    "safe_frame": {
+      "x": 0,
+      "y": 0,
+      "width": 5504,
+      "height": 3072
+    },
+    "f_number": null,
+    "focus_distance": null,
+    "dof_enabled": false,
+    "exposure": {
+      "mode": "none"
+    },
+    "white_balance": {
+      "mode": "neutral"
+    },
+    "frames": {
+      "hero": 0,
+      "start": 0,
+      "end": 0,
+      "fps": 25
+    }
+  },
+  "colour": {
+    "max_colour_mode": "not_applicable",
+    "working_space": "display_only",
+    "master": "client_plate",
+    "vfb_corrections_baked": false,
+    "display_encoding": {
+      "primaries": "unknown",
+      "transfer": "srgb",
+      "icc": "none"
+    }
+  },
+  "files": {
+    "client_plate": {
+      "kind": "file",
+      "path": "client_plate.png",
+      "bytes": 33816576,
+      "hash": {
+        "algo": "blake3",
+        "hex": "27c465c6d277911422a08507b977ce1c4a5e2203152382e41d7ea3daa80b2a59"
+      },
+      "format": "png",
+      "width": 5504,
+      "height": 3072,
+      "bit_depth": 8
+    },
+    "depth_estimated": {
+      "kind": "file",
+      "path": "depth_estimated.exr",
+      "bytes": 67633152,
+      "hash": {
+        "algo": "blake3",
+        "hex": "7a09199b2a1eb6b45f1a598de2f71ed19e760751555ab4dd361db677dc495e06"
+      },
+      "format": "exr",
+      "width": 5504,
+      "height": 3072,
+      "bit_depth": 32
+    },
+    "segments": {
+      "kind": "file",
+      "path": "segments.png",
+      "bytes": 1048576,
+      "hash": {
+        "algo": "blake3",
+        "hex": "606c1e382c3daead9a43ad2d7b41a92e15933262f22ceec033c7ec56d381d1e6"
+      },
+      "format": "png",
+      "width": 5504,
+      "height": 3072,
+      "bit_depth": 16
+    },
+    "id_legend": {
+      "kind": "file",
+      "path": "id_legend.json",
+      "bytes": 1536,
+      "hash": {
+        "algo": "blake3",
+        "hex": "a9b91e98a61cdc5908d316d1c3f1051d2f65a10fd4b94893efc0e34577133b48"
+      },
+      "format": "json"
+    }
+  },
+  "id_legend": {
+    "file": "id_legend",
+    "source": "segmentation",
+    "segmentation": {
+      "model": "sam2.1-hiera-base-plus",
+      "file": "segments"
+    },
+    "entry_count": 7,
+    "coverage": {
+      "labelled_share": 0.979,
+      "unlabelled_share": 0.011,
+      "uncovered_share": 0.01
+    }
+  },
+  "policy": {
+    "rules_version": "1",
+    "class_rules": [],
+    "lock_by_default": true,
+    "locked_ids": [
+      "s:00001",
+      "s:00002",
+      "s:00005",
+      "s:00007"
+    ],
+    "editable_ids": [
+      "s:00003",
+      "s:00004",
+      "s:00006"
+    ],
+    "text_lock": true,
+    "lint": {
+      "max_unlabelled_share": 0.05,
+      "unlabelled_share": 0.011,
+      "passed": true
+    },
+    "custody": {
+      "nda": false
+    }
+  },
+  "render": {
+    "session": "client_supplied",
+    "sampler": "unknown",
+    "time_s": null,
+    "denoiser": {
+      "beauty": "unknown"
+    }
+  },
+  "estimated": {
+    "depth": {
+      "model": "depth-anything-v2-small",
+      "version": "2024-06",
+      "licence": "Apache-2.0"
+    },
+    "intrinsics": {
+      "model": "geocalib",
+      "version": "pinhole-2024",
+      "licence": "Apache-2.0 (verify weights licence before NDA use)"
+    },
+    "segments": {
+      "model": "sam2.1-hiera-base-plus",
+      "version": "2.1",
+      "licence": "Apache-2.0"
+    },
+    "depth_is_metric": false,
+    "depth_semantics": "relative_inverse_depth",
+    "gravity_camera": [
+      0.0,
+      -0.9986,
+      0.0523
+    ],
+    "client": {
+      "original_filename_hash": {
+        "algo": "blake3",
+        "hex": "471b9f6c3f237412a9bc8810e30d4ec877772d8e0f426d6af179f05ea229f876"
+      },
+      "consent_record": "docs/consent/client-amphi-2026-10.pdf"
+    }
+  }
+}

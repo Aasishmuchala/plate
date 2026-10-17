@@ -1,0 +1,74 @@
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: #101114;
+  color: #e7e7ea;
+}
+
+.plate-app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.make-bar {
+  padding: 10px 16px;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid #2a2c33;
+  color: #a9abb5;
+}
+
+.make-bar em {
+  margin-left: 12px;
+  color: #e7e7ea;
+}
+
+.plate-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.plate-canvas {
+  flex: 1;
+  min-width: 0;
+}
+
+.node-list {
+  width: 220px;
+  padding: 12px 16px;
+  border-left: 1px solid #2a2c33;
+  font-size: 13px;
+}
+
+.node-list h2 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #a9abb5;
+}
+
+.node-list ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.refusal {
+  margin-top: 12px;
+  padding: 8px;
+  border: 1px solid #7a2e35;
+  color: #f0a3a9;
+}
+
+.react-flow__node {
+  color: #101114;
+}

@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+node_modules/
+ui/dist/
+.router/
+*.egg-info/
+.DS_Store
+# daemon runtime state (projects live on the box, never in the repo)
+.plate/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+# labels are client-work data: kept locally, not committed
+calib/labels.jsonl
+ui/node_modules/
+# fixture render scratch (fixtures/blender/render.sh), regenerated on demand
+fixtures/**/_work/
+# PLATE lock sidecars are machine state, never committed
+*.lock.plate
+
+# Client-derived imagery never enters git (BUILD_PLAN: client plates are client data).
+gates/tests/golden/stills/*.png
+gates/tests/golden/texture/*.png

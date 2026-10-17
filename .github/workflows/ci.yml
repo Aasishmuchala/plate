@@ -1,0 +1,52 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  fidelity-selftest:
+    # First CI job (BUILD_PLAN section 9, day 1): the fidelity harness proves itself before anything else runs.
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --python 3.12
+      - run: uv run --no-sync python -m plate_gates.fidelity_bench selftest
+        env:
+          PYTHONPATH: gates
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --python 3.12
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
+      - run: uv run --no-sync pytest tests -q
+  python:
+    needs: fidelity-selftest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: FedericoCarboni/setup-ffmpeg@v3
+      - run: uv sync --python 3.12
+      - run: uv run --no-sync pytest
+  ui:
+    needs: fidelity-selftest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test

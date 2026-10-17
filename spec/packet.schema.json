@@ -1,0 +1,2522 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:sthyra:plate:packet:0.1",
+  "title": "PLATE Shot Packet manifest v0.1",
+  "description": "manifest.json at the root of a Shot Packet folder. Normative prose and the semantic rules JSON Schema cannot express live in spec/PACKET.md; spec/plate_spec implements both.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "packet_version",
+    "packet_id",
+    "kind",
+    "tier",
+    "project_id",
+    "shot_id",
+    "created_utc",
+    "host",
+    "renderer",
+    "units",
+    "camera",
+    "colour",
+    "files",
+    "id_legend",
+    "policy",
+    "render"
+  ],
+  "properties": {
+    "packet_version": {
+      "type": "string",
+      "pattern": "^0\\.1\\.[0-9]+$"
+    },
+    "packet_id": {
+      "$ref": "#/$defs/packet_id"
+    },
+    "kind": {
+      "enum": [
+        "still",
+        "motion"
+      ]
+    },
+    "tier": {
+      "description": "A = scene-backed packet from 3ds Max + V-Ray (full gates). C = client-supplied plate with estimated geometry (gates degrade).",
+      "enum": [
+        "A",
+        "C"
+      ]
+    },
+    "project_id": {
+      "$ref": "#/$defs/slug"
+    },
+    "shot_id": {
+      "$ref": "#/$defs/slug"
+    },
+    "created_utc": {
+      "$ref": "#/$defs/utc"
+    },
+    "supersedes": {
+      "description": "packet_id this packet replaces after a client change (decision 17). null for a first packet.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/packet_id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "app",
+        "version",
+        "plugin"
+      ],
+      "properties": {
+        "app": {
+          "enum": [
+            "3dsmax",
+            "none"
+          ]
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "python": {
+          "type": "string"
+        },
+        "plugin": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "version"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "version": {
+              "$ref": "#/$defs/semver"
+            }
+          }
+        }
+      }
+    },
+    "renderer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "enum": [
+            "vray",
+            "vantage",
+            "client"
+          ]
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "scene_hash": {
+      "$ref": "#/$defs/scene_hash"
+    },
+    "view_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "units": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "system_unit",
+        "meters_per_unit",
+        "up_axis"
+      ],
+      "properties": {
+        "system_unit": {
+          "enum": [
+            "millimeters",
+            "centimeters",
+            "meters",
+            "inches",
+            "feet",
+            "relative"
+          ]
+        },
+        "meters_per_unit": {
+          "oneOf": [
+            {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "up_axis": {
+          "const": "Z"
+        }
+      }
+    },
+    "camera": {
+      "$ref": "#/$defs/camera"
+    },
+    "colour": {
+      "$ref": "#/$defs/colour"
+    },
+    "files": {
+      "$ref": "#/$defs/files"
+    },
+    "id_legend": {
+      "$ref": "#/$defs/id_legend_block"
+    },
+    "policy": {
+      "$ref": "#/$defs/policy"
+    },
+    "render": {
+      "$ref": "#/$defs/render"
+    },
+    "motion": {
+      "$ref": "#/$defs/motion"
+    },
+    "estimated": {
+      "$ref": "#/$defs/estimated"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "tier": {
+            "const": "A"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "scene_hash",
+          "view_hash"
+        ],
+        "properties": {
+          "renderer": {
+            "properties": {
+              "name": {
+                "enum": [
+                  "vray",
+                  "vantage"
+                ]
+              }
+            }
+          },
+          "units": {
+            "properties": {
+              "system_unit": {
+                "not": {
+                  "const": "relative"
+                }
+              },
+              "meters_per_unit": {
+                "type": "number"
+              }
+            }
+          },
+          "camera": {
+            "properties": {
+              "source": {
+                "const": "scene"
+              },
+              "f_number": {
+                "type": "number"
+              },
+              "focus_distance": {
+                "type": "number"
+              }
+            }
+          },
+          "files": {
+            "required": [
+              "beauty_exr",
+              "display_tiff16",
+              "id_legend"
+            ]
+          },
+          "estimated": false
+        },
+        "if": {
+          "required": [
+            "render"
+          ],
+          "properties": {
+            "render": {
+              "required": [
+                "session"
+              ],
+              "properties": {
+                "session": {
+                  "const": "fixture"
+                }
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "host": {
+              "properties": {
+                "app": {
+                  "const": "none"
+                }
+              }
+            }
+          }
+        },
+        "else": {
+          "properties": {
+            "host": {
+              "properties": {
+                "app": {
+                  "const": "3dsmax"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "tier": {
+            "const": "C"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "estimated"
+        ],
+        "properties": {
+          "host": {
+            "properties": {
+              "app": {
+                "const": "none"
+              }
+            }
+          },
+          "renderer": {
+            "properties": {
+              "name": {
+                "const": "client"
+              }
+            }
+          },
+          "units": {
+            "properties": {
+              "system_unit": {
+                "const": "relative"
+              },
+              "meters_per_unit": {
+                "type": "null"
+              }
+            }
+          },
+          "camera": {
+            "properties": {
+              "source": {
+                "const": "estimated"
+              },
+              "dof_enabled": {
+                "const": false
+              }
+            }
+          },
+          "files": {
+            "required": [
+              "client_plate",
+              "depth_estimated",
+              "segments",
+              "id_legend"
+            ]
+          },
+          "kind": {
+            "const": "still"
+          },
+          "scene_hash": false,
+          "view_hash": false
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "motion"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "motion"
+        ],
+        "properties": {
+          "camera": {
+            "required": [
+              "frames_file"
+            ]
+          },
+          "files": {
+            "required": [
+              "camera_frames",
+              "clay_seq",
+              "id_seq",
+              "z_seq"
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "motion": false
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "render"
+        ],
+        "properties": {
+          "render": {
+            "required": [
+              "session"
+            ],
+            "properties": {
+              "session": {
+                "const": "fixture"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "tier": {
+            "const": "A"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "packet_id": {
+      "description": "pkt_ + 26-char Crockford base32 ULID (time-sortable, opaque: carries no client or project name).",
+      "type": "string",
+      "pattern": "^pkt_[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$"
+    },
+    "utc": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    },
+    "hash": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algo",
+        "hex"
+      ],
+      "properties": {
+        "algo": {
+          "const": "blake3"
+        },
+        "hex": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "scene_hash": {
+      "description": "BLAKE3 of the canonical scene digest (not the .max bytes). See PACKET.md section 5.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algo",
+        "hex",
+        "digest_version"
+      ],
+      "properties": {
+        "algo": {
+          "const": "blake3"
+        },
+        "hex": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "digest_version": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "max_file": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "mtime_utc": {
+              "$ref": "#/$defs/utc"
+            }
+          }
+        }
+      }
+    },
+    "relpath": {
+      "description": "Packet-relative POSIX path. No leading slash, no backslash, no '..' segment, no drive letter.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(^|/)\\.\\.(/|$))[A-Za-z0-9._%/-]+$"
+    },
+    "number3": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "row4": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      },
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "mat4": {
+      "description": "4x4, row-major nested list, column-vector convention (p_world = M @ [x, y, z, 1]^T). Last row exactly [0, 0, 0, 1].",
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/row4"
+        },
+        {
+          "$ref": "#/$defs/row4"
+        },
+        {
+          "$ref": "#/$defs/row4"
+        },
+        {
+          "const": [
+            0,
+            0,
+            0,
+            1
+          ]
+        }
+      ],
+      "items": false
+    },
+    "mat3": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/number3"
+      }
+    },
+    "rect": {
+      "description": "Pixel rectangle in render-frame pixels, origin top-left.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
+      "properties": {
+        "x": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "y": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "convention": {
+      "description": "The one camera convention of packet v0.1. Every field is a constant so a sender cannot silently use another convention.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "handedness",
+        "world_up",
+        "camera_forward",
+        "camera_up",
+        "camera_right",
+        "matrix",
+        "layout",
+        "vectors",
+        "length_unit",
+        "pixel_origin",
+        "pixel_center"
+      ],
+      "properties": {
+        "id": {
+          "const": "plate-cam-v0"
+        },
+        "handedness": {
+          "const": "right"
+        },
+        "world_up": {
+          "const": "+Z"
+        },
+        "camera_forward": {
+          "const": "-Z"
+        },
+        "camera_up": {
+          "const": "+Y"
+        },
+        "camera_right": {
+          "const": "+X"
+        },
+        "matrix": {
+          "const": "world_from_camera"
+        },
+        "layout": {
+          "const": "row_major"
+        },
+        "vectors": {
+          "const": "column"
+        },
+        "length_unit": {
+          "const": "scene"
+        },
+        "pixel_origin": {
+          "const": "top_left_corner"
+        },
+        "pixel_center": {
+          "const": 0.5
+        }
+      }
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "source",
+        "projection",
+        "convention",
+        "world_from_camera",
+        "focal_length_mm",
+        "film_width_mm",
+        "zoom_factor",
+        "fov_deg",
+        "lens_shift",
+        "intrinsics_px",
+        "resolution",
+        "safe_frame",
+        "f_number",
+        "focus_distance",
+        "dof_enabled",
+        "exposure",
+        "white_balance",
+        "frames",
+        "distortion"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "enum": [
+            "scene",
+            "estimated"
+          ]
+        },
+        "node_type": {
+          "type": "string"
+        },
+        "projection": {
+          "const": "perspective"
+        },
+        "convention": {
+          "$ref": "#/$defs/convention"
+        },
+        "world_from_camera": {
+          "$ref": "#/$defs/mat4"
+        },
+        "focal_length_mm": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "film_width_mm": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "zoom_factor": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "fov_deg": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "horizontal",
+            "vertical"
+          ],
+          "properties": {
+            "horizontal": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "exclusiveMaximum": 180
+            },
+            "vertical": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "exclusiveMaximum": 180
+            }
+          }
+        },
+        "lens_shift": {
+          "description": "Raw host values for audit. v0.1 supports unshifted, untilted cameras only: senders refuse Send otherwise (PACKET.md 3.3).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "horizontal",
+            "vertical",
+            "raw_unit"
+          ],
+          "properties": {
+            "horizontal": {
+              "const": 0
+            },
+            "vertical": {
+              "const": 0
+            },
+            "raw_unit": {
+              "enum": [
+                "vray_physical",
+                "max_physical",
+                "none"
+              ]
+            },
+            "vertical_tilt_correction": {
+              "description": "V-Ray vertical tilt (2-point perspective) is not representable by a pinhole K in v0.1.",
+              "const": false
+            }
+          }
+        },
+        "intrinsics_px": {
+          "description": "Authoritative pinhole intrinsics in render-frame pixels. See PACKET.md 3.3 for the projection formula.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "fx",
+            "fy",
+            "principal_point",
+            "K"
+          ],
+          "properties": {
+            "fx": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "fy": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "principal_point": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "K": {
+              "$ref": "#/$defs/mat3"
+            }
+          }
+        },
+        "resolution": {
+          "description": "The rendered frame including overscan.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "width",
+            "height",
+            "pixel_aspect"
+          ],
+          "properties": {
+            "width": {
+              "type": "integer",
+              "minimum": 16,
+              "maximum": 32768
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 16,
+              "maximum": 32768
+            },
+            "pixel_aspect": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          }
+        },
+        "safe_frame": {
+          "description": "The deliverable rectangle inside the rendered frame. Everything outside it is overscan context for vendor padding (decision 3).",
+          "$ref": "#/$defs/rect"
+        },
+        "overscan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "engine_aspect"
+          ],
+          "properties": {
+            "engine_aspect": {
+              "type": "string",
+              "pattern": "^[0-9]+:[0-9]+$"
+            },
+            "note": {
+              "type": "string"
+            }
+          }
+        },
+        "f_number": {
+          "oneOf": [
+            {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "focus_distance": {
+          "description": "Scene units. null only for tier C.",
+          "oneOf": [
+            {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dof_enabled": {
+          "type": "boolean"
+        },
+        "exposure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "physical",
+                "ev",
+                "none"
+              ]
+            },
+            "ev100": {
+              "type": "number"
+            },
+            "iso": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "shutter_s": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "vignetting": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "mode": {
+                    "const": "physical"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "iso",
+                  "shutter_s",
+                  "ev100"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "mode": {
+                    "const": "ev"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "ev100"
+                ]
+              }
+            }
+          ]
+        },
+        "white_balance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "kelvin",
+                "rgb",
+                "neutral"
+              ]
+            },
+            "kelvin": {
+              "type": "number",
+              "minimum": 1000,
+              "maximum": 40000
+            },
+            "rgb": {
+              "$ref": "#/$defs/number3"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "mode": {
+                    "const": "kelvin"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "kelvin"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "mode": {
+                    "const": "rgb"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "rgb"
+                ]
+              }
+            }
+          ]
+        },
+        "frames": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "hero",
+            "start",
+            "end",
+            "fps"
+          ],
+          "properties": {
+            "hero": {
+              "type": "integer"
+            },
+            "start": {
+              "type": "integer"
+            },
+            "end": {
+              "type": "integer"
+            },
+            "fps": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 120
+            }
+          }
+        },
+        "frames_file": {
+          "description": "Role key in files that holds per-frame camera matrices (motion packets).",
+          "const": "camera_frames"
+        },
+        "distortion": {
+          "description": "v0.1 has no distortion model: lens distortion must be off.",
+          "const": "none"
+        }
+      }
+    },
+    "colour": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_colour_mode",
+        "working_space",
+        "master",
+        "vfb_corrections_baked",
+        "display_encoding"
+      ],
+      "properties": {
+        "max_colour_mode": {
+          "description": "How the host was colour-managed when the packet rendered. 'not_applicable' only for tier C.",
+          "enum": [
+            "ocio",
+            "legacy_gamma",
+            "not_applicable"
+          ]
+        },
+        "working_space": {
+          "enum": [
+            "lin_rec709",
+            "acescg",
+            "display_only"
+          ]
+        },
+        "ocio": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "config_name",
+            "config_hash",
+            "display",
+            "view"
+          ],
+          "properties": {
+            "config_name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "config_hash": {
+              "$ref": "#/$defs/hash"
+            },
+            "display": {
+              "type": "string",
+              "minLength": 1
+            },
+            "view": {
+              "type": "string",
+              "minLength": 1
+            },
+            "look": {
+              "type": "string"
+            }
+          }
+        },
+        "legacy_gamma": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "master": {
+          "description": "Decision 2: the approved display master is the VFB-corrected 16-bit TIFF (tier A) or the client's plate (tier C).",
+          "enum": [
+            "display_tiff16",
+            "client_plate"
+          ]
+        },
+        "vfb_corrections_baked": {
+          "type": "boolean"
+        },
+        "vfb_layers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "display_encoding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "primaries",
+            "transfer",
+            "icc"
+          ],
+          "properties": {
+            "primaries": {
+              "enum": [
+                "rec709",
+                "p3d65",
+                "unknown"
+              ]
+            },
+            "transfer": {
+              "enum": [
+                "srgb",
+                "gamma22",
+                "bt1886",
+                "unknown"
+              ]
+            },
+            "icc": {
+              "enum": [
+                "embedded",
+                "none"
+              ]
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "max_colour_mode": {
+                "const": "ocio"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "ocio"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "max_colour_mode": {
+                "const": "legacy_gamma"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "legacy_gamma"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "max_colour_mode": {
+                "const": "not_applicable"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "working_space": {
+                "const": "display_only"
+              },
+              "master": {
+                "const": "client_plate"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "working_space": {
+                "enum": [
+                  "lin_rec709",
+                  "acescg"
+                ]
+              },
+              "master": {
+                "const": "display_tiff16"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "file_ref": {
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "bytes",
+        "hash",
+        "format"
+      ],
+      "properties": {
+        "kind": {
+          "const": "file"
+        },
+        "path": {
+          "$ref": "#/$defs/relpath"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hash": {
+          "$ref": "#/$defs/hash"
+        },
+        "format": {
+          "enum": [
+            "exr",
+            "tiff",
+            "png",
+            "jpeg",
+            "json"
+          ]
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "bit_depth": {
+          "enum": [
+            8,
+            16,
+            32
+          ]
+        }
+      }
+    },
+    "plain_file": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/file_ref"
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "sequence_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "pattern",
+        "first",
+        "last",
+        "format",
+        "width",
+        "height",
+        "hashes"
+      ],
+      "properties": {
+        "kind": {
+          "const": "sequence"
+        },
+        "pattern": {
+          "description": "printf-style frame pattern with exactly one %0Nd and no other '%', e.g. motion/clay.%04d.png",
+          "allOf": [
+            {
+              "$ref": "#/$defs/relpath"
+            },
+            {
+              "pattern": "^[^%]*%0[1-8]d[^%]*$"
+            }
+          ]
+        },
+        "first": {
+          "type": "integer"
+        },
+        "last": {
+          "type": "integer"
+        },
+        "format": {
+          "enum": [
+            "exr",
+            "png",
+            "tiff"
+          ]
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "dtype": {
+          "enum": [
+            "uint8",
+            "uint16",
+            "half",
+            "float"
+          ]
+        },
+        "hashes": {
+          "description": "Packet-relative path of a text file with one '<blake3 hex>  <relpath>' line per frame.",
+          "$ref": "#/$defs/relpath"
+        }
+      }
+    },
+    "element": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "element",
+        "layer",
+        "channels",
+        "dtype",
+        "filtered",
+        "denoised"
+      ],
+      "properties": {
+        "element": {
+          "enum": [
+            "beauty",
+            "zdepth",
+            "normals",
+            "cryptomatte_object",
+            "cryptomatte_material",
+            "wire_colour",
+            "diffuse_filter",
+            "world_position",
+            "light_select",
+            "velocity",
+            "raw_lighting",
+            "raw_gi",
+            "reflection",
+            "refraction",
+            "specular",
+            "self_illumination",
+            "alpha"
+          ]
+        },
+        "layer": {
+          "type": "string",
+          "minLength": 1
+        },
+        "channels": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "dtype": {
+          "enum": [
+            "half",
+            "float"
+          ]
+        },
+        "filtered": {
+          "type": "boolean"
+        },
+        "denoised": {
+          "type": "boolean"
+        },
+        "space": {
+          "enum": [
+            "camera",
+            "world",
+            "screen",
+            "none"
+          ]
+        },
+        "depth_kind": {
+          "enum": [
+            "planar",
+            "radial"
+          ]
+        },
+        "normalized": {
+          "type": "boolean"
+        },
+        "clamped": {
+          "type": "boolean"
+        },
+        "background_value": {
+          "oneOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "encoding": {
+          "enum": [
+            "signed",
+            "unit_remapped"
+          ]
+        },
+        "rank_levels": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "light_name": {
+          "type": "string"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "element": {
+                "const": "zdepth"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "depth_kind",
+              "normalized",
+              "clamped"
+            ],
+            "properties": {
+              "dtype": {
+                "const": "float"
+              },
+              "filtered": {
+                "const": false
+              },
+              "denoised": {
+                "const": false
+              },
+              "normalized": {
+                "const": false
+              },
+              "clamped": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "element": {
+                "enum": [
+                  "cryptomatte_object",
+                  "cryptomatte_material"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "rank_levels"
+            ],
+            "properties": {
+              "dtype": {
+                "const": "float"
+              },
+              "denoised": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "element": {
+                "const": "normals"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "space",
+              "encoding"
+            ],
+            "properties": {
+              "space": {
+                "const": "camera"
+              },
+              "encoding": {
+                "const": "signed"
+              },
+              "denoised": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "element": {
+                "const": "world_position"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "dtype": {
+                "const": "float"
+              },
+              "space": {
+                "const": "world"
+              },
+              "denoised": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "element": {
+                "const": "light_select"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "light_name"
+            ]
+          }
+        }
+      ]
+    },
+    "beauty_exr": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/file_ref"
+        },
+        {
+          "required": [
+            "elements",
+            "width",
+            "height"
+          ],
+          "properties": {
+            "format": {
+              "const": "exr"
+            },
+            "compression": {
+              "description": "Lossless only: DWA and PXR24 corrupt Cryptomatte hashes and float data passes.",
+              "enum": [
+                "none",
+                "rle",
+                "zip",
+                "zips",
+                "piz"
+              ]
+            },
+            "parts": {
+              "description": "single (default): one EXR part holds every layer; multi: one part per layer. Readers find channels by layer + channels across all parts either way.",
+              "enum": [
+                "single",
+                "multi"
+              ],
+              "default": "single"
+            },
+            "elements": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/element"
+              },
+              "minItems": 1,
+              "allOf": [
+                {
+                  "contains": {
+                    "properties": {
+                      "element": {
+                        "const": "beauty"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "element": {
+                        "const": "zdepth"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "element": {
+                        "const": "normals"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "element": {
+                        "const": "cryptomatte_object"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "element": {
+                        "const": "cryptomatte_material"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "element": {
+                        "const": "wire_colour"
+                      }
+                    }
+                  }
+                },
+                {
+                  "contains": {
+                    "properties": {
+                      "element": {
+                        "const": "diffuse_filter"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "display_tiff16": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/file_ref"
+        },
+        {
+          "required": [
+            "width",
+            "height",
+            "bit_depth",
+            "channels"
+          ],
+          "properties": {
+            "format": {
+              "const": "tiff"
+            },
+            "bit_depth": {
+              "const": 16
+            },
+            "channels": {
+              "enum": [
+                "RGB",
+                "RGBA"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "json_file": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/file_ref"
+        },
+        {
+          "properties": {
+            "format": {
+              "const": "json"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "files": {
+      "type": "object",
+      "properties": {
+        "beauty_exr": {
+          "$ref": "#/$defs/beauty_exr"
+        },
+        "display_tiff16": {
+          "$ref": "#/$defs/display_tiff16"
+        },
+        "id_legend": {
+          "$ref": "#/$defs/json_file"
+        },
+        "camera_frames": {
+          "$ref": "#/$defs/json_file"
+        },
+        "clay_seq": {
+          "$ref": "#/$defs/sequence_ref"
+        },
+        "id_seq": {
+          "$ref": "#/$defs/data_sequence"
+        },
+        "z_seq": {
+          "$ref": "#/$defs/data_sequence"
+        },
+        "client_plate": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/file_ref"
+            },
+            {
+              "required": [
+                "width",
+                "height",
+                "bit_depth"
+              ],
+              "properties": {
+                "format": {
+                  "enum": [
+                    "png",
+                    "tiff",
+                    "jpeg",
+                    "exr"
+                  ]
+                }
+              }
+            }
+          ],
+          "unevaluatedProperties": false
+        },
+        "depth_estimated": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/file_ref"
+            },
+            {
+              "required": [
+                "width",
+                "height",
+                "bit_depth"
+              ],
+              "properties": {
+                "format": {
+                  "const": "exr"
+                },
+                "bit_depth": {
+                  "const": 32
+                }
+              }
+            }
+          ],
+          "unevaluatedProperties": false
+        },
+        "segments": {
+          "description": "Label map: integer segment index per pixel (PNG16), indices match id_legend s:NNNN ids.",
+          "allOf": [
+            {
+              "$ref": "#/$defs/file_ref"
+            },
+            {
+              "required": [
+                "width",
+                "height",
+                "bit_depth"
+              ],
+              "properties": {
+                "format": {
+                  "const": "png"
+                },
+                "bit_depth": {
+                  "const": 16
+                }
+              }
+            }
+          ],
+          "unevaluatedProperties": false
+        }
+      },
+      "patternProperties": {
+        "^x_[a-z0-9_]{1,40}$": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/plain_file"
+            },
+            {
+              "$ref": "#/$defs/sequence_ref"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "legend_id": {
+      "description": "o:<8 hex> Cryptomatte object hash, m:<8 hex> Cryptomatte material hash, s:<5 digits> tier C segment label (00001..65535).",
+      "type": "string",
+      "pattern": "^(o:[0-9a-f]{8}|m:[0-9a-f]{8}|s:[0-9]{5})$"
+    },
+    "id_class": {
+      "enum": [
+        "architecture",
+        "glazing",
+        "signage",
+        "ground",
+        "vegetation",
+        "sky",
+        "people",
+        "water",
+        "vehicle",
+        "furniture",
+        "other"
+      ]
+    },
+    "cryptomatte_layer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "layer",
+        "hash",
+        "rank_levels",
+        "manifest",
+        "id_type"
+      ],
+      "properties": {
+        "layer": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hash": {
+          "const": "murmur3_32"
+        },
+        "rank_levels": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "manifest": {
+          "enum": [
+            "exr_metadata",
+            "sidecar_json"
+          ]
+        },
+        "id_type": {
+          "enum": [
+            "node_name",
+            "node_path",
+            "material_name",
+            "layer_name"
+          ]
+        }
+      }
+    },
+    "id_legend_block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "source",
+        "entry_count",
+        "coverage"
+      ],
+      "properties": {
+        "file": {
+          "const": "id_legend"
+        },
+        "source": {
+          "enum": [
+            "cryptomatte",
+            "segmentation"
+          ]
+        },
+        "cryptomatte": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "object",
+            "material"
+          ],
+          "properties": {
+            "object": {
+              "$ref": "#/$defs/cryptomatte_layer"
+            },
+            "material": {
+              "$ref": "#/$defs/cryptomatte_layer"
+            }
+          }
+        },
+        "segmentation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "model",
+            "file"
+          ],
+          "properties": {
+            "model": {
+              "type": "string",
+              "minLength": 1
+            },
+            "file": {
+              "const": "segments"
+            }
+          }
+        },
+        "entry_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "labelled_share",
+            "unlabelled_share",
+            "uncovered_share"
+          ],
+          "properties": {
+            "labelled_share": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "unlabelled_share": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "uncovered_share": {
+              "description": "Pixels with no ID (environment background). Locked by construction.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "cryptomatte"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "cryptomatte"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "segmentation"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "segmentation"
+            ]
+          }
+        }
+      ]
+    },
+    "class_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "match",
+        "pattern",
+        "class"
+      ],
+      "properties": {
+        "source": {
+          "enum": [
+            "layer",
+            "node",
+            "material"
+          ]
+        },
+        "match": {
+          "enum": [
+            "prefix",
+            "exact"
+          ]
+        },
+        "pattern": {
+          "type": "string",
+          "minLength": 1
+        },
+        "class": {
+          "$ref": "#/$defs/id_class"
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rules_version",
+        "class_rules",
+        "lock_by_default",
+        "locked_ids",
+        "editable_ids",
+        "text_lock",
+        "lint"
+      ],
+      "properties": {
+        "rules_version": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "class_rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/class_rule"
+          }
+        },
+        "lock_by_default": {
+          "const": true
+        },
+        "locked_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/legend_id"
+          },
+          "uniqueItems": true
+        },
+        "editable_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/legend_id"
+          },
+          "uniqueItems": true
+        },
+        "text_lock": {
+          "description": "Signage ids are always locked and get an OCR text-lock mask (appendix A).",
+          "const": true
+        },
+        "lint": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_unlabelled_share",
+            "unlabelled_share",
+            "passed"
+          ],
+          "properties": {
+            "max_unlabelled_share": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.25
+            },
+            "unlabelled_share": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "passed": {
+              "const": true
+            }
+          }
+        },
+        "custody": {
+          "description": "Optional custody floor the plugin knows; the daemon's project setting also applies and the stricter wins.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "nda"
+          ],
+          "properties": {
+            "nda": {
+              "type": "boolean"
+            },
+            "allowed_grades": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "C0",
+                  "C1",
+                  "C2",
+                  "D"
+                ]
+              },
+              "uniqueItems": true,
+              "minItems": 1
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "nda": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "allowed_grades"
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "render": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session",
+        "time_s",
+        "denoiser"
+      ],
+      "properties": {
+        "session": {
+          "enum": [
+            "interactive",
+            "batch",
+            "client_supplied",
+            "fixture"
+          ],
+          "description": "fixture: a repo test packet rendered by fixtures/blender (Cycles, repacked to V-Ray layer names); tier A with host.app none only, never client work."
+        },
+        "sampler": {
+          "enum": [
+            "bucket",
+            "progressive",
+            "unknown"
+          ]
+        },
+        "noise_threshold": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_subdivs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "time_s": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "peak_rss_gb": {
+          "type": "number",
+          "minimum": 0
+        },
+        "vrscene_path": {
+          "type": "string"
+        },
+        "denoiser": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "beauty"
+          ],
+          "properties": {
+            "beauty": {
+              "enum": [
+                "none",
+                "vray",
+                "nvidia_ai",
+                "intel_oidn",
+                "unknown"
+              ]
+            },
+            "denoised_elements": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "element_overhead": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "beauty_only_time_s",
+            "time_ratio"
+          ],
+          "properties": {
+            "beauty_only_time_s": {
+              "type": "number",
+              "minimum": 0
+            },
+            "time_ratio": {
+              "type": "number",
+              "minimum": 0
+            },
+            "rss_ratio": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "motion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hero_still_packet_id",
+        "sequence_resolution",
+        "frame0_matches_hero",
+        "clay_override"
+      ],
+      "properties": {
+        "hero_still_packet_id": {
+          "$ref": "#/$defs/packet_id"
+        },
+        "sequence_resolution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "width",
+            "height"
+          ],
+          "properties": {
+            "width": {
+              "type": "integer",
+              "minimum": 16
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 16
+            }
+          }
+        },
+        "frame0_matches_hero": {
+          "description": "The first sequence frame is rendered from the hero still's camera state (BUILD_PLAN 4, Send Motion).",
+          "const": true
+        },
+        "clay_override": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "material",
+            "keeps_glass",
+            "keeps_lights"
+          ],
+          "properties": {
+            "material": {
+              "type": "string",
+              "minLength": 1
+            },
+            "keeps_glass": {
+              "type": "boolean"
+            },
+            "keeps_lights": {
+              "type": "boolean"
+            }
+          }
+        },
+        "path_crossings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "frame",
+              "kind"
+            ],
+            "properties": {
+              "frame": {
+                "type": "integer"
+              },
+              "kind": {
+                "enum": [
+                  "threshold",
+                  "room_change",
+                  "occluder"
+                ]
+              },
+              "note": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "estimated_model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "version",
+        "licence"
+      ],
+      "properties": {
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "licence": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "estimated": {
+      "description": "Tier C provenance: which models estimated geometry. Badged 'estimated geometry' everywhere downstream.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "depth",
+        "intrinsics",
+        "segments",
+        "depth_is_metric",
+        "depth_semantics"
+      ],
+      "properties": {
+        "depth": {
+          "$ref": "#/$defs/estimated_model"
+        },
+        "intrinsics": {
+          "$ref": "#/$defs/estimated_model"
+        },
+        "segments": {
+          "$ref": "#/$defs/estimated_model"
+        },
+        "depth_is_metric": {
+          "const": false
+        },
+        "client": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "original_filename_hash": {
+              "$ref": "#/$defs/hash"
+            },
+            "consent_record": {
+              "type": "string"
+            }
+          }
+        },
+        "depth_semantics": {
+          "enum": [
+            "relative_inverse_depth",
+            "relative_depth"
+          ]
+        },
+        "gravity_camera": {
+          "description": "GeoCalib gravity as a unit vector in the camera frame (+X right, +Y up, +Z toward viewer).",
+          "$ref": "#/$defs/number3"
+        }
+      }
+    },
+    "id_legend_file": {
+      "description": "Schema of id_legend.json (validated by plate_spec against #/$defs/id_legend_file).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "packet_id",
+        "entries"
+      ],
+      "properties": {
+        "packet_id": {
+          "$ref": "#/$defs/packet_id"
+        },
+        "entries": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "kind",
+              "name",
+              "class",
+              "class_source",
+              "pixel_share"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/legend_id"
+              },
+              "kind": {
+                "enum": [
+                  "object",
+                  "material",
+                  "segment"
+                ]
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "layer": {
+                "type": "string"
+              },
+              "material": {
+                "type": "string"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "uniqueItems": true
+              },
+              "class": {
+                "$ref": "#/$defs/id_class"
+              },
+              "class_source": {
+                "enum": [
+                  "rule",
+                  "autotag",
+                  "manual",
+                  "unlabelled"
+                ]
+              },
+              "pixel_share": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "planar": {
+                "type": "boolean"
+              },
+              "digest": {
+                "description": "BLAKE3 hex of this node's or material's digest record (tier A).",
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "detail_size_m": {
+                "description": "Characteristic detail size in metres for the render-it router (leaf 0.06, brick 0.065, sett 0.10).",
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    "camera_frames_file": {
+      "description": "Schema of camera_frames.json for motion packets.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "packet_id",
+        "convention",
+        "fps",
+        "frames"
+      ],
+      "properties": {
+        "packet_id": {
+          "$ref": "#/$defs/packet_id"
+        },
+        "convention": {
+          "const": "plate-cam-v0"
+        },
+        "fps": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 120
+        },
+        "frames": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "frame",
+              "world_from_camera"
+            ],
+            "properties": {
+              "frame": {
+                "type": "integer"
+              },
+              "world_from_camera": {
+                "$ref": "#/$defs/mat4"
+              },
+              "focal_length_mm": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "focus_distance": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    "data_sequence": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/sequence_ref"
+        },
+        {
+          "required": [
+            "dtype"
+          ],
+          "properties": {
+            "format": {
+              "const": "exr"
+            },
+            "dtype": {
+              "const": "float"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

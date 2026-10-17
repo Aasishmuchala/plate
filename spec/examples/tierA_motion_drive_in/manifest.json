@@ -1,0 +1,526 @@
+{
+  "packet_version": "0.1.1",
+  "packet_id": "pkt_01JA7R0B2N6T8W4Y1A3C5E7G9J",
+  "kind": "motion",
+  "tier": "A",
+  "project_id": "tula-wot",
+  "shot_id": "drive-in-s01",
+  "created_utc": "2026-10-17T10:12:55Z",
+  "supersedes": null,
+  "host": {
+    "app": "3dsmax",
+    "version": "2026.2",
+    "python": "3.11.9",
+    "plugin": {
+      "name": "plate_max",
+      "version": "0.1.0"
+    }
+  },
+  "renderer": {
+    "name": "vray",
+    "version": "7.00.03"
+  },
+  "scene_hash": {
+    "algo": "blake3",
+    "hex": "247cb2ab606a5e342536ccf1677d02ac0fe0442d98b06169972824addc4c0afe",
+    "digest_version": "1",
+    "max_file": {
+      "name": "WOT_approach_v7.max",
+      "bytes": 3221225472
+    }
+  },
+  "view_hash": {
+    "algo": "blake3",
+    "hex": "0dbaad03915ec941d29a9f6efba1143083944b991e8234a1e02cdb7af46246c7"
+  },
+  "units": {
+    "system_unit": "millimeters",
+    "meters_per_unit": 0.001,
+    "up_axis": "Z"
+  },
+  "camera": {
+    "name": "CAM_S01_drive_in",
+    "source": "scene",
+    "node_type": "VRayPhysicalCamera",
+    "projection": "perspective",
+    "convention": {
+      "id": "plate-cam-v0",
+      "handedness": "right",
+      "world_up": "+Z",
+      "camera_forward": "-Z",
+      "camera_up": "+Y",
+      "camera_right": "+X",
+      "matrix": "world_from_camera",
+      "layout": "row_major",
+      "vectors": "column",
+      "length_unit": "scene",
+      "pixel_origin": "top_left_corner",
+      "pixel_center": 0.5
+    },
+    "world_from_camera": [
+      [
+        0.9998,
+        0.0002,
+        -0.019995,
+        -2000.0
+      ],
+      [
+        -0.019996,
+        0.009996,
+        -0.99975,
+        -24000.0
+      ],
+      [
+        0.0,
+        0.99995,
+        0.009998,
+        1450.0
+      ],
+      [
+        0,
+        0,
+        0,
+        1
+      ]
+    ],
+    "focal_length_mm": 35.0,
+    "film_width_mm": 36.0,
+    "zoom_factor": 1.0,
+    "fov_deg": {
+      "horizontal": 54.4322,
+      "vertical": 32.2688
+    },
+    "lens_shift": {
+      "horizontal": 0.0,
+      "vertical": 0.0,
+      "raw_unit": "vray_physical",
+      "vertical_tilt_correction": false
+    },
+    "distortion": "none",
+    "intrinsics_px": {
+      "fx": 3733.333333,
+      "fy": 3733.333333,
+      "principal_point": [
+        1920.0,
+        1080.0
+      ],
+      "K": [
+        [
+          3733.333333,
+          0,
+          1920.0
+        ],
+        [
+          0,
+          3733.333333,
+          1080.0
+        ],
+        [
+          0,
+          0,
+          1
+        ]
+      ]
+    },
+    "resolution": {
+      "width": 3840,
+      "height": 2160,
+      "pixel_aspect": 1.0
+    },
+    "safe_frame": {
+      "x": 0,
+      "y": 0,
+      "width": 3840,
+      "height": 2160
+    },
+    "f_number": 8.0,
+    "focus_distance": 20000.0,
+    "dof_enabled": false,
+    "exposure": {
+      "mode": "physical",
+      "iso": 100,
+      "shutter_s": 0.008,
+      "ev100": 12.9658,
+      "vignetting": 0.0
+    },
+    "white_balance": {
+      "mode": "kelvin",
+      "kelvin": 6500
+    },
+    "frames": {
+      "hero": 0,
+      "start": 0,
+      "end": 124,
+      "fps": 25
+    },
+    "frames_file": "camera_frames"
+  },
+  "colour": {
+    "max_colour_mode": "ocio",
+    "working_space": "acescg",
+    "ocio": {
+      "config_name": "studio-config-v2.1.0_aces-v1.3_ocio-v2.3",
+      "config_hash": {
+        "algo": "blake3",
+        "hex": "17a5984f7eb094f31eee433350e7aca7a700ed775dc1ec45b5fc9149898b04d0"
+      },
+      "display": "sRGB - Display",
+      "view": "ACES 1.0 - SDR Video"
+    },
+    "master": "display_tiff16",
+    "vfb_corrections_baked": true,
+    "vfb_layers": [
+      "Exposure",
+      "White Balance",
+      "Curves"
+    ],
+    "display_encoding": {
+      "primaries": "rec709",
+      "transfer": "srgb",
+      "icc": "embedded"
+    }
+  },
+  "files": {
+    "beauty_exr": {
+      "kind": "file",
+      "path": "beauty.exr",
+      "bytes": 398458880,
+      "hash": {
+        "algo": "blake3",
+        "hex": "eea65d8bbee4b73fba68b57a1144f84efa98fe23021d0e9b485a41d2a5cf879a"
+      },
+      "format": "exr",
+      "width": 3840,
+      "height": 2160,
+      "compression": "zip",
+      "elements": [
+        {
+          "element": "beauty",
+          "layer": "RGBA",
+          "channels": [
+            "R",
+            "G",
+            "B",
+            "A"
+          ],
+          "dtype": "half",
+          "filtered": true,
+          "denoised": true
+        },
+        {
+          "element": "zdepth",
+          "layer": "VRayZDepth",
+          "channels": [
+            "Z"
+          ],
+          "dtype": "float",
+          "filtered": false,
+          "denoised": false,
+          "depth_kind": "planar",
+          "normalized": false,
+          "clamped": false,
+          "background_value": null
+        },
+        {
+          "element": "normals",
+          "layer": "VRayNormals",
+          "channels": [
+            "X",
+            "Y",
+            "Z"
+          ],
+          "dtype": "half",
+          "filtered": true,
+          "denoised": false,
+          "space": "camera",
+          "encoding": "signed"
+        },
+        {
+          "element": "cryptomatte_object",
+          "layer": "CryptoObject",
+          "channels": [
+            "CryptoObject00.R",
+            "CryptoObject00.G",
+            "CryptoObject00.B",
+            "CryptoObject00.A",
+            "CryptoObject01.R",
+            "CryptoObject01.G",
+            "CryptoObject01.B",
+            "CryptoObject01.A",
+            "CryptoObject02.R",
+            "CryptoObject02.G",
+            "CryptoObject02.B",
+            "CryptoObject02.A"
+          ],
+          "dtype": "float",
+          "filtered": true,
+          "denoised": false,
+          "rank_levels": 6
+        },
+        {
+          "element": "cryptomatte_material",
+          "layer": "CryptoMaterial",
+          "channels": [
+            "CryptoMaterial00.R",
+            "CryptoMaterial00.G",
+            "CryptoMaterial00.B",
+            "CryptoMaterial00.A",
+            "CryptoMaterial01.R",
+            "CryptoMaterial01.G",
+            "CryptoMaterial01.B",
+            "CryptoMaterial01.A",
+            "CryptoMaterial02.R",
+            "CryptoMaterial02.G",
+            "CryptoMaterial02.B",
+            "CryptoMaterial02.A"
+          ],
+          "dtype": "float",
+          "filtered": true,
+          "denoised": false,
+          "rank_levels": 6
+        },
+        {
+          "element": "wire_colour",
+          "layer": "VRayWireColor",
+          "channels": [
+            "R",
+            "G",
+            "B"
+          ],
+          "dtype": "half",
+          "filtered": false,
+          "denoised": false
+        },
+        {
+          "element": "diffuse_filter",
+          "layer": "VRayDiffuseFilter",
+          "channels": [
+            "R",
+            "G",
+            "B"
+          ],
+          "dtype": "half",
+          "filtered": true,
+          "denoised": false
+        }
+      ]
+    },
+    "display_tiff16": {
+      "kind": "file",
+      "path": "display.tif",
+      "bytes": 49766400,
+      "hash": {
+        "algo": "blake3",
+        "hex": "edc5e4970bd00e59b6c35fd85b48e8c0ba7e3181f964d86ba44f29b3f1771da4"
+      },
+      "format": "tiff",
+      "width": 3840,
+      "height": 2160,
+      "bit_depth": 16,
+      "channels": "RGB"
+    },
+    "id_legend": {
+      "kind": "file",
+      "path": "id_legend.json",
+      "bytes": 3072,
+      "hash": {
+        "algo": "blake3",
+        "hex": "d5be657003c75fcb2572ea673b840810d82251d161174e7911f14101ca503ec6"
+      },
+      "format": "json"
+    },
+    "camera_frames": {
+      "kind": "file",
+      "path": "camera_frames.json",
+      "bytes": 40960,
+      "hash": {
+        "algo": "blake3",
+        "hex": "0310f409be06d33e69ed85954f45dac9027279256fd2a9cc0e025c4dac0f6ade"
+      },
+      "format": "json"
+    },
+    "clay_seq": {
+      "kind": "sequence",
+      "pattern": "motion/clay.%04d.png",
+      "first": 0,
+      "last": 124,
+      "format": "png",
+      "width": 1280,
+      "height": 720,
+      "dtype": "uint16",
+      "hashes": "motion/clay.blake3"
+    },
+    "id_seq": {
+      "kind": "sequence",
+      "pattern": "motion/id.%04d.exr",
+      "first": 0,
+      "last": 124,
+      "format": "exr",
+      "width": 1280,
+      "height": 720,
+      "dtype": "float",
+      "hashes": "motion/id.blake3"
+    },
+    "z_seq": {
+      "kind": "sequence",
+      "pattern": "motion/z.%04d.exr",
+      "first": 0,
+      "last": 124,
+      "format": "exr",
+      "width": 1280,
+      "height": 720,
+      "dtype": "float",
+      "hashes": "motion/z.blake3"
+    }
+  },
+  "id_legend": {
+    "file": "id_legend",
+    "source": "cryptomatte",
+    "cryptomatte": {
+      "object": {
+        "layer": "CryptoObject",
+        "hash": "murmur3_32",
+        "id_type": "node_name",
+        "rank_levels": 6,
+        "manifest": "exr_metadata"
+      },
+      "material": {
+        "layer": "CryptoMaterial",
+        "hash": "murmur3_32",
+        "id_type": "material_name",
+        "rank_levels": 6,
+        "manifest": "exr_metadata"
+      }
+    },
+    "entry_count": 10,
+    "coverage": {
+      "labelled_share": 0.988,
+      "unlabelled_share": 0.006,
+      "uncovered_share": 0.006
+    }
+  },
+  "policy": {
+    "rules_version": "1",
+    "class_rules": [
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "ARCH_",
+        "class": "architecture"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "GLZ_",
+        "class": "glazing"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "SIGN_",
+        "class": "signage"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "HARD_",
+        "class": "ground"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "VEG_",
+        "class": "vegetation"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "SKY",
+        "class": "sky"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "PEOPLE",
+        "class": "people"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "WATER",
+        "class": "water"
+      },
+      {
+        "source": "layer",
+        "match": "prefix",
+        "pattern": "VEH_",
+        "class": "vehicle"
+      }
+    ],
+    "lock_by_default": true,
+    "locked_ids": [
+      "o:4b40a620",
+      "o:54ed7ac7",
+      "o:e4a42d94",
+      "o:2dd0d99d",
+      "o:5cc1eab4",
+      "m:a03ee288"
+    ],
+    "editable_ids": [
+      "o:1a76f14e",
+      "o:b4085595",
+      "o:1fda1ac3",
+      "m:b9c290d5"
+    ],
+    "text_lock": true,
+    "lint": {
+      "max_unlabelled_share": 0.05,
+      "unlabelled_share": 0.006,
+      "passed": true
+    },
+    "custody": {
+      "nda": false,
+      "allowed_grades": [
+        "C0",
+        "C1",
+        "C2",
+        "D"
+      ]
+    }
+  },
+  "render": {
+    "session": "interactive",
+    "sampler": "bucket",
+    "noise_threshold": 0.005,
+    "max_subdivs": 24,
+    "time_s": 5210.0,
+    "peak_rss_gb": 176.4,
+    "vrscene_path": "D:/PLATE/vrscene/tula-wot/drive-in-s01.vrscene",
+    "denoiser": {
+      "beauty": "nvidia_ai",
+      "denoised_elements": [
+        "RGBA"
+      ]
+    }
+  },
+  "motion": {
+    "hero_still_packet_id": "pkt_01JA7QZZ1K3M5P7R9T2V4X6Z8B",
+    "sequence_resolution": {
+      "width": 1280,
+      "height": 720
+    },
+    "frame0_matches_hero": true,
+    "clay_override": {
+      "material": "PLATE_clay_matte_0.7",
+      "keeps_glass": true,
+      "keeps_lights": true
+    },
+    "path_crossings": [
+      {
+        "frame": 88,
+        "kind": "threshold",
+        "note": "car passes the gate line"
+      }
+    ]
+  }
+}
