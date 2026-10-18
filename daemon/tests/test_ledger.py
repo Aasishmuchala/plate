@@ -378,9 +378,9 @@ def test_processes_append_without_corrupting_the_chain(led: Ledger):
 
 
 CHILD_HOLD = (
-    "import sys; from pathlib import Path; from plate_daemon.lock import project_lock\n"
+    "import os, sys; from pathlib import Path; from plate_daemon.lock import project_lock\n"
     "with project_lock(Path(sys.argv[1]), 0, name=sys.argv[2]):\n"
-    "    print('held', flush=True)\n"
+    "    print('held', os.getpid(), flush=True)\n"
     "    sys.stdin.readline()\n"
 )
 
@@ -395,11 +395,14 @@ def test_a_writer_in_another_process_raises_project_locked(led: Ledger):
         encoding="utf-8",
     )
     try:
-        assert holder.stdout.readline().strip() == "held"
+        # The child names its own pid: on Windows a venv's python.exe is a launcher, so Popen.pid is the
+        # launcher's pid, not the one holding the lock.
+        word, child_pid = holder.stdout.readline().split()
+        assert word == "held"
         quick = Ledger(led.project_dir, lock_timeout_s=0.1)
         with pytest.raises(ProjectLocked) as exc:
             quick.append(kind="done", run_id="r1")
-        assert exc.value.holder_pid == holder.pid
+        assert exc.value.holder_pid == int(child_pid)
         assert not led.path.exists()
     finally:
         holder.stdin.write("\n")

@@ -585,3 +585,25 @@ def test_follow_ingest_never_raises_for_the_daemon():
         "/api/v0/packets/pkt_X/events", {"token": TOKEN, "daemon_url": f"http://127.0.0.1:{_closed_port()}"}
     )
     assert gone["ingest"] == "ingesting" and "unreadable" in gone["problem"]
+
+
+def test_a_connect_timeout_is_unreachable_but_an_answer_timeout_is_a_timeout(monkeypatch):
+    """Windows does not refuse a closed loopback port at once: the connect times out instead. urllib wraps a
+    connect-phase timeout in URLError; a timeout waiting for the answer arrives unwrapped."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request("http://127.0.0.1:9/api/v0/health")
+
+    def connect_timeout(*a, **k):
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    def answer_timeout(*a, **k):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(transport._opener, "open", connect_timeout)
+    with pytest.raises(transport.DaemonUnreachable, match="could not connect"):
+        transport._request(req, 1.0)
+    monkeypatch.setattr(transport._opener, "open", answer_timeout)
+    with pytest.raises(transport.DaemonTimeout):
+        transport._request(req, 1.0)

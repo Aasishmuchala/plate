@@ -1536,4 +1536,11 @@ def test_ui_preview_renders_the_dock_to_a_png(qt, tmp_path):
     assert raw[:8] == b"\x89PNG\r\n\x1a\n"
     width, height = int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
     assert (width, height) == preview.SIZE
-    assert len(raw) > 20_000, "a populated dock compresses to more than a flat fill"
+    # Not a flat fill: count distinct colours on a sampling grid. (A byte-size threshold was platform
+    # dependent: the same dock compressed to 14.6 KB on windows-latest and over 20 KB on macOS.)
+    from PySide6.QtGui import QImage
+
+    img = QImage(str(out))
+    assert not img.isNull()
+    colours = {img.pixel(x, y) for x in range(0, img.width(), 7) for y in range(0, img.height(), 7)}
+    assert len(colours) >= 12, f"a populated dock shows text and widgets, got {len(colours)} colours"

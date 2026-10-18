@@ -341,7 +341,8 @@ TOLERANCE_DOC = {
     "*de00* / *tone_shift*": "abs 0.05",
     "*mean_abs*": "abs 0.1",
     "lapvar / fine_ratio / luma_mean / luma_std / sat_mean": "rel 0.02",
-    "first / last / last_vs_start / *luma_delta* / *p95*": "abs 0.1",
+    "first / last / last_vs_start (video landing)": "abs 0.5",
+    "*luma_delta* / *p95*": "abs 0.1",
     "int / bool / str leaves (shifts, verdicts, flags)": "exact",
     "anything else": "rel 0.001",
 }
@@ -362,7 +363,12 @@ def tolerance(key: str, value) -> tuple[float, float]:
         return 0.1, 0.0
     if k in {"lapvar", "fine_ratio", "luma_mean", "luma_std", "sat_mean"}:
         return 0.0, 0.02
-    if k in {"first", "last", "last_vs_start"} or "luma_delta" in k or "p95" in k:
+    if k in {"first", "last", "last_vs_start"}:
+        # Video landing levels come from an ffmpeg decode, and decoders differ by up to ~0.4 levels between
+        # ffmpeg builds (8.1 on macOS vs 9.0.2 on windows-latest CI: dolly first 0.95 vs 0.77). The gate's
+        # own bounds are 12 and 16 levels, so 0.5 is still far finer than any decision it makes.
+        return 0.5, 0.0
+    if "luma_delta" in k or "p95" in k:
         return 0.1, 0.0
     return 0.0, 1e-3
 

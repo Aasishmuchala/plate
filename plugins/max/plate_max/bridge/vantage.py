@@ -27,6 +27,15 @@ LIVE_LINK_GLOBALS = (
 EXPORTER = "vrayExportVRScene"  # TODO-verify: keyword names startFrame/endFrame/exportCompressed
 
 
+def _colon_in_name(target: Path) -> bool:
+    """True when a ':' sits anywhere but a Windows drive. On Windows "a:b.vrscene" parses as drive "a:" plus
+    "b.vrscene" (a drive-relative path), so checking only `.name` misses it there; such a path came from a
+    name that held ':'. Checked before anything touches the disk."""
+    if target.drive and not target.root:
+        return True
+    return any(":" in part for part in target.parts[1 if target.anchor else 0 :])
+
+
 def export_vrscene(path: Path | str, camera: Any, f0: int | None = None, f1: int | None = None) -> str | None:
     """Export the scene as a .vrscene seen through camera (a node or a name), frames f0..f1.
 
@@ -35,8 +44,8 @@ def export_vrscene(path: Path | str, camera: Any, f0: int | None = None, f1: int
     put back afterwards. Returns the path, or None when the exporter is missing, the camera is
     unknown, or no file appeared."""
     target = Path(path)
-    if ":" in target.name:
-        raise ValueError(f"{target.name!r}: ':' is not allowed in a file name")
+    if _colon_in_name(target):
+        raise ValueError(f"{str(target)!r}: ':' is not allowed in a file name")
     exporter = rt_attr(EXPORTER)
     if not callable(exporter):
         return None

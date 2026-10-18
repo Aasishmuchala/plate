@@ -348,6 +348,16 @@ def test_tiff_refuses_things_that_are_not_tiffs(tmp_path):
 # ---------------------------------------------------------------------------- EXR
 
 
+def _header(path: Path) -> dict:
+    """The first part's header, read in a function so the OpenEXR File is freed on return. A File object
+    kept alive past its `with` block still holds the file open on Windows, and the next embed's os.replace
+    then fails with "Access is denied"."""
+    import OpenEXR
+
+    with OpenEXR.File(str(path), header_only=True) as exr:
+        return dict(exr.header())
+
+
 def _channels(path: Path) -> dict[str, np.ndarray]:
     import OpenEXR
 
@@ -382,11 +392,10 @@ def test_exr_single_part_round_trip_changes_nothing_but_the_header(tmp_path):
     assert list(after) == list(before)
     for k in before:
         assert after[k].dtype == before[k].dtype and np.array_equal(after[k], before[k]), k
-    with OpenEXR.File(str(p), header_only=True) as exr:
-        h = exr.header()
-        assert h["cryptomatte/abc/name"] == "CryptoObject"
-        assert h["compression"] == OpenEXR.PIZ_COMPRESSION
-        assert h[L.KEY] == LIN.to_json()
+    h = _header(p)
+    assert h["cryptomatte/abc/name"] == "CryptoObject"
+    assert h["compression"] == OpenEXR.PIZ_COMPRESSION
+    assert h[L.KEY] == LIN.to_json()
     L.embed(p, LIN_B)
     assert L.read(p) == LIN_B
     assert sorted(x.name for x in tmp_path.iterdir()) == ["beauty.exr"]

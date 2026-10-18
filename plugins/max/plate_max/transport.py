@@ -122,9 +122,14 @@ def _request(req: urllib.request.Request, timeout_s: float) -> tuple[int, Any]:
             return exc.code, _decode(exc.read())
         finally:
             exc.close()
-    except urllib.error.URLError as exc:  # connect failures; a connect timeout arrives wrapped
+    except urllib.error.URLError as exc:  # connect (and send) failures arrive wrapped
         if isinstance(exc.reason, TimeoutError):
-            raise DaemonTimeout(f"{req.full_url}: timed out after {timeout_s:g} s") from exc
+            # A timeout while connecting means nothing accepted the connection: a listening daemon is
+            # accepted by the OS at once, however busy it is. On Windows a closed loopback port is not
+            # refused straight away (the stack retries the SYN for about two seconds), so it shows up
+            # here as a connect timeout and must read as unreachable, as ECONNREFUSED does on macOS.
+            # A timeout waiting for the ANSWER is raised unwrapped below and stays DaemonTimeout.
+            raise DaemonUnreachable(f"{req.full_url}: could not connect within {timeout_s:g} s") from exc
         raise DaemonUnreachable(f"{req.full_url}: {exc}") from exc
     except TimeoutError as exc:  # the answer did not come in time (socket.timeout is TimeoutError)
         raise DaemonTimeout(f"{req.full_url}: timed out after {timeout_s:g} s") from exc
