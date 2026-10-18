@@ -72,6 +72,10 @@ OPEN_PATHS = frozenset({"/health"})
 PLATE_UPSCALE_ERROR = "plate upscaling is forbidden (BUILD_PLAN section 1)"
 
 
+# The most body a refused request is read before the 401/403 goes out (see _deny).
+DENY_DRAIN_CAP_BYTES = 8 * 1024 * 1024
+
+
 # --------------------------------------------------------------------------- the shared token
 
 
@@ -186,6 +190,18 @@ class Guard:
 
     @staticmethod
     async def _deny(scope: Scope, receive: Receive, send: Send, status: int, error: str) -> None:
+        # Read (and drop) the request body before answering. A refusal sent while the client is still
+        # writing makes Windows abort the connection (WinError 10053), so the client never sees the 401 and
+        # reports "not reachable" instead of the token mismatch. The cap bounds what a refused caller costs.
+        if scope.get("type") == "http":
+            drained = 0
+            while drained <= DENY_DRAIN_CAP_BYTES:
+                message = await receive()
+                if message.get("type") != "http.request":
+                    break
+                drained += len(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
         await JSONResponse({"error": error}, status_code=status)(scope, receive, send)
 
 
