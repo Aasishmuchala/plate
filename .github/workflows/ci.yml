@@ -18,7 +18,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - uses: FedericoCarboni/setup-ffmpeg@v3
+      # FedericoCarboni/setup-ffmpeg supports x64 only; macos-latest runners are arm64, so macOS takes Homebrew's.
+      - if: runner.os == 'Windows'
+        uses: FedericoCarboni/setup-ffmpeg@v3
+      - if: runner.os == 'macOS'
+        name: ffmpeg (Homebrew)
+        run: brew install ffmpeg || brew upgrade ffmpeg
       - name: uv sync
         run: uv sync --python 3.12
       - name: npm ci (root workspace, includes ui)

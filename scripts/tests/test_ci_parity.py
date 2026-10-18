@@ -18,7 +18,7 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-SETUP_PREFIXES = ("uv sync", "npm ci", "npm install")
+SETUP_PREFIXES = ("uv sync", "npm ci", "npm install", "brew install")  # toolchain setup, not a CI check
 
 EXPECTED = [
     "python -m plate_gates.fidelity_bench selftest",
