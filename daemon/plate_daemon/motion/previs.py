@@ -1,7 +1,13 @@
 """Seedance 2.5 reference-to-video previs: clay motion from the real camera path, dressed by the approved stills,
 watermarked PREVIS (router plan T44, BUILD_PLAN P3 and the "Seedance drifts or invents" risk).
 
-What goes to the engine (`seedance-2.5-r2v`, Atlas, custody D):
+What goes to the engine (`seedance-2.5-r2v`; Runway preferred, Atlas fallback; custody D). The route follows the
+preference rule (Wave 11 decision 63, `prefer.prefer_route`): the project's `video_route_pins` and
+`preferred_video_provider` (default `runway`) decide, and the Runway route is skipped, with the reason on the route
+record, when the hero still's aspect fits none of its legal ratios at the take's resolution. On Runway the request is
+`text_to_video` with the stills as `references` and the clay as `referenceVideos[0]`: reference roles are not a
+Runway field, so the `first_frame` role travels as a plain reference (the adapter notes it on the run), and `480P`
+is a Runway `draft` (the 480p preview, billed at the 480p rate).
 
 - `reference_images`: the approved still upstream of the Motion node as `role: first_frame` (`@img1`), then one
   approved still per room along the path (`occupancy.choose_refs`: the still whose camera sees the room's dominant
@@ -33,7 +39,8 @@ Motion node gets `previs: true`, and delivery refuses it (`check_deliverable`, c
 
 `run(project, motion_node, quality)` in order: the video lock (the upstream still must have passed its gates and
 been approved: `PrevisLocked`, 409 VIDEO_LOCKED, before any route or price exists), custody (`CustodyViolation`
-before a byte is staged: Atlas is grade D, refused on NDA projects, where previs means local Wan 2.2), the plan
+before a byte is staged: Runway and Atlas are grade D, refused on NDA projects, where previs means local Wan 2.2),
+then the preference rule among the allowed routes, the plan
 (rooms, refs, hints, prompt, clay video), the quote (ledger `quoted`), approval (`approved_by` is required for any
 route that leaves the box), then submit, poll, fetch, watermark, CAS, ledger `done`, the node update.
 """
@@ -57,6 +64,8 @@ import cv2
 import numpy as np
 from blake3 import blake3
 
+from plate_engines import prefer
+from plate_engines.adapters import runway_schema
 from plate_gates import io as pio
 from plate_gates.timemap import TimeMap, fps_text
 
@@ -1030,7 +1039,27 @@ def _route_record(manifest: Any, r: Any) -> dict[str, Any]:
     }
 
 
-def _pick_route(manifest: Any, allowed: Any, route_id: str | None) -> tuple[Any, dict[str, Any]]:
+def _runway_ratio(slug: str, w: int, h: int, tier: str | None) -> str | None:
+    """`runway_schema.ratio_for`, None when the model has resolution tiers and `tier` is not one of them."""
+    tiers = [t.upper() for t in runway_schema.spec_for(slug).ratios if t != "all"]
+    if tier is not None and tiers and str(tier).upper() not in tiers:
+        return None
+    return runway_schema.ratio_for(slug, w, h, tier)
+
+
+def _pick_route(
+    manifest: Any,
+    allowed: Any,
+    route_id: str | None,
+    *,
+    prefer_provider: str | None = prefer.PREFERRED_VIDEO_PROVIDER,
+    frame: tuple[int, int] | None = None,
+    tier: str | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """(Route, route record): the allowed active routes (only `route_id` when pinned) in the preference rule's order
+    (`prefer.prefer_route` on the hero still's `frame` at `tier`), the first one taken; `reasons` on the record says
+    why. CustodyViolation when no route is allowed; 422 `route_ratio` when the route taken is a Runway route the
+    frame fits no legal ratio of (Runway would centre-crop the references and the clay)."""
     candidates = [r for r in manifest.routes if r.status == "active"]
     if route_id is not None:
         candidates = [r for r in candidates if r.route_id == route_id]
@@ -1039,7 +1068,42 @@ def _pick_route(manifest: Any, allowed: Any, route_id: str | None) -> tuple[Any,
     ok = [r for r in candidates if custody.route_allowed(r, allowed)]
     if not ok:
         custody.require_route(candidates[0], allowed, what=manifest.id)  # raises CustodyViolation
-    return ok[0], _route_record(manifest, ok[0])
+    ok, reasons = prefer.prefer_route(
+        manifest, ok, provider=prefer_provider, frame=frame, tier=tier, ratio_for=_runway_ratio
+    )
+    r = ok[0]
+    if r.provider == prefer.PREFERRED_VIDEO_PROVIDER and frame is not None:
+        slug = r.model_slug or manifest.model_id
+        if _runway_ratio(slug, frame[0], frame[1], tier) is None:
+            raise PrevisError(
+                f"{manifest.id} via {r.route_id}: no legal ratio for {frame[0]}x{frame[1]} at {tier} on {slug}; "
+                "Runway centre-crops an off-ratio frame: pick another route",
+                code="route_ratio",
+            )
+    return r, {**_route_record(manifest, r), "reasons": list(reasons)}
+
+
+def _hero_frame(cas: Any, ctx: Mapping[str, Any]) -> tuple[int, int] | None:
+    """(w, h) of the hero still (its PNG header in the CAS): the frame a Runway ratio must fit (the refs keep their
+    aspect when brought down); None when it cannot be read."""
+    try:
+        path = cas.find(ctx["hero"].get("outputHash"))
+        with open(path, "rb") as fh:
+            head = fh.read(24)
+    except (OSError, TypeError, ValueError, KeyError):
+        return None
+    if head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+        return None
+    return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+
+
+def _project_route_prefs(project: Project) -> tuple[str | None, dict[str, Any]]:
+    """(preferred_video_provider, video_route_pins) from the project's settings (decision 63)."""
+    stored = project.doc.get("settings") if isinstance(project.doc.get("settings"), Mapping) else {}
+    pins = stored.get("video_route_pins")
+    return stored.get("preferred_video_provider", prefer.PREFERRED_VIDEO_PROVIDER), (
+        dict(pins) if isinstance(pins, Mapping) else {}
+    )
 
 
 def _engine_route(engine: Any, engine_id: str) -> dict[str, Any]:
@@ -1061,8 +1125,9 @@ def seedance_engine(
     legend: Mapping[str, Any] | None = None,
     staging_dir: Path | None = None,
 ) -> AdapterBridge:
-    """The real engine: the plate_engines SeedanceR2V adapter on the project's Egress (host allowlist, metadata
-    strip, leak scan with the packet's names, outbound log) behind the worker protocol."""
+    """The real engine: the route's plate_engines adapter (RunwayVideo on `runway`, SeedanceR2V on Atlas) on the
+    project's Egress (host allowlist, metadata strip, leak scan with the packet's names, outbound log) behind the
+    worker protocol."""
     from ..egress import Egress, EgressRun
     from ..outbound_log import OutboundLog
 
@@ -1213,6 +1278,7 @@ def run(
     client: Any = None,
     manifests: Mapping[str, Any] | None = None,
     route_id: str | None = None,
+    prefer_provider: str | None = None,
     settings: Any = None,
     id_seq: Any = None,
     work_dir: str | Path | None = None,
@@ -1227,8 +1293,10 @@ def run(
     """A previs take for `motion_node`: 480P for `draft`, 1080P for `complete` (module docstring for the order).
 
     `engine` speaks the worker protocol (submit(payload, key) / poll(id) -> PollResult / fetch(url)); without one
-    the Seedance 2.5 adapter is built on the project's egress. A route that leaves the box needs `approved_by`
-    (quote before spend); the in-process fake does not."""
+    the Seedance 2.5 adapter of the preferred allowed route is built on the project's egress (`route_id` pins one,
+    else the project's `video_route_pins`; `prefer_provider` None reads the project's `preferred_video_provider`,
+    default `runway`). A route that leaves the box needs `approved_by` (quote before spend); the in-process fake does
+    not."""
     ctx = _context(project, motion_node)  # the video lock first: 409 before any route or price
     run_id = idempotency.new_id("prv", clock())
     if engine is None:
@@ -1236,7 +1304,15 @@ def run(
         m = mf.get(ENGINE_ID)
         if m is None:
             raise PrevisError(f"no {ENGINE_ID} manifest", code="unknown_engine")
-        r, route = _pick_route(m, ctx["allowed"], route_id)  # CustodyViolation before a byte is staged
+        stored_prefer, pins = _project_route_prefs(project)
+        r, route = _pick_route(  # CustodyViolation before a byte is staged
+            m,
+            ctx["allowed"],
+            route_id if route_id is not None else pins.get(ENGINE_ID),
+            prefer_provider=stored_prefer if prefer_provider is None else prefer_provider,
+            frame=_hero_frame(project.cas(), ctx),
+            tier=QUALITY_RESOLUTION.get(quality),
+        )
         engine = seedance_engine(
             project,
             run_id,

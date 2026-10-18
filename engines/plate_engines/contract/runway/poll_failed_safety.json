@@ -1,0 +1,20 @@
+{
+  "note": "synthetic: FAILED by input moderation (SAFETY.INPUT.TEXT: not refunded)",
+  "request": {
+    "method": "GET",
+    "url": "https://api.dev.runwayml.com/v1/tasks/1c1f5e2a-3b4c-4d5e-8f60-718293a4b5c6"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "id": "1c1f5e2a-3b4c-4d5e-8f60-718293a4b5c6",
+      "createdAt": "2026-10-18T09:00:00.000Z",
+      "status": "FAILED",
+      "failure": "The prompt was rejected by content moderation.",
+      "failureCode": "SAFETY.INPUT.TEXT",
+      "cost": {
+        "credits": 60
+      }
+    }
+  }
+}

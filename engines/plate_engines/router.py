@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from .health import route_health
-from .models import EngineManifest, Route
+from .models import EngineManifest, PriceSpec, Route
 from .tasks import FORBIDDEN_TASKS
 
 GRADE_ORDER: list[str] = ["C0", "C1", "C2", "D"]
@@ -126,9 +126,13 @@ def estimate_price(
     megapixels: float | None = None,
     seconds: float | None = None,
     images: int = 1,
+    *,
+    route: Route | None = None,
 ) -> float:
-    """Unit price times the billed quantity times the number of outputs. Placeholder prices stay placeholders."""
-    p = manifest.price
+    """Unit price times the billed quantity, raised to the price's per-generation floor, times the number of
+    outputs. A route that carries its own price (Route.price) is priced from it, else the manifest's price
+    applies. Placeholder prices stay placeholders."""
+    p = route.price if route is not None and route.price is not None else manifest.price
     if p.model in ("flat", "per_image"):
         qty = 1.0
     elif p.model == "per_megapixel":
@@ -139,7 +143,7 @@ def estimate_price(
         if seconds is None:
             raise ValueError(f"{manifest.id}: per_second pricing needs seconds")
         qty = seconds
-    return p.usd * qty * images
+    return max(p.usd * qty, p.minimum_usd) * images
 
 
 def _custody_message(
@@ -270,10 +274,11 @@ class Task:
 
 @dataclass(frozen=True)
 class Pin:
-    """A project pin: this engine, and this exact version when given."""
+    """A project pin: this engine, this exact version when given, and this route when route_id is given."""
 
     engine_id: str
     version: str | None = None
+    route_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -285,6 +290,8 @@ class Prefs:
     megapixels: float | None = None
     seconds: float | None = None
     images: int = 1
+    # A provider whose routes go first for video engines (prefer.PREFERRED_VIDEO_PROVIDER); None = no preference.
+    prefer_provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -349,13 +356,22 @@ def _card_cells(cards: Any) -> dict[tuple[str, str, str | None], Any]:
     return {(c.engine_id, c.task, c.shot_class): c for c in values}
 
 
-def _unit_price(manifest: EngineManifest, prefs: Prefs) -> float:
+def _route_spec(manifest: EngineManifest, route: Route) -> PriceSpec:
+    """The price that applies to this route: its own when it has one, else the manifest's."""
+    return route.price if route.price is not None else manifest.price
+
+
+def _unit_price(manifest: EngineManifest, route: Route, prefs: Prefs) -> float:
     try:
         return estimate_price(
-            manifest, megapixels=prefs.megapixels, seconds=prefs.seconds, images=prefs.images
+            manifest,
+            megapixels=prefs.megapixels,
+            seconds=prefs.seconds,
+            images=prefs.images,
+            route=route,
         )
     except ValueError:  # the unit needs a quantity the caller did not give: rank on the unit price
-        return manifest.price.usd
+        return _route_spec(manifest, route).usd
 
 
 def _doctrine_problem(manifest: EngineManifest, task: Task, kinds: frozenset[str] | None) -> str | None:
@@ -405,6 +421,7 @@ def _as_choice(
     requote: bool = False,
     rest: tuple[RouteChoice, ...] = (),
 ) -> RouteChoice:
+    spec = _route_spec(m, r)
     return RouteChoice(
         engine_id=m.id,
         route_id=r.route_id,
@@ -414,8 +431,8 @@ def _as_choice(
         version=m.version,
         region=r.region,
         custody_grade=effective_grade(r),
-        price_usd=m.price.usd,
-        price_status=m.price.status,
+        price_usd=spec.usd,
+        price_status=spec.status,
         fallback_of=r.same_model_fallback_of,
         requote=requote,
         alternatives=rest,
@@ -467,13 +484,21 @@ def choose(
                 f"any more ({have}); pick another version or engine by hand"
             )
         pool = served
-        reasons.append(f"pin: project pins {t.name!r} to {pin.engine_id}@{pin.version or '*'}")
+        via = f" via route {pin.route_id!r}" if pin.route_id else ""
+        reasons.append(f"pin: project pins {t.name!r} to {pin.engine_id}@{pin.version or '*'}{via}")
 
     every = [(m, r) for m in pool for r in m.routes if r.status == "active"]
     if not every:
         if pin is not None:
             raise RetiredPin(f"pinned engine {pin.engine_id} has no active route left")
         raise Refusal("custody", f"no route for task {t.name!r}: no active routes at all")
+    if pin is not None and pin.route_id:
+        every = [(m, r) for m, r in every if r.route_id == pin.route_id]
+        if not every:
+            raise RetiredPin(
+                f"project pins {t.name!r} to {pin.engine_id}@{pin.version or '*'} via route {pin.route_id!r}, "
+                "which no manifest serves"
+            )
 
     # 1. custody
     inside = [(m, r) for m, r in every if effective_grade(r) in allowed]
@@ -530,15 +555,24 @@ def choose(
         card = cells.get((m.id, t.name, t.shot_class))
         return card if card is not None and card.n >= pf.min_card_n else None
 
+    def preferred(m: EngineManifest, r: Route) -> bool:
+        """True when the caller prefers this route's provider and the engine is a video engine."""
+        return (
+            pf.prefer_provider is not None
+            and m.kind in KIND_FAMILIES["video"]
+            and r.provider == pf.prefer_provider
+        )
+
     def key(item: tuple[EngineManifest, Route, float]) -> tuple:
         m, r, latency = item
         card = card_of(m)
         lower = round(card.wilson_lower_95, 4) if card is not None else 0.0
         region_miss = 0 if pf.region is not None and r.region == pf.region else 1
         return (
+            0 if preferred(m, r) else 1,
             -lower,
             m.price.status != "confirmed",
-            round(_unit_price(m, pf), 9),
+            round(_unit_price(m, r, pf), 9),
             round(latency, 3),
             region_miss,
             m.id,
@@ -556,8 +590,11 @@ def choose(
         reasons.append(
             f"cards: no cell with n >= {pf.min_card_n} for {t.name}/{t.shot_class}; ranked on price"
         )
-    unit = "unconfirmed " if m.price.status != "confirmed" else ""
-    reasons.append(f"price: {unit}{_unit_price(m, pf):g} USD ({m.price.model}), latency {latency:g} ms")
+    spec = _route_spec(m, r)
+    unit = "unconfirmed " if spec.status != "confirmed" else ""
+    reasons.append(f"price: {unit}{_unit_price(m, r, pf):g} USD ({spec.model}), latency {latency:g} ms")
+    if preferred(m, r):
+        reasons.append(f"prefer: {r.provider} route first (prefer_provider)")
     if pf.region is not None:
         reasons.append(
             f"region: {r.region!r} ({'preferred' if r.region == pf.region else 'not the preferred ' + pf.region})"

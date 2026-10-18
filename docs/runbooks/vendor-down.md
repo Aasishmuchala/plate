@@ -24,7 +24,7 @@ Put what is left of the job on the deadline priority class (quote the node with 
 
 ## 3. Options, in this order
 
-1. **Same model, another route.** Re-quote the node; if the router offers a fallback route of the same model, the quote shows the new provider, price and custody grade. BytePlus and WaveSpeed are grade D with terms pending, so they are **never available on an NDA project**. Approve only if the grade is allowed.
+1. **Same model, another route** (Runway ↔ Atlas for Kling and Seedance, Runway ↔ Vertex for Veo). Re-quote the node; if the router offers a fallback route of the same model, the quote shows the new provider, price and custody grade. BytePlus and WaveSpeed are grade D with terms pending, so they are **never available on an NDA project**. Approve only if the grade is allowed. Runway is the preferred video route and also grade D (see [runway.md](runway.md)); to quote the Atlas route on purpose, set the project's `preferred_video_provider` to `atlas` or pin the engine with `video_route_pins` (artist manual, section 12).
 2. **A different engine for the same task** (for an image edit: another entry in the Make bar's engine list). Quote, approve, and let the gates judge the result. For a set of cameras, redo the whole set with the same engine so the looks agree; the Set node only corrects numbers, not style.
 3. **Local engine** (Qwen-Image-Edit for stills, Wan 2.2 for previs) if the GPU is free ([vram-oom.md](vram-oom.md)). It is C0 and works on NDA projects, and it is slower and softer.
 4. **Render it** in V-Ray or Vantage. This is always allowed and is what the render-it router recommends for hero wides and risky moves anyway.

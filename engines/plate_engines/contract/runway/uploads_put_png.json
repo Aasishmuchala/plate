@@ -1,0 +1,11 @@
+{
+  "note": "synthetic: the presigned multipart POST of fields + file for a 4 MB start frame (body_hash: field names, file name, blake3 of each payload)",
+  "request": {
+    "method": "POST",
+    "url": "https://plate-test-uploads.s3.amazonaws.com/",
+    "body_hash": "6bf54ef3"
+  },
+  "response": {
+    "status": 204
+  }
+}

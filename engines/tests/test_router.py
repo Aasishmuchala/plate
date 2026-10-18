@@ -150,13 +150,18 @@ def test_unknown_and_unserved_tasks_are_doctrine_refusals(manifests, health_up):
 
 
 def test_f_atlas_down_skips_kling_and_refuses_with_health(manifests, health_up):
-    health = {**health_up, "atlas": Health(False)}
+    # Wave 11: Kling also has a runway route, so "no Kling" needs Atlas AND Runway down.
+    health = {**health_up, "atlas": Health(False), "runway": Health(False)}
     ranked = rank(doctrine_filter(custody_filter(manifests, "D"), "crop_pair_motion"), health)
     assert "kling-o3-4k" not in engine_order(ranked)
-    assert all(r.provider != "atlas" for _, r in ranked)
+    assert all(r.provider not in {"atlas", "runway"} for _, r in ranked)
     with pytest.raises(Refusal) as exc:
         route("crop_pair_motion", "D", manifests, health, engine_pin="kling-o3-4k")
     assert exc.value.code == "health"
+    # Atlas alone down: Kling is still reachable, on its runway route
+    atlas_only = {**health_up, "atlas": Health(False)}
+    pinned = route("crop_pair_motion", "D", manifests, atlas_only, engine_pin="kling-o3-4k")
+    assert (pinned.engine_id, pinned.provider, pinned.custody_grade) == ("kling-o3-4k", "runway", "D")
 
 
 def test_f_everything_down_is_a_health_refusal(manifests, health_up):
@@ -226,9 +231,16 @@ def test_same_model_fallback_only_when_the_primary_is_unavailable(manifests, hea
     pairs = doctrine_filter(custody_filter(manifests, "D"), "crop_pair_motion")
     up = rank(pairs, health_up)
     seedance_up = [r.provider for m, r in up if m.id == "seedance-2.5-r2v"]
-    assert seedance_up == ["atlas"]  # byteplus / wavespeed held back while atlas is up
+    # byteplus / wavespeed held back while atlas is up; runway (Wave 11) is a route in its own right, not a fallback
+    assert sorted(seedance_up) == ["atlas", "runway"]
+    atlas_only = {**health_up, "atlas": Health(False)}
+    assert {r.provider for m, r in rank(pairs, atlas_only) if m.id == "seedance-2.5-r2v"} == {
+        "runway",
+        "byteplus",
+        "wavespeed",
+    }
 
-    health = {**health_up, "atlas": Health(False)}
+    health = {**health_up, "atlas": Health(False), "runway": Health(False)}
     seedance_down = [r for m, r in rank(pairs, health) if m.id == "seedance-2.5-r2v"]
     assert {r.provider for r in seedance_down} == {"byteplus", "wavespeed"}
     assert all(r.same_model_fallback_of == "atlas" for r in seedance_down)
@@ -615,21 +627,30 @@ def test_next_same_model_offers_only_the_same_model_with_requote(manifests, heal
     assert [(c.engine_id, c.provider) for c in nxt] == [
         ("seedance-2.5-r2v", "byteplus"),
         ("seedance-2.5-r2v", "wavespeed"),
+        ("seedance-2.5-r2v", "runway"),  # Wave 11: the same model on Runway, quoted again like the others
     ]
     assert all(c.requote is True for c in nxt)
-    assert all(c.fallback_of == "atlas" and c.model_id == choice.model_id for c in nxt)
+    assert all(c.model_id == choice.model_id for c in nxt)
+    # runway is a route of its own, not a fallback of atlas
+    assert [c.fallback_of for c in nxt] == ["atlas", "atlas", None]
     assert all("requote" in " ".join(c.reasons) or "quoted again" in " ".join(c.reasons) for c in nxt)
     # walking down the chain: each step lists what is left, never the failed route, never another model
     after_byteplus = next_same_model(nxt[0])
-    assert [c.provider for c in after_byteplus] == ["wavespeed"]
-    assert next_same_model(after_byteplus[0]) == []
+    assert [c.provider for c in after_byteplus] == ["wavespeed", "runway"]
+    after_wavespeed = next_same_model(after_byteplus[0])
+    assert [c.provider for c in after_wavespeed] == ["runway"]
+    assert next_same_model(after_wavespeed[0]) == []
 
 
 def test_next_same_model_never_crosses_to_a_different_model(manifests, health_up):
     kling = subset(manifests, "kling-o3-4k", "kling-v3-pro", "veo-3.1")
     choice = choose("crop_pair_motion", kling, ALL_GRADES, None, None, health_up)
-    assert choice.engine_id == "kling-v3-pro"  # the cheapest of three single-route engines
-    assert next_same_model(choice) == []  # kling o3 and veo are other models: a person decides
+    # the cheapest of the three: Kling v3 Pro on its confirmed runway price (0.12 a second)
+    assert (choice.engine_id, choice.provider) == ("kling-v3-pro", "runway")
+    # the same model on its other route (atlas), quoted again; kling o3 and veo are other models: a person decides
+    assert [(c.engine_id, c.provider, c.requote) for c in next_same_model(choice)] == [
+        ("kling-v3-pro", "atlas", True)
+    ]
 
 
 def test_next_same_model_does_not_cross_between_reference_and_image_to_video(manifests, health_up):

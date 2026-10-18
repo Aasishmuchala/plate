@@ -1,0 +1,23 @@
+{
+  "note": "synthetic: POST /v1/uploads for a clip whose uploadUrl host is off the route's allowed_hosts (the transport refuses the hop) (opaque name = blake3 of the bytes, first 26 hex)",
+  "request": {
+    "method": "POST",
+    "url": "https://api.dev.runwayml.com/v1/uploads",
+    "body": {
+      "filename": "092ae7b9ad0828a03e5cfaf3e5.mp4",
+      "type": "ephemeral"
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "uploadUrl": "https://uploads.example.net/",
+      "fields": {
+        "key": "ephemeral/offlist.mp4",
+        "policy": "cG9saWN5",
+        "x-amz-signature": "sig"
+      },
+      "runwayUri": "runway://ephemeral/offlist"
+    }
+  }
+}

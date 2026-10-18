@@ -69,6 +69,12 @@ Wave 9 (T103), all of it over modules that already exist:
 - `smoke` knows the Magnific Precision v2 route as a live-only case (a 128 px PNG, an image expected back): the
   vendor's address and model id are unconfirmed and nothing is recorded, so the fixture smoke skips it with that
   reason and it does not count among the adapters ok.
+- `smoke` has six Runway cases (Seedance 2.5 image-to-video and reference-to-video, Kling O3 4K, Kling 3.0 Pro,
+  Veo 3.1, Gen-4.5): the fixture smoke replays `plate_engines/contract/runway` (a clock that jumps past the
+  adapter's 5 s poll gap stands in, so no recorded poll waits), and `--live` on them needs `RUNWAYML_API_SECRET`
+  (without it a row says `set RUNWAYML_API_SECRET` and nothing is sent). A Runway clip is billed per second of the
+  snapped duration, so the minimum-cost call is the shortest legal clip: Kling 3 s, Veo 4 s, Seedance 480P (a
+  Runway draft, USD 0.80 floor).
 
 `run` follows the doctrine rules in code: the packet's plate is the only starting point (no text-to-image), the
 engine never sees more than egress prepared, and the quote is printed and approved before a byte leaves.
@@ -1471,6 +1477,8 @@ UNHAPPY = (
     "bad_",
 )
 ATLAS_KEY = (("ATLASCLOUD_KEY",),)
+RUNWAY_KEY = (("RUNWAYML_API_SECRET",),)
+SMOKE_EXTRA_ADAPTER_MODULES = ("runway_video",)
 
 
 @dataclass(frozen=True)
@@ -1504,6 +1512,20 @@ SMOKE_CASES: tuple[SmokeCase, ...] = (
     SmokeCase("seedance-2.5-r2v", "atlas", ("atlas_video",), ("r2v",), ATLAS_KEY),
     SmokeCase("kling-o3-4k", "atlas", ("atlas_video",), ("kling_o3",), ATLAS_KEY),
     SmokeCase("kling-v3-pro", "atlas", ("atlas_video",), ("kling_v3",), ATLAS_KEY),
+    # Runway's recordings share one task id for every happy create (`kling_o3_poll` / `kling_o3_result` answer the poll
+    # and the download for all of them); `prefer` picks the create by name, the replay matches on method/host/path only.
+    SmokeCase(
+        "seedance-2.5-i2v",
+        "runway",
+        ("runway",),
+        ("seedance_i2v_submit", "kling_o3_poll", "kling_o3_result"),
+        RUNWAY_KEY,
+    ),
+    SmokeCase("seedance-2.5-r2v", "runway", ("runway",), ("seedance_r2v",), RUNWAY_KEY),
+    SmokeCase("kling-o3-4k", "runway", ("runway",), ("kling_o3",), RUNWAY_KEY),
+    SmokeCase("kling-v3-pro", "runway", ("runway",), ("kling_v3", "kling_o3_poll"), RUNWAY_KEY),
+    SmokeCase("veo-3.1", "runway", ("runway",), ("veo",), RUNWAY_KEY),
+    SmokeCase("gen-4.5", "runway", ("runway",), ("gen45", "kling_o3_poll"), RUNWAY_KEY),
     SmokeCase(
         "veo-3.1",
         "vertex",
@@ -1571,6 +1593,19 @@ class ReplayTransport(httpx.MockTransport):
         self._count[rec.name] = n + 1
         self.served.append((method, host, path, rec.name))
         return self._build(rec.responses[min(n, len(rec.responses) - 1)])
+
+
+class FixtureClock:
+    """A clock that jumps `step_s` every time it is read. An adapter that will not look at a task twice inside its
+    minimum gap (Runway: 5 s) hands back its cached answer to a fast loop, and the recorded polls come one per look;
+    this lets the fixture smoke see each of them without waiting. Only the fixture smoke passes it (never --live)."""
+
+    def __init__(self, step_s: float = 10.0) -> None:
+        self.step_s, self.t = step_s, 0.0
+
+    def __call__(self) -> float:
+        self.t += self.step_s
+        return self.t
 
 
 def default_transport(case: SmokeCase, manifest: Any, route: Any, live: bool) -> httpx.BaseTransport:
@@ -1667,7 +1702,8 @@ def adapter_for(manifest: Any, route: Any) -> type | None:
 
     from .pipeline import ADAPTER_MODULES
 
-    for name in ADAPTER_MODULES:
+    # The Runway adapter is looked up even before the pipeline lists it, so the smoke covers it on its own.
+    for name in (*ADAPTER_MODULES, *(m for m in SMOKE_EXTRA_ADAPTER_MODULES if m not in ADAPTER_MODULES)):
         try:
             module = importlib.import_module(f"plate_engines.adapters.{name}")
         except Exception:  # an adapter that cannot import is an adapter that is not there
@@ -1724,7 +1760,7 @@ def _drive(
         if live:
             if time.monotonic() > deadline:
                 raise TimeoutError(f"job {job} did not finish within {SMOKE_TIMEOUT_S / 60:.0f} minutes")
-            sleep(SMOKE_POLL_S[kind])
+            sleep(max(SMOKE_POLL_S[kind], float(getattr(adapter, "POLL_INTERVAL_S", 0) or 0)))
     if status is None or status.state != "done":
         raise RuntimeError(
             f"job {job} ended {getattr(status, 'state', 'unfinished')}: {getattr(status, 'message', '')}"
@@ -1870,8 +1906,11 @@ def _smoke_one(
         else manifest
     )
     kwargs: dict[str, Any] = {} if live else dict(case.fixture_kwargs)
-    if "staging_dir" in inspect.signature(cls).parameters:
+    accepts = inspect.signature(cls).parameters
+    if "staging_dir" in accepts:
         kwargs["staging_dir"] = tmp / f"stage-{manifest.id}-{route.route_id}"
+    if not live and "now" in accepts:  # the adapter paces its polls by a clock: the fixtures do not wait
+        kwargs["now"] = FixtureClock()
     try:
         with contextlib.nullcontext() if live else fixture_env(case):
             transport = factory(case, manifest, route, live)

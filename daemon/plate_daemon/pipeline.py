@@ -233,6 +233,7 @@ ADAPTER_MODULES = (
     "atlas_video",
     "seedance_fallbacks",
     "vertex_veo",
+    "runway_video",
     "local_wan",
 )
 
@@ -686,7 +687,10 @@ class AdapterBridge:
 
 
 def adapter_class(manifest: Any, route: Any) -> type | None:
-    """The `plate_engines.adapters` class that speaks `manifest` on `route` (by engine id and provider)."""
+    """The `plate_engines.adapters` class that speaks `manifest` on `route` (by engine id and provider). A class
+    that names the route's provider wins over one that names none (a shared base such as the Seedance fallbacks'),
+    so a second provider for the same engine (Runway, Wave 11) is never answered by another provider's base."""
+    agnostic: type | None = None
     for name in ADAPTER_MODULES:
         try:
             module = importlib.import_module(f"plate_engines.adapters.{name}")
@@ -697,9 +701,13 @@ def adapter_class(manifest: Any, route: Any) -> type | None:
                 continue
             ids = getattr(obj, "SUPPORTED_ENGINES", None) or getattr(obj, "ENGINE_IDS", None) or ()
             provider = getattr(obj, "PROVIDER", None)
-            if manifest.id in ids and provider in (None, route.provider):
+            if manifest.id not in ids:
+                continue
+            if provider == route.provider:
                 return obj
-    return None
+            if provider is None and agnostic is None:
+                agnostic = obj
+    return agnostic
 
 
 # ---------------------------------------------------------------------------- the pipeline

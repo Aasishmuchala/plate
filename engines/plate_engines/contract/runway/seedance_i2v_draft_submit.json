@@ -1,0 +1,30 @@
+{
+  "note": "synthetic: Seedance 2.5 at PLATE's 480P tier = Runway draft (854:480, 4 s, draft true); answers the Kling O3 task id",
+  "request": {
+    "method": "POST",
+    "url": "https://api.dev.runwayml.com/v1/image_to_video",
+    "body": {
+      "model": "seedance2_5",
+      "promptImage": [
+        {
+          "uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAJCAIAAAC0SDtlAAABxElEQVR4AQG5AUb+AMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoDHGdgUPQSDsAAAAASUVORK5CYII=",
+          "position": "first"
+        }
+      ],
+      "promptText": "Camera holds still; late sun moves across the oak floor.",
+      "ratio": "854:480",
+      "duration": 4,
+      "audio": false,
+      "draft": true
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "id": "0a6a3a0e-5a1e-4d7a-9f49-2b6f0a4c2d11",
+      "estimatedCost": {
+        "credits": 80
+      }
+    }
+  }
+}

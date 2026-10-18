@@ -7,18 +7,23 @@ the numeric nodes, so `POST /projects/{id}/nodes/{node}/quote`, `POST /runs/{id}
 RUNNING, FETCHING, NORMALIZING, GATING, DONE or GATE_FAIL, every move published as `run.state` and ledgered (with
 `data.model`, `data.task` and `data.shot_class`, and `data.previs` on a previs run). Three flavours:
 
-    kling    A Motion or CropPair node on a start/end engine (`motion.kling_job`: Kling O3 4K, Kling v3 Pro,
-             Veo 3.1). Quote: the video lock first (`check_unlocked`: 409 VIDEO_LOCKED, naming the still, before a
-             pair is cut or a price exists; the end still is locked like the start), the pair cut from the
-             approved still on the `image` input (its `outputHash` in the CAS) by `plan_from_still`, or, with a
+    kling    A Motion or CropPair node on a Motion engine (`motion.kling_job.motion_engines`: Kling O3 4K, Kling
+             v3 Pro and Veo 3.1 take a start and an end frame; Seedance 2.5 i2v and Gen-4.5 a start frame only,
+             so their takes are single-image and an end still is 422 `end_unsupported`). Quote: the video lock
+             first (`check_unlocked`: 409 VIDEO_LOCKED, naming the still, before a pair is cut or a price
+             exists; the end still is locked like the start), the pair cut from the approved still on the
+             `image` input (its `outputHash` in the CAS) by `plan_from_still`, or, with a
              still on the `end` input, `plan_two_stills` between the two (the end must come from the same packet,
              or a packet with the same `camera.name` and `scene_hash`, else 422 `end_frame_camera`). Reference
              nodes on `elements` become the plan's elements (422 `elements_unsupported` on an engine without
              them, 422 `reference_missing` for a hash not in the CAS); every node parameter the engine's manifest
              declares (`cfg_scale`, Veo's `aspect_ratio`) is a drawer parameter of the plan; `single_image`
              sends no end frame (a held frame only). Then the Move policy (a blocked move is 409
-             HIGH_RISK_MOVE) and `quote_motion` (custody before price: Atlas and Veo are grade D, so an NDA
-             project gets `CustodyViolation`, 403). The worker submits the plan's payload (start under `image`,
+             HIGH_RISK_MOVE) and `quote_motion` (custody before price: every video route is grade D, so an NDA
+             project gets `CustodyViolation`, 403; then the preference rule, Wave 11 decision 63: the body's
+             `route_id`, else the project's `video_route_pins[engine]`, pins a route, and the project's
+             `preferred_video_provider`, default `runway`, goes first where the frame fits; the reasons are kept
+             as `motion_run.route_reasons`). The worker submits the plan's payload (start under `image`,
              end under `image_tail`, opaque names), polls and fetches; the fetched clip goes into the CAS as
              `.mp4` at once and NORMALIZING hands it to `run_motion`, which stores the stills, reads the clip's
              real frame rate and runs the video gates. Outputs `[clip, start, end]` (`[clip, start]` for a
@@ -26,7 +31,8 @@ RUNNING, FETCHING, NORMALIZING, GATING, DONE or GATE_FAIL, every move published 
              gate report.
     previs   A Motion node with `params.previs` (or `mode: previs`, or the Seedance r2v engine, which only previs
              drives here): `motion.previs` plans the reference-to-video take (refs, clay reference, timing hints)
-             and prices it; the worker submits, polls and fetches; the fetch burns the PREVIS watermark before
+             on the route the same overrides and preference pick (the hero still is the frame) and prices it;
+             the worker submits, polls and fetches; the fetch burns the PREVIS watermark before
              anything is kept (the clean take never enters the CAS). `inputs.previs` and `normalized.previs` are
              true, the Motion node is marked previs, and delivery refuses the output (`delivery.guard`).
     people   A People node over STAFFAGE (`motion.people`). Quote: custody first (STAFFAGE is grade D unless it is
@@ -38,7 +44,9 @@ RUNNING, FETCHING, NORMALIZING, GATING, DONE or GATE_FAIL, every move published 
 
 A run made here carries `inputs.staging` (the marker `Pipeline.resume` looks for) with `node_kind`, and
 `inputs.motion_run` (how to rebuild the job at execution). Execution rebuilds the job from that spec and the CAS and
-refuses to send it when the approved still changed since the quote. Approval goes through the budget rules (these
+refuses to send it when the approved still changed since the quote; what the vendor adapter did that the plan did
+not say (the Runway adapter's `notes(job)`: a duration snap, reference roles) is appended to `normalized.notes` at
+NORMALIZING. Approval goes through the budget rules (these
 runs are priced); custody is re-checked at approval and again before the submit.
 
 `router_preview` is an object with `prepare(q)` and `preview(c)` in the protocol `nodes.runner.preview` drives
@@ -62,6 +70,8 @@ from pathlib import Path
 from typing import Any
 
 from blake3 import blake3
+
+from plate_engines import prefer
 
 from . import canvas_rules, custody
 from .adapter import PollResult, lookup_fn, submit_is_idempotent
@@ -187,6 +197,18 @@ def _sheet(project: Any) -> ProjectSheet:
     settings = project.doc.get("settings") or {}
     data = settings.get("project_sheet") if isinstance(settings, Mapping) else None
     return ProjectSheet.from_dict(data if isinstance(data, Mapping) else None)
+
+
+def _route_choice(project: Any, body: Mapping[str, Any], engine_id: str) -> tuple[str | None, str | None]:
+    """(route_id, prefer_provider) for a video quote (decision 63): the body's `route_id`, else the project's
+    `video_route_pins[engine_id]`; the project's `preferred_video_provider` (default `runway`, "none" = manifest
+    order)."""
+    settings = project.doc.get("settings") or {}
+    settings = settings if isinstance(settings, Mapping) else {}
+    pins = settings.get("video_route_pins") if isinstance(settings.get("video_route_pins"), Mapping) else {}
+    route_id = body.get("route_id") or pins.get(engine_id)
+    prefer_provider = settings.get("preferred_video_provider", prefer.PREFERRED_VIDEO_PROVIDER)
+    return (str(route_id) if route_id else None), prefer_provider
 
 
 # ---------------------------------------------------------------------------- the render-it router
@@ -790,9 +812,11 @@ class MotionRunner:
         }
         plan = self._plan_kling(project, pv, node_id, motion_spec, still16)
         allowed = pl.allowed_grades(project_id, pv.manifest)
+        route_id, prefer_provider = _route_choice(project, body, engine_id)
         route, quote = kling_job.quote_motion(
-            plan, g, pl.manifests, allowed, route_id=body.get("route_id"), now=now
+            plan, g, pl.manifests, allowed, route_id=route_id, prefer_provider=prefer_provider, now=now
         )
+        motion_spec["route_reasons"] = list(route.get("reasons") or [])
         cas.put_bytes(plan.start_png, "png")
         if plan.end_png is not None:
             cas.put_bytes(plan.end_png, "png")
@@ -886,7 +910,15 @@ class MotionRunner:
         if manifest is None:
             raise PipelineError(f"unknown engine {engine_id!r}", code="unknown_engine")
         ctx = previs._context(project, node_id)  # the lock again, the motion packet, the allowed grades
-        route = kling_job.pick_route(manifest, ctx["allowed"], body.get("route_id"))  # custody before a byte
+        route_id, prefer_provider = _route_choice(project, body, engine_id)
+        route = kling_job.pick_route(  # custody before a byte, then the preference on the hero still's frame
+            manifest,
+            ctx["allowed"],
+            route_id,
+            prefer_provider=prefer_provider,
+            frame=previs._hero_frame(pl.cas_for(project_id), ctx),
+            tier=previs.QUALITY_RESOLUTION.get(quality),
+        )
         p = previs.plan(
             project,
             node_id,
@@ -909,6 +941,7 @@ class MotionRunner:
             "hero_node_id": p.hero_node_id,
             "tier": pl.packet(project_id, p.hero_packet_id).tier,
             "record": p.record(),  # what the take records, kept so NORMALIZING needs no second plan
+            "route_reasons": list(route.get("reasons") or []),
         }
         inputs = {
             "previs": True,
@@ -1287,6 +1320,22 @@ class MotionRunner:
 
     # ------------------------------------------------------------------ NORMALIZING and GATING
 
+    def adapter_notes(self, run: Run) -> list[str]:
+        """What the run's vendor adapter did that the plan did not say, by its task id (the Runway adapter's
+        `notes(job)`: a duration snap, reference roles); [] for an adapter that keeps none, an injected engine, or
+        a daemon restarted since the submit (the notes live in the adapter)."""
+        with self._guard:
+            engine = self._engines.get(run.id)
+        adapter = getattr(getattr(engine, "inner", None), "adapter", None)
+        fn = getattr(adapter, "notes", None)
+        if not callable(fn) or not run.provider_job_id:
+            return []
+        try:
+            return [str(n) for n in fn(str(run.provider_job_id)) or ()]
+        except Exception as e:  # notes explain a take; they never fail one
+            log.warning("adapter notes for %s not read: %s", run.id, e)
+            return []
+
     def normalize(self, run: Run, cas: CAS) -> dict[str, Any]:
         flavour = flavour_of(run)
         if flavour == "people":
@@ -1319,7 +1368,7 @@ class MotionRunner:
                 "timemap": res.timemap.to_json(),
                 "timemap_source": res.timemap_source,
                 "motion": record,
-                "notes": list(res.notes),
+                "notes": [*res.notes, *self.adapter_notes(run)],
                 "gate_key": cas.put_bytes(canonical_json(plain(res.gate_report)), "json"),
             }
         )
@@ -1342,17 +1391,19 @@ class MotionRunner:
         except Exception as e:  # the run carries previs: true either way; delivery reads the run
             marked = False
             log.warning("motion node %s not marked previs: %s", run.node_id, e)
-        return plain(
-            {
-                "outputs": [marker["clip"]],
-                "clip": marker["clip"],
-                "previs": True,
-                "timemap": record.get("timemap"),
-                "watermark": marker.get("watermark"),
-                "previs_record": record,
-                "node_marked": marked,
-            }
-        )
+        out: dict[str, Any] = {
+            "outputs": [marker["clip"]],
+            "clip": marker["clip"],
+            "previs": True,
+            "timemap": record.get("timemap"),
+            "watermark": marker.get("watermark"),
+            "previs_record": record,
+            "node_marked": marked,
+        }
+        notes = self.adapter_notes(run)
+        if notes:
+            out["notes"] = notes
+        return plain(out)
 
     def _normalize_people(self, run: Run, cas: CAS) -> dict[str, Any]:
         blob = json.loads(cas.read_bytes(run.result_key).decode("utf-8"))

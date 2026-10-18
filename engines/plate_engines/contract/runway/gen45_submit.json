@@ -1,0 +1,28 @@
+{
+  "note": "synthetic: Gen-4.5 start frame only (1280:720, 5 s, no audio field); answers the Kling O3 task id",
+  "request": {
+    "method": "POST",
+    "url": "https://api.dev.runwayml.com/v1/image_to_video",
+    "body": {
+      "model": "gen4.5",
+      "promptImage": [
+        {
+          "uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAJCAIAAAC0SDtlAAABxElEQVR4AQG5AUb+AMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoDHGdgUPQSDsAAAAASUVORK5CYII=",
+          "position": "first"
+        }
+      ],
+      "promptText": "Dolly forward through the atrium.",
+      "ratio": "1280:720",
+      "duration": 5
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "id": "0a6a3a0e-5a1e-4d7a-9f49-2b6f0a4c2d11",
+      "estimatedCost": {
+        "credits": 60
+      }
+    }
+  }
+}

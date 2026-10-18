@@ -1,0 +1,27 @@
+{
+  "note": "synthetic: create while Runway sheds load: 503 (body shape undocumented)",
+  "request": {
+    "method": "POST",
+    "url": "https://api.dev.runwayml.com/v1/image_to_video",
+    "body": {
+      "model": "kling3.0_pro",
+      "promptImage": [
+        {
+          "uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAJCAIAAAC0SDtlAAABxElEQVR4AQG5AUb+AMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoDHGdgUPQSDsAAAAASUVORK5CYII=",
+          "position": "first"
+        }
+      ],
+      "promptText": "Busy probe: the doors open.",
+      "ratio": "1920:1080",
+      "duration": 5,
+      "audio": false,
+      "cfgScale": 0.5
+    }
+  },
+  "response": {
+    "status": 503,
+    "json": {
+      "error": "Service Unavailable"
+    }
+  }
+}

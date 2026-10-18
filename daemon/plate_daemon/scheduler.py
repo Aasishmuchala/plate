@@ -124,6 +124,8 @@ DEFAULT_CONTRACT_TESTS = (
     "engines/tests/test_transport.py",
     "engines/tests/test_adapters_image.py",
     "engines/tests/test_adapters_video.py",
+    "engines/tests/test_adapters_runway.py",
+    "engines/tests/test_runway_schema.py",
 )
 CONFIG_KEYS = frozenset(
     {

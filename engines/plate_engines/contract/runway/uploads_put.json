@@ -1,0 +1,11 @@
+{
+  "note": "synthetic: the presigned multipart POST of fields + file for the clay reference clip (body_hash: field names, file name, blake3 of each payload)",
+  "request": {
+    "method": "POST",
+    "url": "https://plate-test-uploads.s3.amazonaws.com/",
+    "body_hash": "f1b9b4f8"
+  },
+  "response": {
+    "status": 204
+  }
+}

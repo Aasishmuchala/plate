@@ -1,0 +1,57 @@
+{
+  "note": "synthetic: THROTTLED -> PENDING -> RUNNING (progress 0.4) -> SUCCEEDED with the documented cloudfront output",
+  "request": {
+    "method": "GET",
+    "url": "https://api.dev.runwayml.com/v1/tasks/0a6a3a0e-5a1e-4d7a-9f49-2b6f0a4c2d11"
+  },
+  "responses": [
+    {
+      "status": 200,
+      "json": {
+        "id": "0a6a3a0e-5a1e-4d7a-9f49-2b6f0a4c2d11",
+        "createdAt": "2026-10-18T09:00:00.000Z",
+        "status": "THROTTLED",
+        "estimatedCost": {
+          "credits": 215
+        }
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "id": "0a6a3a0e-5a1e-4d7a-9f49-2b6f0a4c2d11",
+        "createdAt": "2026-10-18T09:00:00.000Z",
+        "status": "PENDING",
+        "estimatedCost": {
+          "credits": 215
+        }
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "id": "0a6a3a0e-5a1e-4d7a-9f49-2b6f0a4c2d11",
+        "createdAt": "2026-10-18T09:00:00.000Z",
+        "status": "RUNNING",
+        "progress": 0.4,
+        "estimatedCost": {
+          "credits": 215
+        }
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "id": "0a6a3a0e-5a1e-4d7a-9f49-2b6f0a4c2d11",
+        "createdAt": "2026-10-18T09:00:00.000Z",
+        "status": "SUCCEEDED",
+        "output": [
+          "https://dnznrvs05pmza.cloudfront.net/output.mp4?_jwt=test"
+        ],
+        "cost": {
+          "credits": 215
+        }
+      }
+    }
+  ]
+}

@@ -32,7 +32,9 @@ import {
   allowedGrades,
   bestAllowedGrade,
   drawerParams,
+  effectiveGrade,
   type EngineParamSpec,
+  type EngineRouteSummary,
   type EngineSummary,
   engineOptions,
   MAKE_MODES,
@@ -41,6 +43,7 @@ import {
 } from "./engines";
 import { cardsKey, compareIdsOf, compareReady, EMPTY_ENTRY, type MakeEntry, useMakeStore } from "./makeStore";
 import {
+  CUSTODY_TONE,
   formatCard,
   formatCountdown,
   formatEta,
@@ -170,12 +173,32 @@ export const priceUnitText = (unit: string): string => PRICE_UNITS[unit] ?? `per
 interface Chip {
   key: string;
   text: string;
-  tone?: "amber" | "red";
+  tone?: "green" | "blue" | "amber" | "red";
   title?: string;
   strong?: boolean;
 }
 
-/** The chips under the engine select: manifest capabilities, route health and the engine card. */
+const isVideoEngine = (engine: EngineSummary): boolean => engine.kind.startsWith("video") || engine.kind === "local_video";
+
+/** One chip per active route of a video engine, the preferred route first: `runway · D · 0.43 USD per second`
+ * (no price: `atlas · D`), toned by the route's effective grade. T123: the artist sees which route a quote tries
+ * first and what it costs per second before asking for one. */
+function routeChips(engine: EngineSummary): Chip[] {
+  const active = engine.routes.filter((r: EngineRouteSummary) => (r.status ?? "active") === "active");
+  const ordered = [...active.filter((r) => r.preferred === true), ...active.filter((r) => r.preferred !== true)];
+  return ordered.map((r) => {
+    const grade = effectiveGrade(r);
+    const price = r.price ? ` · ${formatUsd(r.price.usd)} ${priceUnitText(r.price.model)}` : "";
+    return {
+      key: `route-${r.route_id ?? r.provider}`,
+      text: `${r.provider} · ${grade}${price}`,
+      tone: CUSTODY_TONE[grade],
+      title: r.preferred === true ? "preferred route for video" : "fallback route",
+    };
+  });
+}
+
+/** The chips under the engine select: manifest capabilities, video routes, route health and the engine card. */
 export function engineChips(engine: EngineSummary, custody: ProjectCustody | null, card: EngineCard | null): Chip[] {
   const caps = capabilitiesOf(engine);
   const chips: Chip[] = [];
@@ -195,6 +218,7 @@ export function engineChips(engine: EngineSummary, custody: ProjectCustody | nul
   if (caps?.unverified) {
     chips.push({ key: "unverified", text: "unverified", tone: "amber", title: "nothing about this manifest was checked against the vendor yet (P0 smoke test)" });
   }
+  if (isVideoEngine(engine)) chips.push(...routeChips(engine));
   const health = engineHealth(engine, custody);
   if (health.status === "degraded") {
     chips.push({

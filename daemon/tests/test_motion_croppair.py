@@ -337,8 +337,9 @@ def test_negative_prompt_stays_under_thirty_words(still):
     assert e.value.code == "negative_prompt_long" and e.value.status == 422
 
 
-@pytest.mark.parametrize(("shot", "seconds"), [(0.2, 1), (2, 2), (4.2, 5), (14.01, 15), (40, 15)])
-def test_duration_is_ceil_of_the_shot_clamped_to_one_to_fifteen(still, shot, seconds):
+@pytest.mark.parametrize(("shot", "seconds"), [(0.2, 3), (2, 3), (3, 3), (4.2, 5), (14.01, 15), (40, 15)])
+def test_duration_is_ceil_of_the_shot_clamped_to_what_every_route_takes(still, shot, seconds):
+    # Kling's range is 1 to 15, the runway route takes 3 to 15: a plan is legal on both (Wave 11 decision 63)
     plan = make_plan(still, shot_s=shot)
     assert plan.duration_s == seconds and plan.params()["duration"] == seconds
 
@@ -347,8 +348,10 @@ def test_engine_resolution_and_kind(still):
     assert make_plan(still).params()["resolution"] == "4K"
     v3 = make_plan(still, engine_id="kling-v3-pro")
     assert v3.params()["resolution"] == "1080P" and v3.engine_id == "kling-v3-pro"
-    with pytest.raises(PipelineError, match="not a Kling"):
-        make_plan(still, engine_id="seedance-2.5-i2v")
+    with pytest.raises(PipelineError, match="not a motion engine") as e:
+        # reference-to-video: previs drives it, not a crop pair
+        make_plan(still, engine_id="seedance-2.5-r2v")
+    assert e.value.code == "engine_kind"
     with pytest.raises(PipelineError, match="resolution"):
         make_plan(still, engine_id="kling-v3-pro", resolution="4K")
     assert make_plan(still, seed=7).params()["seed"] == 7
@@ -415,14 +418,23 @@ def test_a_locked_video_node_answers_409_before_any_quote(still, manifests, monk
 def test_an_unlocked_node_is_quoted_per_second_on_the_allowed_route(still, manifests):
     plan = make_plan(still, shot_s=4.2)
     route, quote = kling_job.quote_motion(plan, graph(), manifests, ALLOWED_D)
+    # Runway is preferred for video by rule (Wave 11 decision 63) and prices from its own route price
     assert (
-        route["engine_id"] == "kling-o3-4k" and route["provider"] == "atlas" and route["custody_grade"] == "D"
+        route["engine_id"] == "kling-o3-4k"
+        and route["provider"] == "runway"
+        and route["custody_grade"] == "D"
     )
     assert quote.model == "kling-o3-4k" and quote.custody_grade == "D"
-    assert quote.price_usd == pytest.approx(5 * 0.357) and quote.price_status == "unconfirmed"
+    assert quote.price_usd == pytest.approx(5 * 0.43) and quote.price_status == "confirmed"
     assert quote.size["label"] == "4K"
     v3 = make_plan(still, shot_s=4.2, engine_id="kling-v3-pro", node_id="m")
-    assert kling_job.quote_motion(v3, graph(), manifests, ALLOWED_D)[1].price_usd == pytest.approx(5 * 0.153)
+    assert kling_job.quote_motion(v3, graph(), manifests, ALLOWED_D)[1].price_usd == pytest.approx(5 * 0.12)
+    # manifest order (no preference) is the Atlas route at the manifest price
+    route, quote = kling_job.quote_motion(plan, graph(), manifests, ALLOWED_D, prefer_provider="none")
+    assert route["provider"] == "atlas" and route["reasons"] == ["prefer: manifest order"]
+    assert quote.price_usd == pytest.approx(5 * 0.357) and quote.price_status == "unconfirmed"
+    v3_atlas = kling_job.quote_motion(v3, graph(), manifests, ALLOWED_D, route_id="atlas")[1]
+    assert v3_atlas.price_usd == pytest.approx(5 * 0.153)
 
 
 def test_custody_refuses_nda_projects_after_the_lock(still, manifests):
@@ -514,7 +526,7 @@ def test_a_finished_job_records_the_time_map_and_a_video_gate_report(still, cas,
         re.fullmatch(r"[0-9a-f]{26}\.png", n) for n in names
     )  # opaque, no node name
     sent = engine.payloads[0]["params"]
-    assert sent["duration"] == 2 and len(sent["negative_prompt"].split()) < 30
+    assert sent["duration"] == 3 and len(sent["negative_prompt"].split()) < 30  # a 2 s shot is a 3 s take
 
     assert cas.exists(result.video_key) and cas.exists(result.start_key) and cas.exists(result.end_key)
     assert result.video_path.suffix == ".mp4" and result.idempotency_key
@@ -641,7 +653,7 @@ def test_adapter_engine_runs_a_plate_engines_adapter_through_the_job(still, cas,
     assert result.verdict != "fail" and engine.output_fps == 24.0 and stub.polls == 2
 
     staged = stub.staged
-    assert staged.inputs["prompt"] == plan.prompt and staged.params["duration"] == 2
+    assert staged.inputs["prompt"] == plan.prompt and staged.params["duration"] == 3  # the 3 s floor
     assert (staged.size.w, staged.size.h) == plan.size
     for name, png in (("image", plan.start_png), ("image_tail", plan.end_png)):
         ref = staged.inputs[name]

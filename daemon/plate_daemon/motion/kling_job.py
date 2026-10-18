@@ -1,8 +1,11 @@
 """Start/end motion job: a CropPair (or any approved start and end still) becomes a clip with a time map and a video
 gate report (router plan T43 and T94, BUILD_PLAN decisions 13 and 14, Wave 9 decision 49).
 
-The engines are `START_END_ENGINES`: Kling O3 4K, Kling v3 Pro and Veo 3.1 (`KLING_ENGINES` is the T43 name, kept as
-an alias). Veo is custody D until its terms are filed, so an NDA project never reaches it.
+The engines are `motion_engines(manifests)` (Wave 11 decision 70): every `video_startend` or `video_i2v` manifest
+with a start-frame input. `START_END_ENGINES` are those that also take an end frame: Kling O3 4K, Kling v3 Pro and
+Veo 3.1 (`KLING_ENGINES` is the T43 name, kept as an alias); Seedance 2.5 i2v and Runway Gen-4.5 take a start frame
+only, so their takes are single-image (a held frame) and an end still wired to them is 422 `end_unsupported`. Every
+route of these engines is custody D until written terms are filed, so an NDA project never reaches them.
 
 The job is a small pipeline of plain functions over a frozen `MotionPlan`:
 
@@ -10,10 +13,11 @@ The job is a small pipeline of plain functions over a frozen `MotionPlan`:
    of one camera) builds the plan: `image` = the start crop, `image_tail` = the end crop, the prompt from a
    motion_croppair recipe with the prompt law applied (an end-frame pin means no pace words: slow, slowly, gently,
    leisurely, unhurried are stripped), a negative prompt under 30 words, `duration = ceil(shot_s)` clamped to the
-   manifest's range, and the Move policy verdict (a `high`, `highest` or router-blocked move raises
-   `MotionBlocked`, 409). The frame-rate map is a `TimeMap`: the motion packet's fps to the engine's (24, or the
-   adapter's `output_fps`); a still-only CropPair has no packet, so its map is virtual (packet fps = engine fps,
-   source "virtual") and says so.
+   manifest's range and then up to the smallest duration EVERY active route accepts (`prefer.legal_durations`,
+   decision 63: Veo 5 s -> 6 s, Kling 1-2 s -> 3 s), and the Move policy verdict (a `high`, `highest` or
+   router-blocked move raises `MotionBlocked`, 409). The frame-rate map is a `TimeMap`: the motion packet's fps
+   to the engine's (24, or the adapter's `output_fps`); a still-only CropPair has no packet, so its map is
+   virtual (packet fps = engine fps, source "virtual") and says so.
 
    The pair may be a push-in (z0 < z1), a pull-back (z0 > z1, the reveal), a locked crop (z0 = z1; a
    `locked_tripod` move always is one, its end crop the start crop) or a slider drift (one zoom, an end centre).
@@ -25,17 +29,21 @@ The job is a small pipeline of plain functions over a frozen `MotionPlan`:
    feeding it (the end still included) to have passed its gate AND been approved by a human (canvas rule
    VIDEO_LOCKED). `quote_motion` calls it FIRST, so a locked node answers 409 `VIDEO_LOCKED`, naming the still,
    before any price is built or any run exists. The UI greys the node out; this is the enforcement.
-3. `quote_motion(plan, graph, manifests, allowed_grades)` picks the allowed route (custody first: Atlas is grade D,
-   refused for NDA projects with `CustodyViolation`) and prices the clip per second from the manifest. `to_run_create`
-   shapes the same plan as a `RunCreate` for the run table (no STAGING_KEY: this is not an image run).
+3. `quote_motion(plan, graph, manifests, allowed_grades)` picks the allowed route (custody first: Atlas and Runway
+   are grade D, refused for NDA projects with `CustodyViolation`), then the preference rule (`prefer.prefer_route`,
+   decision 63: the `runway` route first for video when the plan's frame fits one of its legal ratios at the plan's
+   resolution, else manifest order, with the reason on the route record), and prices the clip per second from the
+   route's own price or the manifest's. A pinned route (`route_id`) is the only candidate; a Runway route that cannot
+   take the frame is 422 `route_ratio` (Runway centre-crops an off-ratio frame, which would move the landing).
+   `to_run_create` shapes the same plan as a `RunCreate` for the run table (no STAGING_KEY: not an image run).
 4. `run_motion(plan, engine, cas)` drives any engine that speaks the worker's protocol (submit / poll / fetch),
    stores the start and end stills and the clip in the project CAS, reads the clip's real fps (a clip that is not at
    the assumed rate gets its time map rebuilt from the clip, with a note) and runs `video_gates.run` with
    `hero_still` = start and `end_still` = end (None for a single-image take: the last frame is not scored).
    Landing, flicker, duration, output tags and, with a motion packet, reprojection drift come back in one versioned
    gate report. Camera lock is scored only for a locked tripod: a push-in moves by design. `AdapterEngine` puts a
-   `plate_engines` video adapter (KlingStartEnd, VertexVeo) behind that protocol, renaming the inputs to the
-   manifest's own (`start_image` / `end_image` for Veo).
+   `plate_engines` video adapter (KlingStartEnd, VertexVeo, RunwayVideo) behind that protocol, renaming the inputs
+   to the manifest's own (`start_image` / `end_image` for Veo).
 
 Nothing here talks to a vendor on its own: engines and transports are passed in, so every test runs on fakes.
 """
@@ -54,13 +62,14 @@ import cv2
 import numpy as np
 from blake3 import blake3
 
+from plate_engines import prefer
+from plate_engines.adapters import runway_schema
 from plate_engines.adapters.atlas_video import frame_size
 from plate_engines.adapters.base import ParamError
 from plate_engines.adapters.base import _check_param as check_param
 from plate_engines.atlas import (
     VIDEO_POLL_INTERVAL_S,
     VIDEO_POLL_TIMEOUT_S,
-    atlas_duration,
     atlas_ratio,
     strip_pace_words,
 )
@@ -101,22 +110,33 @@ __all__ = [
     "clamp_duration",
     "element_png",
     "engine_frame",
+    "motion_engines",
     "pick_route",
     "plan_from_still",
     "plan_motion",
     "plan_two_stills",
     "quote_motion",
     "run_motion",
+    "runway_ratio",
+    "takes_end",
     "to_run_create",
 ]
 
-START_END_ENGINES = ("kling-o3-4k", "kling-v3-pro", "veo-3.1")
-KLING_ENGINES = START_END_ENGINES  # the T43 name, kept as an alias
+MOTION_KINDS = frozenset({"video_startend", "video_i2v"})
+START_INPUTS = frozenset({"image", "start_image"})  # a Motion engine takes its start frame under one of these
+END_INPUTS = frozenset({"image_tail", "end_image"})  # and its end frame, when it takes one
+RUNWAY = prefer.PREFERRED_VIDEO_PROVIDER  # the provider whose routes need a legal ratio for the frame
 DEFAULT_ENGINE = "kling-o3-4k"
 DEFAULT_RECIPE = "croppair_pushin"
 TWO_STILLS_RECIPE = "motion_time_of_day"  # the default when an end still is wired
-DEFAULT_ENGINE_FPS = Fraction(24)  # Kling, Seedance and Veo deliver 24 fps
-DEFAULT_RESOLUTION = {"kling-o3-4k": "4K", "kling-v3-pro": "1080P", "veo-3.1": "1080p"}
+DEFAULT_ENGINE_FPS = Fraction(24)  # Kling, Seedance, Veo and Gen-4.5 deliver 24 fps
+DEFAULT_RESOLUTION = {
+    "kling-o3-4k": "4K",
+    "kling-v3-pro": "1080P",
+    "veo-3.1": "1080p",
+    "seedance-2.5-i2v": "1080P",
+    "gen-4.5": None,
+}
 NEGATIVE_MAX_WORDS = 29  # the adapter rejects 30 and over: an anti-drift list, not an essay
 TASK = "crop_pair_motion"  # the manifests' allowed_tasks entry; the router and the ledger key on it
 LOCKED_MOVE = "locked_tripod"
@@ -125,6 +145,27 @@ PLAN_PARAMS = frozenset({"duration", "negative_prompt", "resolution", "seed"})  
 
 class MotionError(PipelineError):
     """A motion request refused before any spend. `status` and `code` become the HTTP answer."""
+
+
+def motion_engines(manifests: Mapping[str, Any]) -> dict[str, bool]:
+    """Engine id -> whether it takes an end frame (decision 70), in id order: every `video_startend` or `video_i2v`
+    manifest with an `image` or `start_image` input is a Motion engine; one without an `image_tail` or `end_image`
+    input takes a start frame only (its takes are single-image)."""
+    out: dict[str, bool] = {}
+    for engine_id, m in sorted(manifests.items()):
+        names = {i.name for i in m.inputs}
+        if m.kind in MOTION_KINDS and names & START_INPUTS:
+            out[engine_id] = bool(names & END_INPUTS)
+    return out
+
+
+def takes_end(manifest: Any) -> bool:
+    """True when the engine pins an end frame (`image_tail` / `end_image`)."""
+    return bool({i.name for i in manifest.inputs} & END_INPUTS)
+
+
+START_END_ENGINES = tuple(sorted(e for e, tail in motion_engines(load_manifests()).items() if tail))
+KLING_ENGINES = START_END_ENGINES  # the T43 name, kept as an alias
 
 
 class MotionLocked(MotionError):
@@ -202,12 +243,14 @@ def apply_prompt_law(prompt: str, *, end_pinned: bool) -> tuple[str, dict[str, A
 
 
 def clamp_duration(shot_s: float, manifest: Any) -> int:
-    """`ceil(shot_s)` clamped to the manifest's duration range (Kling 1 to 15)."""
+    """`ceil(shot_s)` clamped to the manifest's duration range, then up to the smallest duration every active route
+    accepts (decision 63: Kling 1-2 s -> 3 s, the Runway floor; Veo 5 s -> 6 s, Runway takes 4, 6 or 8), so the
+    plan is legal on whichever route the quote picks and the quote never under-prices. The take outlasts the shot."""
     if not shot_s > 0:
         raise MotionError(f"shot length must be positive, got {shot_s!r}", code="shot_length")
     p = next((p for p in manifest.params if p.name == "duration"), None)
     lo, hi = (int(p.range[0]), int(p.range[1])) if p is not None and p.range else (1, 15)
-    return atlas_duration(float(shot_s), lo, hi)
+    return prefer.clamp_to_legal(float(shot_s), prefer.legal_durations(manifest), lo, hi)
 
 
 def build_timemap(
@@ -432,15 +475,16 @@ def _resolve_recipe(recipe: RunnableRecipe | str | None) -> RunnableRecipe | Non
 
 
 def _manifest(engine_id: str, manifests: Mapping[str, Any] | None) -> Any:
-    if engine_id not in START_END_ENGINES:
+    mf = manifests if manifests is not None else load_manifests()
+    engines = motion_engines(mf)
+    if engine_id not in engines:
+        if engine_id in START_END_ENGINES and engine_id not in mf:
+            raise MotionError(f"unknown engine {engine_id!r}", code="unknown_engine")
         raise MotionError(
-            f"{engine_id} is not a Kling or Veo start/end engine; have {list(START_END_ENGINES)}",
+            f"{engine_id} is not a motion engine (a start frame, or a start and an end frame); have {list(engines)}",
             code="engine_kind",
         )
-    m = (manifests if manifests is not None else load_manifests()).get(engine_id)
-    if m is None:
-        raise MotionError(f"unknown engine {engine_id!r}", code="unknown_engine")
-    return m
+    return mf[engine_id]
 
 
 def _resolution(engine_id: str, manifest: Any, resolution: str | None) -> str | None:
@@ -546,10 +590,27 @@ def plan_motion(
     single_image: bool = False,
 ) -> MotionPlan:
     """Build the plan for a start/end pair (`croppair.make_pair`'s or `make_two_stills`' result). `single_image`
-    drops the end frame (no `image_tail`, nothing pinned at the end). Raises MotionBlocked (409) when the Move policy
-    blocks the move, MotionError (422) for a bad engine, resolution, prompt, negative prompt, element or drawer
-    parameter."""
+    drops the end frame (no `image_tail`, nothing pinned at the end); an engine that takes a start frame only
+    (Seedance 2.5 i2v, Gen-4.5) always does, so its pair must hold the frame (422 `single_image_move` otherwise) and
+    two stills are 422 `end_unsupported`. Raises MotionBlocked (409) when the Move policy blocks the move,
+    MotionError (422) for a bad engine, resolution, prompt, negative prompt, element or drawer parameter."""
     manifest = _manifest(engine_id, manifests)
+    if not takes_end(manifest):  # a start frame only (Seedance 2.5 i2v, Gen-4.5): the take is single-image
+        if pair.get("mode") == "two_stills":
+            raise MotionError(
+                f"{engine_id} takes a start frame only; unwire the end still",
+                code="end_unsupported",
+                engine=engine_id,
+            )
+        end = pair.get("end_png")
+        if not single_image and end is not None and bytes(end) != bytes(pair["start_png"]):
+            raise MotionError(
+                f"{engine_id} takes a start frame only, so the take holds the frame: a moving crop needs its end "
+                "frame pinned (one zoom and one centre, or a start/end engine)",
+                code="single_image_move",
+                engine=engine_id,
+            )
+        single_image = True
     r = _resolve_recipe(recipe)
     motion = dict(r.motion or {}) if r is not None else {}
     shot = float(shot_s if shot_s is not None else motion.get("duration_s", 5))
@@ -695,8 +756,8 @@ def plan_from_still(
     A `locked_tripod` move (the node's `move_kind`, else the recipe's `motion.move`) is one zoom with the end crop
     equal to the start: an explicit equal pair's zoom, else the recipe's single zoom, else 1.0 (an unequal pair is
     not a hold, so it is not used). A pull-back is a zoom pair with z0 > z1. `single_image` (default: the recipe's
-    `motion.start_end: false`) sends the start frame alone, which only a frame that holds may do (one zoom, one
-    centre)."""
+    `motion.start_end: false`, and always on an engine that takes a start frame only) sends the start frame alone,
+    which only a frame that holds may do (one zoom, one centre)."""
     r = _resolve_recipe(recipe)
     assert r is not None
     cp = dict(r.croppair or {})
@@ -726,13 +787,18 @@ def plan_from_still(
     if end_centre is not None:
         cx1, cy1 = croppair.centre_px(w, h, list(end_centre))
     single = bool(single_image) if single_image is not None else motion.get("start_end") is False
-    if single and (z0 != z1 or (cx1 is not None and (cx1, cy1) != (cx, cy))):
-        raise MotionError(
-            "a single-image take only holds the frame (one zoom, one centre): a moving crop needs its end frame "
-            "pinned",
-            code="single_image_move",
-        )
     engine_id = plan_kwargs.get("engine_id", DEFAULT_ENGINE)
+    if plan_kwargs.get("manifests") is None:
+        plan_kwargs["manifests"] = load_manifests()  # read once for the envelope, the hold check and the plan
+    start_only = not takes_end(_manifest(engine_id, plan_kwargs["manifests"]))
+    if single or start_only:
+        if z0 != z1 or (cx1 is not None and (cx1, cy1) != (cx, cy)):
+            raise MotionError(
+                "a single-image take only holds the frame (one zoom, one centre): a moving crop needs its end frame "
+                "pinned" + (f" ({engine_id} takes a start frame only)" if start_only else ""),
+                code="single_image_move",
+            )
+        single = True
     if engine_size is None:
         engine_size = _envelope(engine_id, w, h, plan_kwargs)
     pair = croppair.make_pair(
@@ -788,9 +854,52 @@ def plan_two_stills(
 # ---------------------------------------------------------------------------- quote
 
 
-def pick_route(manifest: Any, allowed_grades: Iterable[Any], route_id: str | None = None) -> dict[str, Any]:
-    """The first active route whose effective custody grade the run allows, as the run's route record.
-    Raises `CustodyViolation` (403) when none is allowed: Atlas is grade D, so an NDA project never gets here."""
+def runway_ratio(slug: str, w: int, h: int, tier: str | None) -> str | None:
+    """`runway_schema.ratio_for`, except None when the model has resolution tiers and `tier` is not one of them:
+    the adapter refuses a Kling resolution other than its slug's own (decision 69), so that route does not fit."""
+    tiers = [t.upper() for t in runway_schema.spec_for(slug).ratios if t != "all"]
+    if tier is not None and tiers and str(tier).upper() not in tiers:
+        return None
+    return runway_schema.ratio_for(slug, w, h, tier)
+
+
+def _check_fits(manifest: Any, r: Any, frame: tuple[int, int] | None, tier: str | None) -> None:
+    """A Runway route the frame does not fit (a pinned one, or the engine's only one) is refused at the quote:
+    Runway centre-crops an off-ratio frame, which would move the landing, and its adapter refuses it anyway."""
+    if r.provider != RUNWAY or frame is None:
+        return
+    slug = r.model_slug or manifest.model_id
+    if runway_ratio(slug, frame[0], frame[1], tier) is not None:
+        return
+    spec = runway_schema.spec_for(slug)
+    legal = next((v for k, v in spec.ratios.items() if tier and k.upper() == str(tier).upper()), None)
+    legal = legal or tuple(x for v in spec.ratios.values() for x in v)
+    at = f" at {tier}" if tier else ""
+    raise MotionError(
+        f"{manifest.id} via {r.route_id}: no legal ratio for {frame[0]}x{frame[1]}{at} on {slug} (legal: "
+        f"{', '.join(legal)}); Runway centre-crops an off-ratio frame, which would move the landing: pick another "
+        "route or crop the still to a legal ratio",
+        code="route_ratio",
+        engine=manifest.id,
+        route_id=r.route_id,
+    )
+
+
+def pick_route(
+    manifest: Any,
+    allowed_grades: Iterable[Any],
+    route_id: str | None = None,
+    *,
+    prefer_provider: str | None = prefer.PREFERRED_VIDEO_PROVIDER,
+    frame: tuple[int, int] | None = None,
+    tier: str | None = None,
+) -> dict[str, Any]:
+    """The run's route record: the active routes (only `route_id` when one is pinned) whose effective custody grade
+    the run allows, ordered by the preference rule (`prefer.prefer_route`: `prefer_provider`'s routes first for a
+    video engine when `frame` fits one of their legal ratios at `tier`; None or "none" keeps manifest order), the
+    first one taken. `reasons` on the record says why. Raises `CustodyViolation` (403) when no route is allowed:
+    every route of these engines is grade D, so an NDA project never gets here; MotionError 422 `route_ratio` when
+    the route taken is a Runway route the frame does not fit."""
     candidates = [r for r in manifest.routes if r.status == "active"]
     if route_id is not None:
         candidates = [r for r in candidates if r.route_id == route_id]
@@ -800,7 +909,11 @@ def pick_route(manifest: Any, allowed_grades: Iterable[Any], route_id: str | Non
     ok = [r for r in candidates if custody.route_allowed(r, allowed)]
     if not ok:
         custody.require_route(candidates[0], allowed, what=manifest.id)  # raises CustodyViolation
+    ok, reasons = prefer.prefer_route(
+        manifest, ok, provider=prefer_provider, frame=frame, tier=tier, ratio_for=runway_ratio
+    )
     r = ok[0]
+    _check_fits(manifest, r, frame, tier)
     return {
         "engine_id": manifest.id,
         "provider": r.provider,
@@ -810,6 +923,7 @@ def pick_route(manifest: Any, allowed_grades: Iterable[Any], route_id: str | Non
         "custody_status": r.custody_status,
         "upload_visibility": r.upload_visibility,
         "model_version": r.model_slug or manifest.model_id or manifest.version,
+        "reasons": list(reasons),
     }
 
 
@@ -820,13 +934,22 @@ def quote_motion(
     allowed_grades: Iterable[Any],
     *,
     route_id: str | None = None,
+    prefer_provider: str | None = prefer.PREFERRED_VIDEO_PROVIDER,
     now: Any = None,
 ) -> tuple[dict[str, Any], Quote]:
     """(route, Quote) for the job. The lock comes first: a locked video node raises MotionLocked (409) before a
-    route is picked or a price is built. Then custody (CustodyViolation), then the manifest price per second."""
+    route is picked or a price is built. Then custody (CustodyViolation), then the preference rule on the plan's
+    frame and resolution, then the route's price per second (its own price, else the manifest's)."""
     check_unlocked(graph, plan.node_id)
     manifest = _manifest(plan.engine_id, manifests)
-    route = pick_route(manifest, allowed_grades, route_id)
+    route = pick_route(
+        manifest,
+        allowed_grades,
+        route_id,
+        prefer_provider=prefer_provider,
+        frame=plan.size,
+        tier=plan.resolution,
+    )
     quote = build_quote(manifest, route, plan.input_hashes(), plan.params(), now=now)
     return route, quote
 

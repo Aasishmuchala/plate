@@ -418,7 +418,8 @@ def test_a_people_take_over_a_locked_clip_runs_to_a_gated_composite(env):
     assert r.status_code == 200, r.text
     q = r.json()
     run_id, inputs = q["run"]["id"], q["run"]["inputs"]
-    assert q["quote"]["price_usd"] == pytest.approx(0.20) and q["quote"]["custody_grade"] == "D"
+    # the 2 s shot's Kling take is 3 s (Wave 11 decision 63), and the People pass is priced on the take
+    assert q["quote"]["price_usd"] == pytest.approx(0.30) and q["quote"]["custody_grade"] == "D"
     assert q["run"]["route"]["engine_id"] == "staffage" and not fake.calls  # nothing sent at the quote
     assert inputs["clip"] == base_run["outputs"][0] and inputs["clip_run"] == base_run["id"]
     assert inputs["ground_point"] == [DISC_X0, DISC_Y + DISC_R] and inputs["behaviour"].startswith("walks")

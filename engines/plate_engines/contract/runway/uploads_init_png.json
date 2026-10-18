@@ -1,0 +1,23 @@
+{
+  "note": "synthetic: POST /v1/uploads for a 4 MB start frame (opaque name = blake3 of the bytes, first 26 hex)",
+  "request": {
+    "method": "POST",
+    "url": "https://api.dev.runwayml.com/v1/uploads",
+    "body": {
+      "filename": "b92fbac12bb539416f8f358d6f.png",
+      "type": "ephemeral"
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "uploadUrl": "https://plate-test-uploads.s3.amazonaws.com/",
+      "fields": {
+        "key": "ephemeral/big-start.png",
+        "policy": "cG9saWN5",
+        "x-amz-signature": "sig"
+      },
+      "runwayUri": "runway://ephemeral/big-start"
+    }
+  }
+}

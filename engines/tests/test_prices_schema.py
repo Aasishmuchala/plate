@@ -145,10 +145,10 @@ def test_the_loader_skips_the_overlay_file_and_load_priced_manifests_uses_it(tmp
     write_catalogue(cat_dir, "atlas", [entry(KLING, "per_second", 0.50)])
     prices.refresh(cat_dir, overlay_path=copy / prices.OVERLAY_NAME, manifests=load_manifests(copy))
     assert (copy / "_prices.yaml").exists()
-    assert len(load_manifests(copy)) == 14  # the overlay is not a manifest
+    assert len(load_manifests(copy)) == 15  # the overlay is not a manifest
     assert load_manifests(copy)["kling-o3-4k"].price.usd == 0.357
     assert prices.load_priced_manifests(copy)["kling-o3-4k"].price.usd == 0.50
-    assert len(load_manifests()) == 14  # the real folder is untouched by all of this
+    assert len(load_manifests()) == 15  # the real folder is untouched by all of this
     assert not (DEFAULT_MANIFEST_DIR / "_prices.yaml").exists()
 
 

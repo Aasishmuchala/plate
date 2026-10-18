@@ -328,6 +328,7 @@ VENDOR_NAMES = {
     "magnific": "Magnific (Freepik)",
     "byteplus": "BytePlus",
     "wavespeed": "WaveSpeed",
+    "runway": "Runway (Dev API)",
     "local": "Local (render box)",
 }
 

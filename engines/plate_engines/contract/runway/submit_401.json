@@ -1,0 +1,28 @@
+{
+  "note": "synthetic: create with a refused key: 401 (live-observed body shape, mechanics.md skeptic pass)",
+  "request": {
+    "method": "POST",
+    "url": "https://api.dev.runwayml.com/v1/image_to_video",
+    "body": {
+      "model": "kling3.0_pro",
+      "promptImage": [
+        {
+          "uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAJCAIAAAC0SDtlAAABxElEQVR4AQG5AUb+AMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoDHGdgUPQSDsAAAAASUVORK5CYII=",
+          "position": "first"
+        }
+      ],
+      "promptText": "Key probe: the doors open.",
+      "ratio": "1920:1080",
+      "duration": 5,
+      "audio": false,
+      "cfgScale": 0.5
+    }
+  },
+  "response": {
+    "status": 401,
+    "json": {
+      "error": "The provided API key is not valid.",
+      "docUrl": "https://docs.dev.runwayml.com/api"
+    }
+  }
+}

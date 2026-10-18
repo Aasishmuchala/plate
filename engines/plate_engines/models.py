@@ -11,6 +11,10 @@ plate_upscale_forbidden and flags. EngineSize is the runtime "this size was chos
 
 T84 additions, optional with defaults: PriceSpec.tiers (PriceTier rows that price a request by the params it
 carries: quality, image_size, resolution, audio) and EngineManifest.limits (Limits: input and output megapixel caps).
+
+Wave 11 additions, optional with defaults: PriceSpec.minimum_usd (the per-generation floor), Route.price (a
+route-level PriceSpec that wins over the manifest's price) and Route.durations (the integer seconds a route
+accepts when they are not a plain range; each must lie inside the manifest's int `duration` param range).
 """
 
 from __future__ import annotations
@@ -54,6 +58,49 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class PriceTier(_Strict):
+    """One price row: `usd` per billed unit (image, megapixel or second, as price.model says) for a request whose
+    params equal every `match` entry. Values compare as lower-cased strings; `status` is this row's own price status
+    ("estimated" = derived from another row, not a reading)."""
+
+    match: dict[str, str | int | float | bool]
+    usd: float = Field(ge=0)
+    status: Literal["unconfirmed", "confirmed", "estimated"] = "unconfirmed"
+    note: str = ""
+
+    @model_validator(mode="after")
+    def _check(self) -> PriceTier:
+        # An empty match would win for every request and hide the rows after it.
+        if not self.match or any(not key for key in self.match):
+            raise ValueError("price tier: match needs at least one non-empty param name")
+        return self
+
+
+class PriceSpec(_Strict):
+    model: Literal["flat", "per_megapixel", "per_second", "per_image"]
+    usd: float = Field(ge=0)
+    notes: str = ""
+    # "unconfirmed": usd is a placeholder, not a vendor price. Only a catalogue or an invoice confirms it.
+    status: Literal["unconfirmed", "confirmed"] = "unconfirmed"
+    # Tier or resolution -> usd per billed unit (keys like "1K", "1080P", "atlas_discounted"). usd stays the
+    # figure the router ranks on and quotes fall back to; by never replaces it.
+    by: dict[str, float] = Field(default_factory=dict)
+    source: str = ""
+    as_of: date | None = None
+    # Param-keyed price rows, tried in order: the first whose every match key equals the request's value wins
+    # (see daemon quotes.build_quote). Not matched = by[<size label>], then usd.
+    tiers: list[PriceTier] = Field(default_factory=list)
+    # Per-generation floor in USD (Seedance 2.5 on Runway bills at least 80 credits): a quote is never below it.
+    minimum_usd: float = Field(default=0.0, ge=0)
+
+    @model_validator(mode="after")
+    def _check(self) -> PriceSpec:
+        for key, value in self.by.items():
+            if not key or value < 0:
+                raise ValueError(f"price.by[{key!r}]: key must be non-empty and usd >= 0")
+        return self
+
+
 class Route(_Strict):
     provider: str = Field(min_length=1)
     endpoint: str
@@ -73,6 +120,10 @@ class Route(_Strict):
     allowed_hosts: list[str] = Field(default_factory=list)
     max_inflight: int = Field(default=2, ge=1)
     status: Literal["active", "retired"] = "active"
+    # This route's own price when the vendor's catalogue is held (None = the manifest's price applies).
+    price: PriceSpec | None = None
+    # Integer seconds this route accepts when they are not a plain range (Veo on Runway: 4, 6, 8).
+    durations: list[int] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -114,47 +165,13 @@ class Route(_Strict):
             raise ValueError("C1/C2 cannot be 'confirmed' without a terms_hash for the written terms")
         if self.same_model_fallback_of == self.provider:
             raise ValueError("same_model_fallback_of cannot name the route's own provider")
-        return self
-
-
-class PriceTier(_Strict):
-    """One price row: `usd` per billed unit (image, megapixel or second, as price.model says) for a request whose
-    params equal every `match` entry. Values compare as lower-cased strings; `status` is this row's own price status
-    ("estimated" = derived from another row, not a reading)."""
-
-    match: dict[str, str | int | float | bool]
-    usd: float = Field(ge=0)
-    status: Literal["unconfirmed", "confirmed", "estimated"] = "unconfirmed"
-    note: str = ""
-
-    @model_validator(mode="after")
-    def _check(self) -> PriceTier:
-        # An empty match would win for every request and hide the rows after it.
-        if not self.match or any(not key for key in self.match):
-            raise ValueError("price tier: match needs at least one non-empty param name")
-        return self
-
-
-class PriceSpec(_Strict):
-    model: Literal["flat", "per_megapixel", "per_second", "per_image"]
-    usd: float = Field(ge=0)
-    notes: str = ""
-    # "unconfirmed": usd is a placeholder, not a vendor price. Only a catalogue or an invoice confirms it.
-    status: Literal["unconfirmed", "confirmed"] = "unconfirmed"
-    # Tier or resolution -> usd per billed unit (keys like "1K", "1080P", "atlas_discounted"). usd stays the
-    # figure the router ranks on and quotes fall back to; by never replaces it.
-    by: dict[str, float] = Field(default_factory=dict)
-    source: str = ""
-    as_of: date | None = None
-    # Param-keyed price rows, tried in order: the first whose every match key equals the request's value wins
-    # (see daemon quotes.build_quote). Not matched = by[<size label>], then usd.
-    tiers: list[PriceTier] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _check(self) -> PriceSpec:
-        for key, value in self.by.items():
-            if not key or value < 0:
-                raise ValueError(f"price.by[{key!r}]: key must be non-empty and usd >= 0")
+        if self.durations is not None:
+            if not self.durations:
+                raise ValueError("durations needs at least one value (leave it out for no list)")
+            if any(d < 1 for d in self.durations):
+                raise ValueError(f"durations {self.durations}: every value must be an int >= 1")
+            if any(b <= a for a, b in zip(self.durations, self.durations[1:], strict=False)):
+                raise ValueError(f"durations {self.durations} must be strictly increasing")
         return self
 
 
@@ -333,6 +350,15 @@ class EngineManifest(_Strict):
         ):
             if len(set(names)) != len(names):
                 raise ValueError(f"duplicate names in {label}: {names}")
+        duration = next((p for p in self.params if p.name == "duration" and p.type == "int"), None)
+        if duration is not None and duration.range is not None:
+            lo, hi = duration.range
+            for r in self.routes:
+                bad = [d for d in r.durations or [] if not lo <= d <= hi]
+                if bad:
+                    raise ValueError(
+                        f"route {r.route_id}: durations {bad} lie outside the duration param range [{lo:g}, {hi:g}]"
+                    )
         providers = {r.provider for r in self.routes}
         for r in self.routes:
             if r.same_model_fallback_of is not None and r.same_model_fallback_of not in providers:

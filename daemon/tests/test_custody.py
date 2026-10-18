@@ -219,6 +219,8 @@ def test_yaml_agrees_with_docs_custody_md():
     else:  # promoted: the doc row must say so too
         assert f"**{llm.grade.value}**" in api_row and "pending" not in api_row.split("|")[2]
     assert "**Never**" in login_row
+    runway_row = next(ln for ln in text.splitlines() if ln.startswith("| **Runway (Dev API)**"))
+    assert "**D** (on the evidence" in runway_row and "s4.4" in runway_row
     never = yaml.safe_load(custody.ROUTES_YAML.read_text(encoding="utf-8"))["never"]
     assert [n["route_id"] for n in never] == ["anthropic-consumer-login"]
 
@@ -238,8 +240,20 @@ def test_matrix_shows_every_vendor_at_its_effective_grade(manifests):
 
     assert only("Atlas (AtlasCloud)")["effective_grade"] == "D"
     assert only("Atlas (AtlasCloud)")["upload_visibility"] == "public"
-    for vendor in ("Runway", "Higgsfield", "fal"):
+    for vendor in ("Runway (web app)", "Higgsfield", "fal"):
         assert only(vendor)["effective_grade"] == "D" and not only(vendor)["nda_allowed"]
+    runway = only("Runway (Dev API)")
+    assert runway["effective_grade"] == "D" and runway["custody_status"] == "confirmed"
+    assert runway["upload_visibility"] == "private" and runway["nda_allowed"] is False
+    assert set(runway["engines"]) == {
+        "gen-4.5",
+        "kling-o3-4k",
+        "kling-v3-pro",
+        "seedance-2.5-i2v",
+        "seedance-2.5-r2v",
+        "veo-3.1",
+    }
+    assert only("Runway (web app)")["engines"] == [] and "graded apart" in only("Runway (web app)")["note"]
     for vendor in ("OpenAI", "Google Gemini API", "Google Vertex AI", "Anthropic API"):
         row = only(vendor)
         assert (row["declared_grade"], row["custody_status"], row["effective_grade"]) == (

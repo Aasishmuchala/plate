@@ -1,0 +1,30 @@
+{
+  "note": "synthetic: Kling 3.0 Pro with a 4 MB start frame sent as the runway:// URI of its ephemeral upload",
+  "request": {
+    "method": "POST",
+    "url": "https://api.dev.runwayml.com/v1/image_to_video",
+    "body": {
+      "model": "kling3.0_pro",
+      "promptImage": [
+        {
+          "uri": "runway://ephemeral/big-start",
+          "position": "first"
+        }
+      ],
+      "promptText": "Hold on the facade as the clouds pass.",
+      "ratio": "1920:1080",
+      "duration": 5,
+      "audio": false,
+      "cfgScale": 0.5
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "id": "0a6a3a0e-5a1e-4d7a-9f49-2b6f0a4c2d11",
+      "estimatedCost": {
+        "credits": 60
+      }
+    }
+  }
+}

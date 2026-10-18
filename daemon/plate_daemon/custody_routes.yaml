@@ -27,13 +27,13 @@ never:
 
 web_vendors:
   - route_id: runway
-    vendor: Runway
+    vendor: Runway (web app)
     provider: runway
     grade: D
     status: pending_written_terms
     terms_hash: unknown
     upload_visibility: unknown
-    note: web app, no adapter; files made there are imported and count as grade D
+    note: web app, graded apart from the Dev API route (engine manifests); files made there are imported and count as grade D
   - route_id: higgsfield
     vendor: Higgsfield
     provider: higgsfield

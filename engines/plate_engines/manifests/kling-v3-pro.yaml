@@ -8,12 +8,14 @@
 # Inputs use the vendor names: image is the first frame, image_tail pins the end frame. With image_tail set, pace
 # words (slow, gently, leisurely...) are stripped from the prompt (atlas.strip_pace_words); keep negative_prompt
 # under 30 words.
+# Wave 11: `runway` route (preferred for video by rule, not by order; decisions 61-64).
 id: kling-v3-pro
 name: Kling v3 Pro
 version: unpinned
 pinned: false
 kind: video_startend
 model_id: kwaivgi/kling-v3.0-pro/image-to-video
+flags: [runway_hosts_unverified]
 inputs:
   - {name: image, type: image, required: true}
   - {name: image_tail, type: image, required: false}
@@ -51,3 +53,23 @@ routes:
     model_slug: kwaivgi/kling-v3.0-pro/image-to-video
     allowed_hosts: [.atlascloud.ai, .aliyuncs.com]
     note: "Atlas uploadMedia returns public OSS URLs: grade D, refused for NDA projects."
+  - provider: runway
+    endpoint: https://api.dev.runwayml.com/v1
+    region: us
+    custody_grade: D
+    custody_status: confirmed
+    terms_hash: unknown
+    upload_visibility: private
+    same_model_fallback_of: null
+    model_slug: kling3.0_pro
+    allowed_hosts: [api.dev.runwayml.com, .cloudfront.net, .amazonaws.com]
+    max_inflight: 1
+    durations: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    note: "Runway Dev API, the user's own key (RUNWAYML_API_SECRET). Self-serve Terms of Use (15 Sep 2026) s4.4: Inputs and Outputs may be used to train Runway's models under a perpetual licence; D on the evidence. C2 when a signed Runway Dev Enterprise agreement (no training, zero retention) is filed: custody_grade C2, custody_status confirmed, terms_hash = sha256 of the signed agreement. Sub-processors on this route: Google Cloud (US), Byteplus Pte (Singapore), Kling AI Pte (Singapore). Output URLs are signed and expire in 24-48 h; uploads are 24 h ephemeral runway:// URIs."
+    price:
+      model: per_second
+      usd: 0.12
+      status: confirmed
+      source: "docs.dev.runwayml.com/guides/pricing.md, USD 0.01 per credit, read 2026-10-18 and skeptic-checked (router/research/runway/pricing_terms.md)"
+      as_of: 2026-10-18
+      notes: "audio is always off on this route (the manifest has no audio param)"

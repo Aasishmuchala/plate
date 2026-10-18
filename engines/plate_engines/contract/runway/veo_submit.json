@@ -1,0 +1,35 @@
+{
+  "note": "synthetic: Veo 3.1 start+end (1920:1080, duration 6 snapped from 5, audio off, negativePrompt, seed 1234)",
+  "request": {
+    "method": "POST",
+    "url": "https://api.dev.runwayml.com/v1/image_to_video",
+    "body": {
+      "model": "veo3.1",
+      "promptImage": [
+        {
+          "uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAJCAIAAAC0SDtlAAABxElEQVR4AQG5AUb+AMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoAMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKMgoKADIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCjIKCgAyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoyCgoDHGdgUPQSDsAAAAASUVORK5CYII=",
+          "position": "first"
+        },
+        {
+          "uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAJCAIAAAC0SDtlAAABxElEQVR4AQG5AUb+APDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8ADw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PAA8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDwAPDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8ADw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PAA8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDwAPDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8ADw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PAA8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw7J2VEJ+AM30AAAAASUVORK5CYII=",
+          "position": "last"
+        }
+      ],
+      "promptText": "Camera holds; steam rises from the cup.",
+      "ratio": "1920:1080",
+      "duration": 6,
+      "audio": false,
+      "seed": 1234,
+      "negativePrompt": "blur, text"
+    }
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "id": "5b0e8c1f-2d34-4a6b-8c9d-0e1f2a3b4c5d",
+      "estimatedCost": {
+        "credits": 120
+      }
+    }
+  }
+}

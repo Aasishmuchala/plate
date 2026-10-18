@@ -417,3 +417,85 @@ Every `verify-on-box:` line in the router plan, in task order, then the box-only
 - With a fresh quote, Make approves directly as the human (`approved_by: human`); the approval dialog appears only when the daemon refuses (auto cap, envelope). This matches `docs/ui.md`.
 - `room_a` and `room_a_ral3020` are 3.78 MB, over the 3 MB per-packet guideline (known since wave 2); the 25 MB total cap holds at 17 MB.
 - `make test` stops at the first failing step, so a pytest failure hides the vitest result; run `npm test` on its own when that happens (row 3a).
+
+## 11. Wave 11 (T116 to T125): Runway as the video provider
+
+Written by the Wave 11 verification pass (router task T125, Opus 5.5) on 2026-10-18 between 18:25 and 19:08 IST, on the same Mac. Commit `98cc92f` plus the uncommitted Wave 11 edits in the working tree (T116 to T124, and the two fixes below). Nothing here called Runway or any other vendor. Every Runway number comes from the recorded synthetic fixtures under `engines/plate_engines/contract/runway/`, and the live smoke is box-day item 23.
+
+### 11.1 What failed and the fixes
+
+The first two `make ci` runs each stopped at one step. Both causes were cosmetic leftovers of wave 19. Neither touched behaviour or a Wave 11 decision.
+
+- **`make lint`: `ruff format --check` flagged 2 files.** These were T120's edits to `daemon/tests/test_motion_croppair.py` (two lines past the wrap, one of them an assert over three `and` terms) and `daemon/tests/test_motion_wave9.py` (the Veo 5 s → 6 s assert). Fix: `ruff format` on the two files. The trailing comment on `make_plan(still, engine_id="seedance-2.5-r2v")` moved to its own line above the call. No assertion changed.
+- **`make build`: `tsc -b` stopped with `src/test/makeBarRunway.test.tsx(14,23): error TS6133: 'MakeBar' is declared but its value is never read`.** This was T123's new test. vitest does not typecheck, so the suite had passed. Fix: the unused `MakeBar` import is gone (`engineChips` stays). `npx tsc --noEmit -p .` and `tsc -b` are clean.
+
+### 11.2 Command record
+
+All commands ran from the repo root.
+
+| # | command | exit | key output |
+|---|---|---|---|
+| 1 | `perl -e 'alarm shift; exec @ARGV' 1500 make ci` (first) | 2 | `SELFTEST PASS`; hazard selftest and scan clean; `ruff check` `All checks passed!`; `ruff format --check` `2 files would be reformatted, 529 files already formatted` (fix 1) |
+| 2 | the same (second) | 2 | lint `531 files already formatted`; licences OK; pytest `6241 passed, 1 skipped in 704.84s`, 4K gate `run_gates 3840x2160: wall 3.85s`; `scripts/tests` `79 passed`; claims `all 28 claims hold (136 tests passed)`; vitest `Test Files 28 passed (28)`, `Tests 805 passed (805)`; `npm run build` TS6133 (fix 2) |
+| 3 | the same (final) | 0 | `SELFTEST PASS`; hazard `clean (1026 files scanned, 2 allowlist entries)`; `All checks passed!`, `531 files already formatted`; licences `17 files scanned, 7 blocked models absent`; pytest `6241 passed, 1 skipped in 708.00s`, 4K gate `wall 3.85s` (`4.17s` with overlays); `scripts/tests` `79 passed`; `all 28 claims hold (136 tests passed)`; vitest `28 passed (28)` files, `805 passed (805)`; `built in 1.22s`; 12 min 58 s wall |
+| 4 | `scripts/test.sh` | 0 | the same eleven steps in the same order: pytest `6241 passed, 1 skipped in 696.39s`, scripts `79 passed`, claims 28 and 136, vitest `805 passed (805)`, built; last line `All PLATE checks passed.` |
+| 5 | `.venv/bin/python -m plate_daemon.cli smoke` | 0 | last line `fixture smoke: 17 adapters ok`, no `failed`; 8 skipped (the same 8 as section 10) |
+| 6 | `perl -e 'alarm shift; exec @ARGV' 900 .venv/bin/python scripts/smoke_e2e.py` (after `make build`) | 0 | 36 steps `ok`: UI suite `805 passed`, wiring `19 passed`, `16 engines incl. fake`, quote `router ai_by_region`, export `640x268 (crop y 46)`, `full_frame` `640x360`, rescore `versions [1, 2]`, `@ref` quote on nano-banana-2.1, G2 autosave, `night_chain` refused `['no_base']`; last line `SMOKE PASS` |
+| 7 | `git grep -n "key_[0-9a-f]\{32\}"`, and the same with `--untracked` (the Wave 11 files are not committed yet) | 1 and 1 | nothing found. The two adapter tests build their fake key at run time (`"key_" + "0123456789abcdef" * 8`), so no literal key exists in the tree |
+| 8 | `RUNWAYML_API_SECRET` in the recordings and fixtures: `git grep --untracked -I "RUNWAYML_API_SECRET" -- 'engines/plate_engines/contract/**' 'fixtures/**' '*.json' '*.jsonl'`; `grep -rni "bearer\|authorization\|key_" engines/plate_engines/contract/runway` | 1; 1 | nothing found. The name appears only as an environment variable name: in `runway_schema.KEY_ENV`, in the CLI's key table, in tests that set or delete it with `monkeypatch` (`test_cli_runway`, `test_motion_runway`), and in the manifests' custody `note` |
+| 9 | The Wave 11 done-when commands that are not pytest | 0 | T119 `15 ['atlas', 'runway'] [4, 6, 8]`; T121 `smoke --engines kling-o3-4k,gen-4.5 \| grep -c "via runway: ok"` `2`; T122 `claims_check.py --static` `static ok (28 claims, 136 tests named, documents covered)`, every runway grep count ≥ 1 (engines.md 13, artist-manual 5, runway.md 22, README 1, key-revoked 1, vendor-down 1), `14 files` absent from engines.md; T123 `npx tsc --noEmit -p .` clean, `vitest run makeBarRunway makeBarWave9` `18 passed`; T124 the generated custody matrix matches `docs/custody.md` (empty diff) |
+
+### 11.3 The numbers
+
+| measure | after Wave 10 | after Wave 11 |
+|---|---|---|
+| pytest, every package | 5945 passed, 1 skipped | **6241 passed, 1 skipped** (+296; the skip is still the drawtext-less ffmpeg) |
+| vitest | 798 | **805** (28 files; +7 in `makeBarRunway.test.tsx`) |
+| engine manifests | 14 | **15** (`gen-4.5`, video_i2v, `runway` only) |
+| video manifests with a `runway` route | 0 | 6: `gen-4.5`, `kling-o3-4k`, `kling-v3-pro`, `seedance-2.5-i2v`, `seedance-2.5-r2v`, `veo-3.1`; Atlas, Vertex, BytePlus and WaveSpeed stay first in `routes:` and remain the fallbacks |
+| fixture CLI smoke | 11 adapters ok | **17 adapters ok**, 0 failed, 8 skipped |
+| Runway smoke rows | none | **6**, each `ok`, each quoting from the route's own price: gen-4.5 USD 0.24, kling-o3-4k USD 1.29, kling-v3-pro USD 0.36, seedance-2.5-i2v USD 0.80, seedance-2.5-r2v USD 0.80, veo-3.1 USD 0.80, all custody D |
+| claims as tests | 28 claims, 136 tests | 28 claims, 136 tests (`claims.yaml`, `README.md` and `client-explainer.md` untouched, as the wave planned) |
+| hazard scan | clean, 977 files | clean, 1026 files, 2 allowlist entries |
+| new Wave 11 test functions | | `test_prefer` 33, `test_runway_schema` 37, `test_adapters_runway` 48, `test_motion_runway` 15, `test_cli_runway` 15, `test_routes_engines_runway` 7, `test_quotes_route_price` 7, plus edits to the custody, manifest, motion, previs, settings and engines-route suites |
+
+### 11.4 Decisions 59 to 70
+
+| # | decision | status | evidence |
+|---|---|---|---|
+| 59 | Runway over its Dev REST API with the user's key, through `Egress`; no MCP in the daemon | done; the live call is a box-day item | `RunwayVideo` sends `X-Runway-Version: 2024-11-06`; no `httpx.Client(` in `runway_video.py`; `test_egress.py::test_no_httpx_client_outside_egress_and_transport`; `test_the_key_appears_in_the_header_only`, `test_no_key_fails_before_anything_leaves` |
+| 60 | One adapter with per-model closed field allowlists | done | `test_runway_schema` (`test_no_requested_model_has_resolution_or_unlisted_fields`, `test_check_body_names_every_offending_key`); `test_it_drives_only_its_engines_and_only_the_runway_route` |
+| 61 | Prices on the route; preference is a rule, not list order | done | `test_prefer` (`test_estimate_price_uses_the_route_price_and_its_floor`, `test_choose_prefers_runway_on_a_video_manifest`); `test_quotes_route_price`; `test_routes_engines_runway` |
+| 62 | Custody D on the evidence, `private` uploads, a written path to C2 | done | `test_custody` (Dev API row apart from the web-app row, generated matrix); `test_router.py::test_nda_video_has_no_cloud_path`; `test_motion_runway.py::test_an_nda_project_gets_no_video_route_at_all` |
+| 63 | Runway first when custody allows and the frame fits; overrides in order | done | `test_pick_route_orders_by_the_rule_and_says_why`, `test_an_off_ratio_start_crop_goes_to_atlas_with_the_skip_reason`, `test_project_settings_override_the_preference_in_order`, `test_the_duration_is_one_every_active_route_takes` |
+| 64 | Data URI up to 5,242,880 characters, else one ephemeral upload; hosts allowlisted by suffix | done; hosts unverified (box-day item 23) | `test_a_4mb_start_frame_goes_through_uploads`, `test_an_upload_host_off_the_list_fails_closed_naming_the_host`, `test_the_recordings_cover_only_runway_hosts`; `runway_hosts_unverified` on the six manifests |
+| 65 | No blind retry, no lookup | done | `test_429_503_and_401_raise_after_exactly_one_create`, `test_a_create_timeout_propagates_and_is_never_retried`, `test_a_second_look_inside_5_seconds_makes_no_request`; `idempotent_submit = False`, `supports_lookup = False` |
+| 66 | Failure mapping by `failureCode` prefix | done | `test_classify_failure_vectors`, `test_failure_codes_map_by_prefix`, `test_a_safety_400_is_a_stateless_refusal` |
+| 67 | No `video_to_video`, no `video_upscale` | done (nothing built) | `docs/engines.md` "Not routed" paragraph |
+| 68 | Seedance `draft` is the 480P tier on Runway | done; the enhance path is adapter-only (open question 33) | `test_seedance_480p_is_a_runway_draft`, `test_draft_enhance_sends_exactly_two_keys`, `test_a_previs_draft_on_seedance_r2v_goes_to_runway_as_a_draft` |
+| 69 | What a model cannot express is refused or folded, never dropped | done | `test_prompt_text_folds_negative_into_models_without_the_field`, `test_a_seed_on_kling_is_a_param_error`, `test_elements_on_kling_v3_are_an_input_error`, `test_seedance_flags_runway_cannot_express_are_param_errors` |
+| 70 | Start-frame-only engines are Motion engines | done | `test_motion_engines_are_every_start_frame_video_manifest`, `test_seedance_i2v_is_a_single_image_motion_engine_on_runway`, `test_an_end_still_wired_to_gen45_is_422_end_unsupported` |
+
+The doctrine held. Runway is reached only from a plate: `text_to_video` carries Seedance reference mode and refuses an empty reference list. No plate is upscaled, and `video_upscale` is not a route. An off-ratio frame never goes to Runway, because the vendor's centre crop would move a crop pair's landing.
+
+### 11.5 Wave 11 open questions running on their defaults
+
+The build used these defaults (router plan, open questions 29 to 34). Each is a decision for Aasish. Changing one is a small task.
+
+| # | question | default in effect |
+|---|---|---|
+| 29 | Runway as a REST route or an MCP | the Dev REST API with the user's key (`RUNWAYML_API_SECRET`), the same account the Runway MCP fronts; no MCP in the daemon |
+| 30 | Runway custody | `D / confirmed / private` on the evidence of Terms of Use s4.4; the C2 promotion is a manifest edit once a signed Enterprise agreement is filed |
+| 31 | Upload and output hosts | allowlisted by suffix (`.amazonaws.com`, `.cloudfront.net`, plus `api.dev.runwayml.com`), flagged `runway_hosts_unverified`, narrowed after the first live call |
+| 32 | Durations across routes | ceiled to the intersection of every active route (Veo 5 s → 6 s on Vertex too; Kling under 3 s → 3 s), so a plan is legal and correctly priced on whichever route the quote picks |
+| 33 | Seedance `draftTaskId` enhance | adapter-only; previs `quality: complete` stays a fresh 1080p request |
+| 34 | Runway billing reconciliation | none yet; `cost.credits` is recorded on every terminal task in `JobStatus.usage` and the ledger, and the first bill is read by hand |
+
+### 11.6 Box-day lines added by Wave 11
+
+These continue the section 9 checklist.
+
+23. **Live smoke hosts (T118, T121).** Run `PLATE_LIVE=1 RUNWAYML_API_SECRET=<key> .venv/bin/python -m plate_daemon.cli smoke --live --budget-usd 5 --engines kling-v3-pro,seedance-2.5-i2v --out <file>` on the Mac or the box. That is one 3 s Kling 3.0 Pro clip at USD 0.36 and one 4 s Seedance 480p draft at USD 0.80. Read the real `uploadUrl` and `output` hosts from `outbound.jsonl` and record them in `docs/runbooks/runway.md`. Then narrow `allowed_hosts` on the six `runway` routes and drop `runway_hosts_unverified`.
+24. **Enterprise terms.** Runway stays custody D, so NDA projects never reach it, until a signed Runway Dev Enterprise agreement (no training, zero retention) is filed. Then, on every `runway` route: `custody_grade: C2`, `custody_status: confirmed`, `terms_hash` = the sha256 of the signed agreement. Regenerate the matrix in `docs/custody.md`. Nothing else changes.
+
+The Vantage, Max and other vendor lines in section 9 stay on the box list unchanged.

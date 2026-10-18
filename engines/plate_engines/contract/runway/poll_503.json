@@ -1,0 +1,29 @@
+{
+  "note": "synthetic: a task GET while Runway sheds load, then SUCCEEDED",
+  "request": {
+    "method": "GET",
+    "url": "https://api.dev.runwayml.com/v1/tasks/7c7f1e80-91a2-43b4-a5c6-d7e8f90a1b2c"
+  },
+  "responses": [
+    {
+      "status": 503,
+      "json": {
+        "error": "Service Unavailable"
+      }
+    },
+    {
+      "status": 200,
+      "json": {
+        "id": "7c7f1e80-91a2-43b4-a5c6-d7e8f90a1b2c",
+        "createdAt": "2026-10-18T09:00:00.000Z",
+        "status": "SUCCEEDED",
+        "output": [
+          "https://dnznrvs05pmza.cloudfront.net/output.mp4?_jwt=test"
+        ],
+        "cost": {
+          "credits": 60
+        }
+      }
+    }
+  ]
+}

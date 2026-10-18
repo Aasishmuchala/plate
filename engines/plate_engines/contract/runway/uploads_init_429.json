@@ -1,0 +1,17 @@
+{
+  "note": "synthetic: POST /v1/uploads over the (unpublished) ephemeral-upload rate limit: 429 {error}",
+  "request": {
+    "method": "POST",
+    "url": "https://api.dev.runwayml.com/v1/uploads",
+    "body": {
+      "filename": "7e974d8b8403582d067cac93f1.mp4",
+      "type": "ephemeral"
+    }
+  },
+  "response": {
+    "status": 429,
+    "json": {
+      "error": "Too many uploads"
+    }
+  }
+}

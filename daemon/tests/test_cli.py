@@ -801,7 +801,8 @@ def test_python_dash_m_runs_the_smoke_with_the_done_when_environment(tmp_path):
         capture_output=True, text=True, encoding="utf-8", env=env, timeout=300, check=False,
     )  # fmt: skip
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip().splitlines()[-1] == "fixture smoke: 2 adapters ok"
+    # flux, veo via vertex and veo via runway
+    assert proc.stdout.strip().splitlines()[-1] == "fixture smoke: 3 adapters ok"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="the bash shim is the Mac entry; plate.cmd is its Windows twin")

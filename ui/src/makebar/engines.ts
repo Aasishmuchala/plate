@@ -17,6 +17,18 @@ export interface EngineRouteSummary {
   status?: "active" | "retired";
   /** Who can see an upload on this route (`local`, `private`, `public_url`, …), when the daemon sends it. */
   upload_visibility?: string;
+  /** The route's own price when the vendor's catalogue is held for it (the Runway routes); null: the engine's `price`. */
+  price?: RoutePrice | null;
+  /** True on the route a quote tries first for a video engine (the project's preferred provider, default Runway). */
+  preferred?: boolean;
+}
+
+/** `Route.price` from `GET /api/v0/engines` (T123): `minimum_usd` is the per-generation floor. */
+export interface RoutePrice {
+  usd: number;
+  model: string;
+  status?: string;
+  minimum_usd?: number;
 }
 
 /** One manifest param (`plate_engines.models.Param`), shown in the advanced drawer. */
@@ -161,18 +173,19 @@ const C = "confirmed" as const;
  */
 export const FALLBACK_ENGINES: readonly EngineSummary[] = [
   { id: "flux-3-image", name: "FLUX 3 Image", kind: "image_edit", allowed_tasks: ["relight", "vegetation", "sky", "rephotograph_close"], routes: [r("bfl", "D", C)] },
+  { id: "gen-4.5", name: "Runway Gen-4.5", kind: "video_i2v", allowed_tasks: ["crop_pair_motion"], routes: [r("runway", "D", C)] },
   { id: "gpt-image-2.5", name: "GPT Image 2.5", kind: "image_edit", allowed_tasks: [...IMAGE_TASKS], routes: [r("openai", "C1", P)] },
-  { id: "kling-o3-4k", name: "Kling O3 4K", kind: "video_startend", allowed_tasks: ["crop_pair_motion"], routes: [r("atlas", "D", C)] },
-  { id: "kling-v3-pro", name: "Kling v3 Pro", kind: "video_startend", allowed_tasks: ["crop_pair_motion"], routes: [r("atlas", "D", C)] },
+  { id: "kling-o3-4k", name: "Kling O3 4K", kind: "video_startend", allowed_tasks: ["crop_pair_motion"], routes: [r("atlas", "D", C), r("runway", "D", C)] },
+  { id: "kling-v3-pro", name: "Kling v3 Pro", kind: "video_startend", allowed_tasks: ["crop_pair_motion"], routes: [r("atlas", "D", C), r("runway", "D", C)] },
   { id: "magnific-precision-v2", name: "Magnific Precision v2", kind: "upscale", allowed_tasks: ["upscale_ai_layers"], routes: [r("magnific", "D", P)] },
   { id: "nano-banana-2.1", name: "Nano Banana 2.1", kind: "image_edit", allowed_tasks: [...IMAGE_TASKS], routes: [r("gemini", "C1", P), r("atlas", "D", C)] },
   { id: "nano-banana-pro", name: "Nano Banana Pro", kind: "image_edit", allowed_tasks: [...IMAGE_TASKS], routes: [r("gemini", "C1", P)] },
   { id: "qwen-image-edit-2509", name: "Qwen-Image-Edit-2509 (ControlNet depth and edge)", kind: "local_image", allowed_tasks: [...IMAGE_TASKS], routes: [r("local", "C0", C)] },
   { id: "real-esrgan", name: "Real-ESRGAN", kind: "upscale", allowed_tasks: ["upscale_ai_layers"], routes: [r("local", "C0", C)] },
-  { id: "seedance-2.5-i2v", name: "Seedance 2.5 image-to-video", kind: "video_i2v", allowed_tasks: ["crop_pair_motion"], routes: [r("atlas", "D", C), r("byteplus", "D", P), r("wavespeed", "D", P)] },
-  { id: "seedance-2.5-r2v", name: "Seedance 2.5 reference-to-video", kind: "video_r2v", allowed_tasks: ["crop_pair_motion", "previs"], routes: [r("atlas", "D", C), r("byteplus", "D", P), r("wavespeed", "D", P)] },
+  { id: "seedance-2.5-i2v", name: "Seedance 2.5 image-to-video", kind: "video_i2v", allowed_tasks: ["crop_pair_motion"], routes: [r("atlas", "D", C), r("byteplus", "D", P), r("wavespeed", "D", P), r("runway", "D", C)] },
+  { id: "seedance-2.5-r2v", name: "Seedance 2.5 reference-to-video", kind: "video_r2v", allowed_tasks: ["crop_pair_motion", "previs"], routes: [r("atlas", "D", C), r("byteplus", "D", P), r("wavespeed", "D", P), r("runway", "D", C)] },
   { id: "seedream-5-pro", name: "Seedream 5 Pro", kind: "image_edit", allowed_tasks: ["relight", "vegetation", "sky", "rephotograph_close"], routes: [r("atlas", "D", C)] },
-  { id: "veo-3.1", name: "Veo 3.1", kind: "video_i2v", allowed_tasks: ["crop_pair_motion"], routes: [r("vertex", "C1", P)] },
+  { id: "veo-3.1", name: "Veo 3.1", kind: "video_i2v", allowed_tasks: ["crop_pair_motion"], routes: [r("vertex", "C1", P), r("runway", "D", C)] },
   { id: "wan-2.2-vace", name: "Wan 2.2 VACE", kind: "local_video", allowed_tasks: ["previs"], routes: [r("local", "C0", C)] },
 ];
 

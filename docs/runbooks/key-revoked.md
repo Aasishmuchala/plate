@@ -5,6 +5,7 @@ PLATE reads vendor keys from **environment variables only**. It does not write t
 | vendor / route | variable |
 |---|---|
 | Atlas (Seedream, Seedance, Kling, Nano Banana on Atlas) | `ATLASCLOUD_KEY` |
+| Runway Dev API (Seedance 2.5, Kling O3 4K / 3.0 Pro, Veo 3.1, Gen-4.5) | `RUNWAYML_API_SECRET` (project-scoped; removing a portal member does not revoke their key: rotate in the portal; see [runway.md](runway.md)) |
 | Google Gemini API (Nano Banana 2.1, Pro) | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) |
 | Google Vertex AI (Veo 3.1) | `GOOGLE_CLOUD_PROJECT` and `VERTEX_ACCESS_TOKEN` (a short-lived token: an expired one looks like a revoked key) |
 | OpenAI (GPT Image 2.5) | `OPENAI_API_KEY` |

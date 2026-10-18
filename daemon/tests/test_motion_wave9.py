@@ -338,15 +338,18 @@ def test_veo_quotes_on_an_open_project_and_runs_start_end(env):
     assert r.status_code == 200, r.text
     q = r.json()
     route = q["run"]["route"]
-    assert (route["engine_id"], route["provider"]) == ("veo-3.1", "vertex")
-    assert q["quote"]["custody_grade"] == "D"  # C1 pending written terms counts as D
+    assert (route["engine_id"], route["provider"]) == ("veo-3.1", "runway")  # preferred by rule
+    assert q["quote"]["custody_grade"] == "D"  # Runway's self-serve terms: D on the evidence
     params = q["run"]["params"]
-    assert params["duration"] == 4  # a 2 s shot clamps to Veo's 4 to 8
+    assert params["duration"] == 4  # a 2 s shot clamps to Veo's 4 to 8, a duration both routes take
     assert params["resolution"] == "1080p" and params["aspect_ratio"] == "16:9"  # Veo's own spelling
-    assert q["quote"]["price_usd"] == pytest.approx(4 * 0.21)
+    assert q["quote"]["price_usd"] == pytest.approx(4 * 0.20)  # the runway route's audio-off rate
     run = env.approve(q["run"]["id"])
     assert run["state"] == "DONE", run.get("error")
     assert "image_tail" in fake.payloads[0]["inputs"] and fake.payloads[0]["engine_id"] == "veo-3.1"
+    vertex = env.quote(body={"engine_id": "veo-3.1", "route_id": "vertex"}).json()
+    assert vertex["run"]["route"]["provider"] == "vertex"  # C1 pending written terms counts as D
+    assert vertex["quote"]["price_usd"] == pytest.approx(4 * 0.21) and vertex["quote"]["custody_grade"] == "D"
 
 
 @have_packets
@@ -548,8 +551,12 @@ def test_start_end_engines_and_the_old_name(manifests):
     # matched without regard to case, sent in the manifest's spelling
     up = kling_job.plan_from_still(still, engine_id="veo-3.1", shot_s=6, resolution="720P")
     assert up.params()["resolution"] == "720p"
-    with pytest.raises(PipelineError, match="not a Kling"):
-        kling_job.plan_from_still(still, engine_id="seedance-2.5-i2v", shot_s=2)
+    with pytest.raises(PipelineError, match="not a motion engine"):
+        kling_job.plan_from_still(still, engine_id="seedance-2.5-r2v", shot_s=2)
+    # Veo on either route takes 4, 6 or 8 s (Runway's list): a 5 s shot is a 6 s take (decision 63)
+    assert (
+        kling_job.plan_from_still(still, engine_id="veo-3.1", shot_s=5, manifests=manifests).duration_s == 6
+    )
     portrait = kling_job.plan_from_still(textured(270, 480), engine_id="veo-3.1", shot_s=4)
     assert portrait.params()["aspect_ratio"] == "9:16"
 
@@ -573,7 +580,7 @@ def test_a_single_image_plan_has_no_end_and_no_pace_law():
 def test_extra_params_are_checked_against_the_manifest(manifests):
     still = textured(480, 270)
     plan = kling_job.plan_from_still(still, shot_s=2, extra_params={"cfg_scale": 0.6}, manifests=manifests)
-    assert plan.params()["cfg_scale"] == 0.6 and plan.params()["duration"] == 2
+    assert plan.params()["cfg_scale"] == 0.6 and plan.params()["duration"] == 3  # the 3 s floor
     other = kling_job.plan_from_still(still, shot_s=2, extra_params={"cfg_scale": 0.4})
     assert plan.idempotency_key() != other.idempotency_key()
     for bad in ({"cfg_scale": 2}, {"cfg_scael": 0.5}, {"duration": 5}, {"cfg_scale": "high"}):

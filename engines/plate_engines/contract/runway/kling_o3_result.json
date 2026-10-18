@@ -1,0 +1,14 @@
+{
+  "note": "synthetic: GET the signed output URL: a 48-byte ftyp stub, not a playable mp4",
+  "request": {
+    "method": "GET",
+    "url": "https://dnznrvs05pmza.cloudfront.net/output.mp4?_jwt=test"
+  },
+  "response": {
+    "status": 200,
+    "bytes_b64": "AAAAGGZ0eXBtcDQyAAAAAG1wNDJpc29tAAAAGGZyZWVQTEFURS1SVU5XQVktSzAz",
+    "headers": {
+      "content-type": "video/mp4"
+    }
+  }
+}

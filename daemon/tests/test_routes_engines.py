@@ -37,6 +37,8 @@ ROUTE_KEYS = {
     "status",
     "upload_visibility",
     "health",
+    "price",
+    "preferred",
 }
 RECIPE_KEYS = {
     "id",
@@ -76,10 +78,10 @@ def make_project(c: TestClient, auth: dict, project_id: str, **custody) -> None:
 # ---------------------------------------------------------------------------- GET /engines
 
 
-def test_engines_lists_the_14_manifests_and_the_fake_engine(client, auth, manifests):
-    assert len(manifests) == 14
+def test_engines_lists_the_15_manifests_and_the_fake_engine(client, auth, manifests):
+    assert len(manifests) == 15
     got = engines(client, auth)
-    assert set(got) == set(manifests) | {"fake"} and len(got) == 15
+    assert set(got) == set(manifests) | {"fake"} and len(got) == 16
     ids = list(got)
     assert ids[:-1] == sorted(manifests) and ids[-1] == "fake"  # sorted by id, the fake one last
 
@@ -112,6 +114,8 @@ def test_the_fake_engine_entry_is_the_daemons_own(client, auth):
             "status": "active",
             "upload_visibility": "local",
             "health": "ok",
+            "price": None,
+            "preferred": False,
         }
     ]
     assert fake["params"] == [] and fake["presets"] == ["default"]

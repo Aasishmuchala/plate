@@ -2,13 +2,14 @@
 
 `build_quote(engine_manifest, route, inputs, params)` prices a request from a `plate_engines` manifest: the
 route's provider and region, its effective custody grade (unconfirmed terms and public uploads count as D),
-the model version the route will call, the chosen size and the manifest price (the first `price.tiers` row
-whose params match the request, else `price.by[<size label>]`, else `price.usd`; times megapixels or seconds
-when the price model says so, times the image count). A tier row prices by quality, image size, resolution or
-audio and carries its own status; the quote names it in `price_tier`. A quote expires 15 minutes after it is
-made; `requote_needed(old, new)` says when a fresh quote must be shown again (price moved more than 5 %, or the
-model version changed). `make_quote` uses the manifest when one is known for the run's engine and the fake
-0.04 USD price otherwise.
+the model version the route will call, the chosen size and the price (the first `price.tiers` row whose params
+match the request, else `price.by[<size label>]`, else `price.usd`; times megapixels or seconds when the price
+model says so, raised to `price.minimum_usd`, times the image count). A route that carries its own `price`
+(Runway) is priced from that spec, every other route from the manifest's. A tier row prices by quality, image
+size, resolution or audio and carries its own status; the quote names it in `price_tier`. A quote expires 15
+minutes after it is made; `requote_needed(old, new)` says when a fresh quote must be shown again (price moved
+more than 5 %, or the model version changed). `make_quote` uses the manifest when one is known for the run's
+engine and the fake 0.04 USD price otherwise.
 
 `quote_run` moves DRAFT -> QUOTED with the quote stored (the `quotes` row for approval bookkeeping, the full
 terms in `runs.quote_json`). `approve` moves QUOTED -> APPROVED only before expiry, otherwise commits
@@ -176,9 +177,9 @@ def _tier_context(manifest: Any, params: Mapping[str, Any], label: str) -> dict[
     return {key: _norm(value) for key, value in ctx.items()}
 
 
-def _pick_tier(manifest: Any, ctx: Mapping[str, str]) -> Any:
-    """The first price tier whose every match entry equals the context value; None when none does."""
-    for tier in getattr(manifest.price, "tiers", None) or []:
+def _pick_tier(spec: Any, ctx: Mapping[str, str]) -> Any:
+    """The first price tier of `spec` whose every match entry equals the context value; None when none does."""
+    for tier in getattr(spec, "tiers", None) or []:
         if all(key in ctx and ctx[key] == _norm(want) for key, want in tier.match.items()):
             return tier
     return None
@@ -201,13 +202,15 @@ def build_quote(
     r = _pick_route(m, route)
     size = _pick_size(m, params)
     label = (size or {}).get("label") or ""
-    tier = _pick_tier(m, _tier_context(m, params, label))
+    route_price = getattr(r, "price", None)
+    spec = route_price if route_price is not None else m.price  # a route with its own price (Runway) wins
+    tier = _pick_tier(spec, _tier_context(m, params, label))
     if tier is not None:
         unit, price_status = tier.usd, tier.status
         price_tier: str | None = _tier_name(tier.match)
     else:
-        unit, price_status, price_tier = m.price.by.get(label, m.price.usd), m.price.status, None
-    if m.price.model == "per_megapixel":
+        unit, price_status, price_tier = spec.by.get(label, spec.usd), spec.status, None
+    if spec.model == "per_megapixel":
         mp = (
             (size["w"] * size["h"] / 1e6)
             if size and size["w"] and size["h"]
@@ -216,7 +219,7 @@ def build_quote(
         if mp is None:
             raise ValueError(f"{m.id}: per_megapixel pricing needs a width and height (or megapixels)")
         qty = mp
-    elif m.price.model == "per_second":
+    elif spec.model == "per_second":
         secs = _number(params, DURATION_PARAMS)
         if secs is None:
             raise ValueError(f"{m.id}: per_second pricing needs a duration ({', '.join(DURATION_PARAMS)})")
@@ -231,7 +234,7 @@ def build_quote(
         model_version=r.model_slug or m.model_id or m.version,
         region=r.region,
         custody_grade=effective_grade(r),
-        price_usd=round(unit * qty * count, 6),
+        price_usd=round(max(unit * qty, spec.minimum_usd) * count, 6),
         eta_s=DEFAULT_ETA_S.get(m.kind, 120.0),
         created_utc=now,
         expires_utc=now + QUOTE_TTL,

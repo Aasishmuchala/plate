@@ -1,0 +1,20 @@
+{
+  "note": "synthetic: FAILED while the third-party model provider is unavailable",
+  "request": {
+    "method": "GET",
+    "url": "https://api.dev.runwayml.com/v1/tasks/3e3b7a4c-5d6e-4f70-a182-93a4b5c6d7e8"
+  },
+  "response": {
+    "status": 200,
+    "json": {
+      "id": "3e3b7a4c-5d6e-4f70-a182-93a4b5c6d7e8",
+      "createdAt": "2026-10-18T09:00:00.000Z",
+      "status": "FAILED",
+      "failure": "The model provider is temporarily unavailable.",
+      "failureCode": "THIRD_PARTY.UNAVAILABLE",
+      "cost": {
+        "credits": 0
+      }
+    }
+  }
+}

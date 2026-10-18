@@ -65,7 +65,7 @@ def recipe_doc(rid: str = "my_recipe", **patch) -> dict:
 
 def test_every_engine_has_capabilities_and_a_health_per_route(client, auth):
     got = engines(client, auth)
-    assert len(got) == 15
+    assert len(got) == 16  # 15 manifests (gen-4.5 joined in Wave 11) + the fake engine
     for e in got.values():
         assert set(e["capabilities"]) == CAPABILITY_KEYS, e["id"]
         assert all(r["health"] in HEALTH for r in e["routes"]), e["id"]

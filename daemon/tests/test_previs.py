@@ -639,8 +639,9 @@ def test_a_submit_that_raises_is_ledgered_as_failed(tmp_path, monkeypatch):
 
 @needs_ffmpeg
 def test_the_real_seedance_route_is_quoted_and_waits_for_a_human(tmp_path):
-    """engine=None builds the Atlas SeedanceR2V adapter on the project's egress; without approved_by the run stops
-    after the quote, before any request: the adapter's own parser and pricer accept the plan's payload."""
+    """engine=None builds the preferred route's adapter (Runway by rule, Wave 11 decision 63; Atlas SeedanceR2V in
+    manifest order) on the project's egress; without approved_by the run stops after the quote, before any request:
+    each adapter's own parser and pricer accept the plan's payload."""
     from plate_engines.loader import load_manifests
 
     project = make_project(tmp_path)
@@ -649,22 +650,31 @@ def test_the_real_seedance_route_is_quoted_and_waits_for_a_human(tmp_path):
     assert e.value.code == "approval_required" and e.value.status == 409
     (quoted,) = Ledger(project.root).records()
     assert quoted["kind"] == "quoted" and quoted["engine_id"] == "seedance-2.5-r2v"
-    assert quoted["route_id"] == "atlas" and quoted["custody_grade"] == "D"
-    assert quoted["cost_usd_quoted"] == pytest.approx(0.10 * 4)  # manifest per-second placeholder x 4 s
+    assert quoted["route_id"] == "runway" and quoted["custody_grade"] == "D"
+    assert quoted["cost_usd_quoted"] == pytest.approx(0.80)  # Runway's 480p draft: 4 s x 0.20, the 0.80 floor
+    with pytest.raises(previs.PrevisError):  # manifest order: the Atlas route
+        previs.run(project, "m", "draft", work_dir=tmp_path / "work", prefer_provider="none")
+    atlas = Ledger(project.root).records()[-1]
+    assert atlas["kind"] == "quoted" and atlas["route_id"] == "atlas" and atlas["custody_grade"] == "D"
+    assert atlas["cost_usd_quoted"] == pytest.approx(0.10 * 4)  # manifest per-second placeholder x 4 s
     assert OutboundLog.for_project(project.root).records()[0] == []  # nothing left the box
 
     m = load_manifests()["seedance-2.5-r2v"]
     ctx = previs._context(project, "m")
     r, route = previs._pick_route(m, ctx["allowed"], None)
-    bridge = previs.seedance_engine(project, "prv_check", r, m, ctx["motion"])
-    p = previs.plan(project, "m", "complete", route=route, work_dir=tmp_path / "work", _ctx=ctx)
-    adapter = bridge.adapter
-    parsed = adapter.parse_inputs(p.payload["inputs"])
-    assert parsed.references[0].role == "first_frame" and len(parsed.videos) == 1
-    params = adapter.validate_params(p.payload["params"])
-    assert (
-        params["resolution"] == "1080P"
-        and params["camera_fixed"] is False
-        and params["generate_audio"] is False
-    )
-    assert adapter.quote(p.payload["inputs"], params).price_usd == pytest.approx(0.4)
+    assert r.route_id == "runway" and route["reasons"][0].startswith("prefer: runway")
+    for route_id, price in (("atlas", 0.4), ("runway", 4 * 0.68)):
+        r, route = previs._pick_route(m, ctx["allowed"], route_id)
+        bridge = previs.seedance_engine(project, "prv_check", r, m, ctx["motion"])
+        p = previs.plan(project, "m", "complete", route=route, work_dir=tmp_path / "work", _ctx=ctx)
+        adapter = bridge.adapter
+        assert adapter.PROVIDER == route_id
+        parsed = adapter.parse_inputs(p.payload["inputs"])
+        assert parsed.references[0].role == "first_frame" and len(parsed.videos) == 1
+        params = adapter.validate_params(p.payload["params"])
+        assert (
+            params["resolution"] == "1080P"
+            and params["camera_fixed"] is False
+            and params["generate_audio"] is False
+        )
+        assert adapter.quote(p.payload["inputs"], params).price_usd == pytest.approx(price)

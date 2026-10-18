@@ -5,13 +5,14 @@
 # adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
 # T7: params are the vendor FULL schema (advanced: true only hides a field in the UI drawer). price.usd is the
 # default-tier figure the router ranks on; price.by holds the tiers we know. Nothing is billed-price-verified yet.
+# Wave 11: `runway` route (preferred for video by rule, not by order; decisions 61-64).
 id: veo-3.1
 name: Veo 3.1
 version: unpinned
 pinned: false
 kind: video_i2v
 model_id: veo-3.1-generate-001
-flags: [unverified_p0]
+flags: [unverified_p0, runway_hosts_unverified]
 inputs:
   - {name: start_image, type: image, required: true}
   - {name: end_image, type: image, required: false}
@@ -49,3 +50,26 @@ routes:
     same_model_fallback_of: null
     allowed_hosts: [.googleapis.com]
     note: "C1 candidate only: Vertex zero-retention terms and regional availability not yet confirmed in writing."
+  - provider: runway
+    endpoint: https://api.dev.runwayml.com/v1
+    region: us
+    custody_grade: D
+    custody_status: confirmed
+    terms_hash: unknown
+    upload_visibility: private
+    same_model_fallback_of: null
+    model_slug: veo3.1
+    allowed_hosts: [api.dev.runwayml.com, .cloudfront.net, .amazonaws.com]
+    max_inflight: 1
+    durations: [4, 6, 8]
+    note: "Runway Dev API, the user's own key (RUNWAYML_API_SECRET). Self-serve Terms of Use (15 Sep 2026) s4.4: Inputs and Outputs may be used to train Runway's models under a perpetual licence; D on the evidence. C2 when a signed Runway Dev Enterprise agreement (no training, zero retention) is filed: custody_grade C2, custody_status confirmed, terms_hash = sha256 of the signed agreement. Sub-processors on this route: Google Cloud (US), Byteplus Pte (Singapore), Kling AI Pte (Singapore). Output URLs are signed and expire in 24-48 h; uploads are 24 h ephemeral runway:// URIs."
+    price:
+      model: per_second
+      usd: 0.20
+      status: confirmed
+      source: "docs.dev.runwayml.com/guides/pricing.md, USD 0.01 per credit, read 2026-10-18 and skeptic-checked (router/research/runway/pricing_terms.md)"
+      as_of: 2026-10-18
+      notes: "audio off unless generate_audio is true"
+      tiers:
+        - {match: {generate_audio: false}, usd: 0.20, status: confirmed}
+        - {match: {generate_audio: true}, usd: 0.40, status: confirmed}

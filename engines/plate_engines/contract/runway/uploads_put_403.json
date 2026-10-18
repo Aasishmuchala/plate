@@ -1,0 +1,11 @@
+{
+  "note": "synthetic: the presigned multipart POST of fields + file for a clip whose presigned POST is refused (body_hash: field names, file name, blake3 of each payload)",
+  "request": {
+    "method": "POST",
+    "url": "https://plate-test-uploads.s3.amazonaws.com/",
+    "body_hash": "e240f3e5"
+  },
+  "response": {
+    "status": 403
+  }
+}

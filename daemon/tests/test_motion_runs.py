@@ -359,8 +359,9 @@ def test_a_croppair_after_a_server_approved_still_runs_to_a_gated_clip(env):
     assert inputs["start_hash"] == inputs["image"] and inputs["end_hash"] == inputs["image_tail"]
     assert inputs["still"] == edit["outputHash"] and inputs["motion"]["task"] == "crop_pair_motion"
     route = q["run"]["route"]
-    assert (route["engine_id"], route["provider"], route["custody_grade"]) == ("kling-o3-4k", "atlas", "D")
-    assert q["quote"]["model"] == "kling-o3-4k" and q["quote"]["price_usd"] == pytest.approx(2 * 0.357)
+    assert (route["engine_id"], route["provider"], route["custody_grade"]) == ("kling-o3-4k", "runway", "D")
+    # a 2 s shot is a 3 s take (every route takes it, Wave 11 decision 63), priced on the runway route
+    assert q["quote"]["model"] == "kling-o3-4k" and q["quote"]["price_usd"] == pytest.approx(3 * 0.43)
     assert is_pipeline_run(env.run(run_id)) and motion_runs.is_motion_run(env.run(run_id))
 
     run = env.approve(run_id)
@@ -387,7 +388,7 @@ def test_a_croppair_after_a_server_approved_still_runs_to_a_gated_clip(env):
     assert base64.b64decode(ins["image"]["b64"]) == env.cas.read_bytes(start)
     assert base64.b64decode(ins["image_tail"]["b64"]) == env.cas.read_bytes(end)
     assert all(re.fullmatch(r"[0-9a-f]{26}\.png", ins[k]["name"]) for k in ("image", "image_tail"))
-    assert fake.payloads[0]["params"]["duration"] == 2
+    assert fake.payloads[0]["params"]["duration"] == 3
 
     # every move on the bus; the ledger carries the motion fields
     assert env.moves(run_id) == [*WORKER_STATES, "DONE"]

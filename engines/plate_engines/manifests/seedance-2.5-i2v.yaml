@@ -7,13 +7,14 @@
 # default-tier figure the router ranks on; price.by holds the tiers we know. Nothing is billed-price-verified yet.
 # Plain image-to-video: image is the strict first frame, no reference arrays. Same limits as the r2v manifest:
 # 4-30 s, 480p/720p 8-bit and 1080p 10-bit, no 4K, 24 fps output (recorded as JobStatus.output_fps by T18).
+# Wave 11: `runway` route (preferred for video by rule, not by order; decisions 61-64).
 id: seedance-2.5-i2v
 name: Seedance 2.5 image-to-video
 version: unpinned
 pinned: false
 kind: video_i2v
 model_id: dreamina-seedance-2-5-260628
-flags: [unverified_p0]
+flags: [unverified_p0, runway_hosts_unverified]
 inputs:
   - {name: image, type: image, required: true}
   - {name: prompt, type: text, required: true}
@@ -82,3 +83,27 @@ routes:
     same_model_fallback_of: atlas
     allowed_hosts: [.wavespeed.ai]
     note: "Same model, other provider: fallback of the atlas route only, re-quoted, never silent."
+  - provider: runway
+    endpoint: https://api.dev.runwayml.com/v1
+    region: us
+    custody_grade: D
+    custody_status: confirmed
+    terms_hash: unknown
+    upload_visibility: private
+    same_model_fallback_of: null
+    model_slug: seedance2_5
+    allowed_hosts: [api.dev.runwayml.com, .cloudfront.net, .amazonaws.com]
+    max_inflight: 1
+    note: "Runway Dev API, the user's own key (RUNWAYML_API_SECRET). Self-serve Terms of Use (15 Sep 2026) s4.4: Inputs and Outputs may be used to train Runway's models under a perpetual licence; D on the evidence. C2 when a signed Runway Dev Enterprise agreement (no training, zero retention) is filed: custody_grade C2, custody_status confirmed, terms_hash = sha256 of the signed agreement. Sub-processors on this route: Google Cloud (US), Byteplus Pte (Singapore), Kling AI Pte (Singapore). Output URLs are signed and expire in 24-48 h; uploads are 24 h ephemeral runway:// URIs."
+    price:
+      model: per_second
+      usd: 0.20
+      minimum_usd: 0.80
+      status: confirmed
+      source: "docs.dev.runwayml.com/guides/pricing.md, USD 0.01 per credit, read 2026-10-18 and skeptic-checked (router/research/runway/pricing_terms.md)"
+      as_of: 2026-10-18
+      notes: "audio off unless generate_audio is true; 480P is Runway's draft tier; at least 80 credits (USD 0.80) per generation"
+      tiers:
+        - {match: {resolution: "480P"}, usd: 0.20, status: confirmed}
+        - {match: {resolution: "720P"}, usd: 0.30, status: confirmed}
+        - {match: {resolution: "1080P"}, usd: 0.68, status: confirmed}

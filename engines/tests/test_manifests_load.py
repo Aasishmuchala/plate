@@ -1,4 +1,4 @@
-"""The 14 shipped manifests load, are internally consistent and keep Atlas at grade D / public."""
+"""The 15 shipped manifests load, are internally consistent and keep Atlas at grade D / public."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from datetime import date
 
 import pytest
 
+from plate_engines.adapters import runway_schema
 from plate_engines.atlas import RESULT_HOSTS
 from plate_engines.loader import DEFAULT_MANIFEST_DIR
 from plate_engines.models import host_allowed
@@ -30,6 +31,7 @@ EXPECTED_IDS = {
     "kling-o3-4k",
     "kling-v3-pro",
     "veo-3.1",
+    "gen-4.5",
     "wan-2.2-vace",
     "magnific-precision-v2",
     "real-esrgan",
@@ -41,10 +43,11 @@ def routes(manifests):
     return [(m, r) for m in manifests.values() for r in m.routes]
 
 
-def test_fourteen_manifests_load(manifests):
+def test_fifteen_manifests_load(manifests):
     assert set(manifests) == EXPECTED_IDS
-    assert len(list(_manifest_files())) == 14
+    assert len(list(_manifest_files())) == 15
     assert (DEFAULT_MANIFEST_DIR / "seedance-2.5-i2v.yaml").is_file()
+    assert (DEFAULT_MANIFEST_DIR / "gen-4.5.yaml").is_file()
 
 
 def test_ids_are_unique_hyphenated_and_match_their_file(manifests):
@@ -102,19 +105,27 @@ def test_c1_candidates_are_pending_not_confirmed(manifests):
 
 
 def test_no_unconfirmed_fact_is_dressed_as_confirmed(manifests):
-    """Cloud prices are placeholders; only the local zero-fee prices are confirmed."""
+    """Manifest-level cloud prices are placeholders; only the local zero-fee prices are confirmed.
+
+    The one documented licence fact is Runway's self-serve s4.4 (no training opt-out), recorded on gen-4.5."""
     for m in manifests.values():
         is_local = all(r.provider == "local" for r in m.routes)
         assert (m.price.status == "confirmed") == is_local, m.id
-        assert m.licence.vendor_terms_url == "unknown", m.id
-        assert m.licence.training_opt_out is None, m.id
+        if m.id == "gen-4.5":
+            assert m.licence.vendor_terms_url == "https://runway.com/terms-of-use"
+            assert m.licence.training_opt_out is False
+        else:
+            assert m.licence.vendor_terms_url == "unknown", m.id
+            assert m.licence.training_opt_out is None, m.id
 
 
 @pytest.mark.parametrize("engine_id", ["seedance-2.5-r2v", "seedance-2.5-i2v"])
 def test_seedance_fallbacks_are_same_model_other_provider(manifests, engine_id):
     by_provider = {r.provider: r for r in manifests[engine_id].routes}
-    assert set(by_provider) == {"atlas", "byteplus", "wavespeed"}
+    assert set(by_provider) == {"atlas", "byteplus", "wavespeed", "runway"}
     assert by_provider["atlas"].same_model_fallback_of is None
+    # runway is a preferred route in its own right, not a fallback
+    assert by_provider["runway"].same_model_fallback_of is None
     assert by_provider["byteplus"].same_model_fallback_of == "atlas"
     assert by_provider["wavespeed"].same_model_fallback_of == "atlas"
     for fallback in ("byteplus", "wavespeed"):
@@ -135,6 +146,7 @@ def test_allowed_tasks_in_vocabulary_none_forbidden(manifests):
 def test_restricted_engines(manifests):
     assert manifests["wan-2.2-vace"].allowed_tasks == ["previs"]
     assert manifests["seedance-2.5-i2v"].allowed_tasks == ["crop_pair_motion"]
+    assert manifests["gen-4.5"].allowed_tasks == ["crop_pair_motion"]
     assert manifests["seedance-2.5-r2v"].allowed_tasks == [
         "crop_pair_motion",
         "previs",
@@ -180,7 +192,7 @@ def test_cloud_prices_are_positive_sourced_dated_and_unconfirmed(manifests):
     for m in cloud(manifests):
         assert m.price.usd > 0, m.id
         assert m.price.status == "unconfirmed", m.id
-        assert m.price.as_of == date(2026, 10, 17), m.id
+        assert m.price.as_of in (date(2026, 10, 17), date(2026, 10, 18)), m.id
         assert m.price.source, m.id
         assert all(v > 0 for v in m.price.by.values()), m.id
     for m in manifests.values():
@@ -207,6 +219,7 @@ def test_per_second_engines_are_the_video_ones(manifests):
     for m in manifests.values():
         is_video = m.kind in {"video_i2v", "video_r2v", "video_startend", "local_video"}
         assert (m.price.model == "per_second") == is_video, m.id
+    assert manifests["gen-4.5"].price.model == "per_second"
 
 
 def test_every_non_local_route_names_the_hosts_it_may_reach(manifests):
@@ -243,6 +256,7 @@ def test_kinds_cover_the_new_literals(manifests):
     assert manifests["wan-2.2-vace"].kind == "local_video"
     assert manifests["seedance-2.5-i2v"].kind == "video_i2v"
     assert manifests["seedance-2.5-r2v"].kind == "video_r2v"
+    assert manifests["gen-4.5"].kind == "video_i2v"
 
 
 def test_upscalers_never_touch_the_plate(manifests):
@@ -336,3 +350,119 @@ def test_magnific_and_veo_details(manifests):
     veo = {p.name: p for p in manifests["veo-3.1"].params}
     assert veo["duration"].range == [4, 8] and veo["resolution"].enum == ["720p", "1080p"]
     assert veo["generate_audio"].default is False
+
+
+# ---- Wave 11 (T119): the runway route on the video engines and the gen-4.5 manifest ----------------------------
+
+RUNWAY_HOSTS = ["api.dev.runwayml.com", ".cloudfront.net", ".amazonaws.com"]
+RUNWAY_SLUGS = {
+    "seedance-2.5-i2v": "seedance2_5",
+    "seedance-2.5-r2v": "seedance2_5",
+    "kling-o3-4k": "klingO3_4k",
+    "kling-v3-pro": "kling3.0_pro",
+    "veo-3.1": "veo3.1",
+    "gen-4.5": "gen4.5",
+}
+
+
+def runway_routes(manifests):
+    return [(m, r) for m, r in routes(manifests) if r.provider == "runway"]
+
+
+def test_runway_routes_are_d_confirmed_private_priced_and_preferred_by_rule(manifests):
+    found = runway_routes(manifests)
+    assert {m.id: r.model_slug for m, r in found} == RUNWAY_SLUGS
+    for m, r in found:
+        assert (r.custody_grade, r.custody_status, r.upload_visibility) == ("D", "confirmed", "private"), m.id
+        assert r.terms_hash == "unknown" and r.region == "us" and r.max_inflight == 1, m.id
+        assert r.endpoint == "https://api.dev.runwayml.com/v1" and r.same_model_fallback_of is None, m.id
+        assert r.price is not None and r.price.status == "confirmed", m.id
+        assert r.price.as_of == date(2026, 10, 18) and r.price.model == "per_second", m.id
+        assert r.allowed_hosts == RUNWAY_HOSTS, m.id
+        assert r.model_slug in runway_schema.MODELS, m.id
+        assert "runway_hosts_unverified" in m.flags, m.id
+        assert "s4.4" in r.note and "RUNWAYML_API_SECRET" in r.note, m.id
+        # preferred by rule (prefer.prefer_route), not by position: Atlas / Vertex stay first
+        # on the five existing engines; gen-4.5 has no other route
+        first = m.routes[0]
+        assert (first is r) == (m.id == "gen-4.5"), m.id
+        assert m.routes[-1] is r, m.id
+
+
+def test_runway_prices_follow_the_catalogue(manifests):
+    def tiers(route):
+        return [(dict(t.match), t.usd, t.status) for t in route.price.tiers]
+
+    by_engine = {m.id: r for m, r in runway_routes(manifests)}
+    for engine_id in ("seedance-2.5-i2v", "seedance-2.5-r2v"):
+        p = by_engine[engine_id].price
+        assert (p.usd, p.minimum_usd) == (0.20, 0.80), engine_id
+        assert tiers(by_engine[engine_id]) == [
+            ({"resolution": "480P"}, 0.20, "confirmed"),
+            ({"resolution": "720P"}, 0.30, "confirmed"),
+            ({"resolution": "1080P"}, 0.68, "confirmed"),
+        ], engine_id
+    assert (by_engine["kling-o3-4k"].price.usd, by_engine["kling-o3-4k"].price.tiers) == (0.43, [])
+    assert (by_engine["kling-v3-pro"].price.usd, by_engine["kling-v3-pro"].price.tiers) == (0.12, [])
+    assert (by_engine["gen-4.5"].price.usd, by_engine["gen-4.5"].price.tiers) == (0.12, [])
+    veo = by_engine["veo-3.1"].price
+    assert veo.usd == 0.20 and veo.minimum_usd == 0
+    assert tiers(by_engine["veo-3.1"]) == [
+        ({"generate_audio": False}, 0.20, "confirmed"),
+        ({"generate_audio": True}, 0.40, "confirmed"),
+    ]
+    # the manifests and the schema tables read the same catalogue
+    for engine_id, route in by_engine.items():
+        slug = route.model_slug
+        assert route.price.minimum_usd == runway_schema.minimum_usd(slug), engine_id
+        for t in route.price.tiers:
+            if "resolution" in t.match:
+                tier_usd = runway_schema.usd_per_second(slug, resolution=t.match["resolution"])
+                assert t.usd == tier_usd, engine_id
+            else:
+                audio = t.match["generate_audio"]
+                assert t.usd == runway_schema.usd_per_second(slug, audio=audio), engine_id
+        if not route.price.tiers:
+            assert route.price.usd == runway_schema.usd_per_second(slug), engine_id
+    # no route price is below the manifest's own unconfirmed figure for the same tier by accident of units
+    assert all(r.price.usd > 0 for r in by_engine.values())
+
+
+def test_runway_durations_sit_inside_each_manifests_duration_range(manifests):
+    for m, r in runway_routes(manifests):
+        duration = next(p for p in m.params if p.name == "duration")
+        lo, hi = duration.range
+        listed = r.durations if r.durations is not None else list(range(int(lo), int(hi) + 1))
+        assert listed and all(lo <= d <= hi for d in listed), m.id
+        # what the schema table lets Runway accept is never narrower than what the route lists
+        assert set(listed) <= set(runway_schema.MODELS[r.model_slug].durations), m.id
+    veo = next(r for m, r in runway_routes(manifests) if m.id == "veo-3.1")
+    assert veo.durations == [4, 6, 8]
+    kling = [r for m, r in runway_routes(manifests) if m.id.startswith("kling")]
+    # Runway's Kling takes 3-15 s where the manifests say 1-15: the list is what makes a 1-2 s shot round up to 3 s
+    assert all(r.durations == list(range(3, 16)) for r in kling)
+
+
+def test_gen_4_5_is_a_start_frame_only_runway_engine(manifests):
+    m = manifests["gen-4.5"]
+    assert (m.model_id, m.kind, m.pinned, m.version) == ("gen4.5", "video_i2v", False, "unpinned")
+    assert [f.name for f in m.inputs if f.required] == ["image", "prompt"]
+    assert {f.name for f in m.inputs} == {"image", "prompt"}  # no last frame, no references on image_to_video
+    params = {p.name: p for p in m.params}
+    assert params["duration"].range == [2, 10] and params["duration"].default == 5
+    assert params["ratio"].enum == ["16:9", "9:16", "4:3", "1:1", "3:4", "21:9"]
+    assert params["seed"].range == [0, 4294967295] and params["seed"].advanced is True
+    assert [(s.w, s.h, s.label) for s in m.sizes.legal] == [
+        (1280, 720, "16:9"),
+        (720, 1280, "9:16"),
+        (1104, 832, "4:3"),
+        (960, 960, "1:1"),
+        (832, 1104, "3:4"),
+        (1584, 672, "21:9"),
+    ]
+    # the labels, the ratio enum and the schema table name the same six pixel ratios
+    table = set(runway_schema.MODELS["gen4.5"].ratios["all"])
+    assert {f"{s.w}:{s.h}" for s in m.sizes.legal} == table
+    assert (m.price.model, m.price.usd, m.price.status) == ("per_second", 0.12, "unconfirmed")
+    assert m.determinism == "nondeterministic" and m.flags == ["runway_hosts_unverified"]
+    assert [r.provider for r in m.routes] == ["runway"]

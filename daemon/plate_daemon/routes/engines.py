@@ -3,10 +3,15 @@
 - `GET /engines[?project_id=]` lists every engine manifest (`c.pipeline.manifests`, sorted by id) in one fixed
   shape: `{id, name, kind, allowed_tasks, model_id, version, routes, params, presets, price, sizes, flags,
   capabilities}`. A route is `{route_id, provider, region, custody_grade, custody_status, effective_grade, status,
-  upload_visibility, health}`, where `effective_grade` is `custody.effective_grade` (a pending route counts as D,
-  a public upload is D) and is what the quote acts on, so the UI never has to repeat that rule, and `health` is
-  `ok | degraded | down | suspended` from `c.pipeline.health_board()` (`plate_engines.health.route_health`: a
-  suspended engine reads suspended on every route, a route with no reading is down). `capabilities` is
+  upload_visibility, health, price, preferred}`, where `effective_grade` is `custody.effective_grade` (a pending
+  route counts as D, a public upload is D) and is what the quote acts on, so the UI never has to repeat that rule,
+  and `health` is `ok | degraded | down | suspended` from `c.pipeline.health_board()`
+  (`plate_engines.health.route_health`: a suspended engine reads suspended on every route, a route with no reading
+  is down). `price` is the route's own `{usd, model, status, minimum_usd}` when the vendor's catalogue is held for
+  that route (Wave 11: the Runway routes), else null (the quote then prices from the engine's `price`).
+  `preferred` is true on a video engine's route whose provider is the preferred one (`prefer.PREFERRED_VIDEO_PROVIDER`,
+  or with `project_id` that project's `settings.preferred_video_provider`; `"none"` makes every route false), so
+  the Make bar can show which route a quote will try first. `capabilities` is
   `{largest_size: "WxH" | null, image_tail, reference_images_max, elements, price_unit, runnable, unverified}`:
   `image_tail` is true when the manifest takes an `image_tail` or `end_image` input, `reference_images_max` is the
   `reference_images` input's `max_items` (0 when the manifest declares none), `runnable` is true when the manifest
@@ -50,6 +55,7 @@ from pydantic import BaseModel, ConfigDict
 
 from plate_engines.cards import from_ledger
 from plate_engines.health import route_health
+from plate_engines.prefer import PREFERRED_VIDEO_PROVIDER, VIDEO_KINDS
 
 from .. import recipes as recipes_mod
 from ..custody import Grade, effective_grade
@@ -80,6 +86,8 @@ FAKE_ENGINE: dict[str, Any] = {
             "status": "active",
             "upload_visibility": "local",
             "health": "ok",
+            "price": None,
+            "preferred": False,
         }
     ],
     "params": [],
@@ -111,7 +119,19 @@ def _runnable(project_dir: Path | None = None) -> list[Any]:
     return recipes_mod.runnable_entries(project_dir)
 
 
-def _route(r: Any, health: str) -> dict[str, Any]:
+def _route_price(r: Any) -> dict[str, Any] | None:
+    """The route's own price (None when the route is priced by its engine's manifest price)."""
+    if r.price is None:
+        return None
+    return {
+        "usd": r.price.usd,
+        "model": r.price.model,
+        "status": r.price.status,
+        "minimum_usd": r.price.minimum_usd,
+    }
+
+
+def _route(r: Any, health: str, m: Any, prefer_provider: str | None) -> dict[str, Any]:
     return {
         "route_id": r.route_id,
         "provider": r.provider,
@@ -122,6 +142,10 @@ def _route(r: Any, health: str) -> dict[str, Any]:
         "status": r.status,
         "upload_visibility": r.upload_visibility,
         "health": health,
+        "price": _route_price(r),
+        "preferred": bool(
+            m.kind in VIDEO_KINDS and prefer_provider is not None and r.provider == prefer_provider
+        ),
     }
 
 
@@ -181,8 +205,14 @@ def _capabilities(m: Any) -> dict[str, Any]:
     }
 
 
-def engine_view(m: Any, recipe_ids: list[str], health: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """One manifest in the catalogue shape (see the module docstring). `health` is the pipeline's health board."""
+def engine_view(
+    m: Any,
+    recipe_ids: list[str],
+    health: Mapping[str, Any] | None = None,
+    prefer_provider: str | None = PREFERRED_VIDEO_PROVIDER,
+) -> dict[str, Any]:
+    """One manifest in the catalogue shape (see the module docstring). `health` is the pipeline's health board;
+    `prefer_provider` is the provider whose routes read `preferred` on a video engine (None: none do)."""
     board = health if health is not None else {}
     return {
         "id": m.id,
@@ -191,7 +221,10 @@ def engine_view(m: Any, recipe_ids: list[str], health: Mapping[str, Any] | None 
         "allowed_tasks": list(m.allowed_tasks),
         "model_id": m.model_id,
         "version": m.version,
-        "routes": [_route(r, route_health(board, m.id, r.route_id, r.provider)[0]) for r in m.routes],
+        "routes": [
+            _route(r, route_health(board, m.id, r.route_id, r.provider)[0], m, prefer_provider)
+            for r in m.routes
+        ],
         "params": [_param(p) for p in m.params],
         "presets": [DEFAULT_PRESET, *recipe_ids],
         "price": {
@@ -210,6 +243,18 @@ def _allowed(view: dict[str, Any], grades: set[Grade]) -> bool:
     return any(r["status"] == "active" and Grade(r["effective_grade"]) in grades for r in view["routes"])
 
 
+def _prefer_provider(c: Ctx, project_id: str | None) -> str | None:
+    """The provider whose video routes read `preferred`: the constant, or the project's own
+    `settings.preferred_video_provider` (`"none"` = manifest order = nobody preferred)."""
+    if project_id is None:
+        return PREFERRED_VIDEO_PROVIDER
+    project = c.pipeline.load_project(project_id)
+    stored = ((project.doc if project else {}).get("settings") or {}).get("preferred_video_provider")
+    if not isinstance(stored, str) or not stored.strip():
+        return PREFERRED_VIDEO_PROVIDER
+    return None if stored.strip().lower() == "none" else stored.strip()
+
+
 def build_engines(
     c: Ctx, project_id: str | None = None, project_dir: Path | None = None
 ) -> list[dict[str, Any]]:
@@ -217,8 +262,9 @@ def build_engines(
     for rec in _runnable(project_dir):
         by_engine.setdefault(rec.engine, []).append(rec.id)
     health = c.pipeline.health_board()
+    prefer_provider = _prefer_provider(c, project_id)
     views = [
-        engine_view(m, by_engine.get(m.id, []), health)
+        engine_view(m, by_engine.get(m.id, []), health, prefer_provider)
         for _id, m in sorted(c.pipeline.manifests.items(), key=lambda kv: kv[0])
     ]
     if getattr(c.engine, "stub", False):

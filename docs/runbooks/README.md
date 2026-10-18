@@ -7,6 +7,7 @@ Short, ordered procedures for the things that go wrong on a delivery day. Each o
 | [daemon-wont-start.md](daemon-wont-start.md) | the daemon exits at start, the page says token missing, the plugin gets 401 or 403 |
 | [vendor-down.md](vendor-down.md) | a vendor is down, slow or refusing, and a deadline is close |
 | [key-revoked.md](key-revoked.md) | an API key was revoked, leaked, expired or never set |
+| [runway.md](runway.md) | a Runway video run was refused, throttled, failed or left in an unknown state; the first live smoke and the two hosts to record; the way to C2 |
 | [vram-oom.md](vram-oom.md) | a local model (Qwen-Image-Edit, Wan 2.2, Real-ESRGAN) is refused or runs out of GPU memory |
 | [schema-change.md](schema-change.md) | a nightly check says a vendor changed its request or response schema |
 | [max-update-breaks-dock.md](max-update-breaks-dock.md) | a 3ds Max, V-Ray or Windows update broke the PLATE dock or Send |

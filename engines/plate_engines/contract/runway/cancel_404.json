@@ -1,0 +1,13 @@
+{
+  "note": "synthetic: DELETE an already cancelled task: 404, safe to ignore",
+  "request": {
+    "method": "DELETE",
+    "url": "https://api.dev.runwayml.com/v1/tasks/8d802f91-a2b3-44c5-b6d7-e8f90a1b2c3d"
+  },
+  "response": {
+    "status": 404,
+    "json": {
+      "error": "Task not found"
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "note": "synthetic: DELETE a running task: 204",
+  "request": {
+    "method": "DELETE",
+    "url": "https://api.dev.runwayml.com/v1/tasks/0a6a3a0e-5a1e-4d7a-9f49-2b6f0a4c2d11"
+  },
+  "response": {
+    "status": 204
+  }
+}

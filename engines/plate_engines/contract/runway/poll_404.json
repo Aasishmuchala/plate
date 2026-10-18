@@ -1,0 +1,13 @@
+{
+  "note": "synthetic: a task that was deleted or cancelled: 404 {error}",
+  "request": {
+    "method": "GET",
+    "url": "https://api.dev.runwayml.com/v1/tasks/6b6e0d7f-8091-42a3-94b5-c6d7e8f90a1b"
+  },
+  "response": {
+    "status": 404,
+    "json": {
+      "error": "Task not found"
+    }
+  }
+}

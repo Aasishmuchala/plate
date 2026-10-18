@@ -277,14 +277,15 @@ def test_a_per_megapixel_manifest_multiplies_the_tier_price_by_the_megapixels():
 
 def test_manifests_without_tiers_price_exactly_as_before():
     for m in MANIFESTS.values():
-        if m.price.tiers:
+        spec = m.routes[0].price or m.price  # Wave 11: a route that carries its own price (gen-4.5) wins
+        if spec.tiers:
             continue
         params = fill(m, {})
         try:
             q = quote(m, params)
         except ValueError:
             continue  # a size or duration it needs is not in this bare request
-        assert q.price_tier is None and q.price_status == m.price.status
+        assert q.price_tier is None and q.price_status == spec.status
 
 
 # ---------------------------------------------------------------------------- requote and storage

@@ -96,7 +96,15 @@ def _put(c: TestClient, auth: dict, body: dict, project_id: str = "alpha", **hea
 def test_a_new_project_answers_the_defaults(c, auth):
     _project(c, auth)
     got = _get(c, auth)
-    assert set(got) == {"project_sheet", "sheet_fields", "default_engine", "auto_carry_over", "policy"}
+    assert set(got) == {
+        "project_sheet",
+        "sheet_fields",
+        "default_engine",
+        "auto_carry_over",
+        "policy",
+        "preferred_video_provider",
+        "video_route_pins",
+    }
     assert got["project_sheet"] == ProjectSheet().as_dict() and len(got["project_sheet"]) == 14
     assert got["project_sheet"]["format"] == "4K architectural film, 16:9"
     assert [f["key"] for f in got["sheet_fields"]] == list(got["project_sheet"])  # form order
@@ -104,6 +112,7 @@ def test_a_new_project_answers_the_defaults(c, auth):
     assert got["sheet_fields"][3] == {"key": "light_logic", "lensbook_key": "lightLogic", "default": ""}
     assert all(got["project_sheet"][f["key"]] == f["default"] for f in got["sheet_fields"])
     assert got["default_engine"] == {} and got["auto_carry_over"] is True and got["policy"] == {}
+    assert got["preferred_video_provider"] == "runway" and got["video_route_pins"] == {}
 
 
 def test_put_a_sheet_then_get_returns_it_and_it_is_stored_under_settings(c, auth, settings):
