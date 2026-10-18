@@ -193,7 +193,7 @@ def test_from_run_logs_the_override_on_the_run_exactly_like_export(settings):
     from plate_daemon.models import Route, RunCreate
 
     route = Route(engine_id="nano-banana-2.1", provider="google", region="global")
-    with Index(settings.home).project("p9") as conn:
+    with Index(settings.home).project("p9", create=True) as conn:  # T144: opening never creates
         with tx(conn):
             apply_packet_entry(
                 conn,

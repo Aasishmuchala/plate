@@ -460,7 +460,8 @@ def test_the_lock_is_checked_again_before_the_submit(env):
         env.pipeline.queue(conn, PROJECT, run_id)
     env.pipeline.execute(run_id, PROJECT)
     run = env.run(run_id)
-    assert run.state.value == "FAILED" and run.reason_code == "submit_error"
+    # T130: a refusal raised before any byte left (the lock re-check) is staging_error, not submit_error.
+    assert run.state.value == "FAILED" and run.reason_code == "staging_error"
     assert "MotionLocked" in (run.error or "") and fake.submit_count == 0
 
 

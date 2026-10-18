@@ -464,7 +464,7 @@ def write_catalogue(directory: Path, vendor: str, models: list[dict], as_of: str
 
 def quoted_run_in_index(settings: Settings, project_id: str, run_id: str, engine_id: str, label=None) -> None:
     index = Index(settings.home)
-    conn = index.connect(project_id)
+    conn = index.connect(project_id, create=True)  # the helper makes the project real (T144)
     try:
         apply_packet_entry(
             conn,

@@ -209,7 +209,10 @@ def test_index_rejects_malformed_arguments():
 
 @pytest.fixture
 def index(plate_env):
-    return Index(plate_env)
+    idx = Index(plate_env)
+    with idx.project(PROJECT, create=True):  # T144: opening never creates; the fixture makes it real
+        pass
+    return idx
 
 
 def test_sqlite_index_stores_the_hash_in_the_assets_table(index):

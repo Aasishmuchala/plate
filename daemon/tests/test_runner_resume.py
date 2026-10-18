@@ -64,7 +64,7 @@ class Collector:
 
 def make_index(home: Path, pid: str = PID) -> Index:
     idx = Index(home)
-    with idx.project(pid) as conn, tx(conn):
+    with idx.project(pid, create=True) as conn, tx(conn):  # the harness makes the project real (T144)
         apply_packet_entry(
             conn,
             pid,

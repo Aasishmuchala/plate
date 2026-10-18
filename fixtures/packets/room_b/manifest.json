@@ -285,10 +285,10 @@
     "display_tiff16": {
       "kind": "file",
       "path": "display.tif",
-      "bytes": 940492,
+      "bytes": 932922,
       "hash": {
         "algo": "blake3",
-        "hex": "2c831c6f5663d46ff704fb1317012f4011da9723045cc12822119f6e0b0a5b2a"
+        "hex": "78266650f38c4e70f0b0496482f697b98ddb07700dc504ff1c52f1c774a9de1b"
       },
       "format": "tiff",
       "width": 640,

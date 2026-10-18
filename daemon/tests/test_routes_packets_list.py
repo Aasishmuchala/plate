@@ -21,7 +21,7 @@ PACKETS = ROOT / "fixtures" / "packets"
 ROOM_A, ROOM_A_V2, ROOM_B = PACKETS / "room_a", PACKETS / "room_a_v2", PACKETS / "room_b"
 BASE = "http://127.0.0.1:4610"
 PROJECT = "plate-fixture"
-ROOM_A_PLATE = "807554a6ed3dcfdb72eacc24d30c95a14d203dc65db98f76e2880eb560efb389"
+ROOM_A_PLATE = "d31462e31c9c6bc7067c85a13deb1acb1001bf08640d4d4a5232d04a3580e7fe"
 
 pytestmark = pytest.mark.skipif(
     not all((p / "manifest.json").is_file() for p in (ROOM_A, ROOM_A_V2, ROOM_B)),

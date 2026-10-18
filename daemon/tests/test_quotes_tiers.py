@@ -330,7 +330,7 @@ def test_price_tier_defaults_to_none_and_rides_the_quote_json():
 @pytest.fixture
 def idx(tmp_path: Path) -> Index:
     index = Index(tmp_path / "home")
-    with index.project("tiers") as conn, tx(conn):
+    with index.project("tiers", create=True) as conn, tx(conn):  # T144: opening never creates
         apply_packet_entry(
             conn,
             "tiers",

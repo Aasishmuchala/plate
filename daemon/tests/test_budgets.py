@@ -281,7 +281,7 @@ def test_envelope_owners_are_agent_or_user():
 @pytest.fixture
 def idx(tmp_path: Path) -> Index:
     index = Index(tmp_path / "home")
-    with index.project(PID) as conn, tx(conn):
+    with index.project(PID, create=True) as conn, tx(conn):  # the fixture makes the project real (T144)
         apply_packet_entry(
             conn,
             PID,
@@ -469,7 +469,7 @@ def test_the_caps_count_every_project_index_in_the_home(idx, tmp_path, caplog):
     with idx.project(PID) as conn:
         approve(conn, new_quoted(conn), "auto", last_human_interaction_utc=now)
     other = "budget-two"
-    with idx.project(other) as conn:
+    with idx.project(other, create=True) as conn:  # a second real project (T144)
         with tx(conn):
             apply_packet_entry(
                 conn,
@@ -500,7 +500,7 @@ def test_the_caps_count_every_project_index_in_the_home(idx, tmp_path, caplog):
     spent = spend_snapshot_all(idx, now, now)
     assert (spent.today_usd, spent.projects) == (pytest.approx(0.08), 2)
     assert "broken" in caplog.text
-    with idx.project(other) as conn:
+    with idx.project(other, create=True) as conn:  # a second real project (T144)
         assert spend_snapshot(conn, now, now).projects is None  # one connection: this project only
         with pytest.raises(AutoApprovalDenied, match="across 2 projects"):
             approve(

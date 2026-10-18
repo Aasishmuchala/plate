@@ -246,7 +246,8 @@ def test_a_done_run_ignores_a_typed_reason(capsys, tmp_path):
 
 
 def _as_repeat(done: Exported) -> SimpleNamespace:
-    return SimpleNamespace(**dataclasses.asdict(done) | {"framing": done.framing}, repeat=True)
+    # Exported carries `repeat` itself since T127, so set it inside the mapping rather than twice.
+    return SimpleNamespace(**(dataclasses.asdict(done) | {"framing": done.framing, "repeat": True}))
 
 
 @needs_room_a

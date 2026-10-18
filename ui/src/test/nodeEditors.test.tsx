@@ -83,7 +83,7 @@ class FakeEventSource implements EventSourceLike {
 
 // ------------------------------------------------------------------------------------------------ fixtures
 
-const ROOM_A_PLATE = "807554a6ed3dcfdb72eacc24d30c95a14d203dc65db98f76e2880eb560efb389";
+const ROOM_A_PLATE = "d31462e31c9c6bc7067c85a13deb1acb1001bf08640d4d4a5232d04a3580e7fe";
 const ROOM_B_PLATE = "b2".repeat(32);
 
 /** Two packets as T55's `GET /projects/{pid}/packets` lists them (room_a superseded by room_a_v2). */

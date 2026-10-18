@@ -60,7 +60,7 @@ SPEC_TABLE = {
 @pytest.fixture(scope="module")
 def conn(tmp_path_factory):
     home = tmp_path_factory.mktemp("home")
-    c = Index(home).connect(PROJECT)
+    c = Index(home).connect(PROJECT, create=True)  # the fixture makes the project real (T144)
     with tx(c):
         apply_packet_entry(
             c,

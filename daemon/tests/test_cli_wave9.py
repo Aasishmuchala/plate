@@ -406,8 +406,11 @@ def test_export_runs_writes_each_take_with_its_sidecar_and_never_overwrites(worl
     assert "exported 2 run(s)" in out and "0 refused" in out
     # the default name is {node}_{run8}
     assert all(re.fullmatch(r"edit_cam_a_[12]_\w{8}\.tif", p.name) for p in out_dir.glob("*.tif"))
+    before = {p.name: p.read_bytes() for p in out_dir.glob("*.tif")}
     code, out, err = world.cli("export", "--runs", ",".join(world.run_ids), "--to", str(out_dir))
-    assert code == cli.EXIT_ERROR and err.count("already exists") == 2, (out, err)
+    # identical bytes already there are repeats, not refusals (decision 74 / T127); nothing is rewritten
+    assert code == cli.EXIT_OK and "exported 2 run(s)" in out and "0 refused" in out, (out, err)
+    assert {p.name: p.read_bytes() for p in out_dir.glob("*.tif")} == before
     # one name pattern, one format
     png_dir = tmp_path / "png"
     code, out, err = world.cli(

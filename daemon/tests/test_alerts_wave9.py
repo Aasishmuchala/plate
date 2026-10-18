@@ -73,7 +73,7 @@ class Clock:
 
 def make_index(home: Path) -> Index:
     idx = Index(home)
-    with idx.project(PID) as conn, tx(conn):
+    with idx.project(PID, create=True) as conn, tx(conn):  # the harness makes the project real (T144)
         apply_packet_entry(
             conn,
             PID,

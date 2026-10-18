@@ -396,14 +396,17 @@ def test_export_writes_each_format_with_lineage_and_one_shared_gate_json(capsys,
         report["export"]["files"] == [tif.name, png.name, exr.name]
         and report["export"]["override_reason"] is None
     )
-    # never overwrites an export
+    # never overwrites an export: identical bytes already there is a repeat (exit 0, ledgered as such,
+    # decision 74 / T127); a different file at the same name is refused (covered in test_stress_wave12_cli)
+    before = tif.read_bytes()
     code, out, err = plate(capsys, "export", rid, "--to", str(dest), "--format", "tiff16", env=fake_env)
-    assert code == cli.EXIT_ERROR and "already exists" in err
+    assert code == cli.EXIT_OK and "already exported (identical)" in out, (out, err)
+    assert tif.read_bytes() == before
     ledger = [
         json.loads(x)["kind"]
         for x in (tmp_path / "proj" / "runs.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert ledger.count("export") == 3
+    assert ledger.count("export") == 4  # three formats + the repeat record (repeat: true)
 
 
 @needs_room_a

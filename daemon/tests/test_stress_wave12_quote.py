@@ -645,7 +645,7 @@ def test_envelopes_and_price_counts_are_bounded(sync_settings):
     from plate_daemon.index import Index
 
     index = Index(sync_settings.home)
-    with index.project(PROJECT) as conn:
+    with index.project(PROJECT, create=True) as conn:  # T144: opening never creates
         for bad in (
             {"max_total_usd": float("inf")},
             {"max_total_usd": 1e308},
