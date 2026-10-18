@@ -29,13 +29,19 @@ node; each editor is keyed by node id, so no local state leaks from one node to 
 | Motion | `move` (a risk-ladder key), `duration`, `engine_id`, dials `revealM`, `orbitDeg`, `sliderCm`; the node's `riskLabel`, `overrides` and `labels` are set through the store |
 | People | `cast`, `behavior`, `placement` {x, y}, `light`, `personDepthM`, `depthSource` ("z" or "manual"), `mode` ("i2v", "retake", "wan-edit") |
 | Set | `hero` (the hero's packet id) |
-| LightMix | `lights` (cached names), `gains` ({light: gain}), `preset`, `targetHash` |
-| Recolour | `material` (m: id), `materialName`, `target` (`RAL 7016` or `#383E42`), `targetHex` |
+| LightMix | `lights` (cached names), `gains` ({light: gain} or {light: [r, g, b]}), `preset` (`dusk`, `moonlight`, `luxury_exterior`, `artificial_light`), `max_gain`, `keep_base`, `seed`, `targetHash` |
+| Recolour | `material` (m: id), `materialName`, `target` (`RAL 7016` or `#383E42`), `targetHex`, `method`, `source_lab`; several in one pass as `materials` [{material, materialName, target, method?, source_lab?}] |
+| Comp (T93, T112) | `order` (layer order), `require_accept` |
+| Colour (T93, T112) | `kelvin` and the other grade values (a neutral value is not written), `scope`, `ids` |
+| Atmosphere (T93, T112) | `visibility_m`, `height_falloff_m`, `colour`, `sky_fog` |
+| Sky (T93, T112) | `skyHash` (the backplate in the CAS), `horizon_frac`, `scale`, `dx_px`, `tone_match` (default on) |
+| Frame (T81, T112) | `title`, `w`, `h` (an annotation box; the daemon reads none of them) |
 | Light | `referenceHash`, `camera`, `locks` (MaxGaffer parameter keys, sorted), `deep` |
 | Scout | `count` (1 to 24), `keep` |
 
 `nodes/kinds.tsx` already reads `ids`, `textLock`, `zoomStart`, `zoomEnd`, `move`, `engine_id`, `cast`, `target` and
-`count` for the node's summary line.
+`count` for the node's summary line. Comp, Colour, Atmosphere, Sky and Frame panels are registered in `pathEditorFor`
+(PATH_EDITOR_KINDS), not `editorFor`; the sidebar mounts both registries.
 
 ## Routes the editors call
 

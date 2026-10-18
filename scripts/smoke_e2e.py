@@ -14,12 +14,22 @@ fresh home under `<repo>/.smoke/<timestamp>/`, starts `python -m plate_daemon` o
 `PLATE_PORT`, `PLATE_FAKE_ENGINE=1` (the echo fake), `PLATE_PIXELS_INPROC=1` and `PLATE_NIGHTLY=0`, reads the
 token from `<home>/config.json`, waits for `/api/v0/health` and walks one still from packet to shipped export:
 
-    project `smoke` (non-NDA, every grade) -> POST /packets (room_a) -> ingested -> listed with its plate hash
-    -> plate thumbnail -> `fake` in /engines -> graph Plate -> Mask(VEG_shrub_A) -> Edit(fake) -> Export
-    -> quote (router verdict) -> human approval -> DONE -> gate pass/advisory, identical outside the mask,
-    feather band advisory -> full scrub -> accept -> the server marks the Edit approved -> png16 export with
-    lineage and `.gate.json`, report shipped -> run history -> rescore writes version 2 -> the built UI at `/`
-    with a JavaScript asset -> an unknown API path is a JSON 404
+    /health with its plugin block and alerts_recent -> project `smoke` (non-NDA, every grade) -> POST /packets
+    (room_a) -> ingested -> listed with its plate hash -> plate thumbnail -> `fake` in /engines -> graph Plate
+    -> Mask(VEG_shrub_A) -> Edit(fake) -> Export -> quote (router verdict) -> human approval -> DONE -> gate
+    pass/advisory, identical outside the mask, feather band advisory -> full scrub -> accept -> the server marks
+    the Edit approved -> png16 export at the packet's safe-frame size with lineage and `.gate.json` (the crop in
+    the sidecar), then the whole render with `full_frame: true` -> report shipped -> run history -> rescore
+    writes version 2
+
+and then the Wave 9 surface, on the same project:
+
+    two Reference nodes feeding an Edit on nano-banana-2.1 (quoted only, nothing is sent) -> the quote shows
+    `@ref1`/`@ref2` as the engine's wording, `@ref3` is a 422 `bad_ref_token` -> the Edit's accepted take is
+    picked with a Motion downstream -> a free re-mask of the stored raw take (a second take) -> the autosave PUT
+    is still 200 with the Edit approved (G2) -> templates: `edit_chain` quotes one Edit, `night_chain` reports
+    its documented `no_base` refusal in the body -> the built UI at `/` with a JavaScript asset -> an unknown
+    API path is a JSON 404
 
 `fixtures/packets/room_a` names project `plate-fixture` and the daemon files a packet under the project its
 manifest names, so the smoke sends a copy staged in `<home>/packets/room_a` whose manifest says `smoke` (the
@@ -37,11 +47,13 @@ import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import zlib
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -64,6 +76,13 @@ SENDER = {"name": "smoke_e2e", "version": "1"}
 MASK_NAME = "VEG_shrub_A"
 EDIT_NODE = "edit"
 FEATHER_CHECK = "feather_band.de00_p99"
+REF_EDIT_NODE = "ref_edit"
+# Quoted, never run: a registered manifest that declares reference_images (the fake engine declares none), so the
+# quote shows the engine's own wording for `@ref1`; no vendor is contacted before a human approves a run.
+REF_ENGINE = "nano-banana-2.1"
+REF_PROMPT = "Match the cushion fabric to @ref1 and the lamp to @ref2, keep the room as it is."
+MOTION_NODE = "motion"
+RECOMPOSITE_FEATHER_PX = 4
 # What a browser runs as a module script (WHATWG "JavaScript MIME type essence"); text/plain must fail.
 JS_TYPES = ("text/javascript", "application/javascript", "application/x-javascript")
 IN_FLIGHT = frozenset(
@@ -138,9 +157,10 @@ class Http:
         headers: Mapping[str, str] | None = None,
         auth: bool = True,
         timeout: float = REQUEST_TIMEOUT_S,
+        raw: bytes | None = None,
     ) -> Resp:
         hdrs = {"Accept": "*/*"}
-        data = None
+        data = raw  # raw bytes go as they are (the caller names the Content-Type); a body is JSON
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             hdrs["Content-Type"] = "application/json"
@@ -179,6 +199,33 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
+
+
+def _png(width: int, height: int, rgb: tuple[int, int, int]) -> bytes:
+    """A flat 8-bit RGB PNG, from the standard library alone (a Reference image to upload)."""
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    rows = (b"\x00" + bytes(rgb) * width) * height
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _png_size(path: Path) -> tuple[int, int]:
+    """(width, height) from the IHDR of a PNG file."""
+    head = path.read_bytes()[:24]
+    if head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+        raise ValueError(f"{path.name} is not a PNG")
+    width, height = struct.unpack(">II", head[16:24])
+    return width, height
 
 
 def _make_home() -> Path:
@@ -425,12 +472,31 @@ class Smoke:
     def walk(self) -> None:
         ui = {"X-Plate-Client": "ui"}
 
+        with self.step("health.plugin") as notes:
+            h = self.api("GET", "/health", auth=False)
+            plugin = h.get("plugin")
+            self.check(isinstance(plugin, dict), f"/health has no plugin block: {h}")
+            self.check({"last_poll_utc", "queued"} <= set(plugin), f"/health plugin block {plugin}")
+            self.check(plugin["last_poll_utc"] is None, f"a Max dock polled a fresh daemon: {plugin}")
+            self.check(plugin["queued"] == 0, f"plugin queued {plugin['queued']!r}, want 0 on a fresh home")
+            recent = h.get("alerts_recent")
+            self.check(
+                isinstance(recent, int) and not isinstance(recent, bool) and recent >= 0,
+                f"/health alerts_recent {recent!r}, want a count (null means the files could not be read)",
+            )
+            notes.append(f"plugin {plugin}, alerts_recent {recent}")
+
         with self.step("project.create") as notes:
             head = self.api("POST", "/projects", {"project_id": PROJECT, "custody": CUSTODY}, status=201)
             self.check(head.get("project_id") == PROJECT, f"created {head}")
             notes.append(f"custody {head.get('custody')}")
 
         packet_dir = self.stage_packet()
+        camera = (
+            json.loads((packet_dir / "manifest.json").read_text(encoding="utf-8-sig")).get("camera") or {}
+        )
+        safe = camera.get("safe_frame") or {}
+        res = camera.get("resolution") or {}
 
         with self.step("packet.post") as notes:
             r = self.expect(
@@ -579,14 +645,57 @@ class Smoke:
             notes.append(f"server-derived approved, gateStatus {node.get('gateStatus')}")
 
         out_dir = self.home / "out"
+        want_crop = {k: safe.get(k) for k in ("x", "y", "width", "height")}
         with self.step("run.export") as notes:
+            self.check(
+                all(isinstance(v, int) for v in want_crop.values()), f"room_a has no safe_frame: {safe}"
+            )
             ex = self.api("POST", f"/runs/{run_id}/export", {"out_dir": str(out_dir), "format": "png16"})
             path, sidecar = Path(ex.get("path") or ""), Path(ex.get("sidecar") or "")
             self.check(path.is_file() and path.parent == out_dir, f"no exported file at {path}")
             self.check(sidecar.is_file(), f"no sidecar at {sidecar}")
             self.check(sidecar.name.endswith(".gate.json"), f"sidecar name {sidecar.name}")
-            json.loads(sidecar.read_text(encoding="utf-8"))
-            notes.append(f"{path.name} + {sidecar.name}")
+            side = json.loads(sidecar.read_text(encoding="utf-8"))
+            # The packet declares a safe frame, so the default is that region, a pixel crop (T114).
+            size = _png_size(path)
+            self.check(
+                size == (want_crop["width"], want_crop["height"]),
+                f"{path.name} is {size[0]}x{size[1]}, want the safe frame {want_crop['width']}x{want_crop['height']}",
+            )
+            block = side.get("export") or {}
+            self.check(block.get("crop") == want_crop, f"sidecar export block {block}")
+            self.check("full_frame" not in block, f"a default export says full_frame: {block}")
+            notes.append(f"{path.name} {size[0]}x{size[1]} (crop y {want_crop['y']}) + {sidecar.name}")
+
+        with self.step("export.full_frame") as notes:
+            # full_frame keeps the whole render; the batch route is used here (the single-run route takes it too, G3).
+            ex = self.api(
+                "POST",
+                f"/projects/{PROJECT}/export",
+                {
+                    "run_ids": [run_id],
+                    "out_dir": str(out_dir),
+                    "format": "png16",
+                    "name_pattern": "whole_frame",
+                    "full_frame": True,
+                },
+            )
+            self.check(not ex.get("refused"), f"the batch export refused: {ex.get('refused')}")
+            (entry,) = ex.get("exported") or [{}]
+            whole, whole_side = Path(entry.get("path") or ""), Path(entry.get("sidecar") or "")
+            self.check(whole.is_file() and whole.parent == out_dir, f"no exported file at {whole}")
+            size = _png_size(whole)
+            self.check(
+                size == (res.get("width"), res.get("height")),
+                f"{whole.name} is {size[0]}x{size[1]}, want the whole render {res.get('width')}x{res.get('height')}",
+            )
+            self.check(entry.get("full_frame") is True and "crop" not in entry, f"export entry {entry}")
+            block = json.loads(whole_side.read_text(encoding="utf-8")).get("export") or {}
+            self.check(
+                block.get("full_frame") is True and "crop" not in block, f"sidecar export block {block}"
+            )
+            self.check(block.get("safe_frame") == want_crop, f"sidecar safe_frame {block.get('safe_frame')}")
+            notes.append(f"{whole.name} {size[0]}x{size[1]}, safe_frame kept in the sidecar")
 
         with self.step("export.lineage") as notes:
             got = subprocess.run(
@@ -621,6 +730,159 @@ class Smoke:
             rep = self.api("POST", f"/runs/{run_id}/gate/rescore", {})
             self.check(rep.get("n") == 2, f"rescore n {rep.get('n')!r}, want 2")
             notes.append(f"versions {rep.get('versions')}, verdict {rep.get('verdict')}")
+
+        # ---- Wave 9: references, a free re-mask, the G2 path (T111), templates (T95) ----
+
+        with self.step("ref.quote") as notes:
+            hashes = []
+            for colour in ((200, 60, 40), (40, 90, 200)):
+                up = self.expect(
+                    self.http.call(
+                        "POST",
+                        f"{API}/assets?kind=reference&project_id={PROJECT}",
+                        raw=_png(40, 30, colour),
+                        headers={"Content-Type": "image/png"},
+                    ),
+                    201,
+                ).json()
+                self.check(isinstance(up.get("hash"), str) and up["hash"], f"no hash in the upload: {up}")
+                hashes.append(up["hash"])
+            graph["nodes"] += [
+                {
+                    "id": f"r{i}",
+                    "kind": "Reference",
+                    "label": "Reference",
+                    "params": {"referenceHash": h, "role": "object"},
+                }
+                for i, h in enumerate(hashes, 1)
+            ]
+            graph["nodes"].append(
+                {"id": REF_EDIT_NODE, "kind": "Edit", "label": "Edit", "params": {"engine": REF_ENGINE}}
+            )
+            graph["edges"] += [{"id": f"mask->{REF_EDIT_NODE}", "source": "mask", "target": REF_EDIT_NODE}]
+            graph["edges"] += [
+                {
+                    "id": f"r{i}->{REF_EDIT_NODE}",
+                    "source": f"r{i}",
+                    "target": REF_EDIT_NODE,
+                    "targetHandle": "refs",
+                }
+                for i in (1, 2)
+            ]
+            saved = self.api("PUT", f"/projects/{PROJECT}/graph", graph, headers=ui)
+            self.check(saved.get("ok") is True, f"graph not saved: {saved}")
+            bad = self.http.call(
+                "POST",
+                f"{API}/projects/{PROJECT}/nodes/{REF_EDIT_NODE}/quote",
+                {"engine_id": REF_ENGINE, "prompt": "like @ref3"},
+            )
+            self.expect(bad, 422)
+            self.check(
+                bad.json().get("error") == "bad_ref_token", f"@ref3 with 2 Reference nodes: {bad.text()}"
+            )
+            q = self.api(
+                "POST",
+                f"/projects/{PROJECT}/nodes/{REF_EDIT_NODE}/quote",
+                {"engine_id": REF_ENGINE, "prompt": REF_PROMPT},
+            )
+            inputs = (q.get("run") or {}).get("inputs") or {}
+            want = REF_PROMPT.replace("@ref1", "reference image 1").replace("@ref2", "reference image 2")
+            self.check(q["run"].get("state") == "QUOTED", f"run state {q['run'].get('state')!r}")
+            self.check(
+                inputs.get("prompt") == want, f"the quote shows {inputs.get('prompt')!r}, want {want!r}"
+            )
+            self.check(inputs.get("prompt_raw") == REF_PROMPT, f"prompt_raw {inputs.get('prompt_raw')!r}")
+            sent = [x.get("hash") for x in inputs.get("reference_images") or []]
+            self.check(sent == hashes, f"reference_images {sent}, want {hashes}")
+            notes.append(f"{q['run']['id']} quoted on {REF_ENGINE}: {inputs['prompt'][:60]}...")
+
+        # G2 (T111): the Edit's accepted take is picked (outputHash) and a Motion hangs off it; a newer take
+        # is a candidate and unapproves nothing, so autosave and every quote keep working.
+        take = self.api("GET", f"/runs/{run_id}")
+        picked = (take.get("outputs") or [None])[0]
+        with self.step("g2.motion_wired") as notes:
+            self.check(isinstance(picked, str) and picked, f"run {run_id} has no output: {take}")
+            edit = next(n for n in graph["nodes"] if n["id"] == EDIT_NODE)
+            edit["outputHash"] = picked
+            graph["nodes"].append(
+                {"id": MOTION_NODE, "kind": "Motion", "label": "Motion", "riskLabel": "low"}
+            )
+            edge_id = f"{EDIT_NODE}->{MOTION_NODE}"
+            graph["edges"].append({"id": edge_id, "source": EDIT_NODE, "target": MOTION_NODE})
+            saved = self.api("PUT", f"/projects/{PROJECT}/graph", graph, headers=ui)
+            node = next((n for n in saved["graph"]["nodes"] if n.get("id") == EDIT_NODE), {})
+            self.check(node.get("approved") is True, f"the picked, accepted take left the Edit as {node}")
+            self.check(saved.get("violations") == [], f"violations {saved.get('violations')}")
+            edge = next((e for e in saved["graph"]["edges"] if e.get("id") == edge_id), {})
+            self.check(edge and not edge.get("locked"), f"the Motion edge is {edge}")
+            notes.append("Edit approved on its picked take, Motion edge open")
+
+        with self.step("recomposite") as notes:
+            second = self.api("POST", f"/runs/{run_id}/recomposite", {"feather_px": RECOMPOSITE_FEATHER_PX})
+            self.check(second.get("state") == "DONE", f"re-mask is {second.get('state')}: {second}")
+            self.check(second.get("id") != run_id, "the re-mask answered the original run")
+            self.check(second.get("outputs"), f"the re-mask has no output: {second}")
+            self.check(
+                second["outputs"][0] != picked,
+                "the re-mask made the same picture as the raw take (not a new take)",
+            )
+            notes.append(f"{second['id']} DONE, a new take beside {run_id}")
+
+        with self.step("g2.autosave") as notes:
+            saved = self.api(
+                "PUT", f"/projects/{PROJECT}/graph", graph, headers=ui
+            )  # status 200, not 422 VIDEO_LOCKED
+            node = next((n for n in saved["graph"]["nodes"] if n.get("id") == EDIT_NODE), {})
+            self.check(node.get("approved") is True, f"a second take unapproved the Edit: {node}")
+            self.check(saved.get("violations") == [], f"violations {saved.get('violations')}")
+            self.check(
+                not any(e.get("locked") for e in saved["graph"]["edges"]),
+                f"an edge was locked: {saved['graph']['edges']}",
+            )
+            runs = self.api("GET", f"/projects/{PROJECT}/runs?node_id={EDIT_NODE}")
+            ids = {r.get("id") for r in runs}
+            self.check(
+                {run_id, second["id"]} <= ids, f"the second take is not listed beside the first: {ids}"
+            )
+            q = self.http.call(
+                "POST", f"{API}/projects/{PROJECT}/nodes/{EDIT_NODE}/quote", {"engine_id": "fake"}
+            )
+            self.expect(q, 200)  # every quote used to fail with the graph unsaved
+            notes.append(f"Edit still approved with {len(ids)} takes, a quote still works")
+
+        def apply_template(template_id: str) -> dict[str, Any]:
+            body = {
+                "template_id": template_id,
+                "packet_ids": [packet_id],
+                "engine_id": "fake",
+                "prompt": "smoke",
+                "quote": True,
+            }
+            return self.api("POST", f"/projects/{PROJECT}/templates/apply", body)
+
+        with self.step("templates.edit_chain") as notes:
+            listed = {t.get("id") for t in self.api("GET", f"/templates?project_id={PROJECT}")}
+            self.check({"edit_chain", "night_chain"} <= listed, f"/templates lists {sorted(listed)}")
+            r = apply_template("edit_chain")
+            self.check(r.get("edits"), f"edit_chain made no Edit: {r}")
+            self.check(r.get("refused") == [], f"edit_chain refused {r.get('refused')}")
+            runs = r.get("runs") or []
+            self.check(len(runs) == len(r["edits"]), f"{len(r['edits'])} Edit(s) but {len(runs)} quote(s)")
+            self.check(
+                all(x.get("state") == "QUOTED" for x in runs), f"run states {[x.get('state') for x in runs]}"
+            )
+            notes.append(f"{r.get('nodes_added')} nodes, {len(runs)} quote(s), USD {r.get('total_usd')}")
+
+        with self.step("templates.night_chain") as notes:
+            r = apply_template("night_chain")  # a 200: the refusal is reported in the body, not raised
+            self.check(r.get("edits"), f"night_chain made no Edit: {r}")
+            refused = r.get("refused") or []
+            self.check(
+                any(x.get("error") == "no_base" and x.get("status") == 422 for x in refused),
+                f"night_chain should be refused with no_base (its Edit has no take to start from): {refused}",
+            )
+            self.check(r.get("runs") == [], f"a refused Edit left a run: {r.get('runs')}")
+            notes.append(f"{r.get('nodes_added')} nodes laid, refused: {[x.get('error') for x in refused]}")
 
         with self.step("ui.index") as notes:
             r = self.expect(self.http.call("GET", "/", auth=False), 200)

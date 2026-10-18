@@ -1,6 +1,10 @@
 """Run history, gate rescore, export through `export.export`, ledgered overrides and the seed's dev routes
 behind `PLATE_DEV` (router plan T57), on the committed Blender packet `fixtures/packets/room_a`.
 
+room_a declares a 2.39:1 safe frame (y 46, height 268) inside its 640 x 360 render, so an export writes that
+band by default (router plan T114: a pixel crop of the composite); `test_export_safe_frame.py` covers the
+framing itself.
+
 `EchoEngine` is a FakeEngine whose result is the PNG egress sent it (optionally shifted), so the gates score
 real pixels: an unshifted echo ends DONE, a 12 px shift ends GATE_FAIL on camera drift.
 """
@@ -33,6 +37,8 @@ BASE = "http://127.0.0.1:4610"
 PROJECT = "plate-fixture"  # room_a's manifest project_id
 FAKE_ROUTE = {"engine_id": "fake", "provider": "fake", "region": "local"}
 DEV_404 = {"error": "not_found", "detail": "dev route; set PLATE_DEV=1"}
+BAND = {"x": 0, "y": 46, "width": 640, "height": 268}  # room_a's camera.safe_frame (T114)
+ROWS = slice(BAND["y"], BAND["y"] + BAND["height"])
 
 needs_room_a = pytest.mark.skipif(
     not (ROOM_A / "manifest.json").is_file() or not (ROOM_A / "beauty.exr").is_file(),
@@ -248,18 +254,21 @@ def test_export_png16_writes_the_composite_and_its_sidecar_and_ships_the_report(
             "sidecar": str(out / "take_01.gate.json"),
             "format": "png16",
             "shipped": True,
+            "crop": {"x": 0, "y": 46, "width": 640, "height": 268},  # the route reports its framing (G3)
         }
 
         img = cv2.imread(str(out / "take_01.png"), cv2.IMREAD_UNCHANGED)
-        assert img.dtype == np.uint16 and img.shape == (360, 640, 3)
+        assert img.dtype == np.uint16 and img.shape == (268, 640, 3)  # the safe frame (T114)
         cas = CAS(sync_settings.projects_dir / PROJECT / "assets")
         composite = decode_png16(cas.read_bytes(run["outputs"][0]))
-        assert np.array_equal(np.ascontiguousarray(img[..., ::-1]), composite)
+        assert composite.shape == (360, 640, 3)
+        assert np.array_equal(np.ascontiguousarray(img[..., ::-1]), composite[ROWS])
         lin = lineage.read(out / "take_01.png")
         assert lin is not None and lin.run_id == run_id and lin.packet_id == packet_id and lin.node_id == "e"
         sidecar = json.loads((out / "take_01.gate.json").read_text(encoding="utf-8"))
         assert sidecar["export"]["run_id"] == run_id and sidecar["export"]["files"] == ["take_01.png"]
         assert sidecar["export"]["gate_report"] == f"gates/{run_id}.1.json"
+        assert sidecar["export"]["crop"] == BAND and "full_frame" not in sidecar["export"]
         assert sidecar["verdict"] == c.get(f"/api/v0/runs/{run_id}/gate", headers=auth).json()["verdict"]
 
         gate = c.get(f"/api/v0/runs/{run_id}/gate", headers=auth).json()
@@ -296,9 +305,9 @@ def test_the_legacy_dest_body_writes_a_real_tiff_and_bad_bodies_are_refused(sync
         assert r.status_code == 200, r.text
         assert r.json()["format"] == "tiff16" and r.json()["path"] == str(dest)
         tif = tifffile.imread(dest)
-        assert tif.dtype == np.uint16 and tif.shape == (360, 640, 3)
+        assert tif.dtype == np.uint16 and tif.shape == (268, 640, 3)  # the safe frame (T114)
         cas = CAS(sync_settings.projects_dir / PROJECT / "assets")
-        assert np.array_equal(tif, decode_png16(cas.read_bytes(run["outputs"][0])))
+        assert np.array_equal(tif, decode_png16(cas.read_bytes(run["outputs"][0]))[ROWS])
         assert (dest.parent / "plate_take.gate.json").is_file()
         assert lineage.read(dest).run_id == run_id
 
@@ -441,12 +450,29 @@ def test_dev_routes_drive_a_seed_run_under_plate_dev(dev_settings, auth, tmp_pat
         assert state == "DONE"
         assert [v["id"] for v in c.get(f"/api/v0/projects/{PROJECT}/runs", headers=auth).json()] == [run_id]
 
-        # a seed run exports through export.export too; its stub gate wrote no report file to ship
+        # a seed run exports through export.export too. Its 64 x 64 stub take is not room_a's aspect, so the
+        # safe frame cannot be placed on it (T114): the default export refuses, and the whole take leaves only
+        # on request (`full_frame`, which the batch route takes). Its stub gate wrote no report file to ship.
         dest = tmp_path / "seed.png"
         r = _export(c, auth, run_id, dest=str(dest))
-        assert r.status_code == 200 and r.json()["shipped"] is False, r.text
+        assert r.status_code == 409 and r.json()["error"] == "not_exportable", r.text
+        assert "full_frame" in r.json()["detail"] and not dest.exists()
+        body = {"run_ids": [run_id], "out_dir": str(tmp_path), "format": "png16", "name_pattern": "seed"}
+        r = c.post(f"/api/v0/projects/{PROJECT}/export", json={**body, "full_frame": True}, headers=auth)
+        assert r.status_code == 200 and r.json()["refused"] == [], r.text
+        assert r.json()["exported"] == [
+            {
+                "run_id": run_id,
+                "path": str(dest),
+                "sidecar": str(tmp_path / "seed.gate.json"),
+                "full_frame": True,
+            }
+        ]
         assert dest.is_file() and (tmp_path / "seed.gate.json").is_file()
+        assert cv2.imread(str(dest), cv2.IMREAD_UNCHANGED).shape[:2] == (64, 64)
         assert lineage.read(dest).run_id == run_id
+        rec = _records(dev_settings, "export", run_id)[-1]
+        assert rec["data"]["shipped"] is False and rec["data"]["full_frame"] is True
 
         r = c.post(f"/api/v0/runs/{run_id}/gate/rescore", json={}, headers=auth)
         assert r.status_code == 409 and r.json()["error"] == "no_report"

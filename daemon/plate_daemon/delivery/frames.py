@@ -8,6 +8,7 @@ yields `Frame` records one at a time (nothing is held beyond the frame being enc
     a folder                         its images in name order
     a list of paths and/or arrays    in that order
     an iterable of arrays            float [0, 1] (encoding as declared), uint8 or uint16; (H, W, 3 or 4)
+    a `Frames`                       itself (already opened, e.g. by `crop_frames`)
 
 Files go through `plate_pixels.imageio` (PNG, TIFF, JPEG; 8 or 16 bit) or OpenImageIO (EXR, always linear;
 its `chromaticities` or ASWF `colorInteropID` say which primaries, and a frame in anything but Rec.709, such as
@@ -15,12 +16,16 @@ the ACEScg EXRs `plate export` writes for an ACEScg packet, is converted to Rec.
 Rec.709 video tags that follow are true; an EXR that names no primaries is taken as Rec.709).
 Display images are sRGB-encoded unless the file is a float TIFF. Nothing here resizes, resamples or
 upscales: a frame whose size differs from the first is an error.
+
+`crop_frames(source, box)` cuts every frame of a source to `box = (x, y, width, height)` (the packet's safe
+frame, router plan T114): a pixel crop, nothing resampled. The encoders take the `Frames` it returns as they
+take any other source.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,7 +34,16 @@ import numpy as np
 
 from .guard import DeliveryError
 
-__all__ = ["VIDEO_SUFFIXES", "Frame", "Frames", "is_video_file", "open_frames", "to_display16"]
+__all__ = [
+    "VIDEO_SUFFIXES",
+    "Frame",
+    "Frames",
+    "crop_frame",
+    "crop_frames",
+    "is_video_file",
+    "open_frames",
+    "to_display16",
+]
 
 VIDEO_SUFFIXES = frozenset({".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi"})
 IMAGE_SUFFIXES = frozenset({".png", ".tif", ".tiff", ".jpg", ".jpeg", ".exr"})
@@ -204,9 +218,12 @@ class Frames:
 
 
 def open_frames(source: Any, *, start_number: int | None = None, encoding: str = "srgb") -> Frames:
-    """See the module docstring. `encoding` applies to float arrays only ('srgb' or 'linear')."""
+    """See the module docstring. `encoding` applies to float arrays only ('srgb' or 'linear'); a `Frames` is
+    returned as it is (its frames were decoded when it was opened)."""
     if encoding not in ("srgb", "linear"):
         raise DeliveryError(f"encoding is 'srgb' or 'linear', not {encoding!r}")
+    if isinstance(source, Frames):
+        return source
     if _is_array(source):
         if source.ndim == 4:  # a stack of frames
             return Frames(list(source), encoding, len(source))
@@ -229,6 +246,46 @@ def open_frames(source: Any, *, start_number: int | None = None, encoding: str =
     if isinstance(source, Iterable):
         return Frames(source, encoding, None)
     raise DeliveryError(f"cannot read frames from a {type(source).__name__}")
+
+
+# ---------------------------------------------------------------------------- the safe-frame crop
+
+
+def _box(box: Sequence[int], width: int, height: int) -> tuple[int, int, int, int]:
+    try:
+        x, y, w, h = (int(v) for v in box)
+    except (TypeError, ValueError) as e:
+        raise DeliveryError("a crop box is (x, y, width, height)") from e
+    if w < 1 or h < 1 or x < 0 or y < 0 or x + w > width or y + h > height:
+        raise DeliveryError(f"crop box {(x, y, w, h)} is not inside the {width} x {height} frame")
+    return x, y, w, h
+
+
+def crop_frame(frame: Frame, box: Sequence[int]) -> Frame:
+    """The `box` = (x, y, width, height) of one frame, alpha included. Pixels are copied, never resampled."""
+    width, height = frame.size
+    x, y, w, h = _box(box, width, height)
+    alpha = frame.alpha
+    return Frame(
+        rgb=np.ascontiguousarray(frame.rgb[y : y + h, x : x + w]),
+        alpha=None if alpha is None else np.ascontiguousarray(alpha[y : y + h, x : x + w]),
+        encoding=frame.encoding,
+    )
+
+
+def crop_frames(
+    source: Any, box: Sequence[int], *, start_number: int | None = None, encoding: str = "srgb"
+) -> Frames:
+    """Every frame of `source` (anything `open_frames` takes) cut to `box`, as a single-pass `Frames` the
+    encoders accept. A box outside the frames is a DeliveryError before anything is encoded."""
+    frames = open_frames(source, start_number=start_number, encoding=encoding)
+    x, y, w, h = _box(box, frames.width, frames.height)
+
+    def cut() -> Iterator[Frame]:
+        for frame in frames:
+            yield crop_frame(frame, (x, y, w, h))
+
+    return Frames(cut(), encoding, frames.count)
 
 
 # ---------------------------------------------------------------------------- conversions

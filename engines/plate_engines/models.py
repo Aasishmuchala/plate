@@ -171,11 +171,16 @@ class IOField(_Strict):
     required: bool = True
     # Upper bound on how many items an images / video / json input may carry (vendor reference caps).
     max_items: int | None = Field(default=None, ge=1)
+    # How the engine names its K-th reference image in a prompt (`{k}` marks the number), read by the
+    # daemon to replace `@refK` (T113). None: the daemon's default, "reference image {k}".
+    reference_token: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _check(self) -> IOField:
         if self.max_items is not None and self.type not in ("images", "video", "json"):
             raise ValueError(f"input {self.name}: max_items only applies to images, video or json inputs")
+        if self.reference_token is not None and self.type != "images":
+            raise ValueError(f"input {self.name}: reference_token only applies to an images input")
         return self
 
 

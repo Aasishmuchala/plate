@@ -236,6 +236,8 @@ export function ExportEditor({ nodeId }: { nodeId: string }): ReactElement {
   const [cutName, setCutName] = useState("");
   const [cutLong, setCutLong] = useState<number | null>(null);
   const [cutResult, setCutResult] = useState<CutdownResult | null>(null);
+  // Off: the daemon exports the packet's safe frame (T114). On: the whole render, overscan included.
+  const [fullFrame, setFullFrame] = useState(false);
 
   const format = isFormat(params.format) ? params.format : DEFAULT_EXPORT_FORMAT;
   const clipFormat = isClipFormat(params.clipFormat) ? params.clipFormat : DEFAULT_CLIP_FORMAT;
@@ -277,6 +279,7 @@ export function ExportEditor({ nodeId }: { nodeId: string }): ReactElement {
         format,
         ...(name.trim() ? { name: name.trim() } : {}),
         ...(r.exportable ? {} : { override: true, reason: reason.trim() }),
+        ...(fullFrame ? { full_frame: true } : {}),
       });
       setResult({ path: res.path, sidecar: res.sidecar, note: res.shipped ? "gate report marked shipped" : null });
       setReason("");
@@ -287,7 +290,12 @@ export function ExportEditor({ nodeId }: { nodeId: string }): ReactElement {
   }, errorMessage);
 
   const [doBatch, batchState] = useAction(async (pid: string, ids: string[]) => {
-    const res = await exportMany(pid, { run_ids: ids, out_dir: outDir.trim(), format });
+    const res = await exportMany(pid, {
+      run_ids: ids,
+      out_dir: outDir.trim(),
+      format,
+      ...(fullFrame ? { full_frame: true } : {}),
+    });
     setBatchResult(res);
     if (res.exported.length > 0) {
       count(res.exported.length);
@@ -440,6 +448,17 @@ export function ExportEditor({ nodeId }: { nodeId: string }): ReactElement {
             onChange={(e) => set({ outDir: e.target.value || undefined })}
           />
         </Field>
+        {clip ? null : (
+          <label style={E.field} title="Off: the camera's safe frame. On: the whole render, overscan included.">
+            <input
+              type="checkbox"
+              checked={fullFrame}
+              data-testid="export-full-frame"
+              onChange={(e) => setFullFrame(e.target.checked)}
+            />{" "}
+            whole frame (keep overscan)
+          </label>
+        )}
         <div style={E.row}>
           <Button
             onClick={() => run && void doExport(run)}

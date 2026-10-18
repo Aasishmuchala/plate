@@ -77,8 +77,16 @@ def test_packet_to_export_on_the_project_cas(tmp_path, monkeypatch, auth):
                 break
         assert state == "DONE"
         dest = tmp_path / "out" / "result.png"
+        # T114: export places the packet's safe frame by default and will not guess it onto a take of
+        # another aspect (the seed fake returns 64 x 64); full_frame keeps the whole take.
         r = c.post(f"/api/v0/runs/{run_id}/export", json={"dest": str(dest)}, headers=auth)
-        assert r.status_code == 200 and dest.is_file()
+        assert r.status_code == 409 and r.json()["error"] == "not_exportable", r.text
+        assert "full_frame" in r.json()["detail"] and not dest.exists()
+        r = c.post(
+            f"/api/v0/runs/{run_id}/export", json={"dest": str(dest), "full_frame": True}, headers=auth
+        )
+        assert r.status_code == 200 and dest.is_file(), r.text
+        assert r.json()["full_frame"] is True and "crop" not in r.json()
         counts = c.app.state.index.counts(project_id)
     cas = CAS(settings.projects_dir / project_id / "assets")
     objects = list(cas.iter_objects())

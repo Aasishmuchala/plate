@@ -6,7 +6,7 @@ the batch forms of run, export, review and spend are wave 9 (T103).
               [--approve auto|human] [--envelope USD] [--shot-class C] [--param K=V]
               [--nda] [--allow-grades C0,C1,C2]            (the last two only when the project is new)
     plate gate <plate> <candidate> [--packet DIR] [--out report.json]
-    plate export <run_id> --to <dir> --format tiff16|png16|exr [--override-reason TEXT] [--name N] [--project DIR]
+    plate export <run_id> --to <dir> --format tiff16|png16|exr [--override-reason TEXT] [--name N] [--full-frame] [--project DIR]
     plate export --runs r1,r2 --to <dir> [--format F] [--name-pattern P] [--project P]
     plate export --project P --accepted --to <dir> [--format F] [--name-pattern P]
     plate reindex <project> [--verify]
@@ -634,6 +634,23 @@ def _existing_chain(
     return None
 
 
+def drop_held_locks(graph: dict[str, Any], problems: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop VIDEO_LOCKED problems on edges the daemon stored with `locked: true`.
+
+    Since G2 (T111) such an edge is held, not refused: the artist picked an unaccepted take upstream of a
+    Motion, and the Motion still refuses its quote. Any other problem, or a lock on an edge without the
+    server's flag, still counts.
+    """
+    held = {
+        str(e.get("id")) for e in graph.get("edges", []) if isinstance(e, dict) and e.get("locked") is True
+    }
+    return [
+        v
+        for v in problems
+        if not (v.get("code") == "VIDEO_LOCKED" and str((v.get("edge") or {}).get("id")) in held)
+    ]
+
+
 def _graph_for(
     project: Project,
     packet_id: str,
@@ -677,6 +694,7 @@ def _graph_for(
             _set_mask(next(n for n in added if n.get("kind") == "Mask"), mask)
         edit_id = str(edit["id"])
     problems = canvas_rules.check_nodes(graph) or canvas_rules.validate_graph(graph)
+    problems = drop_held_locks(graph, problems)
     if problems:
         raise CliExit(
             EXIT_USAGE, f"canvas rules refuse the graph: {problems[0]['code']}: {problems[0]['message']}"
@@ -1154,6 +1172,7 @@ def _export_one(session: Session, args: argparse.Namespace) -> int:
                 cas=CAS(project_dir / "assets"),
                 project_dir=project_dir,
                 name=args.name,
+                full_frame=bool(getattr(args, "full_frame", False)),
             )
         except NotExportable as e:
             session.warn(f"not exported: {e}")
@@ -1166,7 +1185,12 @@ def _export_one(session: Session, args: argparse.Namespace) -> int:
             pid,
             "export",
             run,
-            data={"dest_name": done.path.name, "format": done.fmt, "overridden": done.overridden},
+            data={
+                "dest_name": done.path.name,
+                "format": done.fmt,
+                "overridden": done.overridden,
+                **done.framing.record(),
+            },
         )
     session.say(f"exported {done.path}")
     session.say(f"gate report {done.report_path}" + (f" (from {done.report_ref})" if done.report_ref else ""))
@@ -1238,6 +1262,7 @@ def _export_batch(session: Session, args: argparse.Namespace) -> int:
         fmt=args.format,
         name_pattern=args.name_pattern or DEFAULT_PATTERN,
         by="human",
+        full_frame=bool(getattr(args, "full_frame", False)),
     )
     for row in result["exported"]:
         session.say(f"exported {row['path']}")
@@ -2737,6 +2762,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--override-reason", help=f"why a GATE_FAIL take ships anyway ({MIN_OVERRIDE_REASON}+ characters)"
     )
     e.add_argument("--name", help="file name stem (default: the run id)")
+    e.add_argument(
+        "--full-frame",
+        action="store_true",
+        help="keep the whole render (overscan included) instead of the camera's safe frame",
+    )
     e.add_argument("--project", help="the project folder, if this machine's index does not know the run")
 
     x = sub.add_parser("reindex", help="rebuild this machine's index of a project from its folder")

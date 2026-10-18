@@ -83,6 +83,17 @@ Wave 9 (router plan T92; decisions 46, 47, 50, 51, 54 and 55):
   the run with `reason_code ingress_hook:<name>`.
 - Degraded routes. `health_board()` marks every route `route_tracker.degraded()` names as `degraded` (never
   routed to); the quote's router reasons name each degraded route of the engine.
+
+Wave 10 (router plan T113):
+
+- Reference tokens. `@ref1`..`@refN` in the prompt (N = the Reference nodes wired to the Edit, in edge order)
+  become the engine's own wording for the K-th reference image: the manifest's `reference_token` (on its
+  `reference_images` input, else on the manifest; `{k}` marks the number, a token without it takes " K"
+  appended), default `reference image {k}`. The route dict carries `reference_token` when the manifest has
+  one. Refused at the quote, before a run row, with 422 `bad_ref_token`: `@refK` with K past N, an `@ref` with
+  no number (or any other `@ref...` word, such as `@ref0` or `@ref1a`), or any token on an engine that
+  declares no `reference_images` input. `inputs.prompt` is the substituted text (what the quote shows, the
+  ledger records and the engine receives); `inputs.prompt_raw` keeps the artist's text when it differed.
 """
 
 from __future__ import annotations
@@ -100,7 +111,7 @@ import threading
 import time
 import zlib
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -204,6 +215,10 @@ REFERENCE_INPUT = "reference_images"
 REFERENCE_HANDLE = "refs"
 REFERENCE_ROLES = ("style", "object", "sky", "person", "swatch")
 DEFAULT_REFERENCE_ROLE = "style"
+# Wave 10 (T113): `@ref1`..`@refN` in a prompt. A word starting `@ref` that is not a lone positive number is
+# a bad token (`@ref`, `@ref0`, `@ref1a`); `@refine` and `a@ref1` are plain text.
+REF_TOKEN = re.compile(r"(?<![A-Za-z0-9_])@ref(?![A-Za-z_])[A-Za-z0-9_]*")
+DEFAULT_REFERENCE_TOKEN = "reference image {k}"
 BASE_HANDLE = "image"
 MASK_INPUT = "mask"
 INGRESS_HOOK_CODE = "ingress_hook"
@@ -1062,6 +1077,8 @@ class Pipeline:
                 f"doctrine: task {task!r} on a {shot_class} shot",
                 *self.degraded_reasons(engine_id),
             ]
+            if self.reference_token(engine_id) is not None:
+                route["reference_token"] = self.reference_token(engine_id)
             return route
         manifest = self.manifests.get(engine_id)
         if manifest is None:
@@ -1091,7 +1108,7 @@ class Pipeline:
                 f"{engine_id} declares no sizes: egress would have to guess what {r.provider} accepts",
                 code="no_sizes",
             )
-        return {
+        picked = {
             "engine_id": engine_id,
             "provider": r.provider,
             "region": r.region or "unknown",
@@ -1102,6 +1119,9 @@ class Pipeline:
             "model_version": r.model_slug or manifest.model_id or manifest.version,
             "reasons": reasons,
         }
+        if self.reference_token(engine_id) is not None:  # T113: the engine's wording for `@refK`
+            picked["reference_token"] = self.reference_token(engine_id)
+        return picked
 
     def render_it(self, pv: PacketView, task: str) -> dict[str, Any]:
         """Doctrine 4 before spend: the detail the frame can resolve, as `run.inputs["router"]`. Advisory
@@ -1199,10 +1219,91 @@ class Pipeline:
         body: Mapping[str, Any],
         params_node: Mapping[str, Any],
         recipe: Any,
+        *,
+        engine_id: str | None = None,
+        references: Sequence[Any] | None = None,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        """(prompt, prompt_source, negative_prompt, raw_prompt). Explicit > recipe (decision 33); a recipe is
+        composed by the LLM when the Anthropic route's custody allows it, else filled from the Project Sheet
+        alone. The node's `params.tokens` (decision 50) override the recipe's token defaults on both paths.
+
+        With `engine_id` (the quote passes it with the node's resolved `references`) every `@refK` in the text
+        becomes that engine's name for the K-th reference image (`substitute_ref_tokens`; 422 `bad_ref_token`).
+        `prompt` is then the substituted text and `raw_prompt` what the artist's text said before; the two are
+        the same string when nothing was substituted."""
+        raw, source, negative = self._compose_prompt(project, pv, body, params_node, recipe)
+        if raw is None or engine_id is None:
+            return raw, source, negative, raw
+        return self.substitute_ref_tokens(raw, engine_id, references or ()), source, negative, raw
+
+    def reference_token(self, engine_id: str) -> str | None:
+        """The engine's own wording for a reference image, as its manifest states it: `reference_token` on the
+        `reference_images` input, else on the manifest itself. None when the manifest has none (the default,
+        `reference image {k}`, then applies)."""
+        item = self._declared(engine_id, "inputs", REFERENCE_INPUT)
+        for holder in (item, self._engine_manifest_for(engine_id)):
+            if holder is None:
+                continue
+            token = (
+                holder.get("reference_token")
+                if isinstance(holder, Mapping)
+                else getattr(holder, "reference_token", None)
+            )
+            if isinstance(token, str) and token.strip():
+                return token
+        return None
+
+    def substitute_ref_tokens(self, prompt: str, engine_id: str, references: Sequence[Any]) -> str:
+        """Replace each `@refK` (K = 1..N, N = len(references)) with the engine's name for the K-th reference
+        image. Everything is checked before anything is replaced: 422 `bad_ref_token` for a token on an engine
+        that declares no `reference_images` input, for K past N and for an `@ref` word that is not `@ref` plus
+        a positive number. A prompt with no `@ref` token comes back untouched."""
+        found = list(REF_TOKEN.finditer(prompt))
+        if not found:
+            return prompt
+        n = len(references)
+        named = ", ".join(dict.fromkeys(m.group(0) for m in found))
+        if self._declared(engine_id, "inputs", REFERENCE_INPUT) is None:
+            raise PipelineError(
+                f"the prompt uses {named}, but {engine_id} takes no reference images; remove the token or "
+                f"pick an engine whose manifest declares {REFERENCE_INPUT}",
+                code="bad_ref_token",
+                tokens=[m.group(0) for m in found],
+                references=n,
+            )
+        template = self.reference_token(engine_id) or DEFAULT_REFERENCE_TOKEN
+        if "{k}" not in template:
+            template = f"{template} {{k}}"
+        for m in found:
+            tok = m.group(0)
+            digits = tok[len("@ref") :]
+            if not digits.isascii() or not digits.isdigit() or digits.startswith("0"):
+                raise PipelineError(
+                    f"{tok} is not a reference token; name a reference with @ref1..@ref{max(n, 1)}",
+                    code="bad_ref_token",
+                    token=tok,
+                    references=n,
+                )
+            if int(digits) > n:
+                have = f"{n} Reference image{'s are' if n != 1 else ' is'} wired" if n else "none is wired"
+                raise PipelineError(
+                    f"the prompt names {tok}, but {have} to this Edit; wire the Reference node or fix the "
+                    "number",
+                    code="bad_ref_token",
+                    token=tok,
+                    references=n,
+                )
+        return REF_TOKEN.sub(lambda m: template.replace("{k}", str(int(m.group(0)[len("@ref") :]))), prompt)
+
+    def _compose_prompt(
+        self,
+        project: Project,
+        pv: PacketView,
+        body: Mapping[str, Any],
+        params_node: Mapping[str, Any],
+        recipe: Any,
     ) -> tuple[str | None, str | None, str | None]:
-        """(prompt, prompt_source, negative_prompt). Explicit > recipe (decision 33); a recipe is composed by
-        the LLM when the Anthropic route's custody allows it, else filled from the Project Sheet alone. The
-        node's `params.tokens` (decision 50) override the recipe's token defaults on both paths."""
+        """(text, prompt_source, negative_prompt) before any `@ref` token is touched."""
         explicit = body.get("prompt") or params_node.get("prompt")
         if isinstance(explicit, str) and explicit.strip():
             return explicit, "explicit", None
@@ -1546,7 +1647,8 @@ class Pipeline:
         mask, engine, task (`router_refused:<code>`) and `prompt_required`; 409 packet not ingested,
         `retired_pin`, `pin_conflict` and `render_it` (blocking mode); `CustodyViolation` (403) when no route of
         the engine is allowed; after the mask, the base (`no_base`, `bad_base`, `ambiguous_base`, `base_size`)
-        and the references (`references_unsupported`, `too_many_references`, `reference_missing`). Body (all
+        and the references (`references_unsupported`, `too_many_references`, `reference_missing`), then the
+        prompt's `@refK` tokens (`bad_ref_token`). Body (all
         optional): engine_id, route_id, packet_id, task, shot_class, recipe, prompt, params (`params.tokens`
         fills a recipe's tokens and never reaches the engine), preset, region_crop, feather_px, priority,
         attempt (server-side when absent)."""
@@ -1627,7 +1729,9 @@ class Pipeline:
             inputs[REFERENCE_INPUT] = references
         params = dict(body.get("params") or {})
         params.pop("tokens", None)  # recipe text, not an engine parameter
-        prompt, prompt_source, negative = self.resolve_prompt(project, pv, body, params_node, recipe)
+        prompt, prompt_source, negative, prompt_raw = self.resolve_prompt(
+            project, pv, body, params_node, recipe, engine_id=engine_id, references=references
+        )
         if prompt is None and self.prompt_required(engine_id):
             raise PipelineError(
                 f"{engine_id} needs a prompt: give prompt, or a recipe to build one from",
@@ -1636,6 +1740,8 @@ class Pipeline:
         if prompt is not None:
             inputs["prompt"] = prompt
             inputs["prompt_source"] = prompt_source
+            if prompt_raw != prompt:  # @refK became the engine's wording: the artist's text stays beside it
+                inputs["prompt_raw"] = prompt_raw
         if recipe is not None:
             inputs["recipe_id"] = recipe.id
             tokens = self.recipe_tokens(body, params_node)

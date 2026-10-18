@@ -1,8 +1,8 @@
 # PLATE verification record
 
-Written by the final verification pass (router task T53, Opus 5.5) on 2026-10-18 between 07:20 and 07:50 IST, after Wave 9 (T81 to T110), on the Mac (macOS 27.0 arm64, Python 3.12.12, Node 22.22.3, npm 10.9.8, Blender 5.1.1, ffmpeg from Homebrew, no `oiiotool`). Commit `23c147e` plus the uncommitted T107 (api wiring) and T108 (docs) edits in the working tree. Nothing here ran on the Windows render box, inside 3ds Max or against a live vendor; those lines are in the box-day checklist (section 8).
+Written by the final verification pass (router task T53, Opus 5.5) on 2026-10-18 between 12:20 and 13:00 IST, after Wave 10 (T111 to T115), on the Mac (macOS 27.0 arm64, Python 3.12.12, Node 22.22.3, npm 10.9.8, Blender 5.1.1, ffmpeg 8.1 from Homebrew, no `oiiotool`). Commit `48d7910` plus the uncommitted Wave 10 edits in the working tree (18 modified and 9 new files, all T111 to T115). Nothing here ran on the Windows render box, inside 3ds Max or against a live vendor; those lines are in the box-day checklist (section 9).
 
-The first pass (03:00 to 04:00 IST, commit `dd78f02`) found two failing tests and gap G1 (viewer edges and ΔE00 heatmap not fed by the daemon). The orchestrator fixed both tests in `8d65859`; T109 closed G1. This pass re-ran everything and found one new defect, G2 (section 2).
+Earlier passes: the first (03:00 to 04:00 IST, commit `dd78f02`) found two failing tests and gap G1 (viewer edges and ΔE00 heatmap not fed by the daemon); the orchestrator fixed the tests in `8d65859` and T109 closed G1. The second (07:20 to 07:50 IST, `23c147e` plus T107/T108) found G2 (a new take on an approved Edit blocked every graph save while a Motion hung off it); Wave 10 was written from it. This pass re-ran everything: **G2 is closed** (T111, rows W2 and W3), the three Wave 9 gaps T112 to T114 work in the browser, and **one new defect, G3**, fails `make test` (section 2).
 
 ## Result
 
@@ -10,18 +10,38 @@ The first pass (03:00 to 04:00 IST, commit `dd78f02`) found two failing tests an
 |---|---|
 | Windows-hazard scan (`scripts/hazard_scan.py`, `--selftest`, `--strict-allow`) | pass |
 | `make lint` (ruff check and format check) | pass |
-| `make test` (fidelity selftest, hazard, pytest for every package, vitest) | pass: 5,877 pytest passed, 1 skipped; 751 vitest passed |
+| `make test` (fidelity selftest, hazard, pytest for every package, vitest) | pass (after the orchestrator closed G3, see "Closing pass"): pytest `5945 passed, 1 skipped`, vitest `798 passed` |
 | `npm run build` in `ui` | pass |
 | licence registry check | pass |
 | claims as tests (`scripts/claims_check.py`) | pass: 28 claims, 136 tests |
 | `PLATE_FAKE_ENGINE=1 python -m plate_daemon.cli smoke` | pass: 11 adapters ok |
 | fixture render idempotency (`bash fixtures/blender/render.sh` twice) | pass: 0 changed files |
-| scripted end-to-end smoke (`scripts/smoke_e2e.py --build-ui`, T79) | pass: `SMOKE PASS` |
-| UI smoke in a real browser against a real daemon (section 2) | pass: every step of the plan's smoke, including the edges and ΔE00 modes |
+| scripted end-to-end smoke (`scripts/smoke_e2e.py --build-ui`, T79 and T115) | pass: `SMOKE PASS`, 36 steps |
+| UI smoke in a real browser against a real daemon (section 2) | pass: every step of the plan's smoke, plus G2's repro and the Wave 10 surfaces |
 
 UI smoke: PASS
 
-One defect outside the plan's smoke steps was found while exercising Wave 9 in the browser: G2, a new take on an approved Edit blocks every graph save while a Motion node hangs off it (section 2). It does not touch any step of the plan's smoke, so the line above stays PASS; it needs a task.
+## Closing pass (orchestrator, 2026-10-18, after T53)
+
+G3 is closed. The orchestrator applied the patch in section 2 ("Gap G3"): `full_frame` on `POST /runs/{id}/export`, with the route's framing (`crop` or `full_frame`) in its response and ledger record, and `test_app.py` asserting the 409 on a take of another aspect followed by a `full_frame` export. The follow-ups the last builders flagged were fixed at the same time, each with a test:
+
+- **Accept also picks the take.** The UI's accept now picks the accepted take too. Since G2 the daemon reads approval from the run behind the picked take, so before this an accept on a compared take left the node unapproved. The regression test fails on the old code.
+- **CLI holds locked edges.** `plate run` no longer refuses a project holding an edge the daemon stored with `locked: true`. It drops only those held VIDEO_LOCKED problems.
+- **Whole frame from every surface.** The Export editor has a "whole frame (keep overscan)" box and `plate export` takes `--full-frame`. Both reach the single-run and batch routes.
+- **Per-engine reference wording.** An engine manifest can state its wording for a reference image (`reference_token` on its images input). The daemon's default, `reference image {k}`, applies otherwise.
+
+The orchestrator re-ran the plan's whole done-when chain independently on that tree. Every step exits 0:
+
+| check | result |
+|---|---|
+| `make lint` | `All checks passed!`, 519 files formatted |
+| pytest, every package | `5945 passed, 1 skipped` (no drawtext in this Mac's ffmpeg) |
+| `npm run typecheck`, `vitest run`, `npm run build` in `ui` | clean; `798 passed`; built |
+| `scripts/hazard_scan.py --strict-allow` | clean, 977 files |
+| `scripts/claims_check.py` | all 28 claims hold (136 tests) |
+| `python -m plate_pixels.licences --check` | OK |
+| `pytest scripts/tests` | pass |
+| `scripts/smoke_e2e.py` | `SMOKE PASS` |
 
 ## 1. Command record, in the order the plan gives
 
@@ -29,33 +49,35 @@ All from the repo root.
 
 | # | command | exit | key output |
 |---|---|---|---|
-| 1 | `.venv/bin/python scripts/hazard_scan.py` | 0 | `hazard_scan: clean (966 files scanned, 2 allowlist entries)` |
+| 1 | `.venv/bin/python scripts/hazard_scan.py` | 0 | `hazard_scan: clean (975 files scanned, 2 allowlist entries)` |
 | 1a | `.venv/bin/python scripts/hazard_scan.py --selftest` | 0 | `hazard_scan selftest ok: 13 planted hazards caught, clean sample passes` |
-| 1b | `.venv/bin/python scripts/hazard_scan.py --strict-allow` | 0 | `hazard_scan: clean (966 files scanned, 2 allowlist entries)` |
-| 2 | `make lint` | 0 | `All checks passed!`, `514 files already formatted` |
-| 3 | `make test PYTEST=".venv/bin/pytest -rs --junitxml=<scratch>/junit.xml"` (the same targets; the two flags only add skip reasons and per-package counts) | 0 | `SELFTEST PASS`; hazard selftest and scan clean; pytest `5877 passed, 1 skipped in 646.63s`; vitest `Test Files 26 passed (26)`, `Tests 751 passed (751)`; 4K gate lines `run_gates 3840x2160: wall 3.68s per_material 0.76s` and `run_gates 3840x2160 with overlays: wall 4.19s overlays 0.21s` |
-| 4 | `npm run build` (in `ui/`: `tsc -b && vite build`) | 0 | `dist/assets/index-CMwEfprQ.js 755.25 kB`, `RecompositeBar-*.js 2.39 kB`, `built in 1.18s` (Vite's 500 kB chunk warning only) |
+| 1b | `.venv/bin/python scripts/hazard_scan.py --strict-allow` | 0 | `hazard_scan: clean (975 files scanned, 2 allowlist entries)` |
+| 2 | `make lint` | 0 | `All checks passed!`, `517 files already formatted` |
+| 3 | `make test PYTEST=".venv/bin/pytest -rs --junitxml=<scratch>/junit2.xml"` (the same targets; the two flags only add skip reasons and per-package counts) | 2 | `SELFTEST PASS`; hazard selftest and scan clean; pytest `1 failed, 5936 passed, 1 skipped in 814.67s`, the failure `FAILED daemon/tests/test_app.py::test_packet_to_export_on_the_project_cas` (`assert (409 == 200)`, G3); 4K gate lines `run_gates 3840x2160: wall 4.70s per_material 0.99s` and `run_gates 3840x2160 with overlays: wall 4.95s overlays 0.26s` |
+| 3a | `npm test` (what `make test` would have run next) | 0 | `Test Files 27 passed (27)`, `Tests 796 passed (796)` |
+| 4 | `npm run build` (in `ui/`: `tsc -b && vite build`) | 0 | `dist/assets/index-B9EOQ_Z6.js 788.34 kB`, `RecompositeBar-*.js 2.39 kB`, `built in 1.41s` (Vite's 500 kB chunk warning only) |
 | 5 | `.venv/bin/python -m plate_pixels.licences --check` | 0 | `licence check OK: 17 files scanned, 7 blocked models absent` |
-| 6 | `.venv/bin/python scripts/claims_check.py` | 0 | `claims_check: all 28 claims hold (136 tests passed)` |
-| 7 | `PLATE_FAKE_ENGINE=1 .venv/bin/python -m plate_daemon.cli smoke` | 0 | `fixture smoke: 11 adapters ok` (8 routes skipped, listed in section 9) |
-| 8 | `bash fixtures/blender/render.sh` twice, then `git status --porcelain fixtures \| wc -l` | 0 | stamps current (`base`, `ral3020`, `v2`: up to date), repack validated 6 packets; `0` changed files after each run, and `diff -r` against a copy of `fixtures/packets` taken before the runs is empty |
-| 9 | `perl -e 'alarm shift; exec @ARGV' 900 .venv/bin/python scripts/smoke_e2e.py --build-ui` | 0 | 28 steps `ok` (UI suite 751, wiring 19, build, daemon start, project, packet stage/post/ingest in 0.3 s/list, thumb, 15 engines incl. fake, summary, graph, quote with `router ai_by_region`, approve, DONE in 0.8 s, gate `advisory`, scrub, accept, server-derived approval, export + lineage, shipped, runs list, rescore `versions [1, 2]`, `index.html`, `text/javascript` asset, JSON 404); last line `SMOKE PASS`; `.smoke/` removed |
+| 6 | `.venv/bin/python scripts/claims_check.py` | 0 | `claims_check: all 28 claims hold (136 tests passed)`; `--skip-ui` gives the same |
+| 7 | `PLATE_FAKE_ENGINE=1 .venv/bin/python -m plate_daemon.cli smoke` | 0 | `fixture smoke: 11 adapters ok` (8 routes skipped, listed in section 10) |
+| 8 | `bash fixtures/blender/render.sh` twice, then `git status --porcelain fixtures \| wc -l` | 0 | stamps current (`base`, `ral3020`, `v2`: up to date), repack validated 6 packets; `0` changed files before and after each run, and `diff -r` against a copy of `fixtures/packets` taken before the runs is empty |
+| 9 | `perl -e 'alarm shift; exec @ARGV' 900 .venv/bin/python scripts/smoke_e2e.py --build-ui` | 0 | 36 steps `ok`: UI suite 796, wiring 19, build, daemon start, `/health` plugin block and `alerts_recent`, project, packet stage/post/ingest in 0.3 s/list, thumb, 15 engines incl. fake, summary, graph, quote with `router ai_by_region`, approve, DONE in 1.0 s, gate `advisory`, scrub, accept, server-derived approval, export `640x268 (crop y 46)` + sidecar, `full_frame` export `640x360`, lineage, shipped, runs list, rescore `versions [1, 2]`, `@ref` quote on nano-banana-2.1 (`reference image 1`), G2 Motion wired, recomposite, G2 autosave still 200, `edit_chain` template, `night_chain` refused `['no_base']`, `index.html`, `text/javascript` asset, JSON 404; last line `SMOKE PASS`; `.smoke/` removed |
 | 10 | `.venv/bin/pytest scripts/tests` (the `make ci` step outside `make test`) | 0 | `79 passed` |
 | 11 | `git ls-files -z fixtures \| xargs -0 du -ch \| tail -1` | 0 | `17M total` (cap 25 MB) |
+| 12 | 13:13 to 13:30 IST retry, same tree: `make lint && make test && .venv/bin/python scripts/hazard_scan.py && .venv/bin/python scripts/claims_check.py` (the plan's done-when, verbatim) | 2 | lint `All checks passed!`, `517 files already formatted`; `SELFTEST PASS`; hazard clean; pytest `1 failed, 5936 passed, 1 skipped in 802.30s`, again only `test_app.py::test_packet_to_export_on_the_project_cas` (G3); 4K gate `wall 4.59s`. Run on their own afterwards: `hazard_scan.py` exit 0 (clean, 975 files), `claims_check.py` exit 0 (`all 28 claims hold (136 tests passed)`), `npm test` `796 passed (796)` |
 
-Pytest per package (junit of run 3): daemon 2,101 (1 skipped), engines 673, fixtures 130, gates 601, pixels 315, plugins/max 926, spec 115, repo-root `tests` 954, tools/plate_label 63; no failures anywhere. The two tests that failed in the first pass (`test_people.py` feather band, `test_flow_nvml.py` GPU window) are fixed in code, not by the clock: the window test now builds its window from `now + 2 h`.
+Pytest per package (junit of row 3): daemon 2,155 (1 failed, 1 skipped), engines 673, fixtures 130, gates 601, pixels 315, plugins/max 926, spec 115, repo-root `tests` 960, tools/plate_label 63.
 
-The `make test` run overlapped the browser smoke below (an idle daemon and a headless browser); the 4K gate stayed at 3.68 s (4.19 s with the overlays), under T67's 10 s.
+Row 3 is the second `make test` of this pass. The first one overlapped row 8 and also errored `daemon/tests/test_carryover_wave9.py::test_with_nothing_accepted_nothing_is_carried_but_the_record_is_still_published` with `FileNotFoundError: .../fixtures/packets/room_a/manifest.json`: `render.sh` re-validates the packets in place while that test read them. That was this pass's doing, not a defect; the test passes alone and in run 3. Do not run `render.sh` and pytest together. Both `make test` runs overlapped the browser smoke below (two idle daemons and a headless browser); the 4K gate stayed at 4.70 s (4.95 s with the overlays), under T67's 10 s.
 
 ## 2. UI smoke
 
 ### How it was driven
 
-The orchestrator's hand-driven browser pass was done by script in a real browser: chrome-headless-shell 153 (Playwright's cached `chromium_headless_shell-1243`), driven by `playwright-core` 1.59.1 from an existing `node_modules` on this Mac over CDP, WebGL2 through SwiftShader, viewport 1600×1000. Every click, wire and key press goes through the page as an artist's would: palette buttons, handles dragged with the mouse, editor fields, viewer keys. Screenshots were checked at every step. Nothing was installed or downloaded; the driver scripts and screenshots stayed in the session scratchpad.
+The orchestrator's hand-driven browser pass was done by script in a real browser: chrome-headless-shell 153.0.8010.12 (Playwright's cached `chromium_headless_shell-1243`), driven over CDP by `playwright-core` from an existing `node_modules` on this Mac, WebGL2 through SwiftShader, viewport 1600×1000. Every click, wire and key press goes through the page as an artist's would: palette buttons, handles dragged with the mouse, editor fields, file inputs, viewer keys. Screenshots were checked at every step. Nothing was installed or downloaded; the driver scripts, the daemon homes and the screenshots stayed in the session scratchpad. The only image uploaded was a synthetic 256×256 swatch made in the scratchpad (no client imagery).
 
 ### The exact steps (as run, corrected where the plan's text no longer matches the code)
 
-Start a daemon on a throw-away home. `PLATE_LABELS` is no longer needed: verdict labels land in `<PLATE_HOME>/calib/labels.jsonl` (T110). On Windows, set each variable with `$env:NAME = 'value'`.
+Start a daemon on a throw-away home. `PLATE_LABELS` is not needed: verdict labels land in `<PLATE_HOME>/calib/labels.jsonl` (T110). On Windows, set each variable with `$env:NAME = 'value'`.
 
 ```bash
 cd /Users/aasish/Desktop/plate
@@ -78,47 +100,93 @@ For rows 9c and 18 a second daemon ran beside it with a fake that shifts every t
 |---|---|---|---|
 | 1 | Open the printed `http://127.0.0.1:4610/#token=...` as is | status bar `daemon: up v0.1.0 (stub engine)`, `token: present`, `Max dock · never polled`; the fragment is gone from the address bar and the token sits in `sessionStorage` (`plate.token`) | pass |
 | 2 | Projects tab, New project: id `smoke`, NDA unticked, grades C0 C1 C2 D, Create project | `smoke` listed and opened with its four grade chips | pass |
-| 3 | `curl -X POST http://127.0.0.1:4610/api/v0/packets -H "Authorization: Bearer $TOKEN" -H "X-Plate-Packet-Version: 0.1.1" -H "Content-Type: application/json" -d "{\"packet_path\": \"$SMOKE/packets/room_a\", \"sender\": {\"name\": \"curl\", \"version\": \"0\"}}"` | the plan's literal command (no content type) gives `422`; with it, `202 {"packet_id":"pkt_2ZHQ7DX53BCK1J9P8GJB9Z2V5G","status":"ingesting",...}`, ingested in 0.10 s; `GET /projects/smoke/packets` lists it (plate `807554a6...`, 640×360, camera `CAM_a`) | pass |
-| 4 | `+ node`: Plate, Mask, Edit, Export; drag Plate `packet` to Mask `source`, Plate `beauty` to Edit `image`, Mask `mask` to Edit `mask`, Edit `image` to Export `media` | 4 edges, no refusal; the save chip goes `unsaved` then `saved 07:24:19` (`PUT /projects/smoke/graph` 200) | pass |
+| 3 | `curl -X POST http://127.0.0.1:4610/api/v0/packets -H "Authorization: Bearer $TOKEN" -H "X-Plate-Packet-Version: 0.1.1" -H "Content-Type: application/json" -d "{\"packet_path\": \"$SMOKE/packets/room_a\", \"sender\": {\"name\": \"curl\", \"version\": \"0\"}}"` | the plan's literal command (no content type) gives `422`; with it, `202 {"packet_id":"pkt_2ZHQ7DX53BCK1J9P8GJB9Z2V5G","status":"ingesting",...}`, ingested in 0.12 s; `GET /projects/smoke/packets` lists it (plate `807554a6...`, 640×360, camera `CAM_a`) | pass |
+| 4 | `+ node`: Plate, Mask, Edit, Export; drag Plate `packet` to Mask `source`, Plate `beauty` to Edit `image`, Mask `mask` to Edit `mask`, Edit `image` to Export `media` | 4 edges, no refusal; the save chip reads `saved 12:26:02` (`PUT /projects/smoke/graph` 200) | pass |
 | 5 | Select Plate; in the Plate editor, link `room-a` (Tier A, CAM_a, 640 x 360) | node thumbnail of the plate (served by reference from the packet folder); summary `31 ids · 8 editable · 23 locked` | pass |
 | 6 | Select Mask; tab Pick id; click the shrub at the bottom left (image pixel 56, 324) | tabs `Pick id, Paint, SAM click, Text lock`; last pick `VEG_shrub_A vegetation`, `not locked`, coverage 100%, depth 1.88 m; chip added; `output: 1 id` | pass |
-| 7 | Select Edit; type a prompt; Make bar engine; Quote | `Nano Banana 2.1 · D` is listed but disabled, titled `model id unknown until the P0 smoke test` (also Seedream 5 Pro); see C4. Quoted `Nano Banana Pro · D` instead: chips `max 4096×4096 \| refs ≤ 13 \| per image`, quote `gemini · nano-banana-pro · 0.24 USD · D · ETA ~60 s unconfirmed expires in 15:00`. Not made (cloud route) | pass (C4) |
-| 8 | Engine `Fake (echo) · C0`, N 2, Quote, Make | `fake · fake · 0.080 USD (2 × 0.040 USD) · C0 · ETA ~60 s`; Make is the human approval (the dialog opens only on a refusal); `POST .../fanout` and `.../approve` 200; two candidates `DONE`, score 1.00 each; both runs `approved_by: human` | pass |
+| 7 | Select Edit; type a prompt; Make bar engine; Quote | Nano Banana 2.1 and Seedream 5 Pro are listed but disabled, titled `model id unknown until the P0 smoke test` (C4). Quoted `Nano Banana Pro · D` instead: chips `max 4096×4096 \| refs ≤ 13 \| per image`, quote `gemini · nano-banana-pro · 0.24 USD · D · ETA ~60 s unconfirmed expires in 15:00`. Not made (cloud route). No `@ref` hint (no Reference wired) | pass (C4) |
+| 8 | Engine `Fake (echo) · C0`, N 2, Quote, Make | `fake · fake · 0.080 USD (2 × 0.040 USD) · C0 · ETA ~60 s`; Make is the human approval (no dialog: the daemon did not refuse); two candidates `DONE`, score 1.00 each; both runs `approved_by: human` | pass |
 | 9a | Click candidate 1's thumbnail: the viewer shows `A plate · B candidate 1`; wipe, then `` ` `` toggle (candidate 1, then plate), then `d` difference ×4 | each mode drew, no viewer error | pass |
-| 9b | `e` edges, `h` ΔE00 heatmap | both modes draw with no notice: red plate G-buffer edges, cyan candidate edges, white where both agree; the ΔE00 map with its 0 to 10 legend. `GET /runs/{id}/gate` carries `overlays` (`edges_plate` and `edges_candidate` png8 640×360, `de00_map` r16f 640×360). On the echo take the map is near 0 everywhere; on the 12 px shifted take the map lights the shrub only and the cyan edges sit 12 px off the red ones there | pass (G1 closed by T109) |
-| 9c | `t` tiles | on this passing take: `no gate-flagged points for tiles` (the report flags none). On the shifted daemon the take is `GATE_FAIL` on `registration.shift_px 12 > 8` (nothing else fails: the composite is still mask-locked); Gate panel `Open tiles (2)` puts the viewer in Tiles mode with plate/candidate pairs at 100% | pass |
+| 9b | `e` edges, `h` ΔE00 heatmap | both draw with no notice: red plate G-buffer edges, cyan candidate edges, white where both agree; the ΔE00 map with its 0 to 10 legend, near 0 on the echo take. On the 12 px shifted take the cyan edges sit off the red ones on the shrub | pass |
+| 9c | `t` tiles | on this passing take: `no gate-flagged points for tiles`. On the shifted daemon the take is `GATE_FAIL` on `registration.shift_px 12 > 8` (nothing else fails: the composite is still mask-locked); Gate panel `Open tiles (2)` puts the viewer in Tiles mode with plate/candidate pairs at 100% | pass |
 | 10 | Gate tab | verdict `advisory`, version `v1`, 14 checks with value, threshold and status: advisory on `feather_band.de00_p99 0.2095` (decision 35), `texture.lapvar 707.3`, `tone.luma 121.8`; pass on registration (0.0083 px, shift 0.0006 px), `outside_mask.de00 0`, `gbuffer_edge_recall_r2 1`, `invention_flags 0`, material ΔE00 0/0, `texture.fine_ratio 0.5714`, tone contrast and saturation, image edge agreement 0.9999. See C6 | pass |
 | 11 | Verdict `1` with focus outside the viewer, before any scrub | `a full scrub must be logged before a verdict`; Full scrub and Accept take disabled | pass |
-| 12 | Focus the viewer, `1` (100%), shift+arrows | `4/4 quadrants at 100%`; tick Full scrub: `POST /runs/{id}/scrub` 200, `Full scrub (logged)` | pass |
-| 13 | `1` again, then Accept take | `Ship recorded`, Accept offered, then `Accepted`; the Edit node shows `gate pass` and `✓ approved`; the stored graph has `edit-1` `gateStatus: pass`, `approved: true`, `approvedBy: human`, `scrubLogId: scrub-f5998821e2a8`, all server-derived. The verdict went to `<PLATE_HOME>/calib/labels.jsonl` (1 line); the repo has no `calib/labels.jsonl` | pass |
-| 13b | Focus the candidate strip, press `1` | candidate 1 becomes the node's output: the Edit card shows the take, the stored graph has `outputHash 9694c658...` | pass |
-| 14 | Select Export; candidate `run_01M5... · attempt 1 · fake · DONE`; format png16; out dir `$SMOKE/out`; Export | `run_01M56BJ8CH1NKP4TMGDNBGJDVF.png` (640×360, 3 channels, uint16, 2,528-byte ICC profile) and `.gate.json`; `lineage.read` names project `smoke`, node `edit-1`, the run, packet, engine `fake` and `gates/<run>.1.json`; `GET /runs/{id}/gate` now `shipped: true` | pass |
-| 15 | Add Review, wire from Edit, tick one take, Build bundle | `projects/smoke/review/review-3f82e349b585df13.zip`; its `index.html` opened from `file://` shows 1 take, the ADVISORY badge, wipe and toggle, 2 images, no page errors | pass |
+| 12 | Focus the viewer, `1` (100%), shift+arrows | `4/4 quadrants at 100%`; tick Full scrub: `Full scrub (logged)` | pass |
+| 13 | `1` again, then Accept take | `Ship recorded`, Accept offered, then `Accepted`; the Edit node shows `gate pass` and `✓ approved`; the stored graph has `edit-1` `gateStatus: pass`, `approved: true`, `approvedBy: human`, `scrubLogId: scrub-291e65a1d7f1`, all server-derived. The verdict went to `<PLATE_HOME>/calib/labels.jsonl` (1 line); the repo's `calib/` holds only `README.md` and `reason_codes.yaml` | pass |
+| 13b | Focus the candidate strip, press `1` | candidate 1 becomes the node's output: the Edit card shows the take and `picked`, the stored graph has `outputHash 2392c48c...` | pass |
+| 14 | Select Export; the accepted take; format png16; out dir `$SMOKE/out`; Export | `run_01M56WR3GT6N6YNQY5KQ9DRQME.png`, **640×268** (the packet's 2.39:1 safe frame, T114; C10), 3 channels, uint16, 2,528-byte ICC profile, and `.gate.json` whose `export.crop` is `{x: 0, y: 46, width: 640, height: 268}`; `lineage.read` names project `smoke`, node `edit-1`, the run, packet, engine `fake` and `gates/<run>.1.json`; `GET /runs/{id}/gate` now `shipped: true` | pass |
+| 15 | Add Review, wire from Edit, tick one take, Build bundle | Build bundle stays disabled (`pick at least one take`) until a take is ticked; then `projects/smoke/review/review-daa01e902883ec16.zip`; its `index.html` opened from `file://` shows 1 take, the ADVISORY badge, wipe and toggle, 2 images, no page errors | pass |
 | 16 | Add Concept, wire Plate `beauty` to it, then Concept to a new Export | refused on the node: `CONCEPT_TO_DELIVERY concept tier cannot reach Export`; no edge added | pass |
-| 17 | Add a second Edit (not approved) from Plate, then wire it to a new Motion | refused: `VIDEO_LOCKED motion is locked until the upstream still passes gates and is approved`. Control: Plate `packet` to Motion `packet` and the approved `edit-1` to Motion are accepted; the Motion editor shows start `Edit (edit-1) approved` | pass |
+| 17 | Add a second Edit (not approved) from Plate, then wire it to a new Motion | refused: `VIDEO_LOCKED motion is locked until the upstream still passes gates and is approved`. Control: Plate `packet` to Motion `packet` and the approved `edit-1` to Motion `start` are accepted (edges 7 to 9, saved); the Motion editor shows start `Edit (edit-1) approved` | pass |
 | 18 | On the shifted daemon: Export the `GATE_FAIL` take | the reason field appears and Export stays disabled until a reason is typed; nothing written | pass |
-| 19 | Allowlist and auth probes (curl against the smoke daemon) | Origin `http://127.0.0.1:4610` and `http://localhost:4610` 200; `http://localhost:5173`, `http://127.0.0.1:5173` (no `PLATE_DEV`) and a foreign origin 403; foreign Host 403; no token and a wrong token 401; `POST /api/v0/nope` a JSON 404; `/health` carries `plugin {last_poll_utc, queued}` and `alerts_recent` (T107) | pass |
+| 19 | Allowlist and auth probes (curl against the smoke daemon) | Origin `http://127.0.0.1:4610` and `http://localhost:4610` 200; `http://localhost:5173`, `http://127.0.0.1:5173` (no `PLATE_DEV`) and a foreign origin 403; foreign Host 403; no token and a wrong token 401; `POST /api/v0/nope` a JSON 404; `/health` carries `plugin {last_poll_utc, queued}` and `alerts_recent` | pass |
 
-Wave 9 in the same browser session, beyond the plan's steps:
+Wave 9 and Wave 10 in the same browser session, beyond the plan's steps:
 
 | # | step | observed | result |
 |---|---|---|---|
-| W1 | Viewer on candidate 1; Re-mask (free) with feather 8 | `Re-masked as run_01M56C3TDBYK9S6MV99FZC5G0N · DONE · 0.00 USD`; the run joins the strip | pass |
-| W2 | Make bar `Compare engines…`; tick Fake and Nano Banana Pro (Nano Banana 2.1 and Seedream 5 Pro cannot be ticked); Quote | `2 picked (2 to 5)`; the quote is refused: `the graph is not saved: motion is locked until the upstream still passes gates and is approved` | **fail (G2)** |
-| W3 | Spend, Settings, Enlarge | Spend: `quoted 0.080 USD`, `billed 0.00 USD`, 3 generations, 1 accepted, by week and engine; Settings: read-only config; Enlarge: the viewer fills the canvas (1279×652) | pass |
-| W4 | History tab | `No runs yet.` until Refresh is pressed; then the four runs (re-mask 0.00 USD, two fake 0.04 USD with the B and Ship marks, the quoted Nano Banana Pro run). The panel does not follow run events | minor |
+| W1 | Viewer on candidate 1; Re-mask (free) with feather 8 | `Re-masked as run_01M56X2H04XSZ598H20B0TAH9M · DONE · 0.00 USD`; the strip now holds 3 takes, the accepted one still picked | pass |
+| W2 | G2 repro: with the approved `edit-1` wired into Motion and the re-mask take beside it, Make bar `Compare engines…`; tick Fake and Nano Banana Pro (Nano Banana 2.1 and Seedream 5 Pro cannot be ticked); Quote | `2 picked (2 to 5)`; quote `fake 0.040 USD · nano-banana-pro 0.24 USD unconfirmed · 0.28 USD (2 engines) · D · ETA ~60 s`; the save chip keeps saving; the daemon log shows 28 `PUT /projects/smoke/graph` 200 and no 422; `edit-1` still `approved: true` on its picked take | **pass (G2 closed)** |
+| W3 | G2, second half: pick the re-mask take (strip key `2`), then the accepted one again (`1`) | picking the unaccepted take drops `✓ approved`, draws the Edit-to-Motion edge red and dashed and the Motion card says it is locked; the save still answers 200, with `violations: [{edge edit-1 → motion-1, code VIDEO_LOCKED}]` and the stored edge `locked: true` (T111). Picking the accepted take back restores `approved: true` and clears the lock | pass |
+| W4 | Spend, Settings, Enlarge | Spend: `quoted 0.080 USD`, `billed 0.00 USD`, 3 generations, 1 accepted, by week and engine; Settings: read-only config; Enlarge: the viewer fills the canvas (1279×652) | pass |
+| W5 | History tab | lists only the runs it had when it last loaded; Refresh shows the new ones. The panel does not follow run events | minor (unchanged) |
+| W6 | T112: a clean project `panels`; add Comp, Colour, Atmosphere, Sky, Frame, Recolour, LightMix and open each editor | every one has a panel: Comp (layer order and reset, require accepted takes, preview coverage), Colour (scope auto/mask/ids/frame, exposure EV, tint, contrast, saturation, hue, white balance toggle, reset, preview), Atmosphere (visibility slider and metres field, fog colour from the sky, sky fog, height falloff, preview), Sky (picture hash or wired Reference, scale, horizon, slide, tone match, preview), Frame (title, width, height, shot/set/sequence sizes), Recolour (target with the RAL grid, project swatches, method auto/recomposition/ratio/degraded, source Lab, a pass of up to 8 materials with add/estimate/clear), LightMix (gains with reset, presets dusk, moonlight, luxury exterior, artificial light, max gain, keep base, NNLS seed). The graph saves 200 throughout | pass |
+| W7 | T113: add a Reference, upload the synthetic swatch, wire it into `edit-1`'s `references`; prompt with `@ref1`, Quote on Nano Banana Pro; then `@ref2` | upload `POST /assets?kind=reference&project_id=smoke` 201 (`reference 97034c346f`, 256 x 256); the Edit editor shows `@ref1 names the wired reference (@ref1 = Reference); the engine's own wording replaces each at the quote`; the quote's runs carry `prompt: "smoke: match the shrub foliage to reference image 1, same light"`, the artist's text in `prompt_raw` and `reference_images`; `@ref2` gives `422 bad_ref_token: the prompt names @ref2, but 1 Reference image is wired to this Edit; wire the Reference node or fix the number` in the Make bar and no run row | pass |
+| W8 | T114: the UI export is the safe frame (row 14); then `full_frame: true` by curl on both still routes | `POST /projects/smoke/export {run_ids, out_dir, format: png16, full_frame: true}` writes `edit-1_KQ9DRQME.png` at 640×360 with `full_frame: true` and the placed `safe_frame` in its entry. `POST /runs/{id}/export {..., full_frame: true}` answers `422 {"errors":["full_frame: Extra inputs are not permitted"]}` | **fail (G3)** |
 
-### G1 is closed
+### G2 is closed
 
-T109 stores the G-buffer edge masks and the ΔE00 map in the project CAS at gate time, lists them under the gate report's `overlays`, and `CompareViewer` hands them to the viewer. Row 9b shows both modes drawing on a real daemon, on a passing and on a failing take.
+T111 lets the run behind the node's picked `outputHash` decide approval. Rows W1 to W3 show both halves on a real daemon: a newer, unaccepted take no longer unapproves the node or blocks saves and quotes, and picking that take marks the Motion edge locked inside a 200 save instead of refusing the graph. `scripts/smoke_e2e.py` now walks the same path (`g2.motion_wired`, `recomposite`, `g2.autosave`).
 
-### Gap G2: a new take on an approved node blocks every graph save while a Motion node hangs off it
+### Gap G3: the single-run export has no `full_frame`, and `make test` fails on it
 
-Repro: rows 1 to 13 and 17's control (the approved `edit-1` wired into a Motion), then any new take on `edit-1`; here the free Re-mask of W1. From then on every autosave `PUT /projects/smoke/graph` answers `422 VIDEO_LOCKED`; the status bar reads `save failed: motion is locked until the upstream still passes gates and is approved`, the canvas marks the `edit-1` to Motion edge locked, and every quote in the project fails first with `the graph is not saved: ...`. The node's picked output (`outputHash`) is still the accepted take.
+Repro: `.venv/bin/pytest daemon/tests/test_app.py::test_packet_to_export_on_the_project_cas` (fails alone and in the suite). The test ingests the `tierA_still_clubhouse` example (3840×2160, `camera.safe_frame {x 0, y 277, w 3840, h 1606}`), runs the seed fake (a 64×64 take) and exports through `POST /runs/{id}/export`. Since T114 the export places the safe frame by default, cannot place it on a take of another aspect, and refuses: `409 not_exportable: the take is 64 x 64 and the packet renders 3840 x 2160 with the safe frame {...}; ... Export it with full_frame to keep the whole take`. That route's `ExportBody` (`daemon/plate_daemon/routes/runs.py`, `extra="forbid"`) has no `full_frame`, so the advice it gives is refused with 422 (row W8).
 
-Cause: `daemon/plate_daemon/routes/projects.py::_node_status` lets the node's latest live run (or its sibling group) decide approval. The re-mask run is newer and not accepted, so `edit-1` derives `approved: false`, and `canvas_rules.validate_graph` refuses the whole graph. That is decision 31 as written ("latest run of that node"), but its consequence was not planned: the artist can save nothing, on any node, until the new take is accepted or the Motion edge is deleted, and the message does not say which node. The same path follows a plain second Make on an approved Edit. The scripted smoke never makes a take after an accept, so it cannot see this.
+Cause: T114's spec covers "still export" with `full_frame: true` in the request, but its `files:` list had `export.py`, `routes/export_batch.py`, `routes/delivery.py` and `delivery/frames.py`, not `routes/runs.py`, where the single still export route lives, nor `daemon/tests/test_app.py`. `export.export(..., full_frame=...)` exists; nothing passes it from that route. The refusal itself is right (a safe frame must not be guessed onto a take of another aspect); the gaps are the route and the stale test. The UI Export editor and `plate export` also have no way to ask for the whole frame (the batch export and delivery routes do).
 
-Fix (needs a task; `routes/projects.py` was T59's): let the run whose output is the node's `outputHash` decide when it is one of the node's runs, else the latest; or keep the save and mark the locked edge instead of refusing the graph. Add a second-take-after-accept step to `scripts/smoke_e2e.py` either way.
+Fix (needs a task; files `daemon/plate_daemon/routes/runs.py`, `daemon/tests/test_app.py`, optionally `ui/src/editors/ExportEditor.tsx`, `daemon/plate_daemon/cli.py` and the stale comment at `scripts/smoke_e2e.py:671`): add `full_frame: bool = False` to `ExportBody` and pass it to `export.export`; put the framing (`crop` or `full_frame`) into the route's ledger record and response the way `routes/export_batch.py` does; change `test_app.py` to assert the 409 on the mismatched take and then export with `full_frame: true` (the same shape T114 gave `test_routes_runs_wave8.py:452`); optionally a "whole frame" checkbox in the Export editor and `--full-frame` on `plate export`. Then `make test` should be green again; rerun T53's done-when.
+
+The patch the 13:10 retry wrote (reverted, not applied):
+
+```diff
+--- daemon/plate_daemon/routes/runs.py  (ExportBody)
+     override: bool = False
+     reason: str | None = None
++    full_frame: bool = False
+--- daemon/plate_daemon/routes/runs.py  (export_route)
+-            done = export(
+-                run, fmt, out_dir, typed, conn=conn, cas=c.cas_for(pid), project_dir=project_dir, name=name
+-            )
++            done = export(
++                run,
++                fmt,
++                out_dir,
++                typed,
++                conn=conn,
++                cas=c.cas_for(pid),
++                project_dir=project_dir,
++                name=name,
++                full_frame=body.full_frame,
++            )
+                 "by": "human",
++                **done.framing.record(),
+             },
+         ...
+             "shipped": shipped,
++            **done.framing.record(),
+         }
+--- daemon/tests/test_app.py  (test_packet_to_export_on_the_project_cas)
+         dest = tmp_path / "out" / "result.png"
+         r = c.post(f"/api/v0/runs/{run_id}/export", json={"dest": str(dest)}, headers=auth)
+-        assert r.status_code == 200 and dest.is_file()
++        assert r.status_code == 409 and r.json()["error"] == "not_exportable", r.text
++        assert "full_frame" in r.json()["detail"] and not dest.exists()
++        r = c.post(f"/api/v0/runs/{run_id}/export", json={"dest": str(dest), "full_frame": True}, headers=auth)
++        assert r.status_code == 200 and dest.is_file(), r.text
++        assert r.json()["full_frame"] is True and "crop" not in r.json()
+```
+
+Also update the route's module docstring (the `POST /runs/{id}/export` line) to list `full_frame?`. A suggested done-when: `.venv/bin/pytest daemon/tests/test_app.py daemon/tests/test_routes_runs_wave8.py daemon/tests/test_export_safe_frame.py daemon/tests/test_pipeline_e2e.py -q` passes, then T53's chain.
 
 ### Corrections to the plan's smoke text (T53 spec)
 
@@ -127,12 +195,13 @@ Fix (needs a task; `routes/projects.py` was T59's): let the run whose output is 
 | C1 | `curl ... -d '{...}'` with no content type | `422 {"errors":["<body>: Input should be a valid dictionary ..."]}` | `-H "Content-Type: application/json"` |
 | C2 | token in `/tmp/plate-smoke/token` | no token file; the token is in `<home>/config.json` (`PLATE_TOKEN_FILE` only when set) | `scripts/plate_config.py token` |
 | C3 | register `fixtures/packets/room_a` for project `smoke` | the manifest names `plate-fixture`; posted by path, the packet is filed under an auto-created `plate-fixture` project and `smoke` lists nothing | stage a copy with `project_id: smoke` before the first post (what `scripts/smoke_e2e.py` does) |
-| C4 | Edit with engine `nano-banana-2.1`, Quote, Make | Nano Banana 2.1 is disabled in the Make bar until its manifest has a vendor model id (T102, decision 51: `model id unknown until the P0 smoke test`); the first pass could still quote it | quote Nano Banana Pro for the D quote line, Make on `fake`; box-day item 16 fills the model id |
+| C4 | Edit with engine `nano-banana-2.1`, Quote, Make | Nano Banana 2.1 is disabled in the Make bar until its manifest has a vendor model id (T102, decision 51: `model id unknown until the P0 smoke test`) | quote Nano Banana Pro for the D quote line, Make on `fake`; box-day item 20 fills the model id |
 | C5 | `localhost` is allowed only under `PLATE_DEV=1` | `http://localhost:4610` is always allowed; `PLATE_DEV=1` adds only the two `:5173` origins (as `docs/ui.md` says) | the printed `127.0.0.1` URL |
 | C6 | the Gate panel shows a pass report | `advisory`: decision 35 makes `feather_band.de00_p99` advisory on every in-mask edit until calibration | advisory accepted as the expected verdict |
-| C7 | (first pass) the verdict wrote into the repo's `calib/labels.jsonl` | resolved by T110: labels live in `<PLATE_HOME>/calib/labels.jsonl`; the repo file is gone | nothing extra |
+| C7 | (first pass) the verdict wrote into the repo's `calib/labels.jsonl` | resolved by T110: labels live in `<PLATE_HOME>/calib/labels.jsonl` | nothing extra |
 | C8 | `PLATE_HOME=/tmp/plate-smoke` | any throw-away folder works | `$HOME/plate-smoke-home` |
-| C9 | candidates appear, then viewer and accept | clicking a candidate compares it; its digit key in the strip picks it as the node's output (what an Edit to Edit chain needs, decision 47); Export picks from its own list either way | row 13b |
+| C9 | candidates appear, then viewer and accept | clicking a candidate compares it; its digit key in the strip picks it as the node's output (what an Edit to Edit chain and a Motion start need, decision 47); Export picks from its own list either way | row 13b |
+| C10 | Export (png16) writes a file with lineage | it writes the packet's safe frame by default (T114): `room_a`'s 2.39:1 band, 640×268 of the 640×360 render; the whole render needs `full_frame: true` (batch export and delivery today; see G3) | row 14 |
 
 ## 3. Tests skipped on this Mac
 
@@ -157,14 +226,14 @@ Status words: **done** (built and tested here), **partial (task)** (some of it i
 | 4 | Ingress: ECC registration, Lanczos, ring tone match, feather inside the mask | done | T4, T25; AI layers smaller than the region may go through Real-ESRGAN instead of Lanczos, plates never (T100, decision 55); outside-mask ΔE00 0 in every gate report above |
 | 5 | Default element set, overhead caps | deferred-to-box (T19) | elements forced by the plugin (T9, fake-tested); the overhead number is a box measurement |
 | 6 | Packets render in the interactive Max session; Vantage by vrscene | deferred-to-box (T9, T37) | Chaos questions (CLI licence, background renders) are Aasish's emails |
-| 7 | Backend shape: one daemon, WAL index in app data, CAS, separate GPU worker, UI served by the daemon | done | proven live in this pass (daemon, index under `PLATE_HOME`, built UI at `/`, in-process pixels backends); the Tailscale bind is off by default |
+| 7 | Backend shape: one daemon, WAL index in app data, CAS, separate GPU worker, UI served by the daemon | done | proven live in this pass (two daemons, index under `PLATE_HOME`, built UI at `/`, in-process pixels backends); the Tailscale bind is off by default |
 | 8 | LLM route: Anthropic API, Sonnet composer, Opus two-sample judge | done | T33 on recorded fixtures only; Anthropic is effective grade D until terms are filed, so NDA projects get no composer and no judge (claim `judge_cannot_overrule_numbers`) |
 | 9 | Custody grades C0 to D, NDA on C0/C1 | done | T14; claims `nda_c0_c1_only`, `pending_terms_count_as_d`, `nda_egress` |
 | 10 | Retroactive contract review | n/a (Aasish, counsel) | the code side is done: consent template (`docs/consent-template.md`) and custody per project |
 | 11 | GPU and RAM admission by NVML, explicit unload, RAFT ≤ 960 px | deferred-to-box (T22) | admission, windows and slots built and tested (T22) |
 | 12 | Host scope: 3ds Max 2026 only | done | schema `host.app: 3dsmax \| none`; no other sender |
-| 13 | Engine roster, pins, retirement alerts, same-model fallback only | done; deferred-to-box (live smoke) | 14 manifests plus the fake (Veo 3.1 added as a start/end engine, T94), adapters on recorded fixtures (T17, T18), pins and alerts (T27), price tiers (T84), route health (T85); prices `unconfirmed`, 9 manifests flagged `unverified_p0`; Nano Banana 2.1 and Seedream 5 Pro cannot be picked in the UI until their model ids are known (C4) |
-| 14 | One gate value per metric, resolution stated | done | values as corrected by plan decision 3 and decision 35, with `calibration_needed` where the plan says so; 4K gate 3.68 s on CPU, 4.19 s with the viewer overlays (T67, T109) |
+| 13 | Engine roster, pins, retirement alerts, same-model fallback only | done; deferred-to-box (live smoke) | 14 manifests plus the fake (Veo 3.1 as a start/end engine, T94), adapters on recorded fixtures (T17, T18), pins and alerts (T27), price tiers (T84), route health (T85), `reference_token` wording per engine (T113); prices `unconfirmed`, 9 manifests flagged `unverified_p0`; Nano Banana 2.1 and Seedream 5 Pro cannot be picked in the UI until their model ids are known (C4) |
+| 14 | One gate value per metric, resolution stated | done | values as corrected by plan decision 3 and decision 35, with `calibration_needed` where the plan says so; 4K gate 4.70 s on CPU, 4.95 s with the viewer overlays, on a loaded machine (T67, T109) |
 | 15 | Render-it router: advisory in P1, blocking in P3 | done (advisory) | T28; `PLATE_ROUTER_MODE=blocking` exists; turning it on is a P3 decision after calibration. Every quote above carried the router verdict (`ai_by_region`) |
 | 16 | Re-photograph close and medium frames only | done | router doctrine by shot class; cutdowns are downsample-only crops, never generated close-ups (T86) |
 | 17 | Client revisions: packet invalidation, approved layers carry over | done | T41; automatic carry-over on supersede (T96, T107, default on) |
@@ -179,7 +248,7 @@ Status words: **done** (built and tested here), **partial (task)** (some of it i
 | 26 | Lineage inside every output plus a phash index | done | T26 (EXR attribute, PNG iTXt, TIFF XMP, MP4/MOV udta), IPTC `digitalSourceType` on AI-touched outputs (T86); PNG lineage read back in this pass |
 | 27 | Gate report versioning; re-scoring never rewrites a shipped report | done | `rescore` gave versions `[1, 2]` in the scripted smoke; claim `shipped_report_never_rewritten` |
 | 28 | Human-minute timer in the app and a CLI | done | T36, T38, T78 (`plate timer`); the P0 baseline is Aasish's |
-| 29 | One consolidated budget | n/a (Aasish) | `plate spend` and the Spend tab (T88, T102; row W3) report it |
+| 29 | One consolidated budget | n/a (Aasish) | `plate spend` and the Spend tab (T88, T102; row W4) report it |
 | 30 | Windows first-class from day 1 | partial (T11 and T80 on the box) | hazard scan, portability and PowerShell static tests are green on the Mac. The suite has never run on Windows, and CI has never run because there is no git remote (open question 13) |
 
 ## 5. Verifier pass: section 4 and 5 deliverables, P0 to P4
@@ -193,7 +262,8 @@ Status words: **done** (built and tested here), **partial (task)** (some of it i
 | Daemon state machine QUOTED-first, idempotency, boot re-poll, best-of-N under one quote, priority classes, budgets | done | fan-out of 2 under one quote, one approval for the group, in this pass |
 | Routing: manifests as data, custody first, nightly prices, daily reconciliation, contract tests, engine cards, canaries | done; deferred-to-box (live) | the daemon assumes routes healthy until canaries run (decision 44) and says so in the quote; route degradation after 3 failures (T85) |
 | Pixels service with the licence registry | done (stub); deferred-to-box (T22) | real DA-V2 Small, GeoCalib, SAM 2.1, RAFT, PaddleOCR need the CUDA extra |
-| Canvas: node kinds, viewer, enforced rules, project folder, rebuildable index | done; one open defect (G2) | everything drove in a real browser, edges and heatmap included; G2 blocks saving after a second take on an approved node with a Motion downstream |
+| Canvas: node kinds, viewer, enforced rules, project folder, rebuildable index | done | everything drove in a real browser; G2 closed (T111); every numeric node has a parameter panel (T112) |
+| Export and delivery framing | partial (G3) | the safe frame is the default for still export, batch export and frame/clip delivery (T114, row 14); `full_frame` works on batch export and delivery but not on the single-run export route the UI uses |
 
 ### P0 deliverables and exits
 
@@ -203,7 +273,7 @@ Status words: **done** (built and tested here), **partial (task)** (some of it i
 | on-box spike report | deferred-to-box (T9; `docs/onbox-spikes.md` rows all "not run") |
 | conformance scene with the reprojection check | done for the Blender fixture (`fixtures/tests/test_packets_valid.py::test_marker_reprojection_rms_under_half_a_pixel_at_640_wide`, 8 markers); the Max scene is box work (open question 8). The plan's exit says 3840 wide; the fixture measures at 640 |
 | provider matrix for ten engines | partial: manifests and `docs/custody.md` done; billed price to the cent needs `plate smoke --live` (≤ USD 5) |
-| labelling UI and the first 100 labels | UI done (T23); labels are Aasish's (none yet). Labels now live in the data folder (T110), and the repo's audit/smoke lines are gone |
+| labelling UI and the first 100 labels | UI done (T23); labels are Aasish's (none yet); they live in the data folder (T110) |
 | baseline of two live jobs; day-1 emails | n/a (Aasish) |
 | client-consent template | done |
 | exits: real camera packet reprojects ≤ 1 px; markers ≤ 0.5 px RMS at 3840; TIFF16 vs OCIO; element overhead; billed price; Windows suite and CI green | deferred-to-box (T9, T11, T19); identity round trip at ΔE00 p99 ≤ 0.5 is done (T4) |
@@ -215,16 +285,16 @@ Status words: **done** (built and tested here), **partial (task)** (some of it i
 | gates package (register, comp_masked, labmatch, gbuffer edges, invention, depth agreement, maskdiff, texture, tone, crop pair, video) with goldens | done (601 gate tests, procedural and Blender goldens) |
 | adapters for Nano Banana 2.1 and Pro, GPT Image 2.5, Seedream 5 Pro, Kling O3 4K and v3 Pro, Seedance 2.5 i2v and r2v, direct Gemini and OpenAI | done on fixtures; deferred-to-box (live smoke); Nano Banana 2.1 via Gemini, Magnific and Seedance r2v via BytePlus/WaveSpeed have no recorded call yet |
 | ledger and daily reconciliation | done (T13) |
-| `plate run / gate / export` with three Lensbook recipes | done; the Lensbook stills a01 to a10 now ship as runnable recipes and 12 motion recipes from the shot library (T83, T94) |
+| `plate run / gate / export` with three Lensbook recipes | done; the Lensbook stills a01 to a10 ship as runnable recipes and 12 motion recipes from the shot library (T83, T94); `plate export` has no `--full-frame` yet (G3) |
 | advisory render-it router; calibration report | done (the report needs labels) |
 | exits: AUC ≥ 0.85 on ≥ 100 takes; two live client jobs; ledger equals billing within 1% | deferred (labels and live jobs) |
-| exit: gate run on a 4K still ≤ 10 s | done on CPU: `run_gates 3840x2160: wall 3.68s` |
+| exit: gate run on a 4K still ≤ 10 s | done on CPU: `run_gates 3840x2160: wall 4.70s` |
 
 ### P2 deliverables and exits
 
 | item | status |
 |---|---|
-| canvas, Make bar (provider, model, price, custody, ETA), N fan-out, enforced rules | done (this pass); cross-engine compare quote built (T95, T102) but blocked in this session by G2 |
+| canvas, Make bar (provider, model, price, custody, ETA), N fan-out, enforced rules | done (this pass), including the cross-engine compare quote (T95, T102; row W2) |
 | WebGL viewer | done: wipe, toggle, difference, edges, ΔE00 heatmap, tiles, Enlarge, all live |
 | lineage restore by drop; open project format | done (T26, T36; drop was not exercised in the browser here) |
 | Max dock (Send Packet, Batch Cameras, Receive), startup installer, fake-pymxs and import-contract tests | deferred-to-box (T19, T20) |
@@ -241,7 +311,7 @@ Status words: **done** (built and tested here), **partial (task)** (some of it i
 | Seedance 2.5 r2v previs with PREVIS watermark | done (T44, fixtures; watermark by the overlay backend on this Mac) |
 | video gates with drift and the frame-rate time map | done (T29; DIS here, RAFT on the box: T29 line) |
 | People node over STAFFAGE with packet-Z occlusion; people in motion | done against the fake STAFFAGE (T45, T105) |
-| FCPXML, ProRes 4444, EXR delivery | done (T46, route T74, UI T106) |
+| FCPXML, ProRes 4444, EXR delivery | done (T46, route T74, UI T106; safe-frame crop by default, `full_frame` on the deliver route, T114) |
 | local Wan 2.2 VACE previs | deferred-to-box (stub; T22) |
 | exits: a shipped 30 to 60 s film section; gates agree with ≥ 80% of ≥ 30 rejections; ≤ 2.5 generations per clip; zero accepts without a scrub | deferred (live work); the scrub rule is enforced (this pass, row 11) |
 
@@ -251,8 +321,8 @@ Status words: **done** (built and tested here), **partial (task)** (some of it i
 |---|---|
 | Set node with per-material targets and the cross-view gate | done (T30, T48) |
 | Light node over MaxGaffer with Vantage live-link preview | deferred-to-box (T37, T77) |
-| LightMix NNLS | done (T32; presets and per-channel gains T89) |
-| Recolour by recomposition, validated once against a V-Ray re-render | code done (T31, T48, several materials in one pass T90); validation deferred-to-box (T31) |
+| LightMix NNLS | done (T32; presets and per-channel gains T89; every preset and gain has a control, T112, row W6) |
+| Recolour by recomposition, validated once against a V-Ray re-render | code done (T31, T48, several materials in one pass T90, editor T91/T112); validation deferred-to-box (T31) |
 | Scout node; shared Max bridge | deferred-to-box (T37, T49) |
 | client-revision carry-over; backup and purge | done (T41, T42, T96) |
 | runbooks and the manual-pipeline fallback | done (T51, T80, T108: twelve runbooks) |
@@ -262,23 +332,35 @@ Status words: **done** (built and tested here), **partial (task)** (some of it i
 
 | # | decision | status | evidence |
 |---|---|---|---|
-| 46 | References are a node, never pixels of the output | done | T81, T82, T92: `test_canvas_rules_wave9`, `test_mask_tools_wave9`, `test_pipeline_wave9`; the Edit node's `references` port is on the canvas above |
-| 47 | An Edit downstream of a take starts from that take (`inputs.base`), 422 `no_base` | done | T92 (`test_pipeline_wave9`); the base is the upstream node's picked `outputHash` (C9) |
-| 48 | Comp, Colour, Atmosphere, Sky are numeric nodes | done | T93 (`test_numeric_nodes_wave9`, 30 tests) |
+| 46 | References are a node, never pixels of the output | done | T81, T82, T92, T113: `test_canvas_rules_wave9`, `test_mask_tools_wave9`, `test_pipeline_wave9`, `test_prompt_refs`; row W7 |
+| 47 | An Edit downstream of a take starts from that take (`inputs.base`), 422 `no_base` | done | T92 (`test_pipeline_wave9`); the base is the upstream node's picked `outputHash` (C9); `night_chain` reports `no_base` in the scripted smoke |
+| 48 | Comp, Colour, Atmosphere, Sky are numeric nodes | done | T93 (`test_numeric_nodes_wave9`); their editors T112 (row W6) |
 | 49 | Motion end still and elements; locked and pull-back crop pairs | done | T94 (`test_motion_wave9`); end-still camera check and VIDEO_LOCKED on either still |
-| 50 | Recipes from shipped, studio and project folders; saved from the UI | done | T83, T97 (`test_recipes_wave9`); the Edit editor shows the recipe select, Start from this, Expand, Save as recipe |
-| 51 | Engine guidance measured: cards, capability chips, route health, quote_many | done; G2 blocks the compare quote in the session above | T83, T85, T95, T102; chips seen in row 7 |
+| 50 | Recipes from shipped, studio and project folders; saved from the UI | done | T83, T97 (`test_recipes_wave9`) |
+| 51 | Engine guidance measured: cards, capability chips, route health, quote_many | done | T83, T85, T95, T102; chips in row 7, compare quote in row W2 |
 | 52 | Prices tiered by the params that change the bill | done | T84 (`test_price_tiers`, `test_quotes_tiers`); Nano Banana 2K/4K `estimated` |
-| 53 | Batch is a template, not a canvas-wide Make; Send + quote | done; deferred-to-box (T104) | T95 (`test_templates_wave9`), T104 fake-tested |
+| 53 | Batch is a template, not a canvas-wide Make; Send + quote | done; deferred-to-box (T104) | T95 (`test_templates_wave9`; `edit_chain` in the scripted smoke), T104 fake-tested |
 | 54 | Recomposite is a free attempt | done | T99 (`test_recomposite_wave9`); row W1: 0.00 USD run |
 | 55 | AI layers may be upscaled at ingress; plates never; Magnific moved | done (stub) | T100 (`test_layer_upscale`, `test_upscale_wave9`); Real-ESRGAN is a stub on the Mac |
-| 56 | Social cutdowns are downsample-only crops with IPTC provenance | done | T86 (`test_export_wave9`, 61 tests) |
-| 57 | Frames are annotations | done | T81 (`test_canvas_rules_wave9`) |
-| 58 | Two-point perspective cameras become level-and-crop packets | deferred-to-box (T104) | `plugins/max/tests/test_camera_level.py` (27 tests); the V-Ray shift unit is a box measurement |
+| 56 | Social cutdowns are downsample-only crops with IPTC provenance | done | T86 (`test_export_wave9`) |
+| 57 | Frames are annotations | done | T81 (`test_canvas_rules_wave9`); the Frame editor sets title and size only (row W6) |
+| 58 | Two-point perspective cameras become level-and-crop packets | deferred-to-box (T104, T114) | `plugins/max/tests/test_camera_level.py`; exports now crop to the safe frame these packets declare (T114); the V-Ray shift unit is a box measurement |
 
-Doctrine held across Wave 9: no text-to-image path (generation is anchored to a plate camera; the Make bar refuses a node with no plate upstream), no plate upscaling (T100 upscales AI layers only), no invented angles (cutdowns are crops; references never composite).
+Doctrine held across Waves 9 and 10: no text-to-image path (generation is anchored to a plate camera; the Make bar refuses a node with no plate upstream), no plate upscaling (T100 upscales AI layers only), no invented angles (cutdowns and safe-frame exports are pixel crops; references are engine inputs and never composite).
 
-## 7. Wave 9 open questions running on their defaults
+## 7. Wave 10 (T111 to T115)
+
+Each task's own done-when, re-run here, and what the browser showed.
+
+| task | done-when re-run | browser | status |
+|---|---|---|---|
+| T111 G2: a new take on an approved Edit does not lock the graph | `pytest daemon/tests/test_projects_g2.py daemon/tests/test_projects_wave8.py daemon/tests/test_routes_packets.py`: `85 passed` | rows W1 to W3 | done |
+| T112 parameter panels for the nodes that had none | `npm run typecheck` exit 0; `vitest run src/test/nodeParamPanels.test.tsx`: `44 passed`; the whole UI suite 796 | row W6; the `@ref` hint in row W7 | done |
+| T113 `@ref1..@refN` in prompts | `pytest daemon/tests/test_prompt_refs.py daemon/tests/test_pipeline_wave8.py daemon/tests/test_pipeline_wave9.py`: `61 passed` | row W7 | done; the wording per engine is box-day item 16 |
+| T114 export crops to the camera's safe frame | `pytest daemon/tests/test_export_safe_frame.py daemon/tests/test_export_wave9.py daemon/tests/test_routes_runs_wave8.py`: `93 passed` | rows 14 and W8 | partial (G3): `daemon/tests/test_app.py` fails and the single-run route lacks `full_frame` |
+| T115 smoke covers Wave 9; housekeeping | `scripts/smoke_e2e.py`: `SMOKE PASS`; `claims_check.py --skip-ui`: 28 claims, 136 tests; `hazard_scan.py --strict-allow`: clean | (scripted) | done; `.smoke/` is in `.gitignore` and the stale `previs_is_not_deliverable` caveat is gone |
+
+## 8. Wave 9 open questions running on their defaults
 
 The build used these defaults (router plan, open questions 19 to 28). Each is a decision for Aasish; changing one is a small task.
 
@@ -295,7 +377,7 @@ The build used these defaults (router plan, open questions 19 to 28). Each is a 
 | 27 | Colour node gate | structure and outside-scope hard, material ΔE advisory; the output carries `graded` in its lineage |
 | 28 | Veo 3.1 as a start/end engine | in `START_END_ENGINES`, custody D until written terms (NDA projects never see it) |
 
-## 8. Box-day checklist
+## 9. Box-day checklist
 
 Every `verify-on-box:` line in the router plan, in task order, then the box-only exits that have no task line.
 
@@ -314,22 +396,24 @@ Every `verify-on-box:` line in the router plan, in task order, then the box-only
 13. T80: `scripts\test.ps1` on the render box runs the same steps as `make ci`.
 14. T104: a V-Ray Physical Camera with auto vertical tilt on the conformance scene: the level-and-crop packet's safe-frame crop matches the tilt-corrected render within 0.5 px (reprojection exit); the manual `vertical_shift` unit is measured and written into `camera_level.py`.
 15. T109: in a browser against the box daemon, `e` and `h` draw on a real take.
-16. P0: TIFF16 vs OCIO re-derivation ΔE00 p99 ≤ 0.5, or the mismatch understood and the master chosen (`docs/colour.md`).
-17. P0: the conformance scene built in Max from `fixtures/blender/markers.json`; eight markers reproject within 0.5 px RMS at 3840 wide.
-18. P0: `plate smoke --live` with a stated budget (≤ USD 5): billed price per engine to the cent, the vendor model ids behind every `unverified_p0` flag (this also enables Nano Banana 2.1 and Seedream 5 Pro in the Make bar), and a recorded minimum-cost call for Nano Banana 2.1 on the Gemini route.
-19. P0: push the repo to a private remote so the `windows-latest` and `macos-latest` CI legs run once (open question 13).
-20. P2: the same daemon driven from a browser on the box and on a second Windows machine (this pass covered the Mac); a fresh Windows machine from bootstrap to first candidate in under 15 minutes.
+16. T113: the live smoke confirms each engine's `reference_token` wording.
+17. T114: a level-and-crop packet from T104 exports at the camera's delivery size.
+18. P0: TIFF16 vs OCIO re-derivation ΔE00 p99 ≤ 0.5, or the mismatch understood and the master chosen (`docs/colour.md`).
+19. P0: the conformance scene built in Max from `fixtures/blender/markers.json`; eight markers reproject within 0.5 px RMS at 3840 wide.
+20. P0: `plate smoke --live` with a stated budget (≤ USD 5): billed price per engine to the cent, the vendor model ids behind every `unverified_p0` flag (this also enables Nano Banana 2.1 and Seedream 5 Pro in the Make bar), and a recorded minimum-cost call for Nano Banana 2.1 on the Gemini route.
+21. P0: push the repo to a private remote so the `windows-latest` and `macos-latest` CI legs run once (open question 13).
+22. P2: the same daemon driven from a browser on the box and on a second Windows machine (this pass covered the Mac); a fresh Windows machine from bootstrap to first candidate in under 15 minutes.
 
-The first pass's item "delete `calib/labels.jsonl` before any calibration run" is done: the file is gone and T110 keeps labels out of the repo.
+## 10. Other observations
 
-## 9. Other observations
-
-- G2 (section 2) is the one open defect found; it needs a task before artists use Motion on a node they keep iterating.
-- `claims.yaml`, claim `previs_is_not_deliverable`: the caveat says the artist manual still says previs can never reach Review. `docs/artist-manual.md` (the previs paragraph) already reads "can never reach Export or Delivery ... It may go into a Review bundle". The caveat is stale; the claim holds. `claims.yaml` belongs to T52/T80.
-- CLI fixture smoke skipped 8 routes: Magnific and Nano Banana 2.1 via Gemini (no recorded call, no vendor model id: `unverified_p0`), Nano Banana 2.1 via Atlas (no adapter speaks the route), Seedance 2.5 r2v via BytePlus and WaveSpeed (no recording), and the three local stubs (Qwen, Real-ESRGAN, Wan 2.2). Seedream 5 Pro passes the fixture smoke yet is disabled in the Make bar: the UI goes by the manifest's model id, the smoke by the recording. Both clear with box-day item 18.
-- The History tab does not reload on run events (row W4); Refresh shows the runs.
+- G3 (section 2) is the one open defect; it keeps `make test` red and needs a small task before the next commit. The patch is written out in section 2; T53 may not apply it (outside its files).
+- Do not run `bash fixtures/blender/render.sh` while pytest runs: it re-validates the committed packets in place and a test that reads `fixtures/packets/room_a` at that moment fails with `FileNotFoundError` (section 1).
+- The Export editor's take picker labels fan-out siblings identically (`run_01M5 · attempt 1 · fake · DONE` twice): runs made in the same minute share the ULID prefix the label shows, so the artist cannot tell the accepted take from its sibling there. Showing the accepted mark or more of the id would fix it.
+- After a refused wire into Motion (row 17), the `VIDEO_LOCKED` note stays on the Motion card when a later, allowed wire succeeds; it clears when the project is reopened. Cosmetic.
+- The History tab does not reload on run events (row W5); Refresh shows the runs.
 - An Edit card keeps saying `engine: pick in the Make bar` after its runs finish on `fake`; the Make bar does not write the engine into the node's params. Cosmetic.
+- CLI fixture smoke skipped 8 routes: Magnific and Nano Banana 2.1 via Gemini (no recorded call, no vendor model id: `unverified_p0`), Nano Banana 2.1 via Atlas (no adapter speaks the route), Seedance 2.5 r2v via BytePlus and WaveSpeed (no recording), and the three local stubs (Qwen, Real-ESRGAN, Wan 2.2). Seedream 5 Pro passes the fixture smoke yet is disabled in the Make bar: the UI goes by the manifest's model id, the smoke by the recording. Both clear with box-day item 20.
 - The full scrub on the 640×360 fixture plate in a small viewer is complete at the centre view at 100%: the four quadrant centres fall on the viewport edges, and the comparison is inclusive. That is correct by the rule's definition. A 4K plate needs real panning.
 - With a fresh quote, Make approves directly as the human (`approved_by: human`); the approval dialog appears only when the daemon refuses (auto cap, envelope). This matches `docs/ui.md`.
 - `room_a` and `room_a_ral3020` are 3.78 MB, over the 3 MB per-packet guideline (known since wave 2); the 25 MB total cap holds at 17 MB.
-- `make test` stops at the first failing step, so a pytest failure hides the vitest result; run `npm test` on its own when that happens.
+- `make test` stops at the first failing step, so a pytest failure hides the vitest result; run `npm test` on its own when that happens (row 3a).

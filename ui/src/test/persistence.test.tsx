@@ -579,6 +579,19 @@ describe("accept after the full scrub", () => {
     expect(puts(calls)).toHaveLength(1);
   });
 
+  it("accepting a take also picks it, so the daemon's approval (run behind the picked take) follows (G2)", async () => {
+    fakeTimers();
+    const calls = mockApi({ "POST /runs/r1/accept": ACCEPTED, "PUT /projects/p/graph": echoGraph });
+    graph().loadProject(GRAPH, "p");
+    useRunStore.getState().upsertRun({ id: "r1", state: "DONE", outputs: ["hash-r1"] }, "motion-1");
+    usePanelsStore.setState({ scrubLogs: { r1: "scrub-9" } });
+    await act(async () => {
+      await usePanelsStore.getState().acceptRun("r1");
+    });
+    expect(useRunStore.getState().byNode["motion-1"]?.picked).toBe("r1");
+    expect(wireNode(calls[1], "motion-1")).toMatchObject({ approved: true, outputHash: "hash-r1" });
+  });
+
   it("the daemon's refusal is the outcome, and the node stays unapproved", async () => {
     mockApi({ "POST /runs/r1/accept": reply({ error: "scrub_required", detail: "no logged full scrub 'scrub-9' of run r1" }, 409) });
     graph().loadProject(GRAPH, "p");

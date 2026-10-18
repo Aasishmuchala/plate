@@ -137,6 +137,8 @@ export interface ExportManyBody {
   out_dir: string;
   /** `tiff16` when omitted. */
   format?: ExportFormat;
+  /** Keep the whole render (overscan included) instead of each packet's safe frame. */
+  full_frame?: boolean;
   /** `{node}_{run8}` when omitted; `{node} {run} {run8} {packet} {engine} {n}`. */
   name_pattern?: string;
 }

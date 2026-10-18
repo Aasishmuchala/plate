@@ -217,6 +217,9 @@ export const usePanelsStore = create<PanelsState>()((set, get) => ({
         const answer = await postAccept(runId, scrubLogId, UI_ACTOR);
         set((s) => ({ accepted: { ...s.accepted, [runId]: true } }));
         const nodeId = producingNode(answer, runId, get().runs);
+        // Since G2 (T111) the daemon derives a node's approval from the run behind its picked take, so the
+        // accepted take must also become the picked one, or the node stays unapproved after the save.
+        if (nodeId) useRunStore.getState().pick(nodeId, runId);
         out = nodeId ? await approveOnCanvas(nodeId, scrubLogId) : done("take accepted (its node is not on this canvas)");
       } catch (err) {
         out = fail(`take not accepted: ${errorMessage(err)}`);

@@ -10,11 +10,20 @@
 - `PUT /projects/{id}/graph` is where the canvas rules are ENFORCED (`canvas_rules`, the mirror of
   `ui/src/canvasRules.ts`; the UI's checks are UX). The server owns node status (decision 31): before any
   rule runs, every node's `gateStatus`, `approved`, `approvedBy` and `scrubLogId` are rewritten from the
-  index (`derive_status`), whatever the client sent, so a made-up `scrubLogId` unlocks nothing. Then an
-  unknown node kind, a repeated id or any edge that breaks a rule answers `422 {"errors", "violations":
-  [{edge|node, code, message}]}`, and a node the CLIENT newly claims approved without a `scrubLogId`
-  answers SCRUB_REQUIRED. A good graph is written atomically under the project lock, announced on the bus
-  as `graph.saved`, and answered as stored (the rewritten status included) so the UI reconciles.
+  index (`derive_status`), whatever the client sent, so a made-up `scrubLogId` unlocks nothing. A node that
+  names its take (`outputHash`, the take the artist picked) gets the status of the run behind that take
+  (G2, T111): a newer take is one more candidate and unapproves nothing, and picking a take nobody has
+  accepted unapproves the node until that take is accepted. Then an unknown node kind, a repeated id or any
+  edge that breaks a rule answers `422 {"errors", "violations": [{edge|node, code, message}]}`, and a node
+  the CLIENT newly claims approved without a `scrubLogId` answers SCRUB_REQUIRED. One refusal is held
+  instead: VIDEO_LOCKED on an edge the project already stores, out of a still that names its take (the
+  artist's own pick locked it). That edge is stored with `locked: true` (server-owned, like the node status:
+  a client's `locked` is dropped) and listed under `violations` in the 200, so autosave never deadlocks;
+  the Motion or CropPair behind it still refuses its quote. A NEW edge into a locked still, or a lock on a
+  still with no picked take (it follows its newest run), is refused as before. A good graph is written
+  atomically under the project lock (where a held edge must still be stored: one another writer removed
+  meanwhile is a new edge again), announced on the bus as `graph.saved`, and answered as stored (the
+  rewritten status and the flags included) so the UI reconciles.
 - `PUT /projects/{id}/custody {nda, allowed_grades, reason?}`: tightening (no grade added, NDA not dropped)
   is always allowed; loosening needs a written reason (10 characters at least) and is ledgered first as
   `kind: "override"`, `by: "human"`, `data: {what: "custody", from, to}` (no ledger, no loosening: 503).
@@ -70,6 +79,9 @@ SNAKE_STATUS_FIELDS = {"gate_status": "gateStatus", "approved_by": "approvedBy",
 NO_TAKE_STATES = frozenset({S.CANCELLED.value, S.EXPIRED.value, S.FAILED.value, S.REFUSED.value})
 STATUS_RANK = {"pass": 2, "fail": 1, "none": 0}
 STATUS_DEFAULTS: dict[str, Any] = {"gateStatus": "none", "approved": False}  # canvas_rules.node_data's
+# The server's flag on a stored edge whose still locked after the artist picked another take (T111).
+EDGE_LOCKED = "locked"
+HELD_CODES = frozenset({"VIDEO_LOCKED"})
 
 
 class ProjectBody(BaseModel):
@@ -203,20 +215,31 @@ def _status_of(view: Mapping[str, Any]) -> str:
 
 
 def _node_status(
-    conn: sqlite3.Connection, rows: list[sqlite3.Row], records: Callable[[], list[dict[str, Any]]]
+    conn: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    records: Callable[[], list[dict[str, Any]]],
+    picked: str | None = None,
 ) -> dict[str, Any]:
     """`{gateStatus, approved[, approvedBy, scrubLogId]}` of one node from its runs, newest first.
 
-    The node's latest run that produced (or may still produce) a take decides; when that run is one of a
-    best-of-N group, the whole group does: the sibling the artist accepted, else the group's best gate
-    outcome. Approval is the decisive run's latest `accept` note, and only when `find_scrub` confirms its
-    logged full scrub in the ledger."""
+    A node that names its take (`picked`, its `outputHash`) is decided by the run(s) whose first output is that
+    take and by nothing else (T111, G2): a newer take is one more candidate, so a re-mask or a second Make after
+    an accept leaves the node approved, and a picked take nobody accepted leaves it unapproved until it is. A
+    picked picture that is none of the node's takes (a stale or made-up hash, an upload) was never gated or
+    accepted as this node's take: the defaults. A node with no pick follows its latest run that produced (or
+    may still produce) a take; when that run is one of a best-of-N group, the whole group does. Among the
+    deciding runs, the one the artist accepted approves, else the best gate outcome stands unapproved. Approval
+    is the run's latest `accept` note, and only when `find_scrub` confirms its logged full scrub in the ledger."""
     live = [r for r in rows if r["state"] not in NO_TAKE_STATES]
-    if not live:
+    if picked is not None:
+        candidates = [r for r in live if r["output"] == picked]
+    elif live:
+        group = live[0]["sibling_group"]
+        candidates = [r for r in live if r["sibling_group"] == group] if group else live[:1]
+    else:
+        candidates = []
+    if not candidates:
         return dict(STATUS_DEFAULTS)
-    latest = live[0]
-    group = latest["sibling_group"]
-    candidates = [r for r in live if group and r["sibling_group"] == group] if group else [latest]
     views = [run_view(conn, r["id"]) for r in candidates]
     accepted: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     for v in views:
@@ -242,18 +265,36 @@ def _node_status(
     return {"gateStatus": _status_of(best), "approved": False}
 
 
+def picked_takes(graph: Mapping[str, Any]) -> dict[str, str]:
+    """`{node id: outputHash}` for every node of `graph` that names its take, read where the canvas rules and
+    the Motion runner read it (`canvas_rules.node_data`: the node's `data` object when it has one, else the
+    node; either spelling)."""
+    out: dict[str, str] = {}
+    for raw in graph.get("nodes") or []:
+        if not isinstance(raw, Mapping):
+            continue
+        n = canvas_rules.node_data(raw)
+        nid, key = n.get("id"), n.get("outputHash")
+        if isinstance(nid, str) and nid and isinstance(key, str) and key:
+            out[nid] = key
+    return out
+
+
 def derive_status(
     conn: sqlite3.Connection, project_dir: Path, graph: Mapping[str, Any]
 ) -> dict[str, dict[str, Any]]:
-    """The server's status for every node id of `graph` (decision 31). A node that never ran (Plate, Mask,
-    Export, a fresh Edit...) is `{gateStatus: "none", approved: false}`."""
+    """The server's status for every node id of `graph` (decision 31), from the node's picked take when it
+    names one (`picked_takes`). A node that never ran (Plate, Mask, Export, a fresh Edit...) is
+    `{gateStatus: "none", approved: false}`."""
     ids = {n.get("id") for n in graph.get("nodes") or [] if isinstance(n, Mapping)}
     ids = {i for i in ids if isinstance(i, str) and i}
+    picks = picked_takes(graph)
     by_node: dict[str, list[sqlite3.Row]] = {}
     if ids:
         marks = ",".join("?" * len(ids))
         rows = conn.execute(
-            "SELECT id, node_id, state, json_extract(quote_json, '$.sibling_group') AS sibling_group "
+            "SELECT id, node_id, state, json_extract(quote_json, '$.sibling_group') AS sibling_group, "
+            "CASE WHEN json_valid(normalized) THEN json_extract(normalized, '$.outputs[0]') END AS output "
             f"FROM runs WHERE node_id IN ({marks}) ORDER BY created_utc DESC, rowid DESC",
             tuple(sorted(ids)),
         ).fetchall()
@@ -266,7 +307,7 @@ def derive_status(
             cache.append(Ledger(project_dir).records())
         return cache[0]
 
-    return {nid: _node_status(conn, by_node.get(nid, []), records) for nid in ids}
+    return {nid: _node_status(conn, by_node.get(nid, []), records, picks.get(nid)) for nid in ids}
 
 
 def _apply_status(graph: dict[str, Any], status: Mapping[str, Mapping[str, Any]]) -> None:
@@ -301,30 +342,82 @@ def _newly_approved_without_scrub(old: Any, new: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _edge_key(e: Mapping[str, Any]) -> tuple[Any, ...]:
+    """An edge as the rules see it (`canvas_rules.as_edge`): source, target and the two handles; not its id."""
+    return (e["source"], e["target"], e.get("sourceHandle"), e.get("targetHandle"))
+
+
+def _edge_keys(graph: Any) -> set[tuple[Any, ...]]:
+    """The edges of a stored graph; one that does not read holds none (nothing is held against it)."""
+    try:
+        return {_edge_key(e) for e in canvas_rules.as_graph(graph).edges}
+    except (ValueError, TypeError, KeyError):
+        return set()
+
+
+def _held(v: Mapping[str, Any], stored: set[tuple[Any, ...]], picked: Mapping[str, str]) -> bool:
+    """Does the save keep this violation (flagged) instead of refusing the graph? Only VIDEO_LOCKED on an edge
+    the project already stores, out of a still that names its take: the artist's pick locked it. An edge the
+    client is adding, and a still with no picked take (it follows its newest run), stay refusals."""
+    e = v.get("edge")
+    return (
+        v.get("code") in HELD_CODES
+        and isinstance(e, Mapping)
+        and e.get("source") in picked
+        and _edge_key(e) in stored
+    )
+
+
+def _flag_edges(graph: dict[str, Any], held: list[dict[str, Any]]) -> None:
+    """`locked: true` on every edge of `graph` a held violation names (the client's own flags are gone)."""
+    keys = {_edge_key(v["edge"]) for v in held}
+    for raw in graph.get("edges") or []:
+        try:
+            key = _edge_key(canvas_rules.as_edge(raw))
+        except ValueError:
+            continue
+        if key in keys:
+            raw[EDGE_LOCKED] = True
+
+
+def _refused(problems: list[dict[str, Any]]) -> ApiError:
+    return ApiError(
+        422, {"errors": [f"{p['code']}: {p['message']}" for p in problems], "violations": problems}
+    )
+
+
 @router.put("/projects/{project_id}/graph")
 def put_graph(request: Request, project_id: str, graph: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
     c = ctx(request)
     project = _project(request, project_id)
+    held: list[dict[str, Any]] = []
     try:
         check_graph(graph)
         claimed = copy.deepcopy(graph)
+        for edge in graph["edges"]:
+            edge.pop(EDGE_LOCKED, None)  # server-owned, like the node status
         with c.index.project(project_id) as conn:
             _apply_status(graph, derive_status(conn, project.root, graph))
         problems = canvas_rules.check_nodes(graph)
         if not problems:
-            # The rules read the server's status; SCRUB_REQUIRED answers a client that claims an approval.
-            problems = canvas_rules.validate_graph(graph) + _newly_approved_without_scrub(
-                project.graph, claimed
-            )
+            # The rules read the server's status; a lock the artist's pick put on a stored edge is held.
+            stored, picked = _edge_keys(project.graph), picked_takes(graph)
+            for v in canvas_rules.validate_graph(graph):
+                (held if _held(v, stored, picked) else problems).append(v)
+            # SCRUB_REQUIRED answers a client that claims an approval.
+            problems += _newly_approved_without_scrub(project.graph, claimed)
     except (ProjectError, ValueError) as e:
         raise ApiError(422, {"errors": [str(e)]}) from e
     if problems:
-        raise ApiError(
-            422, {"errors": [f"{p['code']}: {p['message']}" for p in problems], "violations": problems}
-        )
+        raise _refused(problems + held)
+    _flag_edges(graph, held)
     try:
         with project.lock(timeout_s=LOCK_TIMEOUT_S):
             project = Project.load(project.root)  # under the lock: never write back a stale custody
+            stored = _edge_keys(project.graph)
+            gone = [v for v in held if _edge_key(v["edge"]) not in stored]
+            if gone:  # removed by another writer since the check: a new edge again, so refused
+                raise _refused(gone + [v for v in held if v not in gone])
             project.save_graph(graph)
     except ProjectLocked as e:
         raise _locked(project_id, e) from e
@@ -338,7 +431,7 @@ def put_graph(request: Request, project_id: str, graph: Annotated[dict[str, Any]
             "edges": len(graph.get("edges") or []),
         },
     )
-    return {"ok": True, "project_id": project_id, "graph": project.graph}
+    return {"ok": True, "project_id": project_id, "graph": project.graph, "violations": held}
 
 
 # ---------------------------------------------------------------------------- custody

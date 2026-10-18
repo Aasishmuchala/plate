@@ -339,11 +339,9 @@ claims:
         quote: "PREVIS across a moving picture: a rough preview made by AI, to agree a camera move with you."
       - file: docs/client-explainer.md
         quote: "It is not a measured image and it is never a deliverable."
-    caveat: >-
-      docs/artist-manual.md (the previs section) still says previs can never reach Review. The code lets a
-      watermarked PREVIS motion into a client Review on purpose (canvas_rules.py: "a Review may show it"; shared
-      vector "a previs motion may be shown in a review"); Export and Delivery are refused. README.md and the
-      client explainer are accurate as written; the manual should say "Export or Delivery" for previs.
+    # No caveat: README.md, the client explainer and docs/artist-manual.md (the previs section) all say "Export or
+    # Delivery", which is what canvas_rules.py and the exporter enforce. A watermarked PREVIS motion may go into a
+    # client Review on purpose ("a Review may show it"); the claim is about deliverables, not about what is shown.
     tests:
       - daemon/tests/test_previs.py::test_export_of_a_previs_output_is_refused
       - daemon/tests/test_previs.py::test_the_shared_vectors_hold_the_previs_rule

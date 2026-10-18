@@ -9,10 +9,18 @@
 //
 // Expected ΔE comes from the daemon's numeric preview (`recolour.apply`): <= 1 for recomposition, about 2.5 for the
 // ratio fallback, wider when the passes are missing (`degraded`), which is expected to fail on dark semi-gloss panels.
+//
+// T112, several materials in one pass (T90): `Add to the pass` puts the material and colour above into
+// `params.materials` (`[{material, target, method?, source_lab?}]`, 1 to 8 distinct `m:` ids; `materialName` is kept
+// beside each for display, as at the top level). While the picked material is in the pass, a new colour or source Lab
+// updates its entry; clicking a listed material (on the plate or its Edit button) loads it back. With a pass the daemon
+// recolours exactly the listed materials, so the pair above is only what is being edited. `method` (auto,
+// recomposition, ratio, degraded) is the default for every entry that names none, and each entry can name its own;
+// `source_lab` is the source albedo (L a b) when the packet has no diffuse_filter pass and the legend no albedo.
 
 import { type KeyboardEvent, type ReactElement, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useGraphStore } from "../store";
-import { errorMessage, idPick, type RecolourExpect, recolourPreview } from "./api";
+import { errorMessage, idPick, parseRecolourExpect, preview, type RecolourExpect, recolourPreview } from "./api";
 import {
   labTargetOf,
   labText,
@@ -370,6 +378,176 @@ function ProjectSwatches({ projectId, onPick }: { projectId: string | null; onPi
   );
 }
 
+// ------------------------------------------------------------------------------------------------ the pass (T90)
+
+/** The methods `recolour.apply` takes; no method (auto) lets the packet's elements decide. */
+export const RECOLOUR_METHODS = ["recomposition", "ratio", "degraded"] as const;
+export type RecolourMethod = (typeof RECOLOUR_METHODS)[number];
+/** At most this many materials in one pass (`recolour_node.MAX_MATERIALS`). */
+export const MAX_MATERIALS = 8;
+const MATERIAL_ID = /^m:[0-9a-fA-F]{8}$/;
+
+export type RecolourTarget = string | { lab: [number, number, number]; label: string };
+
+/** One entry of `params.materials`. `materialName` is display only; the daemon reads the other four. */
+export interface RecolourEntry {
+  material: string;
+  materialName?: string;
+  target: RecolourTarget;
+  method?: RecolourMethod;
+  source_lab?: [number, number, number];
+}
+
+const isMethod = (v: unknown): v is RecolourMethod => typeof v === "string" && (RECOLOUR_METHODS as readonly string[]).includes(v);
+const lab3 = (v: unknown): [number, number, number] | null =>
+  Array.isArray(v) && v.length === 3 && v.every((n) => typeof n === "number" && Number.isFinite(n)) ? [v[0] as number, v[1] as number, v[2] as number] : null;
+
+/** A target as the node keeps it: a RAL / hex string or a measured `{lab, label}`; null for anything else. */
+export function targetOf(v: unknown): RecolourTarget | null {
+  if (typeof v === "string") return v.trim() !== "" ? v : null;
+  return labTargetOf(v);
+}
+
+/** `params.materials` as the editor shows it: well-formed entries only, first of each material id. */
+export function readEntries(v: unknown): RecolourEntry[] {
+  if (!Array.isArray(v)) return [];
+  const out: RecolourEntry[] = [];
+  for (const raw of v) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const o = raw as Record<string, unknown>;
+    const material = typeof o.material === "string" ? o.material : null;
+    const target = targetOf(o.target);
+    if (!material || target === null || out.some((e) => e.material === material)) continue;
+    const entry: RecolourEntry = { material, target };
+    if (typeof o.materialName === "string" && o.materialName !== "") entry.materialName = o.materialName;
+    if (isMethod(o.method)) entry.method = o.method;
+    const src = lab3(o.source_lab);
+    if (src) entry.source_lab = src;
+    out.push(entry);
+  }
+  return out;
+}
+
+/** What the entry's swatch shows: the RAL or hex colour, or the Lab converted. */
+export function targetHex(t: RecolourTarget): string | null {
+  if (typeof t !== "string") return labToHex(t.lab);
+  const r = parseTarget(t);
+  return r.ok ? r.target.hex : null;
+}
+
+export const targetLabel = (t: RecolourTarget): string => (typeof t === "string" ? t : `swatch ${t.label}`);
+
+/** `L a b` (with or without letters or commas) -> three numbers; null when it is not one. Empty text is `undefined`. */
+export function parseSourceLab(text: string): [number, number, number] | null | undefined {
+  if (text.trim() === "") return undefined;
+  const nums = text.match(/[-+]?\d+(?:\.\d+)?/g)?.map(Number) ?? [];
+  const lab = lab3(nums);
+  if (!lab || lab[0] < 0 || lab[0] > 100 || Math.abs(lab[1]) > 160 || Math.abs(lab[2]) > 160) return null;
+  return lab;
+}
+
+const labWords = (lab: readonly number[]): string => lab.map((n) => String(n)).join(" ");
+
+/** The entry with `key` set to `value`, or without `key` when `value` is undefined (no undefined keys in the graph). */
+function withField(e: RecolourEntry, key: "method" | "source_lab", value: RecolourMethod | [number, number, number] | undefined): RecolourEntry {
+  const out: RecolourEntry = { ...e };
+  if (key === "method") {
+    if (isMethod(value)) out.method = value;
+    else delete out.method;
+  } else {
+    const lab = lab3(value);
+    if (lab) out.source_lab = lab;
+    else delete out.source_lab;
+  }
+  return out;
+}
+
+/** The listed materials, one row each: its colour, its method, the pass estimate, Edit and Remove. */
+function PassSection({
+  entries,
+  current,
+  estimates,
+  onEdit,
+  onRemove,
+  onMethod,
+}: {
+  entries: RecolourEntry[];
+  current: string;
+  estimates: Record<string, RecolourExpect>;
+  onEdit: (e: RecolourEntry) => void;
+  onRemove: (material: string) => void;
+  onMethod: (material: string, m: RecolourMethod | undefined) => void;
+}): ReactElement {
+  return (
+    <table style={E.table} data-testid="recolour-pass-table">
+      <thead>
+        <tr>
+          <th style={E.th}>material</th>
+          <th style={E.th}>colour</th>
+          <th style={E.th}>method</th>
+          <th style={E.th}>expected</th>
+          <th style={E.th} aria-label="actions" />
+        </tr>
+      </thead>
+      <tbody>
+        {entries.map((e, i) => {
+          const hex = targetHex(e.target);
+          const est = estimates[e.material];
+          const de = est?.expectedDe00 ?? null;
+          return (
+            <tr key={e.material} data-testid="recolour-pass-row" data-material={e.material} aria-current={e.material === current ? "true" : undefined}>
+              <td style={E.td}>
+                {e.materialName ?? e.material}
+                {e.materialName ? <span style={E.note}> ({e.material})</span> : null}
+              </td>
+              <td style={E.td}>
+                <span aria-hidden style={{ display: "inline-block", width: 14, height: 10, marginRight: 4, borderRadius: 2, border: `1px solid ${C.line}`, background: hex ?? "transparent" }} />
+                <span data-testid={`recolour-pass-target-${i}`}>{targetLabel(e.target)}</span>
+                {e.source_lab ? <span style={E.note}> · source L a b {labWords(e.source_lab)}</span> : null}
+              </td>
+              <td style={E.td}>
+                <select
+                  style={E.input}
+                  value={e.method ?? ""}
+                  aria-label={`method for ${e.materialName ?? e.material}`}
+                  data-testid={`recolour-pass-method-${i}`}
+                  onChange={(ev) => onMethod(e.material, isMethod(ev.target.value) ? ev.target.value : undefined)}
+                >
+                  <option value="">default</option>
+                  {RECOLOUR_METHODS.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              </td>
+              <td style={E.td}>
+                {est ? (
+                  <Chip tone={de === null ? "muted" : de <= 1 ? "pass" : de <= 2.5 ? "advisory" : "fail"} testId={`recolour-pass-de-${i}`} title={est.method ?? undefined}>
+                    ΔE00 {de === null ? "n/a" : de.toFixed(2)}
+                  </Chip>
+                ) : (
+                  <span style={E.note}>not estimated</span>
+                )}
+              </td>
+              <td style={E.td}>
+                <div style={E.row}>
+                  <Button onClick={() => onEdit(e)} testId={`recolour-pass-edit-${i}`} title="load this material and colour above">
+                    Edit
+                  </Button>
+                  <Button onClick={() => onRemove(e.material)} testId={`recolour-pass-remove-${i}`} title="take this material out of the pass">
+                    Remove
+                  </Button>
+                </div>
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
 export function RecolourEditor({ nodeId }: { nodeId: string }): ReactElement {
   const { params, set } = useNodeEditor(nodeId);
   const plate = usePlate(nodeId);
@@ -377,10 +555,20 @@ export function RecolourEditor({ nodeId }: { nodeId: string }): ReactElement {
   const [text, setText] = useState(asString(params.target));
   const [expect, setExpect] = useState<RecolourExpect | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const [sourceLabText, setSourceLabText] = useState(() => {
+    const src = lab3(params.source_lab);
+    return src ? labWords(src) : "";
+  });
+  const [passEstimates, setPassEstimates] = useState<Record<string, RecolourExpect>>({});
 
   const size = plate?.size ?? null;
   const packetId = plate?.packetId ?? null;
   const material = asString(params.material);
+  const entries = readEntries(params.materials);
+  const inPass = entries.some((e) => e.material === material);
+  const sourceLab = lab3(params.source_lab);
+  const parsedLab = parseSourceLab(sourceLabText);
+  const defaultMethod = isMethod(params.method) ? params.method : "";
   const parsed = text.trim() === "" ? null : parseTarget(text);
   const target = parsed && parsed.ok ? parsed.target : null;
   // a measured Lab swatch is the node's target while the field is empty (typing replaces it)
@@ -397,8 +585,10 @@ export function RecolourEditor({ nodeId }: { nodeId: string }): ReactElement {
       setNote(`no material id at (${p.x}, ${p.y})`);
       return;
     }
-    set({ material: r.id, materialName: r.name });
     setNote(null);
+    const listed = readEntries(useGraphStore.getState().nodes.find((n) => n.id === nodeId)?.data.params?.materials).find((e) => e.material === r.id);
+    if (listed) loadEntry({ ...listed, materialName: listed.materialName ?? r.name });
+    else set({ material: r.id, materialName: r.name });
   }, errorMessage);
 
   const [estimate, estimateState] = useAction(async (m: string, req: { ral?: string; hex?: string }) => {
@@ -413,10 +603,14 @@ export function RecolourEditor({ nodeId }: { nodeId: string }): ReactElement {
     // the preview follows the material and the target, nothing else
   }, [projectId, nodeId, material, requestKey]);
 
+  // While the picked material is in the pass, its entry follows the colour and the source Lab typed above.
+  const withEntry = (edit: (e: RecolourEntry) => RecolourEntry): { materials?: RecolourEntry[] } =>
+    inPass ? { materials: entries.map((e) => (e.material === material ? edit(e) : e)) } : {};
+
   const onText = (v: string): void => {
     setText(v);
     const r = v.trim() === "" ? null : parseTarget(v);
-    if (r && r.ok) set({ target: r.target.label, targetHex: r.target.hex });
+    if (r && r.ok) set({ target: r.target.label, targetHex: r.target.hex, ...withEntry((e) => ({ ...e, target: r.target.label })) });
     else set({ target: undefined, targetHex: undefined });
   };
 
@@ -424,11 +618,58 @@ export function RecolourEditor({ nodeId }: { nodeId: string }): ReactElement {
   const applySwatch = (s: Swatch): void => {
     if (s.lab) {
       setText("");
-      set({ target: swatchTarget(s), targetHex: swatchHex(s) });
+      const t = swatchTarget(s);
+      set({ target: t, targetHex: swatchHex(s), ...withEntry((e) => ({ ...e, target: t })) });
     } else {
       onText(swatchHex(s));
     }
   };
+
+  const onSourceLab = (v: string): void => {
+    setSourceLabText(v);
+    const lab = parseSourceLab(v);
+    if (lab === null) return; // shown as an error; the node keeps its last good value
+    set({ source_lab: lab, ...withEntry((e) => withField(e, "source_lab", lab)) });
+  };
+
+  // an entry back into the fields above: its material, its colour (a Lab swatch stays in params.target) and its Lab
+  function loadEntry(e: RecolourEntry): void {
+    setText(typeof e.target === "string" ? e.target : "");
+    setSourceLabText(e.source_lab ? labWords(e.source_lab) : "");
+    set({ material: e.material, materialName: e.materialName, target: e.target, targetHex: targetHex(e.target) ?? undefined, source_lab: e.source_lab });
+  }
+
+  const currentTarget = targetOf(params.target);
+  const canAdd = MATERIAL_ID.test(material) && currentTarget !== null && (inPass || entries.length < MAX_MATERIALS);
+  const addToPass = (): void => {
+    if (!canAdd || currentTarget === null) return;
+    const entry: RecolourEntry = { material, target: currentTarget };
+    const name = asString(params.materialName);
+    if (name) entry.materialName = name;
+    const old = entries.find((e) => e.material === material);
+    if (old?.method) entry.method = old.method;
+    if (sourceLab) entry.source_lab = sourceLab;
+    set({ materials: inPass ? entries.map((e) => (e.material === material ? entry : e)) : [...entries, entry] });
+  };
+  const writeEntries = (next: RecolourEntry[]): void => {
+    set({ materials: next.length > 0 ? next : undefined });
+    setPassEstimates({});
+  };
+
+  const [estimatePass, passState] = useAction(async (list: RecolourEntry[]) => {
+    if (!projectId) return;
+    const body = await preview(projectId, nodeId, "recolour", {
+      materials: list.map(({ materialName: _name, ...rest }) => rest),
+      ...(defaultMethod ? { method: defaultMethod } : {}),
+    });
+    const rows = typeof body === "object" && body !== null && Array.isArray((body as { materials?: unknown }).materials) ? (body as { materials: unknown[] }).materials : [];
+    const next: Record<string, RecolourExpect> = {};
+    for (const row of rows) {
+      const id = typeof row === "object" && row !== null ? (row as { material?: unknown }).material : null;
+      if (typeof id === "string") next[id] = parseRecolourExpect(row);
+    }
+    setPassEstimates(next);
+  }, errorMessage);
 
   const de = expect?.expectedDe00 ?? null;
   const deTone = de === null ? "muted" : de <= 1 ? "pass" : de <= 2.5 ? "advisory" : "fail";
@@ -491,6 +732,76 @@ export function RecolourEditor({ nodeId }: { nodeId: string }): ReactElement {
       </Section>
 
       <ProjectSwatches projectId={projectId} onPick={applySwatch} />
+
+      <Section title="Method and source" testId="recolour-method-section">
+        <Field label="method">
+          <select style={E.input} value={defaultMethod} data-testid="recolour-method-default" aria-label="method" onChange={(e) => set({ method: isMethod(e.target.value) ? e.target.value : undefined })}>
+            <option value="">auto (the packet's passes decide)</option>
+            {RECOLOUR_METHODS.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="source Lab">
+          <input
+            type="text"
+            style={{ ...E.input, width: 150 }}
+            value={sourceLabText}
+            placeholder="L a b (optional)"
+            aria-label="source albedo Lab"
+            data-testid="recolour-source-lab"
+            onChange={(e) => onSourceLab(e.target.value)}
+          />
+          <span style={E.note}>the material's own colour, when the packet has no diffuse_filter pass and the legend no albedo</span>
+        </Field>
+        {parsedLab === null ? (
+          <Notice tone="error" testId="recolour-source-lab-error">
+            source Lab is three numbers: L 0 to 100, a and b -160 to 160
+          </Notice>
+        ) : null}
+        <span style={E.note}>method is the default for every material of the pass that names none</span>
+      </Section>
+
+      <Section title={`Pass (${entries.length} of ${MAX_MATERIALS} materials)`} testId="recolour-pass">
+        {entries.length === 0 ? (
+          <span style={E.note} data-testid="recolour-pass-empty">
+            one material: the pair above. Add it to recolour up to {MAX_MATERIALS} materials in one run.
+          </span>
+        ) : (
+          <>
+            <PassSection
+              entries={entries}
+              current={material}
+              estimates={passEstimates}
+              onEdit={loadEntry}
+              onRemove={(m) => writeEntries(entries.filter((e) => e.material !== m))}
+              onMethod={(m, method) => writeEntries(entries.map((e) => (e.material === m ? withField(e, "method", method) : e)))}
+            />
+            <span style={E.note} data-testid="recolour-pass-note">
+              the run recolours the {entries.length} listed material{entries.length === 1 ? "" : "s"}
+              {material && !inPass ? `; ${asString(params.materialName, material)} above is not in the pass until you add it` : ""}
+            </span>
+          </>
+        )}
+        <div style={E.row}>
+          <Button onClick={addToPass} disabled={!canAdd} testId="recolour-pass-add" title={canAdd ? undefined : !MATERIAL_ID.test(material) ? "pick a material on the plate first" : currentTarget === null ? "give the material a colour first" : `a pass holds at most ${MAX_MATERIALS} materials`}>
+            {inPass ? "Update in the pass" : "Add to the pass"}
+          </Button>
+          <Button onClick={() => void estimatePass(entries)} disabled={!projectId || entries.length === 0 || passState.pending} testId="recolour-pass-estimate">
+            {passState.pending ? "Estimating" : "Estimate the pass"}
+          </Button>
+          <Button onClick={() => writeEntries([])} disabled={entries.length === 0} testId="recolour-pass-clear">
+            Clear the pass
+          </Button>
+        </div>
+        {passState.error ? (
+          <Notice tone="error" testId="recolour-pass-error">
+            {passState.error}
+          </Notice>
+        ) : null}
+      </Section>
 
       <Section title="Expected result" testId="recolour-expect">
         {expect ? (

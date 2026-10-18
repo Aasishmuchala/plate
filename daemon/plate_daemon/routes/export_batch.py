@@ -1,13 +1,19 @@
 """Batch export (router plan T86): many takes through `export.export` in one request.
 
-- `POST /projects/{id}/export {run_ids?, accepted?, out_dir, format?, name_pattern?}` ->
-  `{exported: [{run_id, path, sidecar}], refused: [{run_id, error, ...}]}`. `format` is `tiff16` (default),
-  `png16` or `exr`; `out_dir` an absolute folder. Each run goes through `export.export` with the single route's
-  guards (`POST /runs/{id}/export`), and one run that cannot leave never stops the others:
+- `POST /projects/{id}/export {run_ids?, accepted?, out_dir, format?, name_pattern?, full_frame?}` ->
+  `{exported: [{run_id, path, sidecar, crop | full_frame}], refused: [{run_id, error, ...}]}`. `format` is
+  `tiff16` (default), `png16` or `exr`; `out_dir` an absolute folder. Each run goes through `export.export`
+  with the single route's guards (`POST /runs/{id}/export`), and one run that cannot leave never stops the
+  others:
   - GATE_FAIL needs an override recorded earlier (`POST /runs/{id}/override`); there is no typed override here;
   - previs is refused (`PREVIS_NOT_DELIVERABLE`), and so is any state but DONE (or an overridden GATE_FAIL);
   - an existing file is never overwritten, so two runs that format to one name leave the second refused.
   Each exported run is marked shipped and gets a ledger `export` record (`data.batch: true`).
+- Framing (router plan T114): a run whose packet declares `camera.safe_frame` is written as its safe-frame
+  region (`export.export`'s default, a pixel crop); `full_frame: true` keeps every take whole. The sidecar,
+  the ledger record and the `exported` entry carry `crop: {x, y, width, height}` or `full_frame: true`; a
+  packet with no safe frame adds neither. A safe frame that cannot be placed on a take refuses that run
+  (`not_exportable`, code `SAFE_FRAME_MISMATCH` or `PACKET_UNREADABLE`).
 - `accepted: true` without `run_ids` exports every run of the project that has an `accept` note in the index,
   oldest first; with `run_ids` it exports those, and any run without an `accept` note is refused
   (`not_accepted`). Neither `run_ids` nor `accepted` is 422 `no_runs`.
@@ -17,8 +23,8 @@
   digits). Characters outside letters, digits, `.`, `_` and `-` become `-` (a Windows file name; no `:`).
 
 A refusal is `{run_id, error, detail}`: `error` is `not_found`, `not_accepted`, `not_exportable` (with `code`
-`PREVIS_NOT_DELIVERABLE`, `GATE_FAIL` or `RUN_NOT_DELIVERABLE` when the guard says why), `bad_name` or
-`bad_format`.
+`PREVIS_NOT_DELIVERABLE`, `GATE_FAIL`, `RUN_NOT_DELIVERABLE`, `SAFE_FRAME_MISMATCH` or `PACKET_UNREADABLE`
+when the guard says why), `bad_name` or `bad_format`.
 
 `export_many(pipeline, project_id, ...)` is the same thing as a function (`plate export --runs/--accepted`,
 T103). It raises `PipelineError` for a problem with the request itself (404 unknown project; 422 `bad_format`,
@@ -62,6 +68,7 @@ class ExportBatchBody(BaseModel):
     out_dir: str = Field(min_length=1)
     format: str = DEFAULT_FORMAT
     name_pattern: str = Field(default=DEFAULT_PATTERN, min_length=1, max_length=200)
+    full_frame: bool = False
 
 
 class _Refused(Exception):
@@ -147,6 +154,7 @@ def export_many(
     fmt: str = DEFAULT_FORMAT,
     name_pattern: str = DEFAULT_PATTERN,
     by: str = "human",
+    full_frame: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Export the runs into `out_dir` (see the module docstring); `{exported, refused}`."""
     pl = pipeline
@@ -193,9 +201,19 @@ def export_many(
                     )
                 stem = _file_name(name_pattern, run, position)
                 try:
-                    done = export(run, fmt, out, None, conn=conn, cas=cas, project_dir=project_dir, name=stem)
+                    done = export(
+                        run,
+                        fmt,
+                        out,
+                        None,
+                        conn=conn,
+                        cas=cas,
+                        project_dir=project_dir,
+                        name=stem,
+                        full_frame=full_frame,
+                    )
                 except NotExportable as e:
-                    code = (
+                    code = getattr(e, "code", None) or (
                         "RUN_NOT_DELIVERABLE"
                         if run.state not in (RunState.DONE, RunState.GATE_FAIL)
                         else None
@@ -223,9 +241,17 @@ def export_many(
                         "override_reason": done.override_reason,
                         "shipped": shipped,
                         "by": by,
+                        **done.framing.record(),
                     },
                 )
-                exported.append({"run_id": rid, "path": str(done.path), "sidecar": str(done.report_path)})
+                exported.append(
+                    {
+                        "run_id": rid,
+                        "path": str(done.path),
+                        "sidecar": str(done.report_path),
+                        **done.framing.record(),
+                    }
+                )
             except _Refused as r:
                 refused.append({"run_id": rid, **r.body})
     return {"exported": exported, "refused": refused}
@@ -248,6 +274,7 @@ def export_batch_route(request: Request, project_id: str, body: ExportBatchBody)
             fmt=body.format,
             name_pattern=body.name_pattern,
             by="human",
+            full_frame=body.full_frame,
         )
     except PipelineError as e:
         raise pipeline_error(e) from e

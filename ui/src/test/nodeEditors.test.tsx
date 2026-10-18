@@ -516,6 +516,21 @@ describe("ExportEditor", () => {
     expect(called(calls, "GET", "/projects/p1/runs").length).toBeGreaterThanOrEqual(2); // re-read after the export
   });
 
+  it("the whole-frame box sends full_frame (off by default: the daemon exports the safe frame)", async () => {
+    const calls = mockApi({
+      "GET /projects/p1/runs": [runView("r1", "DONE")],
+      "POST /runs/r1/export": { run_id: "r1", path: "/out/r1.tif", sidecar: "/out/r1.gate.json", format: "tiff16", shipped: true, full_frame: true },
+    });
+    openChain("Export", { params: { outDir: "/out", format: "tiff16" } });
+    render(<ExportEditor nodeId="n1" />);
+    await waitFor(() => expect(screen.getByTestId("export-candidate")).toHaveValue("r1"));
+    expect(screen.getByTestId("export-full-frame")).not.toBeChecked();
+    fireEvent.click(screen.getByTestId("export-full-frame"));
+    fireEvent.click(screen.getByTestId("export-go"));
+    expect(await screen.findByTestId("export-path")).toHaveTextContent("/out/r1.tif");
+    expect(called(calls, "POST", "/runs/r1/export")[0].body).toEqual({ out_dir: "/out", format: "tiff16", full_frame: true });
+  });
+
   it("a GATE_FAIL candidate needs an override reason of 10 characters before Export enables; the reason is posted", async () => {
     const calls = mockApi({
       "GET /projects/p1/runs": [runView("r1", "GATE_FAIL", { exportable: false })],
@@ -687,7 +702,8 @@ describe("palette, Judge, body hints, registry", () => {
   });
 
   it("the path editors are their own registry; the T47 registry is unchanged", () => {
-    expect([...PATH_EDITOR_KINDS].sort()).toEqual(["Edit", "Export", "Plate", "Reference", "Review"]);
+    // T69 path editors, T97 Reference, T112 parameter panels (Comp, Colour, Atmosphere, Sky, Frame)
+    expect([...PATH_EDITOR_KINDS].sort()).toEqual(["Atmosphere", "Colour", "Comp", "Edit", "Export", "Frame", "Plate", "Reference", "Review", "Sky"]);
     for (const kind of NODE_KINDS) {
       const inPath = (PATH_EDITOR_KINDS as readonly string[]).includes(kind);
       expect(pathEditorFor(kind) !== null).toBe(inPath);

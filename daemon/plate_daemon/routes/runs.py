@@ -35,7 +35,7 @@ best-of-N, export, envelopes.
   logged FULL scrub of this run: a ledger record of kind `scrub` (written by `POST /runs/{id}/scrub`, T38)
   whose `opaque_id` or `data.scrub_log_id` is the id and whose `data.full_scrub` is true, or
   `data.quadrants_visited >= 4` with `data.zoom_100`. Else 409.
-- `POST /runs/{id}/export {out_dir, format?, name?, override?, reason?}` (or the legacy `{dest}`: its folder,
+- `POST /runs/{id}/export {out_dir, format?, name?, override?, reason?, full_frame?}` (or the legacy `{dest}`: its folder,
   stem and suffix): through `export.export` (decision 39), the run's gated composite as tiff16 / png16 / exr
   with its lineage embedded and `<name>.gate.json` beside it; the report is marked shipped and a ledger
   `export` record written. Export does not require accept. GATE_FAIL needs an override, recorded earlier or
@@ -132,6 +132,7 @@ class ExportBody(BaseModel):
     name: str | None = None
     override: bool = False
     reason: str | None = None
+    full_frame: bool = False
 
 
 class RescoreBody(BaseModel):
@@ -703,7 +704,15 @@ def export_route(request: Request, run_id: str, body: ExportBody) -> dict[str, A
         done = None
         try:
             done = export(
-                run, fmt, out_dir, typed, conn=conn, cas=c.cas_for(pid), project_dir=project_dir, name=name
+                run,
+                fmt,
+                out_dir,
+                typed,
+                conn=conn,
+                cas=c.cas_for(pid),
+                project_dir=project_dir,
+                name=name,
+                full_frame=body.full_frame,
             )
         except NotExportable as e:
             raise ApiError(409, {"error": "not_exportable", "detail": str(e)}) from e
@@ -733,6 +742,7 @@ def export_route(request: Request, run_id: str, body: ExportBody) -> dict[str, A
                 "sidecar": done.report_path.name,
                 "override_reason": done.override_reason,
                 "by": "human",
+                **done.framing.record(),
             },
         )
         return {
@@ -741,6 +751,7 @@ def export_route(request: Request, run_id: str, body: ExportBody) -> dict[str, A
             "sidecar": str(done.report_path),
             "format": done.fmt,
             "shipped": shipped,
+            **done.framing.record(),
         }
 
 

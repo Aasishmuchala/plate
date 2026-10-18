@@ -25,3 +25,6 @@ fixtures/**/_work/
 # Client-derived imagery never enters git (BUILD_PLAN: client plates are client data).
 gates/tests/golden/stills/*.png
 gates/tests/golden/texture/*.png
+
+# scripts/smoke_e2e.py keeps its throwaway daemon home here (--keep); never committed
+.smoke/

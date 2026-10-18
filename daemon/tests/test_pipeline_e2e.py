@@ -228,11 +228,14 @@ def test_packet_to_gated_output_on_the_fake_engine(sync_settings, auth, tmp_path
 
         # Export writes the gated composite (with its lineage), never the engine's raw bytes. It goes through
         # `export.export` (decision 39), which adds the lineage and an sRGB ICC profile: the pixels are the
-        # composite's, the file bytes are not the CAS object's.
+        # composite's, the file bytes are not the CAS object's. room_a declares a safe frame, so the export is
+        # that band of the composite (router plan T114: a pixel crop).
         dest = tmp_path / "out" / "take.png"
         r = c.post(f"/api/v0/runs/{run_id}/export", json={"dest": str(dest)}, headers=auth)
         assert r.status_code == 200, r.text
-        assert np.array_equal(decode_png16(dest.read_bytes()), out)
+        sf = json.loads((ROOM_A / "manifest.json").read_text(encoding="utf-8"))["camera"]["safe_frame"]
+        band = out[sf["y"] : sf["y"] + sf["height"], sf["x"] : sf["x"] + sf["width"]]
+        assert np.array_equal(decode_png16(dest.read_bytes()), band)
         lin = lineage.read(dest)
         assert lin is not None and lin.run_id == run_id and lin.packet_id == packet_id and lin.node_id == "e"
 

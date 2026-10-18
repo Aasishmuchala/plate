@@ -406,6 +406,8 @@ export interface ExportBody {
   /** A GATE_FAIL take: export anyway, with `reason` ledgered as an `override` record. */
   override?: boolean;
   reason?: string;
+  /** Keep the whole render (overscan included) instead of the packet's safe frame. */
+  full_frame?: boolean;
 }
 
 export interface ExportResult {

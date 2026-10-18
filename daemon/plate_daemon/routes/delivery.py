@@ -1,6 +1,7 @@
 """The delivery route (router plan T74, doctrine 6: gates can block delivery) and the helper behind it.
 
-- `POST /runs/{id}/deliver {format, out_dir, name?, override_reason?, timeline?}` -> `{path, sidecar, format}`.
+- `POST /runs/{id}/deliver {format, out_dir, name?, override_reason?, timeline?, full_frame?}` ->
+  `{path, sidecar, format}`.
   `format` is one of `prores4444` (`<name>.mov`), `hevc` (`<name>.mp4`), `exr_sequence` (`<name>.%04d.exr`),
   `av1_retag` (`<name>.mp4`, the lossless Vantage 3.3 colour re-tag of an AV1 take) or `fcpxml`
   (`<name>.fcpxml`); `name` defaults to the run id. The take is the run's `outputs[0]` in the project's CAS:
@@ -18,10 +19,20 @@
   stored report is marked shipped and a ledger `export` record is written with `data.delivery: true`.
   ffmpeg or ffprobe missing is 503 `tool_missing`; any other delivery error (an AV1 re-tag of a take that is
   not AV1, a bad timeline) is 422 `delivery_error`.
+- Framing (router plan T114). When the run's packet declares `camera.safe_frame`, the pixel formats
+  (`prores4444`, `hevc`, `exr_sequence`) write the safe-frame region by default, placed on the take by
+  `export.framing` (a pixel crop, nothing resampled; HEVC's 4:2:0 snaps it inward to even coordinates). A clip
+  that is cut is decoded to 16-bit frames, cropped and encoded from them; a take the safe frame does not cut
+  goes straight through as before. `full_frame: true` keeps the whole take. The re-tag and the timeline write
+  no pixel of their own, so they always carry the whole take and say so. The sidecar and the ledger `export`
+  record carry `crop: {x, y, width, height}`, or `full_frame: true` (plus `safe_frame` when one was placed);
+  a packet with no safe frame adds neither. A safe frame that cannot be placed on the take is 422
+  `safe_frame_mismatch`, and a registered packet whose manifest cannot be read is 422 `packet_unreadable`.
 
 `deliver_run(pipeline, run_id, fmt, out_dir, ...)` is the same thing as a function (`plate deliver`, T78): it
 raises `PipelineError` (404 unknown run; 422 `bad_format`, `bad_name`, `bad_out_dir`, `not_a_clip`,
-`no_output`), `DeliveryRefused`, `ToolMissing`, `DeliveryError` or `FileExistsError`.
+`no_output`, `safe_frame_mismatch`, `packet_unreadable`), `DeliveryRefused`, `ToolMissing`, `DeliveryError` or
+`FileExistsError`.
 """
 
 from __future__ import annotations
@@ -38,10 +49,19 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..delivery import fcpxml, video
-from ..delivery.frames import is_video_file
+from ..delivery.frames import crop_frames, is_video_file, open_frames
 from ..delivery.guard import DeliveryError, DeliveryRefused, Provenance, ToolMissing, authorize, sidecar_path
 from ..delivery.tools import probe_video, run_ffmpeg
-from ..export import NAME_RE, recorded_override
+from ..export import (
+    NAME_RE,
+    Framing,
+    SafeFrameError,
+    declared_safe_frame,
+    framing,
+    packet_manifest,
+    recorded_override,
+)
+from ..fsutil import read_json, write_json_atomic
 from ..gate_reports import NoReport
 from ..gate_reports import Service as ReportService
 from ..lineage import LineageError
@@ -58,6 +78,10 @@ FORMATS = ("prores4444", "hevc", "exr_sequence", "av1_retag", "fcpxml")
 CLIP_ONLY = ("prores4444", "hevc", "av1_retag", "fcpxml")
 # The re-tag and the timeline change no pixel: they need no gate report (the guard still refuses previs, GATE_FAIL).
 NO_REPORT_NEEDED = ("av1_retag", "fcpxml")
+# ...and they cannot crop: a stream copy and a timeline carry the whole take (T114).
+WHOLE_TAKE = ("av1_retag", "fcpxml")
+# 4:2:0 encodes crop on even coordinates.
+EVEN_FORMATS = ("hevc",)
 SUFFIXES = {"prores4444": ".mov", "hevc": ".mp4", "av1_retag": ".mp4", "fcpxml": ".fcpxml"}
 EXR_FRAME_FIELD = ".%04d.exr"
 FRAME_NAME = "frame_%06d.png"
@@ -80,6 +104,7 @@ class DeliverBody(BaseModel):
     name: str | None = None
     override_reason: str | None = Field(default=None, max_length=500)
     timeline: dict[str, Any] | None = None
+    full_frame: bool = False
 
 
 # ---------------------------------------------------------------------------- the take's file
@@ -157,6 +182,38 @@ def _report_n(ref: str | None, run_id: str) -> int | None:
     return int(n) if head == run_id and n.isdigit() else None
 
 
+# ---------------------------------------------------------------------------- the safe frame (T114)
+
+
+def _framing(
+    conn: Any, run: Run, fmt: str, full_frame: bool, take_size: Callable[[], tuple[int, int]]
+) -> Framing:
+    """Which part of the take this delivery writes (see the module docstring). `take_size` is only called when
+    the packet declares a safe frame. Raises `PipelineError` (`safe_frame_mismatch`, `packet_unreadable`)."""
+    keep = full_frame or fmt in WHOLE_TAKE
+    try:
+        manifest = packet_manifest(conn, run.packet_id)
+        if declared_safe_frame(manifest) is None:
+            return Framing(full_frame=full_frame)
+        width, height = take_size()
+        return framing(manifest, width, height, full_frame=keep, even=fmt in EVEN_FORMATS)
+    except SafeFrameError as e:
+        if keep:  # the whole take leaves anyway; the safe frame is not known, so none is named
+            return Framing(full_frame=True)
+        raise PipelineError(str(e), code=e.code.lower(), run_id=run.id) from e
+
+
+def _note_framing(sidecar: Path, record: dict[str, Any]) -> None:
+    """Add the framing (`crop` or `full_frame`) to the sidecar the encoder wrote beside the delivery."""
+    body = read_json(sidecar)
+    body.update(record)
+    write_json_atomic(sidecar, body, indent=1)
+
+
+def _work_dir(pl: Pipeline, run_id: str) -> Path:
+    return pl.settings.home / "cache" / "deliver" / f"{run_id}-{uuid.uuid4().hex[:8]}"
+
+
 # ---------------------------------------------------------------------------- the helper
 
 
@@ -170,8 +227,10 @@ def deliver_run(
     override_reason: str | None = None,
     timeline: Mapping[str, Any] | None = None,
     by: str = "human",
+    full_frame: bool = False,
 ) -> dict[str, Any]:
-    """Deliver the run's take as `fmt` into `out_dir` (see the module docstring); `{path, sidecar, format}`."""
+    """Deliver the run's take as `fmt` into `out_dir` (see the module docstring); `{path, sidecar, format}`.
+    The packet's safe frame is cropped out of a pixel format unless `full_frame`."""
     pl = pipeline
     if fmt not in FORMATS:
         raise PipelineError(f"format {fmt!r}: use one of {', '.join(FORMATS)}", code="bad_format")
@@ -213,19 +272,38 @@ def deliver_run(
                 code="not_a_clip",
                 run_id=run_id,
             )
+        taken: dict[str, Any] = {}  # what reading the take's size opened: the clip's stream, a still's frames
+
+        def take_size() -> tuple[int, int]:
+            if clip:
+                stream = taken["stream"] = probe_video(src)
+                taken["size"] = (int(stream.get("width") or 0), int(stream.get("height") or 0))
+            else:
+                still = taken["frames"] = open_frames(src)
+                taken["size"] = (still.width, still.height)
+            return taken["size"]
+
+        frame = _framing(conn, run, fmt, full_frame, take_size)
+        crop = frame.crop if frame.crop is not None and frame.cuts(*taken["size"]) else None
         work: Path | None = None
         try:
-            if fmt == "prores4444":
-                done = video.prores4444(src, out / f"{stem}{SUFFIXES[fmt]}", provenance=prov)
-            elif fmt == "hevc":
-                done = video.hevc(src, out / f"{stem}{SUFFIXES[fmt]}", provenance=prov)
+            if fmt in ("prores4444", "hevc"):
+                source: Any = src
+                fps: Any = None
+                if crop is not None:  # cut to the safe frame: decoded, cropped, encoded from the frames
+                    work = _work_dir(pl, run_id)
+                    source, fps = crop_frames(_clip_frames(src, work), crop), taken["stream"]["fps"]
+                encode = video.prores4444 if fmt == "prores4444" else video.hevc
+                done = encode(source, out / f"{stem}{SUFFIXES[fmt]}", fps, provenance=prov)
             elif fmt == "av1_retag":
                 done = video.av1_retag(src, out / f"{stem}{SUFFIXES[fmt]}", provenance=prov)
             elif fmt == "exr_sequence":
-                frames: Any = src
+                frames: Any = taken.get("frames", src)
                 if clip:
-                    work = pl.settings.home / "cache" / "deliver" / f"{run_id}-{uuid.uuid4().hex[:8]}"
+                    work = _work_dir(pl, run_id)
                     frames = _clip_frames(src, work)
+                if crop is not None:
+                    frames = crop_frames(frames, crop)
                 done = video.exr_sequence(frames, out / (stem + EXR_FRAME_FIELD), provenance=prov)
             else:
                 path = fcpxml.write(
@@ -241,6 +319,9 @@ def deliver_run(
         finally:
             if work is not None:
                 shutil.rmtree(work, ignore_errors=True)
+        record = frame.record()
+        if record:
+            _note_framing(done.sidecar, record)
         shipped = False
         n = _report_n(prov.report_ref, run_id)
         if n is not None:
@@ -261,6 +342,7 @@ def deliver_run(
                 "override_reason": (done.override or {}).get("reason") or None,
                 "shipped": shipped,
                 "by": by,
+                **record,
             },
         )
     return {"path": str(done.path), "sidecar": str(done.sidecar), "format": fmt}
@@ -283,6 +365,7 @@ def deliver_route(request: Request, run_id: str, body: DeliverBody) -> dict[str,
             override_reason=body.override_reason,
             timeline=body.timeline,
             by="human",
+            full_frame=body.full_frame,
         )
     except PipelineError as e:
         raise pipeline_error(e) from e

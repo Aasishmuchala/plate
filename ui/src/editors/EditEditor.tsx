@@ -14,6 +14,10 @@
 // Node params: `recipe` (recipe id), `prompt` (explicit prompt text), `tokens` ({"[TOKEN]": text}), `task`,
 // `shot_class`. The Make bar sends `prompt` / `recipe` / `task` / `shot_class` with the quote; the engine itself is the
 // Make bar's (picking a recipe fills it when the bar has none). The Make bar's `preset` plays no part here (T102).
+//
+// T112: with Reference nodes wired to the Edit, a line under the prompt says that `@ref1`..`@refN` name them, in the
+// order the quote reads them (edge order, `wiredReferences`); the daemon replaces each with the engine's own wording
+// (T113) and refuses a number past N.
 
 import { type ReactElement, useEffect, useRef, useState } from "react";
 import { useMakeStore } from "../makebar/makeStore";
@@ -119,6 +123,34 @@ export function connectedMaskClasses(
     }
   }
   return RECIPE_CLASSES.filter((c) => found.has(c));
+}
+
+/**
+ * The Reference nodes wired to an Edit, as the quote reads them (`pipeline.reference_inputs`): in edge order, every
+ * edge into the node from a Reference (the canvas lets a Reference reach only `refs`). `@refK` names the K-th. Pure.
+ */
+export function wiredReferences(
+  nodes: readonly { id: string; data: { kind: string; label?: string } }[],
+  edges: readonly { source: string; target: string }[],
+  nodeId: string,
+): { id: string; label: string }[] {
+  const out: { id: string; label: string }[] = [];
+  for (const e of edges) {
+    if (e.target !== nodeId) continue;
+    const src = nodes.find((n) => n.id === e.source);
+    // a non-Reference on `refs` is refused at the quote (bad_reference); it names no image, so the hint skips it
+    if (src?.data.kind !== "Reference") continue;
+    out.push({ id: src.id, label: src.data.label || src.id });
+  }
+  return out;
+}
+
+/** The one-line `@ref` hint for N wired references; null when none is wired. Pure. */
+export function refTokenHint(refs: readonly { id: string; label: string }[]): string | null {
+  if (refs.length === 0) return null;
+  const names = refs.map((r, i) => `@ref${i + 1} = ${r.label}`).join(", ");
+  const span = refs.length === 1 ? "@ref1 names the wired reference" : `@ref1..@ref${refs.length} name the wired references`;
+  return `${span} (${names}); the engine's own wording replaces each at the quote`;
 }
 
 // ---------------------------------------------------------------------------------------------------- save dialog
@@ -435,6 +467,7 @@ export function EditEditor({ nodeId }: { nodeId: string }): ReactElement {
     </option>
   );
   const maskClasses = connectedMaskClasses(graphNodes, graphEdges, nodeId);
+  const refHint = refTokenHint(wiredReferences(graphNodes, graphEdges, nodeId));
   const explicitPrompt = asString(params.prompt);
 
   const onSaved = async (saved: SavedRecipe): Promise<void> => {
@@ -542,6 +575,11 @@ export function EditEditor({ nodeId }: { nodeId: string }): ReactElement {
           data-testid="edit-prompt"
           onChange={(e) => writePrompt(e.target.value)}
         />
+        {refHint ? (
+          <span style={E.note} data-testid="edit-ref-hint">
+            {refHint}
+          </span>
+        ) : null}
         <span style={E.note} data-testid="edit-prompt-source" data-source={source}>
           prompt source: {source === "none" ? "none (pick a recipe or type a prompt)" : source}
         </span>

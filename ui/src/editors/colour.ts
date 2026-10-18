@@ -2,7 +2,9 @@
 // <-> Lab for swatches. The RAL values are the published sRGB approximations `plate_gates.recolour.RAL_SRGB` carries
 // (the official RAL Lab values are licensed, so a job enters the swatch's measured Lab or the hex the material was
 // built from). `RAL_SRGB` is those 15 codes; the whole RAL Classic table for the picker is `ralTable.ts`, and
-// `parseTarget` reads any of its codes. Display only: the daemon owns the recolour math.
+// `parseTarget` reads any of its codes. Display only: the daemon owns the recolour math. T112 adds the sRGB <-> linear
+// pair the Atmosphere editor's fog colour needs, vector (`[r, g, b]`) LightMix gains and the full mirror of the
+// daemon's mood presets.
 
 import { RAL_BY_CODE } from "./ralTable";
 
@@ -192,23 +194,68 @@ export function labTargetOf(v: unknown): { lab: [number, number, number]; label:
   return isLab(o.lab) ? { lab: [o.lab[0], o.lab[1], o.lab[2]], label: typeof o.label === "string" ? o.label : "lab" } : null;
 }
 
-/** Mood presets for the LightMix gain sliders (`plate_gates.lightmix.mood_presets`): initial guesses, never a solution. */
-export const MOOD_PRESETS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
+// ------------------------------------------------------------------------------------------------ linear light
+
+/** `#RRGGBB` (sRGB display) -> linear Rec.709 `[r, g, b]` in 0..1 (the sRGB EOTF; Atmosphere's fog colour). */
+export function hexToLinear(hex: string): [number, number, number] {
+  const n = normalizeHex(hex) ?? "#000000";
+  return [1, 3, 5].map((i) => srgbToLinear(parseInt(n.slice(i, i + 2), 16) / 255)) as [number, number, number];
+}
+
+/** Linear Rec.709 `[r, g, b]` -> `#RRGGBB` (clipped to 0..1 first; for showing a linear colour as a swatch). */
+export function linearToHex(rgb: readonly number[]): string {
+  const byte = (c: number): string =>
+    Math.round(255 * linearToSrgb(Math.min(1, Math.max(0, Number.isFinite(c) ? c : 0))))
+      .toString(16)
+      .padStart(2, "0");
+  return `#${[0, 1, 2].map((i) => byte(rgb[i] ?? 0)).join("").toUpperCase()}`;
+}
+
+// ------------------------------------------------------------------------------------------------ LightMix presets
+
+/** One light's gain, as `plate_gates.lightmix` takes it: a number, or an `[r, g, b]` vector (each >= 0). */
+export type Gain = number | readonly [number, number, number];
+
+/** A gain read from params: a finite number >= 0 or three of them; null for anything else. */
+export function readGain(v: unknown): Gain | null {
+  if (typeof v === "number") return Number.isFinite(v) && v >= 0 ? v : null;
+  if (Array.isArray(v) && v.length === 3 && v.every((c) => typeof c === "number" && Number.isFinite(c) && c >= 0)) {
+    return [v[0] as number, v[1] as number, v[2] as number];
+  }
+  return null;
+}
+
+/**
+ * Mood presets for the LightMix gain sliders: a mirror of `plate_gates.lightmix.mood_presets` (the names the daemon's
+ * `params.preset` accepts, in its order, with its patterns and gains). Initial guesses, never a solution. The daemon
+ * has no preset route, so `nodeParamPanels.test.tsx` pins this table to `gates/plate_gates/lightmix.py`.
+ */
+export const MOOD_PRESETS: Readonly<Record<string, Readonly<Record<string, Gain>>>> = {
   dusk: { sun: 0.15, sky: 0.6, "interior_*": 3.0 },
+  moonlight: { sun: 0.0, sky: 0.08, "interior_*": 0.6, "facade_*": 0.3 },
+  luxury_exterior: { sun: 0.0, sky: 0.15, "interior_*": 0.0, "facade_*": 2.5, "landscape_*": 1.5 },
+  artificial_light: { sun: 0.0, sky: 0.05, "interior_*": 3.0, "facade_*": 1.0, "landscape_*": 1.0 },
 };
+
+/** How a preset name reads on a button: `luxury_exterior` -> `luxury exterior`. */
+export const presetLabel = (name: string): string => name.replace(/_/g, " ");
 
 const globToRegExp = (glob: string): RegExp =>
   new RegExp(`^${glob.toLowerCase().replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
 
-/** `lightmix.preset_gains`: each light takes the gain of the first pattern that matches it (case insensitive), else `fallback`. */
-export function presetGains(preset: Readonly<Record<string, number>>, names: readonly string[], fallback = 1): Record<string, number> {
-  const out: Record<string, number> = {};
+/**
+ * `lightmix.preset_gains`: each light takes the gain of the first pattern that matches it (case insensitive), else
+ * `fallback`. A vector gain is passed through as a new `[r, g, b]`, never collapsed to one number.
+ */
+export function presetGains(preset: Readonly<Record<string, Gain>>, names: readonly string[], fallback: Gain = 1): Record<string, Gain> {
+  const copy = (g: Gain): Gain => (typeof g === "number" ? g : [g[0], g[1], g[2]]);
+  const out: Record<string, Gain> = {};
   const entries = Object.entries(preset).map(([pat, gain]) => [globToRegExp(pat), gain] as const);
   for (const name of names) {
-    out[name] = fallback;
+    out[name] = copy(fallback);
     for (const [re, gain] of entries) {
       if (re.test(name.toLowerCase())) {
-        out[name] = gain;
+        out[name] = copy(gain);
         break;
       }
     }

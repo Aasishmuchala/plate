@@ -4,12 +4,18 @@
 // The artist-path editors (T69: Plate packet picker, Edit prompt/recipe, Export, Review; T97: Reference) have their own registry,
 // `pathEditorFor`, which PlateCanvas mounts in the sidebar for the selected node. They are kept out of `editorFor`
 // because the T47 suites pin `editorFor` to its nine kinds; a kind has an editor in one registry or the other.
+// T112 adds the parameter panels of the Wave 9 nodes that had none (Comp, Colour, Atmosphere, Sky and the Frame
+// annotation) to `pathEditorFor` for the same reason; both registries land in the same sidebar.
 
 import { type ComponentType, createElement } from "react";
 import type { NodeKind } from "../nodeTypes";
+import { AtmosphereEditor } from "./AtmosphereEditor";
+import { ColourEditor } from "./ColourEditor";
+import { CompEditor } from "./CompEditor";
 import { CropPairEditor } from "./CropPairEditor";
 import { EditEditor } from "./EditEditor";
 import { ExportEditor } from "./ExportEditor";
+import { FrameEditor } from "./FrameEditor";
 import { LightEditor } from "./LightEditor";
 import { LightMixEditor } from "./LightMixEditor";
 import { MaskEditor } from "./MaskEditor";
@@ -21,6 +27,7 @@ import { ReferenceEditor } from "./ReferenceEditor";
 import { ReviewEditor } from "./ReviewEditor";
 import { ScoutEditor } from "./ScoutEditor";
 import { SetEditor } from "./SetEditor";
+import { SkyEditor } from "./SkyEditor";
 
 export interface EditorProps {
   nodeId: string;
@@ -58,8 +65,14 @@ export function editorFor(kind: NodeKind): EditorComponent | null {
   return EDITORS[kind] ?? null;
 }
 
-/** The kinds of the artist path (T69): link a packet, say what changes, hand the take out; T97 adds the Reference image. */
-export const PATH_EDITOR_KINDS = ["Plate", "Edit", "Export", "Review", "Reference"] as const;
+/**
+ * The kinds of the artist path (T69): link a packet, say what changes, hand the take out; T97 adds the Reference image;
+ * T112 the numeric Wave 9 nodes (Comp, Colour, Atmosphere, Sky) and the Frame annotation.
+ */
+export const PATH_EDITOR_KINDS = ["Plate", "Edit", "Export", "Review", "Reference", "Comp", "Colour", "Atmosphere", "Sky", "Frame"] as const;
+
+/** The T112 parameter panels: every kind of the node vocabulary that has parameters now has an editor. */
+export const PARAM_PANEL_KINDS = ["Comp", "Colour", "Atmosphere", "Sky", "Frame"] as const;
 
 const PATH_EDITORS: Readonly<Partial<Record<NodeKind, EditorComponent>>> = {
   Plate: keyedByNode(PlateEditor, "Plate"),
@@ -67,6 +80,11 @@ const PATH_EDITORS: Readonly<Partial<Record<NodeKind, EditorComponent>>> = {
   Export: keyedByNode(ExportEditor, "Export"),
   Review: keyedByNode(ReviewEditor, "Review"),
   Reference: keyedByNode(ReferenceEditor, "Reference"),
+  Comp: keyedByNode(CompEditor, "Comp"),
+  Colour: keyedByNode(ColourEditor, "Colour"),
+  Atmosphere: keyedByNode(AtmosphereEditor, "Atmosphere"),
+  Sky: keyedByNode(SkyEditor, "Sky"),
+  Frame: keyedByNode(FrameEditor, "Frame"),
 };
 
 export function pathEditorFor(kind: NodeKind): EditorComponent | null {
@@ -75,6 +93,10 @@ export function pathEditorFor(kind: NodeKind): EditorComponent | null {
 
 export { CropPairEditor, LightEditor, LightMixEditor, MaskEditor, MotionEditor, PeopleEditor, RecolourEditor, ScoutEditor, SetEditor };
 export { EditEditor, ExportEditor, PlateEditor, ReferenceEditor, ReviewEditor };
+export { AtmosphereEditor, ColourEditor, CompEditor, FrameEditor, SkyEditor };
+export { moveLayer, orderedLayers, wiredInto } from "./CompEditor";
+export { COLOUR_SCOPES, GRADE_CONTROLS, GRADE_KEYS, KELVIN_RANGE, readIds, type ColourScope } from "./ColourEditor";
+export { MAX_MATERIALS, readEntries, RECOLOUR_METHODS, type RecolourEntry, type RecolourMethod } from "./RecolourEditor";
 export {
   connectedMaskClasses,
   EDIT_RECIPE_KINDS,
@@ -84,9 +106,11 @@ export {
   RECIPE_CLASSES,
   RECIPE_ID_PATTERN,
   recipeLabel,
+  refTokenHint,
   SHOT_CLASSES,
   tokenSlug,
   tokensOf,
+  wiredReferences,
   type PromptSource,
   type RecipeGroups,
 } from "./EditEditor";

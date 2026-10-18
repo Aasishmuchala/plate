@@ -12,7 +12,7 @@ import { FALLBACK_ENGINES } from "../makebar/engines";
 import { EMPTY_ENTRY, useMakeStore } from "../makebar/makeStore";
 import { NODE_KINDS, type NodeKind } from "../nodeTypes";
 import { createInitialGraph, useGraphStore } from "../store";
-import { EDITOR_KINDS, editorFor } from "../editors";
+import { EDITOR_KINDS, editorFor, PARAM_PANEL_KINDS, PATH_EDITOR_KINDS, pathEditorFor } from "../editors";
 import { parseIdPick, parseLightMixSeed, parseRecolourExpect, parseSetSummary } from "../editors/api";
 import { hexToLab, labToHex, MOOD_PRESETS, normalizeHex, parseTarget, presetGains, RAL_SRGB } from "../editors/colour";
 import { boxFor, boxPercent, cutBoxes, moveZoom, zoomError } from "../editors/cropBoxes";
@@ -595,6 +595,17 @@ describe("editorFor", () => {
     }
   });
 
+  it("T112: the parameter panels live in the path registry, so every kind with parameters has exactly one editor", () => {
+    expect([...PARAM_PANEL_KINDS].sort()).toEqual(["Atmosphere", "Colour", "Comp", "Frame", "Sky"]);
+    for (const kind of PARAM_PANEL_KINDS) {
+      expect(editorFor(kind)).toBeNull();
+      expect(pathEditorFor(kind)).not.toBeNull();
+    }
+    // what is left without an editor: the gate and judge reports, the A/B compare, the unmeasured concept
+    const withEditor = new Set<string>([...EDITOR_KINDS, ...PATH_EDITOR_KINDS]);
+    expect(NODE_KINDS.filter((k) => !withEditor.has(k)).sort()).toEqual(["Compare", "Concept", "Gate", "Judge"]);
+  });
+
   it.each(EDITOR_KINDS)("the %s editor renders with mock data", async (kind) => {
     mockApi({
       "POST /projects/p1/nodes/n1/preview": {},
@@ -662,7 +673,7 @@ describe("App slot", () => {
           { id: "plate-1", kind: "Plate", packetId: "room_a", tier: "A", outputHash: "h_plate", outputSize: PLATE },
           { id: "mask-1", kind: "Mask" },
           { id: "scout-1", kind: "Scout" },
-          { id: "comp-1", kind: "Comp" },
+          { id: "gate-1", kind: "Gate" },
         ],
         edges: [{ id: "a", source: "plate-1", target: "mask-1", sourceHandle: null, targetHandle: null }],
       } as never,
@@ -680,9 +691,10 @@ describe("App slot", () => {
     expect(await screen.findByTestId("editor-scout")).toHaveAttribute("data-node", "scout-1");
     expect(screen.queryByTestId("editor-mask")).toBeNull();
     // a kind without an editor shows none, and the Make bar still follows the selection
-    select("comp-1");
+    select("gate-1");
     await waitFor(() => expect(screen.queryByTestId("editor-scout")).toBeNull());
-    expect(screen.getByTestId("make-target")).toHaveTextContent("comp-1");
+    expect(screen.queryByTestId("editor-gate")).toBeNull();
+    expect(screen.getByTestId("make-target")).toHaveTextContent("gate-1");
   });
 });
 

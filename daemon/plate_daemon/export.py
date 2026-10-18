@@ -8,7 +8,8 @@ destination file is never overwritten.
 
 Two entry points share those rules:
 
-- `export_run(conn, run_id, dest, ...)` copies the stored bytes to one file (the daemon's `POST /runs/{id}/export`).
+- `export_run(conn, run_id, dest, ...)` copies the stored bytes to one file (the seed's byte copy: no route
+  calls it any more, and it neither decodes nor crops).
 - `export(run, fmt, out_dir, override=None, ...)` is what `plate export` calls: it decodes the run's gated
   composite (the 16-bit PNG in the CAS), writes it as `tiff16`, `png16` or `exr` with `plate_pixels.imageio`
   (an EXR is the sRGB display master decoded to linear half float in the packet's working primaries), embeds
@@ -17,6 +18,20 @@ Two entry points share those rules:
   sibling is shared by the formats of one take (tiff16 and exr of the same run and name): a second export adds
   its file to the block; a report that belongs to another run blocks the export. The image is written under a
   temp name and moved into place last; a lineage failure leaves nothing behind.
+
+Framing (router plan T114). When the run's packet declares `camera.safe_frame` (an overscan render, a
+level-and-crop packet, room_a's 2.39:1 band in a 16:9 frame), the safe-frame region is what leaves by default:
+a pixel crop, nothing resampled. `full_frame=True` keeps the whole take (for re-framing later). The `export`
+block of the sidecar says which: `crop: {x, y, width, height}` (take pixels), or `full_frame: true` (plus
+`safe_frame` when one was placed on the take); a packet with no safe frame adds neither, exactly as before.
+`take_framing` places the rectangle: on a take at the render resolution it is the declared rectangle; a take
+that is already the safe-frame size, or any take of a packet whose safe frame is its whole render, is kept
+whole; a take of the render's aspect at another size (an engine's 4K clip of a 1080p plate) gets the rectangle
+scaled and rounded inward, so no overscan pixel survives. A take of another aspect on an overscan packet (the
+rectangle cannot be located), or a registered packet whose manifest cannot be read, raises `SafeFrameError`
+unless the whole take was asked for. `cutdown._region` validates the rectangle (inside the take, not empty)
+and, for a 4:2:0 encode (`even=True`), snaps it inward to even coordinates. One sidecar describes one framing:
+a second format of the same take must be framed the same way or take another name.
 
 Colour tags. A tiff16 and a png16 are sRGB-encoded (that is what the gates scored) and carry the sRGB ICC
 profile. An EXR carries `chromaticities` (the primaries of its pixels), the ASWF `colorInteropID` (which OIIO
@@ -32,7 +47,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -69,6 +84,16 @@ INTEROP_CHROMATICITIES: dict[str, tuple[float, ...]] = {
 
 class NotExportable(Exception):
     pass
+
+
+class SafeFrameError(NotExportable):
+    """The packet's safe frame cannot be placed on the take (another aspect, a rectangle outside it), or the
+    packet is registered but its manifest cannot be read. `full_frame=True` exports the whole take instead.
+    `code` is `SAFE_FRAME_MISMATCH` or `PACKET_UNREADABLE`."""
+
+    def __init__(self, message: str, code: str = "SAFE_FRAME_MISMATCH"):
+        super().__init__(message)
+        self.code = code
 
 
 def export_run(
@@ -109,12 +134,185 @@ def export_run(
     return dest
 
 
+# ---------------------------------------------------------------------------- the safe frame (T114)
+
+Rect = tuple[int, int, int, int]  # (x, y, width, height) in take pixels, origin top-left
+# PACKET.md rule 4: an overscan frame matches its engine aspect within 1%; a take of the render's aspect
+# within the same tolerance is the render at another size.
+ASPECT_TOLERANCE = 0.01
+
+
+def _rect_dict(rect: Rect) -> dict[str, int]:
+    x, y, w, h = rect
+    return {"x": x, "y": y, "width": w, "height": h}
+
+
+@dataclass(frozen=True)
+class Framing:
+    """What part of the take leaves. `crop` is the rectangle written, in take pixels; `full_frame` says the
+    whole take was kept; `safe_frame` is the deliverable rectangle placed on the take when it was kept whole."""
+
+    crop: Rect | None = None
+    full_frame: bool = False
+    safe_frame: Rect | None = None
+
+    def cuts(self, width: int, height: int) -> bool:
+        """True when the crop removes pixels (a crop that is the whole take changes nothing)."""
+        return self.crop is not None and self.crop != (0, 0, width, height)
+
+    def record(self) -> dict[str, Any]:
+        """The sidecar and ledger form: `{crop: {x, y, width, height}}`, `{full_frame: true}` (plus
+        `safe_frame` when one was placed), or `{}` for a packet that declares no safe frame."""
+        if self.full_frame:
+            out: dict[str, Any] = {"full_frame": True}
+            if self.safe_frame is not None:
+                out["safe_frame"] = _rect_dict(self.safe_frame)
+            return out
+        return {"crop": _rect_dict(self.crop)} if self.crop is not None else {}
+
+
+def _framing_of(block: Mapping[str, Any]) -> dict[str, Any]:
+    """The framing keys of an `export` block (what `Framing.record()` wrote there)."""
+    return {k: block[k] for k in ("crop", "full_frame", "safe_frame") if k in block}
+
+
+def declared_safe_frame(manifest: Mapping[str, Any] | None) -> tuple[Rect, tuple[int, int] | None] | None:
+    """(the packet's `camera.safe_frame`, its `camera.resolution` as (width, height) or None), or None when
+    the manifest declares no safe frame (no camera block, or one without `safe_frame`)."""
+    camera = manifest.get("camera") if isinstance(manifest, Mapping) else None
+    sf = camera.get("safe_frame") if isinstance(camera, Mapping) else None
+    if not isinstance(sf, Mapping):
+        return None
+    try:
+        x, y, w, h = (int(sf[k]) for k in ("x", "y", "width", "height"))
+    except (KeyError, TypeError, ValueError) as e:
+        raise SafeFrameError(f"the packet's safe_frame {dict(sf)} is not x, y, width and height") from e
+    res = camera.get("resolution")
+    try:
+        size = (int(res["width"]), int(res["height"])) if isinstance(res, Mapping) else None
+    except (KeyError, TypeError, ValueError):
+        size = None
+    return (x, y, w, h), size
+
+
+def _declared(
+    manifest: Mapping[str, Any] | None, *, lenient: bool
+) -> tuple[Rect, tuple[int, int] | None] | None:
+    """`declared_safe_frame`, or None for a malformed one when `lenient` (the whole take is kept anyway)."""
+    try:
+        return declared_safe_frame(manifest)
+    except SafeFrameError:
+        if lenient:
+            return None
+        raise
+
+
+def place_safe_frame(rect: Rect, resolution: tuple[int, int] | None, width: int, height: int) -> Rect:
+    """`rect` (render pixels) on a `width` x `height` take; see the module docstring. Raises `SafeFrameError`
+    when the render has overscan and the take is neither the render, nor the safe frame, nor the render's
+    aspect at another size."""
+    x, y, w, h = rect
+    rw, rh = resolution or (width, height)
+    if (width, height) == (rw, rh):
+        return rect
+    if rect == (0, 0, rw, rh) or (width, height) == (w, h):
+        return 0, 0, width, height  # no overscan to remove, or the take already is the deliverable
+    if rw <= 0 or rh <= 0 or abs((width * rh) / (height * rw) - 1.0) > ASPECT_TOLERANCE:
+        raise SafeFrameError(
+            f"the take is {width} x {height} and the packet renders {rw} x {rh} with the safe frame "
+            f"{_rect_dict(rect)}; the rectangle cannot be placed on a take of another aspect. Export it with "
+            "full_frame to keep the whole take"
+        )
+    # the same rectangle at the take's scale, rounded inward on every edge: no overscan pixel survives
+    x0, y0 = -(-x * width // rw), -(-y * height // rh)
+    x1, y1 = (x + w) * width // rw, (y + h) * height // rh
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def framing(
+    manifest: Mapping[str, Any] | None,
+    width: int,
+    height: int,
+    *,
+    full_frame: bool = False,
+    even: bool = False,
+) -> Framing:
+    """The `Framing` of a `width` x `height` take of the packet `manifest`. `even` snaps the crop inward to
+    even coordinates (a 4:2:0 encode). With `full_frame` nothing raises: a rectangle that cannot be placed is
+    left out."""
+    from .cutdown import CutdownError, _region
+
+    declared = _declared(manifest, lenient=full_frame)
+    if declared is None:
+        return Framing(full_frame=full_frame)
+    rect, resolution = declared
+    try:
+        box = place_safe_frame(rect, resolution, width, height)
+        x0, y0, x1, y1 = _region(width, height, box)  # cutdown's validation: inside the take, not empty
+    except (SafeFrameError, CutdownError) as e:
+        if full_frame:
+            return Framing(full_frame=True)
+        if isinstance(e, SafeFrameError):
+            raise
+        raise SafeFrameError(f"the packet's safe frame on the {width} x {height} take: {e}") from e
+    if full_frame:
+        return Framing(full_frame=True, safe_frame=box)
+    return Framing(crop=(x0, y0, x1 - x0, y1 - y0) if even else box)
+
+
+def packet_manifest(conn: sqlite3.Connection, packet_id: str | None) -> dict[str, Any] | None:
+    """The run's packet manifest, or None when the run names no packet or the index does not know it. Raises
+    `SafeFrameError` (`PACKET_UNREADABLE`) when the packet is registered but its manifest cannot be read: its
+    safe frame is then unknown, and a delivery must not guess it."""
+    if not packet_id:
+        return None
+    try:
+        row = conn.execute("SELECT path FROM packets WHERE packet_id = ?", (packet_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    path = Path(row[0]) / "manifest.json"
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as e:
+        raise SafeFrameError(
+            f"packet {packet_id}'s manifest cannot be read ({type(e).__name__}), so its safe frame is "
+            "unknown; reconnect the packet folder, or export with full_frame to keep the whole take",
+            code="PACKET_UNREADABLE",
+        ) from e
+    return doc if isinstance(doc, dict) else None
+
+
+def take_framing(
+    conn: sqlite3.Connection,
+    packet_id: str | None,
+    size: tuple[int, int] | Callable[[], tuple[int, int]],
+    *,
+    full_frame: bool = False,
+    even: bool = False,
+) -> Framing:
+    """`framing` for a run's take: the manifest comes from the index (`packet_manifest`), and `size` (width,
+    height), or a callable giving it, is only asked for when the packet declares a safe frame."""
+    try:
+        manifest = packet_manifest(conn, packet_id)
+    except SafeFrameError:
+        if full_frame:
+            return Framing(full_frame=True)
+        raise
+    if _declared(manifest, lenient=full_frame) is None:
+        return Framing(full_frame=full_frame)
+    width, height = size() if callable(size) else size
+    return framing(manifest, width, height, full_frame=full_frame, even=even)
+
+
 # ---------------------------------------------------------------------------- plate export (still formats)
 
 
 @dataclass(frozen=True)
 class Exported:
-    """What `export` wrote: the image, its `.gate.json` sibling and the facts the CLI prints."""
+    """What `export` wrote: the image, its `.gate.json` sibling and the facts the CLI prints. `framing`
+    says which part of the take was written; `framing.record()` is what the sidecar and the ledger carry."""
 
     run_id: str
     fmt: str
@@ -124,6 +322,7 @@ class Exported:
     override_reason: str | None
     lineage_embedded: bool
     report_ref: str | None
+    framing: Framing = Framing()
 
 
 def recorded_override(conn: sqlite3.Connection, run_id: str) -> str | None:
@@ -263,14 +462,17 @@ def export(
     project_dir: Path | str | None = None,
     name: str | None = None,
     working_space: str | None = None,
+    full_frame: bool = False,
 ) -> Exported:
     """Write the run's result to `out_dir/<name>.<ext>` (+ `<name>.gate.json`); see the module docstring.
 
     `override` is the written reason (10 characters at least) that lets a GATE_FAIL run out; a reason recorded
     earlier on the run counts when none is given. `name` defaults to the run id. Raises `NotExportable` for a
     run that may not leave (GATE_FAIL without a reason, any state but DONE and GATE_FAIL, no result blob, a
-    blob that fails its hash, a destination that exists) and `ValueError` for an unknown format, name or
-    working space. `working_space` (`lin_rec709` | `acescg`) tags an EXR; the default is the packet's declared one."""
+    blob that fails its hash, a destination that exists, a safe frame that cannot be placed: `SafeFrameError`)
+    and `ValueError` for an unknown format, name or working space. `working_space` (`lin_rec709` | `acescg`)
+    tags an EXR; the default is the packet's declared one. The packet's safe frame is cropped out unless
+    `full_frame`."""
     if fmt not in FORMATS:
         raise ValueError(f"unknown format {fmt!r}; use one of {', '.join(FORMATS)}")
     stem = name or run.id
@@ -310,6 +512,17 @@ def export(
         raise NotExportable(f"{dest} already exists; exports never overwrite")
     earlier = _earlier_report(report_dest, run.id)
     rgb16 = _decode16(cas.read_bytes(key), f"result blob {key[:12]}")
+    height, width = rgb16.shape[:2]
+    frame = take_framing(conn, run.packet_id, (width, height), full_frame=full_frame)
+    if earlier is not None and _framing_of(earlier) != frame.record():
+        was, now = _framing_of(earlier) or "the whole take", frame.record() or "the whole take"
+        raise NotExportable(
+            f"{report_dest.name} describes run {run.id} framed as {was}; this export is {now}. "
+            "One sidecar is one framing: use another name"
+        )
+    if frame.crop is not None and frame.cuts(width, height):
+        x, y, w, h = frame.crop
+        rgb16 = np.ascontiguousarray(rgb16[y : y + h, x : x + w])  # a pixel crop: nothing is resampled
     report, report_ref = _report_for(run, project_dir)
     lin = lineage.Lineage(
         project_id=run.project_id,
@@ -339,6 +552,7 @@ def export(
             "override_reason": reason if run.state is RunState.GATE_FAIL else None,
             "gate_report": report_ref,
             "exported_utc": (earlier or {}).get("exported_utc") or iso(utcnow()),
+            **frame.record(),
         }
         if run.state is RunState.GATE_FAIL and recorded_override(conn, run.id) is None:
             append_note(conn, run.id, kind="override", actor="human", reason=f"{OVERRIDE_PREFIX}{reason}")
@@ -360,4 +574,5 @@ def export(
         override_reason=reason if run.state is RunState.GATE_FAIL else None,
         lineage_embedded=True,
         report_ref=report_ref,
+        framing=frame,
     )
