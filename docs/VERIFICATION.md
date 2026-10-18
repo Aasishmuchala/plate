@@ -499,3 +499,106 @@ These continue the section 9 checklist.
 24. **Enterprise terms.** Runway stays custody D, so NDA projects never reach it, until a signed Runway Dev Enterprise agreement (no training, zero retention) is filed. Then, on every `runway` route: `custody_grade: C2`, `custody_status: confirmed`, `terms_hash` = the sha256 of the signed agreement. Regenerate the matrix in `docs/custody.md`. Nothing else changes.
 
 The Vantage, Max and other vendor lines in section 9 stay on the box list unchanged.
+
+## 12. Wave 12 (T126 to T150): stress-test fixes
+
+Written by the Wave 12 verification pass (router task T150, Opus 5.5) on 2026-10-19 between 02:36 and 03:20 IST, on the same Mac. Commit `e6fd23f` (T126 to T148 in `83fb756`, the orchestrator's integration fixes in `e6fd23f`) plus T149's uncommitted stress target (`scripts/stress/`, `Makefile`, `justfile`, `docs/stress.md`, `.github/workflows/stress.yml`, `scripts/tests/test_stress_scripts_static.py`). Nothing called a vendor: every daemon here ran the fake engine, and every adapter met its recorded fixtures.
+
+### 12.1 What failed and the fixes
+
+Nothing failed. Every command in 12.2 passed on its first run, and this pass made no code or test edit. Both orchestrator notes were already settled when it started:
+
+- **`test_motion_runs.py::test_the_lock_is_checked_again_before_the_submit`.** T130 is right. A refusal raised before any byte leaves (the lock re-check before the submit) is `staging_error`, and it never counts as a provider failure (decision 76). The orchestrator's integration commit `e6fd23f` changed the test to expect `staging_error`, and it passes.
+- **Seedance 2.5 Motion is Runway-only.** This is open question 41 in the router plan, listed in 12.6.
+
+The stress run turned up one thing to note. It is not a failure, and Wave 13 owns it. The `engine_faults` check `submit-timeout` prints `the scripted crash did not end the process; the harness killed it`. The plan's dropped item "fake-crash-not-exiting-in-background" expected T145's executor threads to make `SimulatedCrash` end the daemon. They do not: the executor logs the crash and carries on. The check still passes because the harness kills the daemon itself and asserts the restart (one provider job, no refund). The fix is T152 (decision 85, `os._exit(70)` on every execution path), whose test (4) asserts the exit code.
+
+### 12.2 Command record
+
+All commands ran from the repo root, one after another, with nothing else running.
+
+| # | command | exit | key output |
+|---|---|---|---|
+| 1 | `perl -e 'alarm shift; exec @ARGV' 1800 make ci` | 0 | `SELFTEST PASS`; hazard selftest `13 planted hazards caught`, scan `clean (1067 files scanned, 2 allowlist entries)`; `All checks passed!`, `570 files already formatted`; licences `18 files scanned, 7 blocked models absent`; pytest `7446 passed, 2 skipped in 991.44s`, 4K gate `run_gates 3840x2160: wall 4.21s` (`4.08s` with overlays); `scripts/tests` `117 passed`; `all 28 claims hold (136 tests passed)`; vitest `Test Files 29 passed (29)`, `Tests 835 passed (835)`; `built in 1.30s`; 17 min 58 s wall |
+| 2 | `perl -e 'alarm shift; exec @ARGV' 3600 make stress` | 0 | nine scripts, each `0 findings`; last line `stress: 9 scripts, 75 checks, 75 ok, 0 skipped, 0 findings (290 s)`; 4 min 50 s wall |
+| 3 | `perl -e 'alarm shift; exec @ARGV' 900 .venv/bin/python scripts/smoke_e2e.py` (after `make ci` built `ui/dist`) | 0 | 36 steps `ok`: UI suite `835 passed`, wiring `19 passed`, `16 engines incl. fake`, quote `router ai_by_region`, `DONE in 0.8 s`, export `640x268 (crop y 46)`, `full_frame` `640x360`, rescore `versions [1, 2]`, `@ref` quote on nano-banana-2.1, G2 autosave, `night_chain` refused `['no_base']`; last line `SMOKE PASS` |
+| 4 | `.venv/bin/python -m plate_daemon.cli smoke` | 0 | last line `fixture smoke: 17 adapters ok`, no `failed`; 8 skipped (the same 8 as section 10) |
+| 5 | `PYTEST_ADDOPTS=-rs scripts/test.sh` | 0 | the same eleven steps in the same order: pytest `7446 passed, 2 skipped in 1008.69s`, scripts `117 passed`, claims 28 and 136, vitest `835 passed (835)`, built; last line `All PLATE checks passed.` The two skips: `test_previs.py:396` (this ffmpeg has no drawtext, as before) and `test_stress_wave12_ingest.py:241` (`needs an environment without imagecodecs`: T135's no-imagecodecs fallback; `e6fd23f` added imagecodecs, so it skips here and on CI) |
+| 6 | the three `git grep` checks in 12.3 | 0 (each found matches; every match was read) | no test or doc pins the old behaviour |
+
+Per stress script (command 2):
+
+| script | checks | ok | skipped | findings | seconds |
+|---|---|---|---|---|---|
+| `api_fuzz` | 17 | 17 | 0 | 0 | 15 |
+| `doctrine` | 4 | 4 | 0 | 0 | 10 |
+| `money` | 9 | 9 | 0 | 0 | 61 |
+| `crash` | 8 | 8 | 0 | 0 | 26 |
+| `engine_faults` | 8 | 8 | 0 | 0 | 73 |
+| `scale` | 4 | 4 | 0 | 0 | 67 |
+| `ui` | 3 | 3 | 0 | 0 | 2 |
+| `max_plugin` | 11 | 11 | 0 | 0 | 18 |
+| `mcp_cli_imports` | 11 | 11 | 0 | 0 | 16 |
+
+The measured lines the stress run printed: `scale` `autosave-storm` 150 overlapping PUTs all 200, PUT p50 0.04 s, max 0.10 s, `/health` max 47 ms; `deep-graph` chain-200 PUT 0.02 s; `ingest-unlisted-ids` ingest 0.3 s, cold quote 0.25 s at 640x360 (recorded, not asserted); `ledger-reread` 50,005 records, approve median 8 ms, quote median 14 ms; `engine_faults` `inflight-threads` 45 approvals leave `{'QUEUED': 43, 'RUNNING': 2}` (the route's `max_inflight` of 2); `crash` `sigkill-export-part`: a real SIGKILL mid-export left one hidden temp sibling, and the next export swept it. Neither `crash` check that needs a special volume skipped. `ro-project-volume` ran on a `chmod 0o500` `gates` folder. `low-disk` raised the free-space floor (`PLATE_MIN_FREE_MB`) instead of filling a disk: the run failed `disk_full` with no vendor call.
+
+### 12.3 What no test or doc may still pin
+
+- **The pixel-difference prior mask.** `git grep -n -i "pixel.difference\|pixel diff\|prior_mask"` finds only statements that the term is gone: `CHANGELOG.md:61`, the `pipeline.py` docstring and `Pipeline.prior_mask` (the base run's `mask_union_key`, else its `mask_key`, else `base_mask_missing`), `docs/artist-manual.md:418`, and two tests that assert the new rule (`test_pipeline_wave9.py::test_a_take_made_outside_the_pipeline_is_not_a_base`, `test_stress_wave12_quote.py:322`). Comp's rule that a numeric layer with no stored mask lands where it differs from the base (`nodes/comp_node.py:202`, artist manual line 422) is a different thing. It applies to a take the daemon computed itself (decision 48) and never to the Edit base.
+- **The unconditional `touch_human`.** `git grep -n "touch_human"` finds 13 call sites, and every one is guarded: `from_ui(request)` in `routes/misc.py` (scrub, verdict, both timer actions), `routes/runs.py` (override, accept), `routes/projects.py` and `routes/project_settings.py`; the same header check in `routes/carryover.py`; and `by == "human"` in `Pipeline.approve`, `nodes/runner.py`, `recomposite.py` and `imports.py`. The artist manual's timer paragraph says `plate timer` in a terminal does not reset the clock.
+- **`exists()`-then-replace exports.** `export.export` and `cutdown._place` claim the destination with `O_CREAT | O_EXCL` (`export.claim`). `cutdown._check_destination` keeps an early `exists()` that refuses before the encode starts, and the claim still decides the race. The tests that pinned the old refusal now expect a repeat (`test_cli.py:399`, `test_export_wave9.py:750`, `test_routes_runs_wave8.py:292`), and no doc describes check-then-write. Two writers that decision 74 does not cover still check, then replace. No test or doc pins either one. The first is `export.export_run`, the seed's byte copy, which nothing calls. The second is the delivery library: `delivery/guard.embed_and_place`, `delivery/fcpxml.py:386` and `delivery/video.py:145,443`. Two deliveries racing to one name could still overwrite each other. Moving them onto `export.claim` is a small task for a later wave.
+
+### 12.4 The numbers
+
+| measure | after Wave 11 | after Wave 12 |
+|---|---|---|
+| pytest, every package | 6241 passed, 1 skipped | **7446 passed, 2 skipped** (+1205; the new skip is the no-imagecodecs fallback test) |
+| vitest | 805 (28 files) | **835** (29 files; +25 in the new `saveResilience.test.tsx`, +5 in `store.test.ts`) |
+| `scripts/tests` | 79 | **117** (+38, all in `test_stress_scripts_static.py`: 10 test functions, parametrised over the scripts) |
+| stress target | none | **9 scripts, 75 checks**, 0 findings, about 5 minutes on this Mac |
+| fixture CLI smoke | 17 adapters ok, 8 skipped | 17 adapters ok, 8 skipped |
+| scripted end-to-end smoke | 36 steps, `SMOKE PASS` | 36 steps, `SMOKE PASS` |
+| claims as tests | 28 claims, 136 tests | 28 claims, 136 tests (`claims.yaml`, `README.md` and `client-explainer.md` untouched, as the wave planned) |
+| hazard scan | clean, 1026 files, 2 allowlist entries | clean, **1067 files**, 2 allowlist entries |
+| ruff | 531 files | **570 files** |
+| `make ci` wall time | 12 min 58 s (pytest 708 s) | 17 min 58 s (pytest 991 s) |
+
+### 12.5 Decisions 71 to 82
+
+| # | decision | status | tests |
+|---|---|---|---|
+| 71 | Only the UI resets the unattended clock | done | `test_stress_wave12_routes.py::test_only_a_ui_request_resets_the_unattended_clock`, `test_a_header_less_timer_no_longer_lifts_the_unattended_cap`; `test_carryover_wave9.py` (curl is not a human); stress `api_fuzz unattended-clock`, `money unattended-clock-reset` |
+| 72 | A base is a take of its node; depth counts imports; no pixel-difference prior mask | done | `test_stress_wave12_quote.py::test_repro_a_an_uploaded_reference_relayed_as_a_base_is_not_a_take`, `test_repro_b_a_gate_fail_import_is_a_base_only_after_its_override`, `test_repro_c_a_depth_two_take_relayed_or_rewired_is_depth_exceeded`, `test_an_honest_chain_is_the_plate_outside_the_union_of_its_two_masks`, `test_a_base_run_without_a_readable_mask_fails_normalizing`, `test_the_lineage_walk_stops_on_a_cycle_and_after_eight_hops`; `test_pipeline_wave9.py::test_a_take_made_outside_the_pipeline_is_not_a_base`; stress `doctrine base-any-cas-blob` |
+| 73 | Ledger records are never dropped (fail-closed `override`, the outbox, `event_seq` folding, submitted by evidence) | done | `test_stress_wave12_ledger.py` (outbox, memo and evidence, 27 tests, e.g. `test_an_unwritable_ledger_parks_records_and_drains_them_after_the_mode_is_restored`, `test_a_run_with_no_submitted_record_but_later_ones_counts_as_one_generation_at_its_approved_price`); `test_stress_wave12_pipeline.py::test_a_project_lock_held_through_the_submit_loses_no_record`, `test_a_read_only_ledger_during_the_run_parks_the_records_until_the_next_append`, `test_an_override_the_ledger_cannot_take_is_503_and_leaves_no_note`; `test_stress_wave12_index.py::test_fold_takes_the_state_of_the_highest_event_seq_and_terminal_states_win`, `test_a_rebuild_of_a_raced_ledger_agrees_with_the_live_state`; `test_stress_wave12_cli.py::test_a_ledger_that_refuses_the_override_stops_the_export`; stress `money lost-submitted-record`, `ledger-order-race`, `expired-ledgered`, `doctrine override-not-ledgered`, `cli-sidecar-reason` |
+| 74 | Exports claim their destination; a byte-identical repeat completes; an unwritable project refuses first | done for `export` and `cutdown` (delivery is outside the decision, see 12.3) | `test_stress_wave12_export.py::test_eight_concurrent_exports_of_two_runs_to_one_name_have_exactly_one_winner`, `test_the_same_run_exported_twice_to_one_name_is_a_repeat_and_another_run_is_refused`, `test_a_project_whose_gates_folder_is_read_only_refuses_every_export_with_503`, `test_six_concurrent_cutdowns_to_one_name_write_one_file`, `test_a_failure_after_the_claim_gives_the_name_back_and_keeps_a_shared_sidecar`; `test_stress_wave12_routes.py::test_a_byte_identical_repeat_still_ships_and_is_ledgered_as_a_repeat`; stress `api_fuzz export-race`, `crash sigkill-export-part` |
+| 75 | Runs execute on a bounded executor; orphans re-driven; resume limit; busy retried | done | `test_executor.py` (18 tests, e.g. `test_route_cap_one_starts_the_second_run_only_after_the_first_finishes`, `test_watchdog_runs_an_orphan_once`); `test_stress_wave12_pipeline.py::test_45_slow_approvals_run_on_the_executor_and_never_freeze_the_api`, `test_a_run_survives_an_index_held_busy_for_12_s`, `test_a_run_the_daemon_stopped_on_twice_in_normalizing_fails_resume_limit`; stress `engine_faults inflight-threads`, `resume-starvation`, `money run-stuck-after-db-locked` |
+| 76 | Vendor faults are classified, never guessed (unknown submits, poll tolerance, stale URL, result checks, streamed downloads, non-blocking cancel) | done | `test_stress_wave12_worker.py::test_a_lost_submit_answer_without_lookup_fails_submit_state_unknown_and_never_resubmits`, `test_submit_faults_are_classified`, `test_every_refusal_on_this_side_is_a_staging_error`, `test_five_transport_faults_in_a_row_fail_the_run`, `test_a_stale_result_url_is_repolled_once_for_a_fresh_one`, `test_a_declared_decompression_bomb_is_refused_on_its_header`, `test_a_cancel_during_a_stalled_vendor_call_answers_at_once_and_lands_after_the_stall`; `engines/tests/test_adapter_fetch_stream.py` (12 tests); `test_stress_wave12_pipeline.py::test_a_submit_whose_answer_was_lost_is_ledgered_billing_unknown_never_refunded`; stress `engine_faults` (all 8) |
+| 77 | The graph has a revision; append-node; bounded save queue; the UI retries, reloads and flushes | done | `test_stress_wave12_projects.py::test_a_put_on_a_stale_revision_is_a_conflict_and_an_old_client_still_saves`, `test_twelve_concurrent_appends_each_get_their_own_node`, `test_a_storm_of_big_puts_is_answered_never_500_or_project_locked`, `test_a_full_queue_is_shed_at_once_and_a_long_wait_is_graph_busy`; `ui/src/test/saveResilience.test.tsx` (25 tests: the revision on every PUT, backoff 1, 2, 4, 8, 15 s, `conflict: reload`, a foreign `graph.saved`, pagehide keepalive, reopen after reload); stress `ui` (all 3), `scale autosave-storm`, `deep-graph` |
+| 78 | The NDA scrub is an allowlist; `export_review` guarded; the daemon numbers attempts | done | `test_stress_wave12_mcp.py::test_an_nda_graph_full_of_free_text_hands_over_none_of_it_and_names_every_path`, `test_a_daemon_refusal_that_echoes_project_text_is_withheld_on_nda`, `test_export_review_refuses_a_gate_fail_take_until_it_is_overridden`, `test_six_concurrent_run_node_calls_on_one_node_are_six_done_attempts`, `test_twelve_concurrent_add_node_calls_leave_twelve_nodes`, `test_a_log_failure_after_run_node_names_the_run_it_started`; stress `mcp_cli_imports nda-scrub`, `export-review-guard`, `concurrent-run-node`, `concurrent-add-node`, `outbound-log-failure` |
+| 79 | Custody `unset` is server-owned | done | `test_stress_wave12_projects.py::test_a_client_sent_unset_is_dropped_and_never_reopens_the_custody`, `test_an_unset_mark_in_a_custody_edit_is_dropped_too`, `test_a_packet_first_project_takes_its_custody_once_and_the_fill_in_is_ledgered`, `test_a_fill_in_the_ledger_cannot_hold_does_not_happen`; stress `api_fuzz custody-unset` |
+| 80 | The quote validates everything the run will need; caps sum every project in the home | done | `test_stress_wave12_quote.py::test_mask_ids_and_a_mask_take_are_checked_before_any_run_row`, `test_ten_concurrent_quotes_of_one_node_number_one_to_ten_and_all_run`, `test_attempts_are_bounded`, `test_priority_and_params_are_refused_before_a_run_row`, `test_the_daily_cap_counts_every_project_in_the_home`, `test_approving_an_expired_or_future_quote_is_409_and_ledgered`, `test_envelopes_and_price_counts_are_bounded`; `test_stress_wave12_motion.py::test_a_pinned_route_that_cannot_take_the_params_is_422_params_and_no_run`, `test_a_param_no_route_can_take_is_422_params_and_no_run`; stress `api_fuzz quote-validation`, `attempt-poison`, `envelope-inf`, `money daily-cap`, `concurrent-quote-same-attempt`, `quote-ttl-clock-back`, `doctrine mask-errors-at-quote` |
+| 81 | Send preflight catches what the render would waste | done on the fake; a real merged scene is box-day item 25 | `plugins/max/tests/test_stress_wave12_send.py::test_two_nodes_named_shared_stop_the_send_at_lint_in_either_order`, `test_two_cameras_named_cam_dup_stop_at_lint`, `test_a_camera_name_that_cannot_be_a_shot_id_stops_at_lint`, `test_degenerate_lens_values_are_bad_lens_before_the_render`, `test_a_non_finite_pose_is_bad_pose_before_the_render`, `test_a_forced_manifest_abort_leaves_no_orphan_folder`, `test_dump_json_bytes_refuses_nan_and_infinity`; stress `max_plugin` (all 11) |
+| 82 | The stress scripts are an opt-in target | done | `scripts/tests/test_stress_scripts_static.py` (10 tests, incl. `test_the_stress_target_is_opt_in_everywhere`, `test_the_stress_workflow_is_manual_with_the_ci_matrix_and_setup`); `scripts/tests/test_ci_parity.py` unmodified and green; `make stress` 75 of 75 (12.2) |
+
+### 12.6 Wave 12 open questions running on their defaults
+
+The build used these defaults (router plan, open questions 35 to 41). Each is a decision for Aasish. Changing one is a small task.
+
+| # | question | default in effect |
+|---|---|---|
+| 35 | Scope of the daily and unattended caps | summed across every project index in this home (`budgets.spend_snapshot_all`), so N projects no longer multiply the cap; the 409 names the project count |
+| 36 | `by: "human"` from a client that is not the UI | unchanged from decision 37: an approval as a human bypasses `budgets.authorize` and resets the unattended clock whatever client sent it; the CLI approves as a human and a token holder is trusted |
+| 37 | Whether an external import counts as a generation | yes: an imported retouch, then one Edit, then another Edit is refused `DEPTH_EXCEEDED` |
+| 38 | Executor size | `PLATE_RUN_WORKERS=8` concurrent runs per daemon, per-route `max_inflight` from the manifest (default 2); the rest wait in QUEUED (the stress run's 45 approvals: 2 RUNNING, 43 QUEUED) |
+| 39 | Result caps | `PLATE_RESULT_MAX_PIXELS` 64,000,000 (8000 × 8000); downloads 256 MiB for image kinds and 2 GiB for video kinds, under a 600 s wall clock; uploads and imports 100,000,000 px |
+| 40 | Clips under two frames at import | refused 422 `unreadable_video` |
+| 41 | Seedance 2.5 Motion routes | Runway-only, because the Atlas, BytePlus and WaveSpeed Seedance manifests declare no `negative_prompt` and a recipe's negative prompt cannot be cleared (`motion_runs` treats `""` as unset); this holds until a fallback manifest declares the field or the recipe negative can be cleared |
+
+### 12.7 Box-day lines added by Wave 12
+
+Wave 12 adds no vendor or render-box exit. These two lines continue the section 9 checklist, after items 23 and 24 (section 11.6):
+
+25. **Send preflight on a real scene (T140).** In Max 2026, merge a scene that brings in a second copy of the same geometry (duplicate visible node names) and a duplicated camera. Send Packet must stop at lint with `DUPLICATE_NODE_NAME` / `DUPLICATE_CAMERA_NAME`, render nothing, and leave no packet folder. Three more cameras must stop at lint before `step("render")`: one whose name cannot become a shot id (a non-Latin name) with `BAD_SHOT_SLUG`, one with a zeroed focal length, film gate or exposure with `BAD_LENS`, and one driven by a script to a non-finite pose with `BAD_POSE`.
+26. **`plate timer` with the dock open (decision 71).** Connect the Max dock and close the canvas. After 30 idle minutes, `plate timer start <deliverable>` in a terminal must not lift the unattended cap: agent approvals past the USD 20 unattended cap are still refused (`unattended_cap`). The dock's own requests must not lift it either. Any request from the canvas lifts it.
+
+The stress workflow (`.github/workflows/stress.yml`, `workflow_dispatch`) has not run on `windows-latest` yet. Start it once by hand after this wave is pushed. `docs/stress.md` lists the checks that skip there.

@@ -70,3 +70,7 @@ label DIR:
 hazard:
     {{py}} scripts/hazard_scan.py --selftest
     {{py}} scripts/hazard_scan.py --strict-allow
+
+# the attackers' regression scripts (opt-in; each starts its own daemon)
+stress:
+    {{py}} scripts/stress/run_all.py

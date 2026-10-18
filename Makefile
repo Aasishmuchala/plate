@@ -1,4 +1,4 @@
-.PHONY: help setup selftest hazard licences claims build test test-py test-scripts test-ui ci lint fmt check spec daemon pixels label
+.PHONY: help setup selftest hazard licences claims build test test-py test-scripts test-ui ci lint fmt check spec daemon pixels label stress
 
 PYPATH := spec:daemon:pixels:engines:gates:plugins/max:tools
 PY := PYTHONPATH=$(PYPATH) .venv/bin/python
@@ -18,6 +18,7 @@ help:
 	@echo "make daemon    run the daemon on 127.0.0.1:4610 (fake engine)"
 	@echo "make pixels    run the pixels worker in stub mode"
 	@echo "make label DIR=<folder of images>   open the labelling tool"
+	@echo "make stress    the attackers' regression scripts (opt-in; each starts its own daemon)"
 
 setup:
 	uv sync --python 3.12
@@ -74,3 +75,6 @@ pixels:
 
 label:
 	$(PY) -m plate_label serve $(DIR)
+
+stress:
+	$(PY) scripts/stress/run_all.py

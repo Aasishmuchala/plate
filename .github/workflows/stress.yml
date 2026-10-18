@@ -1,0 +1,33 @@
+name: stress
+# The attackers' regression scripts (docs/stress.md), opt-in: run by hand from the Actions tab, never on push.
+# Each script starts its own daemon on the fake engine; PLATE_LIVE is never set, no vendor is reached.
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  stress:
+    # The CI job's matrix and setup (ci.yml), then the stress target instead of the checks.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # FedericoCarboni/setup-ffmpeg supports x64 only; macos-latest runners are arm64, so macOS takes Homebrew's.
+      - if: runner.os == 'Windows'
+        uses: FedericoCarboni/setup-ffmpeg@v3
+      - if: runner.os == 'macOS'
+        name: ffmpeg (Homebrew)
+        run: brew install ffmpeg || brew upgrade ffmpeg
+      - name: uv sync
+        run: uv sync --python 3.12
+      - name: npm ci (root workspace, includes ui)
+        run: npm ci
+      - name: stress scripts
+        run: uv run --no-sync python scripts/stress/run_all.py
