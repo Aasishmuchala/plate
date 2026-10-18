@@ -145,9 +145,13 @@ def test_usd_and_by_stay_as_they_were(manifests):
     assert all(price.status == "unconfirmed" for price in (gpt, nano, seed))
 
 
-def test_only_the_three_priced_manifests_carry_tiers_and_none_has_limits(manifests):
+def test_only_the_three_priced_manifests_carry_tiers_and_only_the_upscalers_have_limits(manifests):
     assert sorted(k for k, m in manifests.items() if m.price.tiers) == sorted(TIERED)
-    assert [k for k, m in manifests.items() if m.limits is not None] == []
+    # T100 shipped the first limits: Magnific (6 MP in, 50 MP out) and Real-ESRGAN (50 MP out).
+    assert sorted(k for k, m in manifests.items() if m.limits is not None) == [
+        "magnific-precision-v2",
+        "real-esrgan",
+    ]
 
 
 @pytest.mark.parametrize("engine_id", TIERED)

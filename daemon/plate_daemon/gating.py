@@ -34,16 +34,36 @@ Every check carries the threshold, op and unit it was held to (`report.scored_ch
 the highest mean dE00 over the region of a missed outside_mask / feather_band / material metric (the pixels
 outside the editable mask, the feather band inside it, the locked materials), and the image centre for a failed
 registration shift ("camera drift").
+
+Viewer overlays (router plan T109, verification gap G1). With an overlay sink (`overlay_sink=`, a block of
+`overlays_to(sink)`, or the one `install` binds around `Pipeline.gate`: the run's project CAS) the gate also
+stores what the viewer's `e` and `h` modes draw, and lists it under `metrics.overlays` (`OVERLAYS_SCHEMA`):
+
+    edges_plate      the G-buffer reference edges the recall gate scored (Tier A), 8-bit grey PNG, 255 = edge
+    edges_candidate  the output's Canny edges as the recall gate detected them, the same encoding
+    de00_map         per-pixel CIEDE2000 between the plate and the output at the output's size, raw little-endian
+                     binary16, one channel, rows top-first, no header (`ui/src/viewer/README.md`, R16F); 0 where
+                     the output's pixel equals the plate's, which outside the mask is every pixel
+
+Each entry is `{hash, format, media_type, width, height, ...}`. The edge masks are the bool maps edge recall
+scored, at its working size: the output's size up to `gbuffer.WORKING_WIDTH`, that width (aspect kept) above
+it; they are never resampled up (the viewer samples a mask over the image whatever its size). Tier C has no
+G-buffer, so only the map is stored. Without a sink nothing is computed and the report has no `overlays` block,
+which is also what a run gated before T109 has. A sink that fails is a note and an `error` in the block, never a
+failed gate.
 """
 
 from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
+import cv2
 import numpy as np
 
 from plate_gates import align, coc, gbuffer, iddiff, invention, material_de, texture, thresholds, tone
@@ -52,13 +72,21 @@ from plate_gates.io import to_uint8
 from plate_gates.report import Check, EngineRef, FlaggedPoint, GateReport, scored_check
 
 __all__ = [
+    "DE00_FORMAT",
     "DepthFn",
+    "EDGE_FORMAT",
     "LOCKED_SHARE",
+    "OVERLAYS_KEY",
+    "OVERLAYS_SCHEMA",
+    "OverlaySink",
     "TEXTURE_WIDTH",
     "EDGE_AGREEMENT_WIDTH",
     "TILE_PX",
     "TILES_PER_METRIC",
     "FEATHER_NOTE",
+    "install",
+    "overlays_to",
+    "overlays_of",
     "run_gates",
     "score_of",
 ]
@@ -71,6 +99,58 @@ LOCKED_SHARE = 0.5  # a material with less than this share of its pixels inside 
 TILE_PX = 128  # flagged-point tiles
 TILES_PER_METRIC = 3  # the worst tiles named per missed dE00 metric
 FEATHER_NOTE = "feather band: advisory until calibration (T23) sets a bound"
+
+OVERLAYS_KEY = "overlays"  # under the report's metrics
+OVERLAYS_SCHEMA = 1
+EDGE_FORMAT = "png8"  # 8-bit single-channel PNG, 255 = edge, 0 elsewhere
+EDGE_VALUE = 255
+DE00_FORMAT = "r16f"  # raw little-endian IEEE binary16, one channel, rows top-first, no header
+DE00_EXT = "r16f"  # the CAS extension of the map (served as application/octet-stream)
+DE00_ENCODING = "binary16 little-endian, 1 channel, rows top-first, no header"
+INSTALLED_ATTR = "gate_overlays_installed"
+
+
+class OverlaySink(Protocol):
+    """Where the overlays go: a project CAS (`cas.CAS.put_bytes`) returns the BLAKE3 key of what it stored."""
+
+    def put_bytes(self, b: bytes, ext: str | None = None) -> str: ...
+
+
+_SINK: ContextVar[OverlaySink | None] = ContextVar("plate_gate_overlay_sink", default=None)
+
+
+@contextmanager
+def overlays_to(sink: OverlaySink | None) -> Iterator[OverlaySink | None]:
+    """Every `run_gates` inside the block (on this thread) stores its overlays in `sink`."""
+    token = _SINK.set(sink)
+    try:
+        yield sink
+    finally:
+        _SINK.reset(token)
+
+
+def install(pipeline: Any) -> Any:
+    """Let `pipeline.gate` (GATING, `Pipeline.gate(run, cas)`) store the viewer overlays in the run's project
+    CAS (idempotent; returns the pipeline). Wraps that one method on this instance; the report it writes then
+    carries `metrics.overlays`."""
+    if getattr(pipeline, INSTALLED_ATTR, False):
+        return pipeline
+    inner = pipeline.gate
+
+    def gate(run: Any, cas: Any) -> Any:
+        with overlays_to(cas):
+            return inner(run, cas)
+
+    pipeline.gate = gate
+    setattr(pipeline, INSTALLED_ATTR, True)
+    return pipeline
+
+
+def overlays_of(report: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The `metrics.overlays` block of a stored report (JSON), or None (gated before T109, or without a sink)."""
+    metrics = (report or {}).get("metrics")
+    block = metrics.get(OVERLAYS_KEY) if isinstance(metrics, Mapping) else None
+    return dict(block) if isinstance(block, Mapping) and block.get("schema") == OVERLAYS_SCHEMA else None
 
 
 # ---------------------------------------------------------------------------- inputs
@@ -280,6 +360,80 @@ def _invention_points(inv: Mapping[str, Any], src_wh: tuple[int, int], w: int, h
     return pts
 
 
+# ---------------------------------------------------------------------------- viewer overlays
+
+
+def _de00_map(plate16: np.ndarray, out16: np.ndarray, changed: np.ndarray) -> np.ndarray:
+    """Per-pixel CIEDE2000 (h, w) float32, computed on the changed pixels only (an unchanged pixel is exactly 0),
+    in material_de's batched float32 CIEDE2000 (within 1e-4 of float64, far below binary16's step)."""
+    de = np.zeros(changed.size, dtype=np.float32)
+    idx = np.flatnonzero(changed)
+    if idx.size:
+        to8 = np.float32(255.0 / 65535.0)
+        p, o = plate16.reshape(-1, 3), out16.reshape(-1, 3)
+        de[idx] = material_de._de00(p[idx].astype(np.float32) * to8, o[idx].astype(np.float32) * to8)
+    return de.reshape(changed.shape)
+
+
+def _edge_entry(sink: OverlaySink, edges: np.ndarray, source: str) -> dict[str, Any]:
+    h, w = edges.shape
+    ok, buf = cv2.imencode(".png", np.where(edges, EDGE_VALUE, 0).astype(np.uint8))
+    if not ok:
+        raise RuntimeError("cv2 could not encode an edge mask")
+    return {
+        "hash": sink.put_bytes(bytes(buf), "png"),
+        "format": EDGE_FORMAT,
+        "media_type": "image/png",
+        "width": int(w),
+        "height": int(h),
+        "edge_value": EDGE_VALUE,
+        "edge_px": int(edges.sum()),
+        "source": source,
+    }
+
+
+def _overlays(
+    sink: OverlaySink,
+    plate16: np.ndarray,
+    out16: np.ndarray,
+    changed: np.ndarray,
+    edge_masks: tuple[np.ndarray, np.ndarray, str] | None,
+    tier: str,
+) -> dict[str, Any]:
+    """The `metrics.overlays` block (module docstring): the edge masks and the dE00 map, stored in `sink`."""
+    h, w = changed.shape
+    block: dict[str, Any] = {"schema": OVERLAYS_SCHEMA, "width": int(w), "height": int(h)}
+    notes: list[str] = []
+    if edge_masks is None:
+        block["edges_plate"] = block["edges_candidate"] = None
+        notes.append(
+            "edges: tier C has no G-buffer edge masks"
+            if tier == "C"
+            else "edges: no G-buffer edges were scored"
+        )
+    else:
+        ref, cand, backend = edge_masks
+        block["edges_plate"] = _edge_entry(sink, ref, "gbuffer structural edges (depth, normal, id)")
+        block["edges_candidate"] = _edge_entry(sink, cand, backend)
+        if ref.shape != (h, w):
+            notes.append(f"edges: scored at {ref.shape[1]}x{ref.shape[0]}, never resampled up to {w}x{h}")
+    de = _de00_map(plate16, out16, changed)
+    block["de00_map"] = {
+        "hash": sink.put_bytes(de.astype("<f2").tobytes(), DE00_EXT),
+        "format": DE00_FORMAT,
+        "media_type": "application/octet-stream",
+        "encoding": DE00_ENCODING,
+        "width": int(w),
+        "height": int(h),
+        "unit": "dE00",
+        "scale": 1.0,  # stored value x scale = dE00
+        "max": float(de.max()) if de.size else 0.0,
+        "changed_px": int(changed.sum()),
+    }
+    block["notes"] = notes
+    return block
+
+
 def run_gates(
     plate: np.ndarray,
     out: np.ndarray,
@@ -295,9 +449,12 @@ def run_gates(
     edges: tuple[Any, dict[str, Any]] | None = None,
     crypto_material: tuple[np.ndarray, np.ndarray] | None = None,
     extra_metrics: Mapping[str, Any] | None = None,
+    overlay_sink: OverlaySink | None = None,
 ) -> GateReport:
     """Score `out` against `plate` (see the module docstring). `edges` is `gbuffer.from_packet`'s result and
-    `crypto_material` the material Cryptomatte, when the caller already has them (they are read otherwise)."""
+    `crypto_material` the material Cryptomatte, when the caller already has them (they are read otherwise).
+    `overlay_sink` (else the one bound by `overlays_to()` / `install`) stores the viewer overlays."""
+    sink = overlay_sink if overlay_sink is not None else _SINK.get()
     plate16 = _u16(plate, "plate")
     out16 = _u16(out, "out")
     if plate16.shape != out16.shape:
@@ -319,6 +476,7 @@ def run_gates(
     notes: list[str] = []
     points: list[FlaggedPoint] = []
     locked_px: np.ndarray | None = None
+    edge_masks: tuple[np.ndarray, np.ndarray, str] | None = None  # (reference, candidate, backend)
 
     # registration (the engine's pixels against the plate, before compositing)
     reg = _registration(plate16, out16, m, registration)
@@ -346,6 +504,9 @@ def run_gates(
             emap, out8, weights, r=2, plate_rgb=plate8, ids=ctx["ids"], legend=legend or ctx.get("legend")
         )
         metrics["gbuffer"] = {k: v for k, v in rec.items() if k not in ("canny",)}
+        if sink is not None:  # the candidate side exactly as edge_recall detected it (its default detector)
+            cand = gbuffer.test_edges(gbuffer.resample_rgb(out8, emap.width, emap.height))
+            edge_masks = (emap.edges, cand, str(rec.get("backend") or "canny"))
         checks.add(gbuffer.METRIC_ID, rec.get("recall_r2"), variant=variant)
         notes.append(f"gbuffer: {rec.get('backend')} detector at {emap.width} px, r = 2, {variant} bound")
         inv = invention.report(
@@ -428,8 +589,8 @@ def run_gates(
             regions.append(("feather_band.de00_p99", iddiff.feather_band(m), "in the feather band"))
     if locked_px is not None and checks.misses("material.de00_p90"):
         regions.append(("material.de00_p90", locked_px, "on the locked materials"))
+    changed = np.any(plate16 != out16, axis=-1) if regions or sink is not None else None
     if regions:
-        changed = np.any(plate16 != out16, axis=-1)
         for metric_id, region, where in regions:
             points.extend(_de_points(plate16, out16, changed, region, metric_id, where))
     if checks.failed("registration.shift_px"):
@@ -444,6 +605,14 @@ def run_gates(
                 note="camera drift",
             )
         )
+
+    # what the viewer's `e` and `h` modes draw (T109), only with a sink
+    if sink is not None and changed is not None:
+        try:
+            metrics[OVERLAYS_KEY] = _overlays(sink, plate16, out16, changed, edge_masks, tier)
+        except Exception as e:  # a convenience for the viewer, never a reason to fail the gate
+            metrics[OVERLAYS_KEY] = {"schema": OVERLAYS_SCHEMA, "error": f"{type(e).__name__}: {e}"[:300]}
+            notes.append(f"overlays: not stored ({type(e).__name__})")
 
     if extra_metrics:
         metrics.update(extra_metrics)

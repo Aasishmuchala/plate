@@ -81,6 +81,11 @@ RECIPES_DIR = Path(__file__).resolve().parent
 ORIGINS = ("shipped", "studio", "project")  # the order of the folders; a later one shadows an earlier id
 RISKS = ("none", "low", "med", "high", "highest")
 KINDS = ("still_edit", "still_rephotograph", "motion_croppair")
+CROPPAIR_RULES = {  # croppair.direction -> the zoom pair it needs (T94)
+    "in": "1.0 <= z0 < z1 <= 3.0",
+    "out": "1.0 <= z1 < z0 <= 3.0",
+    "locked": "1.0 <= z0 == z1 <= 3.0",
+}
 REGIONS = ("none", "mask_bbox")
 SHOT_CLASSES = ("wide", "medium", "close", "detail")
 # Used when a recipe carries no negative prompt of its own (the Scene Lock, as a list of things not to do).
@@ -477,8 +482,20 @@ def _runnable_from(doc: Any, where: str, origin: str = "shipped") -> RunnableRec
         if croppair is None:
             raise RecipeError(f"{where}: a motion_croppair recipe needs a croppair block")
         z0, z1 = croppair.get("z0"), croppair.get("z1")
-        if not (isinstance(z0, int | float) and isinstance(z1, int | float) and 1.0 <= z0 < z1 <= 3.0):
-            raise RecipeError(f"{where}: croppair needs 1.0 <= z0 < z1 <= 3.0, got {z0!r}, {z1!r}")
+        # T94: `direction` is the zoom's: in (a push-in, the default), out (a pull-back) or locked (one zoom: a held
+        # frame, or a slider drift with `center_end`). A pair that does not match its direction is a typo.
+        direction = croppair.get("direction", "in")
+        if direction not in CROPPAIR_RULES:
+            raise RecipeError(
+                f"{where}: croppair.direction must be one of {list(CROPPAIR_RULES)}, got {direction!r}"
+            )
+        ok = isinstance(z0, int | float) and isinstance(z1, int | float) and 1.0 <= min(z0, z1)
+        ok = ok and max(z0, z1) <= 3.0
+        ok = ok and {"in": z0 < z1, "out": z0 > z1, "locked": z0 == z1}[direction]
+        if not ok:
+            raise RecipeError(
+                f"{where}: croppair needs {CROPPAIR_RULES[direction]} ({direction}), got {z0!r}, {z1!r}"
+            )
     overrides = _mapping(doc, "overrides", where) or {}
     bad = [
         k for k, v in overrides.items() if not (k.startswith("[") and k.endswith("]") and isinstance(v, str))

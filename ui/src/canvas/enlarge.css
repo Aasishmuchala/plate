@@ -1,0 +1,119 @@
+/* The enlarged viewer (T101). App's `.plate-shell` (display: contents, so it adds no box) takes `is-enlarged`: the
+   canvas area with the xyflow pane is hidden with display: none, never unmounted, so the graph keeps its viewport
+   and selection, and the viewer stage is portalled into the same row, ordered first, so it takes the canvas
+   area's place with the selected node's candidate strip docked below. The sidebar keeps the editors and the
+   panels. Also the strip's T101 additions (label, Set as A / Set as B), the Max dock chip and the scrub hint.
+   Loaded after canvas.css. */
+
+.plate-shell {
+  display: contents;
+}
+
+.plate-shell.is-enlarged .plate-canvas {
+  display: none;
+}
+
+.enlarged-stage {
+  order: -1;
+  flex: 1 1 0;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg, #1c1c1e);
+}
+
+.enlarged-stage .compare {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.enlarged-stage .compare > [data-testid="connected-viewer"] {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.enlarged-stage .compare .plate-viewer {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.enlarged-stage .compare-head {
+  border-top: none;
+  border-bottom: 1px solid var(--hair);
+}
+
+.enlarged-strip {
+  flex: none;
+  max-height: 32%;
+  overflow-y: auto;
+  border-top: 1px solid var(--hair);
+}
+
+.enlarged-strip .cand-strip {
+  border-top: none;
+}
+
+.enlarged-strip .cand-strip ol {
+  flex-direction: row;
+  flex-wrap: wrap;
+}
+
+.enlarged-strip .cand {
+  min-width: 220px;
+}
+
+/* ---------------------------------------------------------------- strip: label and sides */
+
+.cand-label {
+  display: block;
+  padding: 0 6px 2px 24px;
+  color: var(--dim);
+  font-size: 10.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cand-sides {
+  display: inline-flex;
+  gap: 4px;
+  padding: 0 6px 4px 24px;
+}
+
+.cand-sides .btn {
+  padding: 1px 6px;
+  font-size: 10.5px;
+}
+
+.cand-sides .btn[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.cand[data-side="a"],
+.cand[data-side="b"] {
+  border-color: var(--hair);
+}
+
+/* ---------------------------------------------------------------- status bar and hints */
+
+.host-chip {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.recomposite-slot {
+  border-top: 1px solid var(--hair);
+}
+
+.scrub-hint {
+  margin: 0;
+  color: var(--amber, #ff9f0a);
+  font-size: 11px;
+}

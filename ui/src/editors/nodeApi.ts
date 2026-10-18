@@ -6,7 +6,14 @@
 //                                                              camera_name, plate: {role, relpath, blake3, width, height},
 //                                                              supersedes, superseded_by}]                         (T55)
 //   GET  /api/v0/packets/{id}/summary                      -> {packet_id, size, plate, camera, legend: {entries}}  (T55)
-//   GET  /api/v0/recipes                                   -> [{id, title, kind, engine, shot_class, library, mask, params}] (T61)
+//   GET  /api/v0/recipes[?project_id=]                    -> [{id, title, kind, engine, shot_class, library, mask, params,
+//                                                              origin, group, thumbnail, task, tokens, overrides}]   (T61, T83)
+//   GET  /api/v0/recipes/{id}/assemble[?project_id=&tokens=<urlencoded JSON>]
+//                                                          -> {prompt, negative_prompt, unfilled, unfilled_tokens,
+//                                                              prompt_source}                                        (T83)
+//   POST /api/v0/recipes {scope, project_id?, overwrite?, recipe}  -> 201 {id, path, origin}; 409 recipe_exists      (T83)
+//   POST /api/v0/assets?kind=reference&project_id=<id>     body = PNG/JPEG bytes -> {hash, width, height, scaled_from} (T82)
+//   GET  /api/v0/projects/{pid}/references                 -> [{hash, width, height, bytes, uploaded_utc, note?}]     (T82)
 //   GET  /api/v0/projects/{pid}/runs[?node_id=]            -> run views, newest first                              (T57)
 //   POST /api/v0/runs/{id}/export {out_dir, format, name?, override?, reason?}
 //                                                          -> {run_id, path, sidecar, format, shipped}             (T57)
@@ -163,7 +170,21 @@ export interface RecipeItem {
   maskClasses: string[];
   region: string | null;
   params: Record<string, unknown>;
+  /** The folder the recipe came from: `shipped`, `studio` or `project` (T83); null on a daemon that does not say. */
+  origin: string | null;
+  /** Heads the recipe in the grouped select (`lighting`, `weather`, ...); null = ungrouped. */
+  group: string | null;
+  /** A CAS hash of an image shown beside the recipe, when it has one. */
+  thumbnail: string | null;
+  /** The engine-card task the recipe's runs belong to, when it names one. */
+  task: string | null;
+  /** The `[TOKEN]` texts still open when the recipe is assembled against an empty Project Sheet with its own defaults. */
+  tokens: string[];
+  /** The recipe's own token defaults, keyed by the literal `[TOKEN]` text. */
+  overrides: Record<string, string>;
 }
+
+const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
 
 export function parseRecipe(raw: unknown): RecipeItem | null {
   if (!isRecord(raw)) return null;
@@ -181,12 +202,141 @@ export function parseRecipe(raw: unknown): RecipeItem | null {
     maskClasses: classes,
     region: str(mask.region),
     params: isRecord(raw.params) ? raw.params : {},
+    origin: str(raw.origin),
+    group: str(raw.group),
+    thumbnail: str(raw.thumbnail),
+    task: str(raw.task),
+    tokens: strings(raw.tokens),
+    overrides: isRecord(raw.overrides) ? Object.fromEntries(Object.entries(raw.overrides).filter((e): e is [string, string] => typeof e[1] === "string")) : {},
   };
 }
 
-/** `GET /recipes`: the runnable recipes shipped with the daemon. */
-export async function listRecipes(): Promise<RecipeItem[]> {
-  return asList<unknown>(await fetchJson<unknown>("/recipes"), "recipes").flatMap((r) => parseRecipe(r) ?? []);
+/** `GET /recipes[?project_id=]`: the runnable recipes (shipped and studio, plus the project's own with `projectId`). */
+export async function listRecipes(projectId?: string | null): Promise<RecipeItem[]> {
+  const q = projectId ? `?project_id=${enc(projectId)}` : "";
+  return asList<unknown>(await fetchJson<unknown>(`/recipes${q}`), "recipes").flatMap((r) => parseRecipe(r) ?? []);
+}
+
+/** A recipe as the daemon would send it: tokens filled, and what is still open. */
+export interface AssembledRecipe {
+  prompt: string;
+  negativePrompt: string;
+  /** How many `[TOKEN]`s are still open in `prompt`. */
+  unfilled: number;
+  unfilledTokens: string[];
+  /** `recipe` today; the daemon names where the text came from. */
+  promptSource: string;
+}
+
+export function parseAssembled(body: unknown): AssembledRecipe {
+  const r = isRecord(body) ? body : {};
+  const open = strings(r.unfilled_tokens);
+  return {
+    prompt: typeof r.prompt === "string" ? r.prompt : "",
+    negativePrompt: typeof r.negative_prompt === "string" ? r.negative_prompt : "",
+    unfilled: num(r.unfilled) ?? open.length,
+    unfilledTokens: open,
+    promptSource: str(r.prompt_source) ?? "recipe",
+  };
+}
+
+/**
+ * `GET /recipes/{id}/assemble`: the text the recipe would send, filled from its own defaults, then `tokens` (the node's
+ * `params.tokens`, keyed by the literal `[TOKEN]` text), then the project's Project Sheet.
+ */
+export async function assembleRecipe(recipeId: string, projectId?: string | null, tokens: Record<string, string> = {}): Promise<AssembledRecipe> {
+  const query: string[] = [];
+  if (projectId) query.push(`project_id=${enc(projectId)}`);
+  if (Object.keys(tokens).length > 0) query.push(`tokens=${enc(JSON.stringify(tokens))}`);
+  const q = query.length > 0 ? `?${query.join("&")}` : "";
+  return parseAssembled(await fetchJson<unknown>(`/recipes/${enc(recipeId)}/assemble${q}`));
+}
+
+export const RECIPE_SCOPES = ["studio", "project"] as const;
+export type RecipeScope = (typeof RECIPE_SCOPES)[number];
+
+/** A schema-1 recipe document as `POST /recipes` takes it (`recipes/README.md`). */
+export interface RecipeDoc {
+  schema: 1;
+  id: string;
+  title: string;
+  kind: "still_edit";
+  engine: string;
+  prompt: string;
+  negative_prompt?: string;
+  group?: string;
+  task?: string;
+  shot_class?: string;
+  mask: { editable_classes: string[] };
+}
+
+export interface SavedRecipe {
+  id: string;
+  path: string | null;
+  origin: string;
+}
+
+/**
+ * `POST /recipes`: save a recipe to the studio folder or the project's. 409 `recipe_exists` (an id that exists in any
+ * folder) throws unless `overwrite`; 422 carries the schema error text.
+ */
+export async function saveRecipe(scope: RecipeScope, projectId: string | null | undefined, doc: RecipeDoc, overwrite = false): Promise<SavedRecipe> {
+  const body: Record<string, unknown> = { scope, recipe: doc };
+  if (projectId) body.project_id = projectId;
+  if (overwrite) body.overwrite = true;
+  const r = await postJson<unknown>("/recipes", body);
+  const o = isRecord(r) ? r : {};
+  return { id: str(o.id) ?? doc.id, path: str(o.path), origin: str(o.origin) ?? scope };
+}
+
+// ---------------------------------------------------------------------------------------------------- references
+
+export interface StoredReference {
+  hash: string;
+  width: number | null;
+  height: number | null;
+  /** The uploaded size when the daemon shrank it (a side over 4096), else null. */
+  scaledFrom: [number, number] | null;
+}
+
+const pair = (v: unknown): [number, number] | null =>
+  Array.isArray(v) && v.length === 2 && v.every((x) => typeof x === "number" && Number.isFinite(x)) ? [v[0] as number, v[1] as number] : null;
+
+/**
+ * `POST /assets?kind=reference&project_id=<id>`: store a PNG or JPEG in the project's CAS as a reference image (decision
+ * 46: an engine input, never composited). The daemon re-encodes it as an 8-bit RGB PNG, which drops all metadata.
+ */
+export async function uploadReference(bytes: Uint8Array<ArrayBuffer>, projectId: string, contentType = "image/png"): Promise<StoredReference> {
+  const r = await fetchJson<unknown>(`/assets?kind=reference&project_id=${enc(projectId)}`, {
+    method: "POST",
+    body: bytes,
+    headers: { "Content-Type": contentType },
+  });
+  const o = isRecord(r) ? r : {};
+  const hash = str(o.hash) ?? str(o.content_hash);
+  if (!hash) throw new Error("the daemon stored the reference but returned no hash");
+  return { hash, width: num(o.width), height: num(o.height), scaledFrom: pair(o.scaled_from) };
+}
+
+export interface ReferenceItem {
+  hash: string;
+  width: number | null;
+  height: number | null;
+  bytes: number | null;
+  uploadedUtc: string | null;
+  note: string | null;
+}
+
+export function parseReference(raw: unknown): ReferenceItem | null {
+  if (!isRecord(raw)) return null;
+  const hash = str(raw.hash);
+  if (!hash) return null;
+  return { hash, width: num(raw.width), height: num(raw.height), bytes: num(raw.bytes), uploadedUtc: str(raw.uploaded_utc), note: str(raw.note) };
+}
+
+/** `GET /projects/{pid}/references`: every reference uploaded to the project, in upload order. */
+export async function listReferences(projectId: string): Promise<ReferenceItem[]> {
+  return asList<unknown>(await fetchJson<unknown>(`/projects/${enc(projectId)}/references`), "references").flatMap((r) => parseReference(r) ?? []);
 }
 
 // ---------------------------------------------------------------------------------------------------- runs

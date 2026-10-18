@@ -1,0 +1,32 @@
+# Motion recipe (T94): Crane Rise (library shot as04, medium risk). Cut from the source view only: one zoom (1.15) and
+# an end centre higher in the frame, so the rise reveals storeys the approved still already holds and nothing above
+# them. The dial stands: +3 m reveals, +10 m invents (reveal_m on the node raises the risk). Prompt law: motion
+# only; no pace words under the end pin; negative prompt under 30 words.
+schema: 1
+id: motion_crane_rise
+title: Crane rise
+kind: motion_croppair
+library: as04
+engine: kling-o3-4k
+shot_class: wide
+croppair:
+  z0: 1.15
+  z1: 1.15
+  center: [0.5, 0.56]
+  center_end: [0.5, 0.44]
+  direction: locked
+motion:
+  move: crane_rise
+  start_end: true
+  duration_s: 5
+  camera_fixed: false
+params:
+  n: 1
+mask:
+  editable_classes: []
+  region: none
+  lock_rest: false
+prompt: |-
+  Shot 1: wide shot, a smooth crane rise from eye level at constant speed. The camera rises from the first frame to the last frame; the framing is set by those two frames. The upper storeys arrive in frame as the ground plane falls away at the bottom edge; vegetation sways below; light holds.
+  SCENE LOCKS: the upper facade keeps the exact bay rhythm, materials and proportions of the source; the roofline stays true; verticals stay vertical; no new geometry appears at the edges; one move only, no drift or pan added.
+negative_prompt: morphing, warping geometry, bending verticals, new storeys, flicker, texture crawl, new objects, people, text, logos, camera shake, extra movement

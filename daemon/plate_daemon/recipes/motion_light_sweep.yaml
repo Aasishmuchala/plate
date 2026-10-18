@@ -1,0 +1,31 @@
+# Motion recipe (T94): Light Sweep (library shot as08, medium risk). A locked crop (one zoom, one centre) sent as a
+# single image (motion.start_end: false): the light ends somewhere else than it starts, so pinning the end to the
+# start frame would drag the day back. With two approved stills of the light at each end, use motion_time_of_day
+# instead. Negative prompt under 30 words.
+schema: 1
+id: motion_light_sweep
+title: Light sweep
+kind: motion_croppair
+library: as08
+engine: kling-o3-4k
+shot_class: wide
+croppair:
+  z0: 1.0
+  z1: 1.0
+  center: [0.5, 0.5]
+  direction: locked
+motion:
+  move: light_sweep
+  start_end: false
+  duration_s: 8
+  camera_fixed: true
+params:
+  n: 1
+mask:
+  editable_classes: []
+  region: none
+  lock_rest: false
+prompt: |-
+  Shot 1: wide shot, locked-off camera, time-lapse light. Over the full clip, sunlight sweeps across the facade from east to west: shadows lengthen and rotate in one continuous motion, the colour temperature deepening toward golden hour, clouds crossing the sky overhead. The building receives the day; nothing else happens.
+  SCENE LOCKS: geometry and framing frozen; the ONLY change is light and sky; shadow edges stay crisp and correctly cast throughout; no flicker; no camera movement.
+negative_prompt: camera movement, zoom, pan, morphing, warping geometry, bending lines, flicker, strobing shadows, texture crawl, new objects, people, text, logos

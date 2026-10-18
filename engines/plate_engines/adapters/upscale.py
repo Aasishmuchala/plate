@@ -1,26 +1,30 @@
-"""Upscalers for AI-made layers only: Magnific Precision v2 (Freepik API) and local Real-ESRGAN (router plan T17).
+"""Upscalers for AI-made layers only: Magnific Precision v2 and local Real-ESRGAN (router plan T17, T100).
 
 New for the PLATE monorepo. Doctrine rule 5 lives here as code: the plate is never upscaled. Both adapters refuse
 an input tagged role == "plate" with PlateUpscaleForbidden (Adapter.check_inputs, from the manifest's
 plate_upscale_forbidden flag, and once more by name below), and `image` is the only required input, so nothing
 here can start from a prompt. Each Quote.size is the size the vendor will send back (input x scale), not the
-size of the input.
+size of the input. Both quote() and submit() refuse an input over the manifest's `limits.max_input_mp`, or an
+output (input x scale) over `limits.max_output_mp`, with InputError naming the limit and the size, before
+anything is sent (decision 55; the daemon's ingress hook in plate_daemon.layer_upscale picks a scale that fits).
 
-MagnificPrecisionV2 (custody D: terms and upload behaviour unestablished). POST {endpoint}/ai/image-upscaler/precision
-with header x-freepik-api-key and a JSON body {"image": <base64>, "scale_factor", "sharpen", "smart_grain",
-"ultra_detail"}; the answer is {"data": {"task_id", "status", "generated": []}}; poll() looks once at
-GET {endpoint}/ai/image-upscaler/precision/{task_id} (CREATED and IN_PROGRESS are not done, COMPLETED carries
-data.generated, FAILED fails). The manifest route has endpoint "unknown", so the default base is
-https://api.freepik.com/v1 until the P0 smoke test sets one. UNVERIFIED (manifest flag unverified_p0): Magnific's
-own documentation now shows api.magnific.com, header x-magnific-api-key and /v1/ai/image-upscaler-precision-v2
-with scale_factor 2 to 16; the class constants below are the only places that change, and the route's
-allowed_hosts must gain .magnific.com in the manifest first.
+MagnificPrecisionV2 (custody D: terms and upload behaviour unestablished). Magnific's own documentation moved the
+API from the Freepik host (decision 55, open question 24): POST {base}/v1/ai/image-upscaler-precision-v2 with header
+x-magnific-api-key and a JSON body {"image": <base64>, "scale_factor", "sharpen", "smart_grain", "ultra_detail"};
+the answer is {"data": {"task_id", "status", "generated": []}}; poll() looks once at GET {that URL}/{task_id}
+(CREATED and IN_PROGRESS are not done, COMPLETED carries data.generated, FAILED fails). The base is the route's
+https endpoint (the manifest names https://api.magnific.com), else DEFAULT_BASE. UNVERIFIED (manifest flag
+unverified_p0) until the P0 smoke test: the host, the header, scale_factor 2 to 16 (manifest `# UNCONFIRMED`) and
+the 6 MP in / 50 MP out limits; the class constants below are the only places the address and header are named.
+The route's allowed_hosts keep .freepik.com beside .magnific.com because generated files may still be served from
+Freepik's CDN. MAGNIFIC_API_KEY is read first, FREEPIK_API_KEY still works.
 
 RealESRGAN (custody C0, extra `gpu`, imported lazily, never exercised on the Mac): the `realesrgan` package with
 RRDBNet weights read from the directory in PLATE_REALESRGAN_DIR (<model_name>.pth; nothing is downloaded). Without
 the package, CUDA or the weights, submit() raises LocalModelUnavailable unless PLATE_STUB_LOCAL=1, in which case a
-deterministic stub runs: bicubic resize plus noise seeded from the input hash and parameters, so the pipeline is
-testable. A stub job says so in its message and usage.
+deterministic stub runs: a Lanczos resample (cv2.INTER_LANCZOS4) at the input's own bit depth, which is what
+ingress would have done to the layer anyway, so the pipeline is testable and a stub take is never worse than no
+upscaler. A stub job says so in its message and usage ({"stub": True}).
 """
 
 from __future__ import annotations
@@ -30,10 +34,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from blake3 import blake3
-
 from ..atlas import REFUSAL_PATTERN
-from ..models import EngineSize
+from ..models import EngineManifest, EngineSize
 from .base import InputError, JobStatus, PlateUpscaleForbidden, Quote, Staged
 from .image_common import (
     ImageAdapter,
@@ -46,7 +48,13 @@ from .image_common import (
     stub_enabled,
 )
 
-__all__ = ["LocalModelUnavailable", "MagnificPrecisionV2", "PlateUpscaleForbidden", "RealESRGAN"]
+__all__ = [
+    "LocalModelUnavailable",
+    "MagnificPrecisionV2",
+    "PlateUpscaleForbidden",
+    "RealESRGAN",
+    "check_limits",
+]
 
 # Param name in the manifest -> field name on the wire (only ones that differ are listed).
 _MAGNIFIC_WIRE = {"scale": "scale_factor"}
@@ -64,15 +72,39 @@ def _upscaled(prep: Prepared, scale: int) -> SizeChoice:
     )
 
 
+def check_limits(manifest: EngineManifest, size: tuple[int, int], scale: int) -> None:
+    """InputError when `size` (w, h) is over the manifest's `limits.max_input_mp`, or `size` x `scale` is over its
+    `limits.max_output_mp`; the message names the limit and the size. No limits (None) means nothing to check."""
+    limits = manifest.limits
+    if limits is None:
+        return
+    w, h = size
+    for what, (pw, ph), cap, name in (
+        ("input", (w, h), limits.max_input_mp, "max_input_mp"),
+        ("output", (w * scale, h * scale), limits.max_output_mp, "max_output_mp"),
+    ):
+        mp = pw * ph / 1e6
+        if cap is not None and mp > cap:
+            raise InputError(
+                f"{manifest.id}: the {what} {'is' if what == 'input' else 'would be'} {pw} x {ph} ({mp:.2f} MP), "
+                f"over limits.{name} of {cap:g} MP"
+                + (f" (input {w} x {h} at scale {scale})" if what == "output" else "")
+            )
+
+
+def _limits(manifest: EngineManifest, prep: Prepared) -> None:
+    check_limits(manifest, (prep.image.width or 0, prep.image.height or 0), int(prep.params["scale"]))
+
+
 class MagnificPrecisionV2(ImageAdapter):
     PROVIDER = "magnific"
     SUPPORTED_ENGINES = ("magnific-precision-v2",)
     ENV_KEY = ("MAGNIFIC_API_KEY", "FREEPIK_API_KEY")
     ETA_S = 45.0
     # UNVERIFIED (see the module docstring): the one place the vendor's address and key header are named.
-    KEY_HEADER = "x-freepik-api-key"
-    DEFAULT_BASE = "https://api.freepik.com/v1"
-    PATH = "/ai/image-upscaler/precision"
+    KEY_HEADER = "x-magnific-api-key"
+    DEFAULT_BASE = "https://api.magnific.com"
+    PATH = "/v1/ai/image-upscaler-precision-v2"
 
     def base_url(self) -> str:
         endpoint = self.route.endpoint
@@ -94,12 +126,14 @@ class MagnificPrecisionV2(ImageAdapter):
         prep = self.prepare(inputs, params)
         self.refuse_upscale_of_plate(prep.image)
         choice = _upscaled(prep, int(prep.params["scale"]))
+        _limits(self.manifest, prep)
         return self.make_quote(self.estimate(), self.ETA_S, choice.size)
 
     def submit(self, staged: Staged) -> str:
         prep = self.prepare(staged.inputs, staged.params)
         self.refuse_upscale_of_plate(prep.image)
         choice = _upscaled(prep, int(prep.params["scale"]))
+        _limits(self.manifest, prep)
         body = self.body(prep)
         key = self.api_key()
         resp = self.http().post(self.url(), json=body, headers={self.KEY_HEADER: key})
@@ -147,17 +181,22 @@ class RealESRGAN(ImageAdapter):
     # ---- the stub ---------------------------------------------------------------------------------------
 
     def stub_upscale(self, prep: Prepared) -> bytes:
+        """The deterministic stand-in: a Lanczos resample by `scale` at the input's own bit depth (8 or 16 bit;
+        alpha dropped, grey kept grey). Different inputs give different outputs; the same input the same bytes."""
         import cv2
         import numpy as np
 
-        arr = decode_png_8bit(prep.image.data)
+        arr = cv2.imdecode(np.frombuffer(prep.image.data, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        if arr is None:
+            raise InputError("the image cannot be decoded")
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[..., :3]
+        if arr.dtype not in (np.uint8, np.uint16):
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
         scale = int(prep.params["scale"])
         h, w = arr.shape[:2]
-        out = cv2.resize(arr, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
-        material = prep.digest + repr(sorted(prep.params.items()))
-        rng = np.random.default_rng(int.from_bytes(blake3(material.encode("utf-8")).digest()[:8], "little"))
-        noise = rng.integers(-3, 4, size=out.shape, dtype=np.int16)
-        return encode_png(np.clip(out.astype(np.int16) + noise, 0, 255).astype(np.uint8))
+        out = cv2.resize(np.ascontiguousarray(arr), (w * scale, h * scale), interpolation=cv2.INTER_LANCZOS4)
+        return encode_png(out)
 
     # ---- the real path ----------------------------------------------------------------------------------
 
@@ -205,12 +244,14 @@ class RealESRGAN(ImageAdapter):
         prep = self.prepare(inputs, params)
         self.refuse_upscale_of_plate(prep.image)
         choice = _upscaled(prep, int(prep.params["scale"]))
+        _limits(self.manifest, prep)
         return self.make_quote(self.estimate(), self.ETA_S, choice.size)
 
     def submit(self, staged: Staged) -> str:
         prep = self.prepare(staged.inputs, staged.params)
         self.refuse_upscale_of_plate(prep.image)
         choice = _upscaled(prep, int(prep.params["scale"]))
+        _limits(self.manifest, prep)
         stub = stub_enabled()
         data = self.stub_upscale(prep) if stub else self.run_pipeline(prep)
         job_id = self.new_job_id(prep.digest)
@@ -218,7 +259,7 @@ class RealESRGAN(ImageAdapter):
         status = JobStatus(
             state="done",
             outputs=outputs,
-            message="stub: deterministic bicubic resize and noise, not a model output" if stub else "",
+            message="stub: deterministic Lanczos resample, not a model output" if stub else "",
             usage={"stub": True} if stub else {},
         )
         self.finish(job_id, status, choice)

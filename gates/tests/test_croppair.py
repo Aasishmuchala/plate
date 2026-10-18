@@ -1,4 +1,5 @@
-"""croppair.cut_crops: the cut_crops.py geometry, zoom validation, PIL / ndarray handling, crop_pair delegation."""
+"""croppair.cut_crops: the cut_crops.py geometry, zoom validation (push-in, pull-back, locked), the end centre of a
+slider drift, PIL / ndarray handling, crop_pair delegation."""
 
 from __future__ import annotations
 
@@ -50,9 +51,11 @@ def test_ndarray_in_gives_ndarray_copies_out():
     assert arr[y0, x0, 0] != 9999  # a copy, not a view
 
 
-@pytest.mark.parametrize("z0,z1", [(0.9, 2.0), (1.5, 1.5), (2.0, 1.5), (1.0, 3.2), (-1.0, 2.0)])
+@pytest.mark.parametrize(
+    "z0,z1", [(0.9, 2.0), (1.5, 1.5), (2.0, 0.9), (1.0, 3.2), (3.2, 1.0), (-1.0, 2.0), (float("nan"), 2.0)]
+)
 def test_zoom_pair_validation(z0, z1):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="zoom pair"):
         croppair.cut_crops(Image.new("RGB", (64, 36)), 32, 18, z0, z1)
 
 
@@ -60,6 +63,56 @@ def test_zoom_pair_validation_accepts_the_limits_and_the_house_moves():
     croppair.validate_zooms(1.0, 3.0)
     croppair.validate_zooms(1.5, 2.3)  # amphi
     croppair.validate_zooms(1.0, 1.18)  # couple-dining
+    croppair.validate_zooms(1.25, 1.0)  # the as02 reveal reversed: a pull-back
+    croppair.validate_zooms(3.0, 1.0)
+
+
+def test_an_equal_pair_is_a_locked_crop_only_when_asked_for():
+    with pytest.raises(ValueError, match="allow_equal"):
+        croppair.validate_zooms(1.0, 1.0)
+    croppair.validate_zooms(1.0, 1.0, allow_equal=True)
+    croppair.validate_zooms(3.0, 3.0, allow_equal=True)
+    with pytest.raises(ValueError, match="zoom pair"):
+        croppair.validate_zooms(0.5, 0.5, allow_equal=True)
+    arr = np.arange(36 * 64 * 3, dtype=np.uint8).reshape(36, 64, 3)
+    start, end, boxes = croppair.cut_crops(arr, 32, 18, 1.0, 1.0, allow_equal=True)
+    assert (
+        boxes == ((0, 0, 64, 36), (0, 0, 64, 36))
+        and np.array_equal(start, end)
+        and np.array_equal(start, arr)
+    )
+
+
+def test_direction_names_the_zoom():
+    assert croppair.direction(1.0, 1.18) == "in"
+    assert croppair.direction(1.25, 1.0) == "out"
+    assert croppair.direction(1.1, 1.1) == "locked"
+
+
+def test_a_pull_back_is_the_push_in_with_its_boxes_swapped():
+    rng = np.random.default_rng(5)
+    arr = rng.integers(0, 256, (307, 550, 3), dtype=np.uint8)
+    p_start, p_end, p_boxes = croppair.cut_crops(arr, 363, 217, 1.5, 2.3)
+    b_start, b_end, b_boxes = croppair.cut_crops(arr, 363, 217, 2.3, 1.5)
+    assert b_boxes == (p_boxes[1], p_boxes[0])
+    assert np.array_equal(b_start, p_end) and np.array_equal(b_end, p_start)
+    assert b_start.shape[1] < b_end.shape[1]  # the start is the tighter crop: the frame widens
+
+
+def test_an_end_centre_slides_the_end_crop_and_leaves_the_start_alone():
+    rng = np.random.default_rng(9)
+    arr = rng.integers(0, 256, (360, 640, 3), dtype=np.uint8)
+    start, end, boxes = croppair.cut_crops(arr, 320, 180, 1.1, 1.1, allow_equal=True, cx1=339.2, cy1=180)
+    ref_start, _, ref_boxes = croppair.cut_crops(arr, 320, 180, 1.1, 1.2)
+    assert boxes[0] == ref_boxes[0] and np.array_equal(start, ref_start)
+    assert boxes[1] == croppair.box_for(640, 360, 339.2, 180, 1.1)
+    (x0, y0, w, h), (x1, y1, w1, h1) = boxes
+    assert (w, h) == (w1, h1) and y1 == y0 and x1 > x0  # same zoom, the frame slides right
+    assert np.array_equal(end, arr[y1 : y1 + h1, x1 : x1 + w1])
+    # a centre past the edge clamps inside the frame, never pads
+    _, _, clamped = croppair.cut_crops(arr, 320, 180, 1.1, 1.1, allow_equal=True, cx1=10_000, cy1=-50)
+    cx0, cy0, cw, ch = clamped[1]
+    assert cx0 + cw == 640 and cy0 == 0
 
 
 def test_boxes_are_even_clamped_and_nested():

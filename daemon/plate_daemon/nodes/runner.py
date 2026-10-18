@@ -4,9 +4,11 @@ A run made here walks the state machine like an Edit run does (DRAFT, QUOTED, AP
 SUBMITTED, RUNNING, FETCHING, NORMALIZING, GATING, DONE or GATE_FAIL), so the ledger, the SSE events, the gate
 report files and `GET /runs/{id}` need no special case. What differs is only who does the work:
 
-    Set, Recolour, LightMix   in this process (`NumericEngine`: submit, poll and fetch are bookkeeping; the
-                              work is `normalize`, the check is `gate`). Route `plate-numeric/numeric-local`,
-                              custody C0, price 0.0000 USD, approved `auto`.
+    Set, Recolour, LightMix,  in this process (`NumericEngine`: submit, poll and fetch are bookkeeping; the
+    Comp, Colour, Atmosphere, work is `normalize`, the check is `gate`). Route `plate-numeric/numeric-local`,
+    Sky                       custody C0, price 0.0000 USD, approved `auto`. The last four are Wave 9's
+                              (decision 48): a stack of accepted layers, a linear-light grade, depth fog from Z
+                              and a reference sky inside the SKY Cryptomatte coverage.
     Light, Scout              in Max. `PluginEngine.submit` puts a job on the plugin queue; the run sits in
                               SUBMITTED/RUNNING until the dock has answered (and, for Light, the superseding
                               packet has arrived); a restart picks the poll up again from the queue.
@@ -52,7 +54,17 @@ from ..quotes import insert_quote
 from ..states import TERMINAL, WORKER_STATES, Priority, RunState
 from ..worker import GateOutcome
 from ..worker import step as worker_step
-from . import light_node, lightmix_node, recolour_node, scout_node, set_node
+from . import (
+    atmosphere_node,
+    colour_node,
+    comp_node,
+    light_node,
+    lightmix_node,
+    recolour_node,
+    scout_node,
+    set_node,
+    sky_node,
+)
 from .common import (
     NUMERIC_ENGINE_ID,
     NUMERIC_ROUTE,
@@ -81,13 +93,25 @@ __all__ = [
 log = logging.getLogger(__name__)
 S = RunState
 
+# Wave 9 (T93, decision 48): Comp, Colour, Atmosphere and Sky join the in-process numeric nodes.
+WAVE9_NUMERIC = (comp_node, colour_node, atmosphere_node, sky_node)
 MODULES: dict[str, Any] = {
-    m.KIND: m for m in (set_node, recolour_node, lightmix_node, light_node, scout_node)
+    m.KIND: m for m in (set_node, recolour_node, lightmix_node, light_node, scout_node, *WAVE9_NUMERIC)
 }
-NUMERIC_KINDS = frozenset({set_node.KIND, recolour_node.KIND, lightmix_node.KIND})
+NUMERIC_KINDS = frozenset(
+    {set_node.KIND, recolour_node.KIND, lightmix_node.KIND, *(m.KIND for m in WAVE9_NUMERIC)}
+)
 PLUGIN_KINDS = frozenset({light_node.KIND, scout_node.KIND})
 KINDS = NUMERIC_KINDS | PLUGIN_KINDS
-PREVIEWS: dict[str, Any] = {"set": set_node, "lightmix": lightmix_node, "recolour": recolour_node}
+PREVIEWS: dict[str, Any] = {
+    "set": set_node,
+    "lightmix": lightmix_node,
+    "recolour": recolour_node,
+    "comp": comp_node,
+    "colour": colour_node,
+    "atmosphere": atmosphere_node,
+    "sky": sky_node,
+}
 
 NUMERIC_URL = "plate-node://"
 PLUGIN_URL = "plate-plugin://"
@@ -518,13 +542,16 @@ class NodeRunner:
     def preview(
         self, project_id: str, node_id: str, what: str, params: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Numbers for the node editors (`POST /projects/{id}/nodes/{node}/preview`): `what` is set, lightmix or
-        recolour. The node's saved params are the base, `params` the artist's edits over them; no run is made
-        and nothing is stored."""
+        """Numbers for the node editors (`POST /projects/{id}/nodes/{node}/preview`): `what` is one of the keys
+        of `PREVIEWS` (set, lightmix, recolour, comp, colour, atmosphere, sky, and whatever the daemon registers,
+        e.g. the Motion router card). The node's saved params are the base, `params` the artist's edits over
+        them; no run is made and nothing is stored."""
         module = PREVIEWS.get(what)
         if module is None:
             raise PipelineError(
-                f"no numeric preview '{what}' (set, lightmix or recolour)", code="unknown_preview", status=404
+                f"no numeric preview '{what}' ({', '.join(sorted(PREVIEWS))})",
+                code="unknown_preview",
+                status=404,
             )
         pl = self.pipeline
         q, _node = self._quote_context(None, project_id, node_id, {"params": dict(params or {})})
@@ -540,7 +567,8 @@ def install(pipeline: Any) -> NodeRunner:
     """Let `pipeline` quote and drive the numeric and plugin nodes (idempotent; returns the runner).
 
     Wraps four methods on this instance and leaves every other node and run to the originals:
-    `quote_node` (a Set, Recolour, LightMix, Light or Scout node is quoted here), `approve` (a free local run
+    `quote_node` (a Set, Recolour, LightMix, Comp, Colour, Atmosphere, Sky, Light or Scout node is quoted
+    here), `approve` (a free local run
     takes no budget decision), `step` (a node run takes this module's engine, normalize and gate) and
     `engine_for` (so `cancel` reaches the plugin queue). The runner is
     kept at `pipeline.node_runner`.

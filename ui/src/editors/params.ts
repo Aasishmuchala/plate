@@ -87,7 +87,9 @@ export function stillRef(nodes: GraphNode[], edges: EdgeLike[], nodeId: string):
       seen.add(id);
       const n = byId.get(id);
       if (!n) continue;
-      if (n.data.outputHash) return refOf(n, plate);
+      // A Reference's hash is its card thumbnail, not a still: it feeds an engine's reference input and is never the
+      // image an editor works on (decision 46).
+      if (n.data.outputHash && n.data.kind !== "Reference") return refOf(n, plate);
       for (const e of edges) if (e.target === id) next.push(e.source);
     }
     queue = next;

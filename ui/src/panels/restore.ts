@@ -5,7 +5,11 @@
 // (Electron's `File.path`, a file:// URL some apps put on the drag, a plain absolute path in the text flavour).
 // When none of those is there the panel asks for the path instead of guessing one: the daemon resolves by path
 // (T26 `resolve_drop`), so there is nothing else to send. The daemon route gap is recorded in the T36 report.
+//
+// T101: a History row opens in the viewer. A click compares the run's output (B) with its plate (A) and selects it,
+// as a candidate click does; shift-click puts the run on side A only, for any pairing (the scrub stays unbound).
 
+import { runLabel, type SideRef, useRunStore } from "../canvas/runStore";
 import { useGraphStore } from "../store";
 import { errorMessage, getRun, resolveAsset } from "./api";
 import { shortId } from "./format";
@@ -101,6 +105,36 @@ export function focusRun(run: RunRow): void {
   const g = useGraphStore.getState();
   g.onNodesChange(g.nodes.map((n) => ({ type: "select" as const, id: n.id, selected: n.id === run.node_id })));
   usePanelsStore.getState().selectRun(run.id);
+}
+
+/** A run row as a viewer side: labelled `<node label> · <engine_id> · attempt n`, carrying its output hash. */
+export function runSide(run: RunRow): SideRef {
+  const extra = run as RunRow & { attempt?: unknown; outputs?: unknown };
+  const nodeId = run.node_id ?? undefined;
+  const node = nodeId ? useGraphStore.getState().nodes.find((n) => n.id === nodeId) : undefined;
+  const outputs = Array.isArray(extra.outputs) ? extra.outputs.filter((o): o is string => typeof o === "string") : [];
+  const outputHash = outputs[0] ?? run.result_key ?? undefined;
+  const attempt = typeof extra.attempt === "number" ? extra.attempt : null;
+  return {
+    kind: "run",
+    runId: run.id,
+    ...(nodeId ? { nodeId } : {}),
+    label: runLabel(node?.data.label ?? nodeId ?? `run ${shortId(run.id)}`, run.route?.engine_id, attempt),
+    ...(outputHash ? { outputHash } : {}),
+  };
+}
+
+/** History's row click: select the run and its node, and compare its output (B) with its plate (A). */
+export function openRunInViewer(run: RunRow): void {
+  focusRun(run);
+  const runs = useRunStore.getState();
+  runs.closeCompare();
+  runs.setCompareSide("b", runSide(run)); // with nothing open, A becomes the plate of the run's node
+}
+
+/** History's shift-click: the run on side A, whatever B is. */
+export function setRunAsA(run: RunRow): void {
+  useRunStore.getState().setCompareSide("a", runSide(run));
 }
 
 /** Accept the "Load N nodes" offer. Returns the number of nodes now selected on the canvas. */

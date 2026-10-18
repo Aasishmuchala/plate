@@ -1,0 +1,30 @@
+# Motion recipe (T94): Weather Pass (library shot as09). A locked tripod sent as a single image
+# (motion.start_end: false): the weather arrives and stays, so the end is not pinned to the dry start frame.
+# Negative prompt under 30 words.
+schema: 1
+id: motion_weather_pass
+title: Weather pass
+kind: motion_croppair
+library: as09
+engine: kling-o3-4k
+shot_class: wide
+croppair:
+  z0: 1.0
+  z1: 1.0
+  center: [0.5, 0.5]
+  direction: locked
+motion:
+  move: locked_tripod
+  start_end: false
+  duration_s: 8
+  camera_fixed: true
+params:
+  n: 1
+mask:
+  editable_classes: []
+  region: none
+  lock_rest: false
+prompt: |-
+  Shot 1: wide shot, locked-off camera. Weather arrives over the clip: mist rolls in from the left, softening the scene depth layer by depth layer, then the first raindrops stipple the water and the paving. Surfaces darken as they wet; reflections bloom on the hardscape; planting bows and recovers. The building stands constant through the change.
+  SCENE LOCKS: architecture, materials and framing identical to the source; the weather is the only event; light shifts only as the weather dictates; no camera movement.
+negative_prompt: camera movement, zoom, pan, morphing, warping geometry, bending lines, flicker, texture crawl, new objects, people, text, logos, camera shake

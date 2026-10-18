@@ -5,6 +5,8 @@
 # adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
 # T7: params are the vendor FULL schema (advanced: true only hides a field in the UI drawer). price.usd is the
 # default-tier figure the router ranks on; price.by holds the tiers we know. Nothing is billed-price-verified yet.
+# T100 (decision 55): the ingress upscaler for AI layers smaller than the plate region. Without the gpu extra, CUDA
+# or the weights (this Mac, CI) the adapter's stub is a Lanczos resample, flagged stub: true in the hook's record.
 id: real-esrgan
 name: Real-ESRGAN
 version: unpinned
@@ -20,6 +22,8 @@ params:
   - {name: model_name, type: enum, default: "RealESRGAN_x4plus", enum: ["RealESRGAN_x4plus", "RealESRGAN_x2plus"]}
   - {name: scale, type: int, default: 4, range: [1, 4]}
   - {name: tile, type: int, default: 0, range: [0, 1024], advanced: true}
+# T100: the same 50 MP output cap as Magnific (a bigger layer is more than any plate region needs); no input cap.
+limits: {max_output_mp: 50}
 price:
   model: per_image
   usd: 0.0

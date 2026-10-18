@@ -1116,16 +1116,19 @@ def test_light_without_maxgaffer_is_disabled_with_the_reason(make_dock):
     assert not dock.btn_light.isEnabled() and dock.btn_light.toolTip().startswith("MAXGAFFER_MISSING")
 
 
-def test_engine_and_preset_are_labelled_hints_that_are_not_sent(make_dock, qt):
+def test_engine_and_preset_are_labelled_as_used_by_send_and_quote(make_dock, qt):
     dock, _ = make_dock()
     form = dock.cb_engine.parentWidget().layout()
     labels = [
         w.text()
         for w in dock.findChildren(qt.QtWidgets.QLabel)
-        if w.buddy() in (dock.cb_engine, dock.cb_preset) or w.text().endswith("(not sent)")
+        if w.buddy() in (dock.cb_engine, dock.cb_preset) or w.text().endswith("(used by Send + quote)")
     ]
-    assert "Engine hint (not sent)" in labels and "Preset hint (not sent)" in labels, (form, labels)
-    assert "not sent" in dock.cb_engine.toolTip() and "Make bar" in dock.cb_preset.toolTip()
+    assert "Engine (used by Send + quote)" in labels and "Preset (used by Send + quote)" in labels, (
+        form,
+        labels,
+    )
+    assert "Send + quote" in dock.cb_engine.toolTip() and "Make bar" in dock.cb_preset.toolTip()
 
 
 # ---- the Project combo

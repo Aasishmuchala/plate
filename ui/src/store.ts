@@ -4,11 +4,18 @@
 //
 // Autosave (decision 31). With a project open, every structural change schedules `saveNow()` 400 ms later, so a
 // burst of edits is one PUT: a node added or removed, an edge, or any node's data (the editors' params, a status, a
-// linked packet). A move, a selection or xyflow measuring a node is not a change. The Make bar calls `saveNow()`
+// linked packet). A move, a selection or xyflow measuring a node is not a structural change. The Make bar calls `saveNow()`
 // itself before every quote. One PUT is on the wire at a time; a change made while it is out goes right after it.
 // The daemon owns the node status: the stored graph it answers with carries the `gateStatus`, `approved`,
 // `approvedBy` and `scrubLogId` it derived, and those are written back onto the nodes without scheduling another
 // save. A 422 rule refusal sets `saveError` and adds the named edge to `violations`, which the canvas draws refused.
+//
+// T98. A move is saved too, but on its own slower clock: a node drag ending (`onNodeDragStop`) schedules a
+// positions save 1500 ms later, so a run of drags is one PUT (a structural save due sooner carries the positions with
+// it). Tidy, Clear and Duplicate are artist commands: Tidy and Clear save at once, Duplicate is a structural change.
+// `saveState` is what the status-bar chip shows: `unsaved` from the first change until its PUT leaves, `saving` while
+// it is out, `saved` (with `savedAt`) once the daemon stored the latest graph, `failed` after a refused or lost PUT.
+// The canvas starts empty: no placeholder nodes; the artist opens or creates a project.
 
 import {
   addEdge,
@@ -22,6 +29,7 @@ import {
 } from "@xyflow/react";
 import { create } from "zustand";
 import { ApiError, saveGraph } from "./api/client";
+import { tidyPositions } from "./canvas/layout";
 import {
   applyOverride,
   canAccept,
@@ -56,6 +64,15 @@ export type NodeStatusPatch = Partial<
 /** How long the store waits after the last structural change before it PUTs the graph. */
 export const SAVE_DEBOUNCE_MS = 400;
 
+/** How long it waits after the last node drag before it PUTs the moved positions. */
+export const POSITION_SAVE_DEBOUNCE_MS = 1500;
+
+/** Where the open project's graph stands against the daemon's copy (the status-bar chip). */
+export type SaveState = "saved" | "unsaved" | "saving" | "failed";
+
+/** A duplicate sits this far right of and below its original. */
+export const DUPLICATE_OFFSET_PX = 40;
+
 /** Why the last save failed. A rule refusal names its code (`VIDEO_LOCKED`, ...) and, for an edge rule, the edge. */
 export interface SaveError {
   /** The canvas-rule code, else the daemon's error code; null when it gave none (a network failure). */
@@ -83,11 +100,29 @@ export interface GraphState {
   violations: RuleViolation[];
   /** The last save's failure; null after a good save. */
   saveError: SaveError | null;
+  saveState: SaveState;
+  /** When the daemon last stored this project's graph from this tab (epoch ms); null since the project was opened. */
+  savedAt: number | null;
   loadProject: (graph: LoadableGraph, projectId?: string | null) => void;
   toGraph: () => Graph;
-  addNode: (kind: NodeKind, position: XYPosition, init?: Partial<PlateNodeData>) => void;
+  /** Add a node; returns its id. */
+  addNode: (kind: NodeKind, position: XYPosition, init?: Partial<PlateNodeData>) => string;
   /** Remove a node and every edge that touches it. */
   removeNode: (id: string) => void;
+  /**
+   * Copy nodes 40 px down and right, selected in place of the originals: the label, params and provenance labels
+   * come along; the status (gate verdict, approval, scrub log, overrides) and the take (`outputHash`) do not, except
+   * that a Plate keeps its packet link. Every edge into a copied node is re-made into its copy (from the copy of its
+   * source when that was copied too) through the canvas rules, so a copy fed by an unapproved still stays unwired.
+   * Returns the new ids.
+   */
+  duplicateNodes: (ids: readonly string[]) => string[];
+  /** Empty the graph and save it at once. The caller asks the artist first. */
+  clearGraph: () => Promise<void>;
+  /** Lay the graph out by rank (canvas/layout.ts) and save the positions at once. */
+  tidy: () => Promise<void>;
+  /** xyflow's `onNodeDragStop`: schedule the positions save. */
+  onNodeDragStop: () => void;
   onNodesChange: (changes: NodeChange<GraphNode>[]) => void;
   onEdgesChange: (changes: EdgeChange[]) => void;
   connect: (connection: Connection) => void;
@@ -110,26 +145,21 @@ function makeNode(id: string, kind: NodeKind, position: XYPosition, init: Partia
   return flowNode(id, position, data);
 }
 
-/** Plate -> Comp -> Gate, left to right: the smallest graph that shows a measured path to a gate. */
+/** No project, no nodes (T98: the canvas shows its empty state until a project is opened). */
 export function createInitialGraph(): Pick<
   GraphState,
-  "projectId" | "nodes" | "edges" | "lastRefusal" | "lastRefusalCode" | "violations" | "saveError"
+  "projectId" | "nodes" | "edges" | "lastRefusal" | "lastRefusalCode" | "violations" | "saveError" | "saveState" | "savedAt"
 > {
   return {
     projectId: null,
-    nodes: [
-      makeNode("plate-1", "Plate", { x: 0, y: 80 }),
-      makeNode("comp-1", "Comp", { x: 260, y: 80 }),
-      makeNode("gate-1", "Gate", { x: 520, y: 80 }),
-    ],
-    edges: [
-      { id: "plate-1->comp-1", source: "plate-1", target: "comp-1" },
-      { id: "comp-1->gate-1", source: "comp-1", target: "gate-1" },
-    ],
+    nodes: [],
+    edges: [],
     lastRefusal: null,
     lastRefusalCode: null,
     violations: [],
     saveError: null,
+    saveState: "saved",
+    savedAt: null,
   };
 }
 
@@ -139,6 +169,28 @@ function nextId(kind: NodeKind, nodes: GraphNode[]): string {
     const id = `${kind.toLowerCase()}-${i}`;
     if (!taken.has(id)) return id;
   }
+}
+
+/** A copy's data: what the artist set (label, params, provenance labels), none of what a run or a human decided. A
+ * Plate's `outputHash`/`outputSize` are its packet's beauty, not a take, so a copied Plate keeps them. */
+function duplicateData(d: PlateNodeData): PlateNodeData {
+  const {
+    approved: _approved,
+    approvedBy: _approvedBy,
+    scrubLogId: _scrubLogId,
+    gateStatus: _gateStatus,
+    overrides: _overrides,
+    outputHash,
+    outputSize,
+    params,
+    ...rest
+  } = d;
+  return makeNodeData(d.kind, {
+    ...rest,
+    labels: [...d.labels],
+    ...(params ? { params: structuredClone(params) } : {}),
+    ...(d.kind === "Plate" && outputHash ? { outputHash, ...(outputSize ? { outputSize: { ...outputSize } } : {}) } : {}),
+  });
 }
 
 /** `project.json.graph` -> store form. Missing node fields get their defaults; an unknown kind throws. */
@@ -189,6 +241,8 @@ const noRefusal = { lastRefusal: null, lastRefusalCode: null } as const;
 // ---------------------------------------------------------------------------- autosave bookkeeping
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+/** The slower positions save (a drag ended); a structural save that leaves first carries the positions. */
+let positionTimer: ReturnType<typeof setTimeout> | null = null;
 /** The PUT on the wire, and the save queued behind it. */
 let inflight: Promise<void> | null = null;
 let followUp: Promise<void> | null = null;
@@ -212,6 +266,17 @@ function cancelScheduledSave(): void {
     clearTimeout(saveTimer);
     saveTimer = null;
   }
+  if (positionTimer !== null) {
+    clearTimeout(positionTimer);
+    positionTimer = null;
+  }
+}
+
+/** The chip's state; the store's own bookkeeping, never an edit. */
+function setSaveState(saveState: SaveState, savedAt?: number): void {
+  const s = useGraphStore.getState();
+  if (s.saveState === saveState && savedAt === undefined) return;
+  quietly(() => useGraphStore.setState(savedAt === undefined ? { saveState } : { saveState, savedAt }));
 }
 
 /** A structural change: remember it and (re)start the debounce. */
@@ -222,6 +287,24 @@ function markChanged(): void {
     saveTimer = null;
     void useGraphStore.getState().saveNow();
   }, SAVE_DEBOUNCE_MS);
+  setSaveState("unsaved");
+}
+
+/** Positions changed (nothing else): the PUT on the wire, if any, no longer carries the graph. */
+function markMoved(): void {
+  revision += 1;
+  setSaveState("unsaved");
+}
+
+/** A drag ended: save the positions 1500 ms after the last one, unless a structural save is due first anyway. */
+function schedulePositionSave(): void {
+  markMoved();
+  if (saveTimer !== null) return;
+  if (positionTimer !== null) clearTimeout(positionTimer);
+  positionTimer = setTimeout(() => {
+    positionTimer = null;
+    void useGraphStore.getState().saveNow();
+  }, POSITION_SAVE_DEBOUNCE_MS);
 }
 
 /** True when `b` differs from `a` in anything that is saved, other than node positions. Data objects are replaced on
@@ -339,16 +422,23 @@ function refuseSave(err: unknown): void {
   quietly(() => useGraphStore.setState({ saveError, violations }));
 }
 
-async function putGraph(projectId: string, graph: Graph): Promise<void> {
+async function putGraph(projectId: string, graph: Graph, carried: number): Promise<void> {
   let stored: LoadableGraph;
   try {
     stored = await saveGraph(projectId, graph);
   } catch (err) {
-    if (useGraphStore.getState().projectId === projectId) refuseSave(err);
+    if (useGraphStore.getState().projectId === projectId) {
+      refuseSave(err);
+      setSaveState("failed");
+    }
     return;
   }
   // another project was opened while the PUT was out: its answer is not about this graph
-  if (useGraphStore.getState().projectId === projectId) applyStored(stored);
+  if (useGraphStore.getState().projectId !== projectId) return;
+  applyStored(stored);
+  // a change made while the PUT was out is still to be saved (its own timer or the queued follow-up sends it)
+  if (revision === carried) setSaveState("saved", Date.now());
+  else setSaveState("unsaved");
 }
 
 // ---------------------------------------------------------------------------- the store
@@ -367,15 +457,92 @@ export const useGraphStore = create<GraphState>()((set, get) => ({
       cancelScheduledSave();
       revision += 1; // a PUT still out for the old project does not carry this graph
     }
-    quietly(() => set({ projectId, edges, ...settled, ...noRefusal, ...(sameProject ? {} : { saveError: null }) }));
+    const fresh = sameProject ? {} : { saveError: null, saveState: "saved" as const, savedAt: null };
+    quietly(() => set({ projectId, edges, ...settled, ...noRefusal, ...fresh }));
     if (edited) markChanged();
   },
   toGraph: () => graphToWire(get().nodes, get().edges),
-  addNode: (kind, position, init) =>
-    set((s) => {
-      const nodes = [...s.nodes, makeNode(nextId(kind, s.nodes), kind, position, init)];
-      return settle(nodes, s.edges);
-    }),
+  addNode: (kind, position, init) => {
+    const id = nextId(kind, get().nodes);
+    set((s) => settle([...s.nodes, makeNode(id, kind, position, init)], s.edges));
+    return id;
+  },
+  duplicateNodes: (ids) => {
+    const { nodes, edges } = get();
+    const wanted = new Set(ids);
+    const originals = nodes.filter((n) => wanted.has(n.id));
+    if (originals.length === 0) return [];
+    const copyOf = new Map<string, string>();
+    const copies: GraphNode[] = [];
+    let taken = nodes;
+    for (const n of originals) {
+      const id = nextId(n.data.kind, taken);
+      const at = { x: n.position.x + DUPLICATE_OFFSET_PX, y: n.position.y + DUPLICATE_OFFSET_PX };
+      const copy: GraphNode = { ...flowNode(id, at, duplicateData(n.data)), selected: true };
+      copyOf.set(n.id, id);
+      copies.push(copy);
+      taken = [...taken, copy];
+    }
+    const next = [...nodes.map((n) => (n.selected ? { ...n, selected: false } : n)), ...copies];
+    // Re-make the incoming edges through the rules. A pass may unlock the next (a copied Plate -> Edit anchors the
+    // copied Edit before its own copied downstream edge is checked), so repeat until a pass adds nothing.
+    let pending = edges
+      .filter((e) => copyOf.has(e.target))
+      .map(
+        (e): Connection => ({
+          source: copyOf.get(e.source) ?? e.source,
+          target: copyOf.get(e.target) as string,
+          sourceHandle: e.sourceHandle ?? null,
+          targetHandle: e.targetHandle ?? null,
+        }),
+      );
+    let wired = edges;
+    let refused: { message: string; code: RuleCode } | null = null;
+    for (let progress = true; progress && pending.length > 0; ) {
+      progress = false;
+      const left: Connection[] = [];
+      for (const c of pending) {
+        const verdict = validateEdge({ nodes: next, edges: wired }, { id: `${c.source}->${c.target}`, ...c });
+        if (verdict.ok) {
+          wired = addEdge(c, wired);
+          progress = true;
+        } else {
+          refused = { message: verdict.message, code: verdict.code };
+          left.push(c);
+        }
+      }
+      pending = left;
+    }
+    const why =
+      pending.length > 0 && refused
+        ? refusal(`${pending.length === 1 ? "1 edge" : `${pending.length} edges`} not copied: ${refused.message}`, refused.code)
+        : noRefusal;
+    set({ edges: wired, ...settle(next, wired), ...why });
+    return copies.map((c) => c.id);
+  },
+  clearGraph: () => {
+    set({ nodes: [], edges: [], violations: [], ...noRefusal });
+    return get().saveNow();
+  },
+  tidy: () => {
+    const { nodes, edges, projectId } = get();
+    const placed = tidyPositions(nodes, edges);
+    let moved = false;
+    const next = nodes.map((n) => {
+      const p = placed.get(n.id);
+      if (!p || (p.x === n.position.x && p.y === n.position.y)) return n;
+      moved = true;
+      return { ...n, position: p };
+    });
+    if (!moved) return Promise.resolve();
+    set({ nodes: next });
+    if (projectId === null) return Promise.resolve();
+    markMoved();
+    return get().saveNow();
+  },
+  onNodeDragStop: () => {
+    if (get().projectId !== null) schedulePositionSave();
+  },
   removeNode: (id) =>
     set((s) => {
       if (!s.nodes.some((n) => n.id === id)) return s;
@@ -395,8 +562,11 @@ export const useGraphStore = create<GraphState>()((set, get) => ({
     }),
   connect: (connection) => {
     const { nodes, edges } = get();
-    const { source, target } = connection;
-    const verdict = validateEdge({ nodes, edges }, { id: `${source}->${target}`, source, target });
+    const { source, target, sourceHandle, targetHandle } = connection;
+    const verdict = validateEdge(
+      { nodes, edges },
+      { id: `${source}->${target}`, source, target, sourceHandle, targetHandle },
+    );
     if (!verdict.ok) {
       set(refusal(verdict.message, verdict.code));
       return;
@@ -474,7 +644,8 @@ export const useGraphStore = create<GraphState>()((set, get) => ({
       return followUp;
     }
     inflightRevision = revision;
-    inflight = putGraph(projectId, get().toGraph()).finally(() => {
+    setSaveState("saving");
+    inflight = putGraph(projectId, get().toGraph(), revision).finally(() => {
       inflight = null;
     });
     return inflight;

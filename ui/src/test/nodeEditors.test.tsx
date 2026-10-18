@@ -621,16 +621,15 @@ describe("palette, Judge, body hints, registry", () => {
       </ReactFlowProvider>,
     );
 
-  it("the palette has no Colour and no Compare button; the kinds stay loadable", () => {
+  it("the palette has no Compare button (Colour is back since T98); the kinds stay loadable", () => {
     mockApi({});
     mountCanvas();
     const palette = screen.getByTestId("add-palette");
-    expect(within(palette).queryByTestId("add-Colour")).toBeNull();
     expect(within(palette).queryByTestId("add-Compare")).toBeNull();
-    for (const k of ["Plate", "Edit", "Mask", "Recolour", "LightMix", "Set", "Judge", "Export", "Review", "Concept"]) {
+    for (const k of ["Plate", "Edit", "Mask", "Colour", "Recolour", "LightMix", "Set", "Judge", "Export", "Review", "Concept"]) {
       expect(within(palette).getByTestId(`add-${k}`)).toBeInTheDocument();
     }
-    expect(PALETTE_KINDS).toHaveLength(NODE_KINDS.length - 2);
+    expect(PALETTE_KINDS).toHaveLength(NODE_KINDS.length - 1);
     expect(NODE_KINDS).toContain("Colour");
     expect(NODE_KINDS).toContain("Compare");
     // a saved graph with the hidden kinds still loads and renders
@@ -688,7 +687,7 @@ describe("palette, Judge, body hints, registry", () => {
   });
 
   it("the path editors are their own registry; the T47 registry is unchanged", () => {
-    expect([...PATH_EDITOR_KINDS].sort()).toEqual(["Edit", "Export", "Plate", "Review"]);
+    expect([...PATH_EDITOR_KINDS].sort()).toEqual(["Edit", "Export", "Plate", "Reference", "Review"]);
     for (const kind of NODE_KINDS) {
       const inPath = (PATH_EDITOR_KINDS as readonly string[]).includes(kind);
       expect(pathEditorFor(kind) !== null).toBe(inPath);

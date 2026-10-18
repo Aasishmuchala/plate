@@ -1,0 +1,19 @@
+# Per packet Plate -> Mask -> Edit; then one Set node, a column to the right, takes every new Edit as a view and
+# scores the views against each other (cross-view consistency).
+schema: 1
+id: set_chain
+title: Set chain (every view edited, then checked together)
+set: true
+nodes:
+  - suffix: plate
+    kind: Plate
+  - suffix: mask
+    kind: Mask
+    params:
+      classes: [sky, vegetation, people]
+    inputs:
+      source: "$packet"
+  - suffix: edit
+    kind: Edit
+    inputs:
+      mask: mask

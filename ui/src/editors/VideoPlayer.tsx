@@ -9,14 +9,22 @@
 //
 // A clip is fetched with the bearer token into a blob URL, because a <video src> cannot send the header. That is a
 // whole 4K clip in memory, so a CAS clip loads on request ("Load clip"), not on selection; `src` loads at once.
+//
+// T106: the picture cannot be saved from the page: `controlsList="nodownload"`, no picture-in-picture and no context
+// menu (`NO_DOWNLOAD`, shared with VideoCompare). A take leaves through `Deliver…` (the Export editor's clip formats,
+// inline: `POST /runs/{id}/deliver`), which keeps lineage, the gate sidecar and the GATE_FAIL override in the ledger.
+// `Compare` mounts VideoCompare on the default pair (the clay reference against the take, else the node's two latest
+// sibling clips).
 
-import { type KeyboardEvent, type ReactElement, useCallback, useEffect, useRef, useState } from "react";
+import { type KeyboardEvent, type MouseEvent, type ReactElement, useCallback, useEffect, useRef, useState } from "react";
 import { assetUrl } from "../canvas/assets";
 import { getToken } from "../api";
 import { formatValue } from "../panels/format";
 import type { GateStatus } from "../panels/types";
+import { ClipDeliver } from "./ExportEditor";
 import { C, E, type Tone } from "./theme";
 import { covers, frameAt, nearestPacketFrame, packetFrameFor, parseTimeMap, type TimeMap, timeForFrame } from "./timeMap";
+import { type CompareSource, defaultPair, VideoCompare } from "./VideoCompare";
 import { Button, Chip, Notice } from "./widgets";
 
 /** The slice of a gate report the player reads. */
@@ -53,8 +61,15 @@ export function chipsFromReport(report: PlayerReport | null | undefined): Player
 
 export const timeMapFromReport = (report: PlayerReport | null | undefined): TimeMap | null => parseTimeMap(report?.metrics?.timemap);
 
+/** Spread on every <video> PLATE shows: no download button, no picture-in-picture, no "Save video as" menu. */
+export const NO_DOWNLOAD = {
+  controlsList: "nodownload",
+  disablePictureInPicture: true,
+  onContextMenu: (e: MouseEvent<HTMLVideoElement>): void => e.preventDefault(),
+} as const;
+
 /** Fetch a CAS clip with the token into a blob URL; `load()` starts it, the URL is revoked when it changes or unmounts. */
-function useClip(hash: string | null | undefined): { url: string | null; loading: boolean; error: string | null; load: () => void } {
+export function useClip(hash: string | null | undefined): { url: string | null; loading: boolean; error: string | null; load: () => void } {
   const [url, setUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -105,10 +120,28 @@ export interface VideoPlayerProps {
   report?: PlayerReport | null;
   /** Frame rate when there is no time map. */
   fps?: number;
+  /** The take's run: enables `Deliver…`. */
+  runId?: string | null;
+  /** A GATE_FAIL take without a recorded override: `Deliver…` asks for the reason. */
+  needsReason?: boolean;
+  /** What `Compare` can pair: the clay reference and the node's takes (see `defaultPair`). */
+  compare?: CompareSource | null;
 }
 
-export function VideoPlayer({ hash = null, src = null, timeMap = null, report = null, fps: fpsProp = 24 }: VideoPlayerProps): ReactElement {
+export function VideoPlayer({
+  hash = null,
+  src = null,
+  timeMap = null,
+  report = null,
+  fps: fpsProp = 24,
+  runId = null,
+  needsReason = false,
+  compare = null,
+}: VideoPlayerProps): ReactElement {
   const clip = useClip(src ? null : hash);
+  const [deliverOpen, setDeliverOpen] = useState(false);
+  const [compareOpen, setCompareOpen] = useState(false);
+  const pair = defaultPair(compare);
   const playable = src ?? clip.url;
   const video = useRef<HTMLVideoElement | null>(null);
   const [time, setTime] = useState(0);
@@ -176,6 +209,7 @@ export function VideoPlayer({ hash = null, src = null, timeMap = null, report = 
           src={playable}
           data-testid="video-element"
           controls
+          {...NO_DOWNLOAD}
           muted
           playsInline
           preload="metadata"
@@ -253,6 +287,29 @@ export function VideoPlayer({ hash = null, src = null, timeMap = null, report = 
           {report.backend_notes.slice(0, 3).join(" · ")}
         </span>
       ) : null}
+
+      <div style={E.row}>
+        <Button
+          onClick={() => setDeliverOpen((o) => !o)}
+          disabled={runId === null}
+          on={deliverOpen}
+          testId="video-deliver"
+          title={runId === null ? "no take to deliver yet" : "deliver this take: ProRes 4444, HEVC, EXR sequence or FCPXML, with its lineage and gate sidecar"}
+        >
+          Deliver…
+        </Button>
+        <Button
+          onClick={() => setCompareOpen((o) => !o)}
+          disabled={pair === null}
+          on={compareOpen && pair !== null}
+          testId="video-compare-toggle"
+          title={pair === null ? "nothing to compare yet: a clay reference or a second take of this node" : `${pair[0].label} against ${pair[1].label}, on one clock`}
+        >
+          Compare
+        </Button>
+      </div>
+      {deliverOpen && runId !== null ? <ClipDeliver runId={runId} needsReason={needsReason} testId="video-deliver-form" /> : null}
+      {compareOpen && pair !== null ? <VideoCompare key={`${pair[0].key}|${pair[1].key}`} a={pair[0]} b={pair[1]} /> : null}
     </div>
   );
 }

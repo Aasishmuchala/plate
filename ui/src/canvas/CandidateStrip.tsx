@@ -6,20 +6,30 @@
 // A GATE_FAIL row shows its first failing check and an "Override (reason required)" button; the override is
 // ledgered by the daemon and only then shown here. Agents' runs show the envelope they spent from. A run that is
 // queued or in flight (QUEUED..FETCHING) has a Cancel button (T71); the chip moves when the daemon's event arrives.
+// T101: each row is labelled `<node label> · <engine_id> · attempt n` and has Set as A / Set as B, which put the run
+// on either side of the viewer for any pairing (two takes, two engines); only the row click compares with the plate
+// and keeps the scrub bound to it.
 
 import { type FormEvent, type KeyboardEvent, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { StateChip } from "../nodes/badges";
 import { errorMessage } from "../panels/api";
 import { usePanelsStore } from "../panels/store";
+import { useGraphStore } from "../store";
 import { useThumb } from "./assets";
 import { cancelRun, overrideRun, UI_ACTOR } from "./runApi";
-import { type Candidate, MAX_CANDIDATES, nodeCandidates, useRunStore } from "./runStore";
+import { type Candidate, candidateLabel, MAX_CANDIDATES, nodeCandidates, runLabel, useRunStore } from "./runStore";
 
 /** Show a candidate against its plate in the viewer and make it the panels' selected run. */
 export function compareCandidate(nodeId: string, runId: string): void {
   useRunStore.getState().openCompare(nodeId, runId);
   usePanelsStore.getState().selectRun(runId);
+}
+
+/** Put a candidate on side A or B of the viewer, labelled as the strip labels it. */
+export function setCandidateSide(side: "a" | "b", cand: Candidate): void {
+  const ref = { kind: "run" as const, runId: cand.runId, nodeId: cand.nodeId, label: candidateLabel(cand) };
+  useRunStore.getState().setCompareSide(side, ref);
 }
 
 /** Make a candidate the node's output (and compare it). */
@@ -88,7 +98,20 @@ function OverrideForm({ cand, onDone }: { cand: Candidate; onDone: () => void })
   );
 }
 
-function Row({ cand, rank, picked, comparing }: { cand: Candidate; rank: number; picked: boolean; comparing: boolean }) {
+function Row({
+  cand,
+  rank,
+  picked,
+  comparing,
+  side,
+}: {
+  cand: Candidate;
+  rank: number;
+  picked: boolean;
+  comparing: boolean;
+  side: "a" | "b" | null;
+}) {
+  const nodeLabel = useGraphStore((s) => s.nodes.find((n) => n.id === cand.nodeId)?.data.label);
   const [overriding, setOverriding] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
@@ -112,6 +135,7 @@ function Row({ cand, rank, picked, comparing }: { cand: Candidate; rank: number;
       data-testid="candidate"
       data-run={cand.runId}
       data-state={cand.state}
+      data-side={side ?? undefined}
     >
       <button type="button" className="cand-main nodrag" onClick={open} title="compare with the plate in the viewer">
         <span className="cand-rank">{rank}</span>
@@ -120,6 +144,31 @@ function Row({ cand, rank, picked, comparing }: { cand: Candidate; rank: number;
         {cand.gateScore !== null ? <span className="cand-score">{cand.gateScore.toFixed(2)}</span> : null}
         {picked ? <span className="cand-picked">picked</span> : null}
       </button>
+      <span className="cand-label" data-testid="candidate-label">
+        {runLabel(nodeLabel ?? cand.nodeId, cand.engineId, cand.attempt)}
+      </span>
+      <span className="cand-sides">
+        <button
+          type="button"
+          className="btn btn-ghost nodrag"
+          onClick={() => setCandidateSide("a", cand)}
+          aria-pressed={side === "a"}
+          title="show this take on side A of the viewer"
+          data-testid="cand-set-a"
+        >
+          Set as A
+        </button>
+        <button
+          type="button"
+          className="btn btn-ghost nodrag"
+          onClick={() => setCandidateSide("b", cand)}
+          aria-pressed={side === "b"}
+          title="show this take on side B of the viewer"
+          data-testid="cand-set-b"
+        >
+          Set as B
+        </button>
+      </span>
       {cand.envelopeId ? (
         <span className="chip chip-envelope" data-testid="candidate-envelope" title="an agent's run: spent from this envelope">
           envelope {cand.envelopeId}
@@ -195,7 +244,8 @@ export function CandidateStrip({ nodeId }: { nodeId: string }) {
             cand={c}
             rank={i + 1}
             picked={picked === c.runId}
-            comparing={compare?.runId === c.runId}
+            comparing={compare?.b?.runId === c.runId || compare?.a.runId === c.runId}
+            side={compare?.a.runId === c.runId ? "a" : compare?.b?.runId === c.runId ? "b" : null}
           />
         ))}
       </ol>

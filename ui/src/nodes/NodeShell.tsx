@@ -3,13 +3,17 @@
 // provenance labels, a broken rule on a loaded edge), typed handles with their port labels, the inline refusal a
 // refused connection leaves for 4 s, and the candidate strip of the node's last Make. A Concept node carries a
 // permanent "CONCEPT, UNMEASURED" watermark; its output handle is marked as never reaching delivery.
+// T98: the card's tooltip says what made it (`prompt: …` or `recipe: …`) and which take it shows; a double-click on
+// the card (not on its strip, a button or a handle) focuses it and opens it in the viewer.
 
-import { Handle, Position } from "@xyflow/react";
-import type { ReactNode } from "react";
+import { Handle, Position, useReactFlow } from "@xyflow/react";
+import type { MouseEvent, ReactNode } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { CandidateStrip } from "../canvas/CandidateStrip";
+import { openInViewer, promptOf } from "../canvas/ContextMenu";
 import { useNodeInfo } from "../canvas/derive";
 import { useThumb } from "../canvas/assets";
+import { focusNodes } from "../canvas/layout";
 import { nodeCandidates, useRunStore } from "../canvas/runStore";
 import type { RunState } from "../canvas/runTypes";
 import { MAX_GENERATION_DEPTH } from "../canvasRules";
@@ -18,6 +22,20 @@ import { ApprovalTick, GateBadge, KindBadge, RiskBadge, StateChip, TierBadge, Wa
 import { acceptsOf, PORTS } from "./ports";
 
 export const CONCEPT_WATERMARK = "CONCEPT, UNMEASURED";
+
+/** The card's tooltip: `prompt: <params.prompt>` (else `recipe: <id>`) and `run <first 8 of outputHash>` (a Plate's
+ * output is its beauty: `plate <hash>`). Undefined when there is neither. */
+export function nodeTooltip(data: PlateNodeData): string | undefined {
+  const made = promptOf(data);
+  const parts = [
+    made ? ("prompt" in made ? `prompt: ${made.prompt}` : `recipe: ${made.recipe}`) : null,
+    data.outputHash ? `${data.kind === "Plate" ? "plate" : "run"} ${data.outputHash.slice(0, 8)}` : null,
+  ].filter((p): p is string => p !== null);
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+/** A double-click on these is theirs, not the card's. */
+const OWN_DOUBLE_CLICK = "button, input, select, textarea, a, .cand-strip, .react-flow__handle";
 
 function Preview({ hash, kind }: { hash?: string; kind: string }) {
   const thumb = useThumb(hash);
@@ -114,14 +132,22 @@ export interface NodeShellProps {
 export function NodeShell({ id, data, selected, summary }: NodeShellProps) {
   const info = useNodeInfo(id);
   const runState = useHeaderState(id);
+  const flow = useReactFlow();
   const concept = data.kind === "Concept" || info.tier === "concept_unmeasured";
   const inherited = info.labels.filter((l) => !data.labels.includes(l));
   const labels = [...data.labels, ...inherited];
+  const onDoubleClick = (e: MouseEvent<HTMLDivElement>) => {
+    if (e.target instanceof Element && e.target.closest(OWN_DOUBLE_CLICK)) return;
+    focusNodes(flow, [id]);
+    openInViewer(id);
+  };
   return (
     <div
       className={`plate-node kind-${data.kind.toLowerCase()}${concept ? " is-concept" : ""}${selected ? " is-selected" : ""}`}
       data-testid={`node-${data.kind}`}
       data-node-id={id}
+      title={nodeTooltip(data)}
+      onDoubleClick={onDoubleClick}
     >
       <header className="node-head">
         <div className="node-head-row">

@@ -1,8 +1,10 @@
 """PLATE dock: PySide6, instrument-grade dark (the MaxGaffer/MaxDirector house style).
 
 One column: daemon status line, the scene's project (with its custody), camera list, per-camera
-recipe editor, the action buttons, the lint panel, progress and log. Threading contract (copied from
-MaxGaffer's dock):
+recipe editor, the action buttons, the lint panel, progress and log. Send + quote is Send Packet and
+then the Edit chain quoted on the canvas for each ingested packet, with the recipe's Engine and Preset
+(the only path on which they leave Max); "auto-approve under cap" (off by default) lets the daemon
+approve the quotes under the project's per-run cap. Threading contract (copied from MaxGaffer's dock):
   * every pymxs touch happens on Max's MAIN thread, always;
   * slow pure I/O (the daemon health and projects calls, the job poller's daemon calls) runs on a
     QThread while the main thread spins a local QEventLoop, so Max stays responsive and no widget is
@@ -96,9 +98,19 @@ STYLE = (
 
 RECEIVE_LABELS = {"vfb_history": "VFB history", "viewport_background": "Viewport background"}
 PENDING_TIP = "Not wired in this build yet."
-HINT_TIP = (
-    "A hint for you only: it is not sent with the packet. The canvas's Make bar picks the engine "
-    "and the preset when the plate is edited."
+RECIPE_TIP = (
+    "Used by Send + quote: once the packet is ingested, its Edit chain on the canvas is quoted with "
+    "this engine and this preset. Send Packet alone does not send them; the canvas's Make bar picks "
+    "the engine and the preset for every other edit."
+)
+SEND_QUOTE_TIP = (
+    "Send Packet, then for each packet the daemon ingests: an Edit chain on the canvas (Plate, Mask, "
+    "Edit, Judge, Export) quoted with the recipe's engine and preset. Nothing is spent until a quote "
+    "is approved."
+)
+AUTO_APPROVE_TIP = (
+    "Let the daemon approve each quote that is under the project's per-run auto cap; anything over "
+    "the cap waits for your approval in the canvas."
 )
 NO_OVERSCAN = "none"
 FRAME_MAX = 20000
@@ -258,14 +270,14 @@ class PlateDock(QtWidgets.QWidget):
         form.setVerticalSpacing(8)
         self.cb_engine = QtWidgets.QComboBox()
         self.cb_engine.addItems(self.ctrl.engines())
-        self.cb_engine.setToolTip(HINT_TIP)
-        form.addRow("Engine hint (not sent)", self.cb_engine)
+        self.cb_engine.setToolTip(RECIPE_TIP)
+        form.addRow("Engine (used by Send + quote)", self.cb_engine)
         self.cb_preset = QtWidgets.QComboBox()
         self.cb_preset.setEditable(True)
         self.cb_preset.addItem("")
         self.cb_preset.addItems(self.ctrl.presets())
-        self.cb_preset.setToolTip(HINT_TIP)
-        form.addRow("Preset hint (not sent)", self.cb_preset)
+        self.cb_preset.setToolTip(RECIPE_TIP)
+        form.addRow("Preset (used by Send + quote)", self.cb_preset)
         self.chk_safe = QtWidgets.QCheckBox("Safe frame (the deliverable crop inside the render)")
         form.addRow("", self.chk_safe)
         frame_row = QtWidgets.QHBoxLayout()
@@ -309,18 +321,27 @@ class PlateDock(QtWidgets.QWidget):
         row1 = QtWidgets.QHBoxLayout()
         row1.setSpacing(8)
         self.btn_send = self._button("Send Packet", self._on_send, primary=True)
+        self.btn_send_quote = self._button("Send + quote", self._on_send_quote)
         self.btn_batch = self._button("Batch Cameras", self._on_batch)
-        for b in (self.btn_send, self.btn_batch):
+        for b in (self.btn_send, self.btn_send_quote, self.btn_batch):
             row1.addWidget(b)
+        row1.addStretch(1)
+        act.addLayout(row1)
+        row1b = QtWidgets.QHBoxLayout()
+        row1b.setSpacing(18)
         self.chk_supersedes = QtWidgets.QCheckBox("supersedes last")
         self.chk_supersedes.setToolTip(
             "The new packet replaces the camera's last packet sent from this dock: approved layers carry "
             "over where the IDs are unchanged."
         )
         self.chk_supersedes.toggled.connect(self._on_supersedes_toggled)
-        row1.addWidget(self.chk_supersedes)
-        row1.addStretch(1)
-        act.addLayout(row1)
+        row1b.addWidget(self.chk_supersedes)
+        self.chk_auto_approve = QtWidgets.QCheckBox("auto-approve under cap")
+        self.chk_auto_approve.setChecked(False)
+        self.chk_auto_approve.setToolTip(AUTO_APPROVE_TIP)
+        row1b.addWidget(self.chk_auto_approve)
+        row1b.addStretch(1)
+        act.addLayout(row1b)
         row2 = QtWidgets.QHBoxLayout()
         row2.setSpacing(8)
         self.btn_motion = self._button("Send Motion", self._on_motion)
@@ -462,6 +483,12 @@ class PlateDock(QtWidgets.QWidget):
             available = cap in caps
             btn.setEnabled(available and not self._busy and (has_cams or not needs_camera))
             btn.setToolTip("" if available else why_not.get(cap) or PENDING_TIP)
+        quotes = ctl.CAP_SEND_PACKET in caps and callable(getattr(self.ctrl, "send_and_quote", None))
+        self.btn_send_quote.setEnabled(quotes and not self._busy and has_cams)
+        self.btn_send_quote.setToolTip(
+            SEND_QUOTE_TIP if quotes else why_not.get(ctl.CAP_SEND_PACKET) or PENDING_TIP
+        )
+        self.chk_auto_approve.setEnabled(quotes and not self._busy)
         self.cb_receive.setEnabled(ctl.CAP_RECEIVE in caps and not self._busy)
         self.chk_scout_keep.setEnabled(ctl.CAP_SCOUT in caps and not self._busy)
         for w in (
@@ -735,6 +762,12 @@ class PlateDock(QtWidgets.QWidget):
                     f'<span style="color:{ERR}">{_html.escape(str(p.get("code")))}</span>{where} · '
                     f"{_html.escape(str(p.get('detail')))}"
                 )
+            for w in report.get("warnings", []):  # not blocking: a camera Send levels and crops
+                where = f" · {_html.escape(str(w.get('node')))}" if w.get("node") else ""
+                lines.append(
+                    f'<span style="color:{DIM}">{_html.escape(str(w.get("code")))}</span>{where} · '
+                    f"{_html.escape(str(w.get('detail')))}"
+                )
             blocks.append("<br>".join(lines))
         self.lint_view.setHtml("<br><br>".join(blocks))
         self.lbl_lint.setText("all selected cameras pass" if all_ok else "blocked: fix the problems below")
@@ -775,6 +808,9 @@ class PlateDock(QtWidgets.QWidget):
             self._log(line, err=err)
             for warning in r.get("warnings") or []:
                 self._log(f"{name}: {r.get('camera')}: {warning}")
+            if r.get("quote_line"):
+                line, err = ctl.quote_message(name, r)
+                self._log(line, err=err)
         if sends and any(r.get("ok") and r.get("packet_id") for r in results):
             self.refresh_projects()  # the first packet may have just created the project, custody unset
             self._show_custody(after_send=True)
@@ -805,6 +841,14 @@ class PlateDock(QtWidgets.QWidget):
 
     def _on_send(self) -> None:
         self._send_flow("Send Packet", self.ctrl.send_packet)
+
+    def _on_send_quote(self) -> None:
+        """Send Packet, then the Edit chain of each ingested packet quoted (auto-approved under the
+        project's cap only when the box is ticked)."""
+        auto = self.chk_auto_approve.isChecked()
+        self._send_flow(
+            "Send + quote", lambda cams, prog: self.ctrl.send_and_quote(cams, prog, auto_approve=auto)
+        )
 
     def _on_batch(self) -> None:
         self._send_flow("Batch Cameras", self.ctrl.batch_cameras)

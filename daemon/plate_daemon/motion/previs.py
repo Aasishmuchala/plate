@@ -569,7 +569,10 @@ def check_unlocked(graph: Any, node_id: str) -> str:
     broken = [v for v in canvas_rules.validate_graph(g) if v["edge"]["target"] in upstream]
     if broken:
         raise PrevisError(broken[0]["message"], code=broken[0]["code"], violations=broken)
-    return incoming[0]["source"]
+    # The approved still is the source on the Motion node's image port. Since T81 a packet edge (Plate) or a
+    # reference edge (elements) may also feed a Motion node, so do not take whichever edge comes first.
+    stills = [e for e in incoming if (e.get("targetHandle") or e.get("target_handle") or "image") == "image"]
+    return (stills or incoming)[0]["source"]
 
 
 def _params(node: Mapping[str, Any]) -> dict[str, Any]:

@@ -8,12 +8,24 @@
 //   POST /api/v0/runs/{id}/fanout {n}               -> Run[] | {runs: Run[]}   (sibling 0 is the quoted run)
 //   POST /api/v0/runs/{id}/approve {by, envelope_id?, reason?}  approves the run's whole sibling group; refusals are
 //                                                    409/422 {error, detail} with the codes in HUMAN_REFUSALS
-//   GET  /api/v0/engines                             -> EngineSummary[] | {engines: [...]}  (FALLBACK on 404)
+//   GET  /api/v0/engines                             -> EngineSummary[] | {engines: [...]}  (FALLBACK on 404); each
+//                                                    engine may carry `capabilities` and per-route `health` (T83)
+//   GET  /api/v0/engines/cards?project_id=&task=&shot_class=  -> EngineCard[]  (Wilson-bounded, T83; [] on any error)
+//   POST /api/v0/projects/{pid}/nodes/{node}/quote_many {engine_ids, ...QuoteRequest but engine_id}
+//                                                    -> {sibling_group, runs: Run[], total_usd}  (T95; one group
+//                                                    across engines, approved once through the primary)
 //   GET  /api/v0/projects                            -> [{project_id, custody: {nda, allowed_grades}}] | {projects}
 
 import { ApiError, fetchJson, postJson } from "../api/client";
 import type { QuoteWire, RunWire } from "../canvas/runTypes";
-import { type EngineSummary, FALLBACK_ENGINES, type ProjectCustody } from "./engines";
+import {
+  allowedGrades,
+  effectiveGrade,
+  type EngineRouteSummary,
+  type EngineSummary,
+  FALLBACK_ENGINES,
+  type ProjectCustody,
+} from "./engines";
 
 const enc = encodeURIComponent;
 
@@ -168,4 +180,166 @@ export async function projectCustody(projectId: string): Promise<ProjectCustody 
     // unknown custody: the bar shows every engine and says the daemon decides
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------------------------------- Wave 9 (T102)
+
+/** `capabilities` of a `GET /engines` entry (T83): what the manifest declares, for the Make bar's chips. */
+export interface EngineCapabilities {
+  /** "WxH" of the biggest output size the manifest declares; null for an auto-only or size-less engine. */
+  largest_size: string | null;
+  /** Takes an end frame (`image_tail` / `end_image`): a start/end motion engine. */
+  image_tail: boolean;
+  /** How many reference images it takes (0: none). */
+  reference_images_max: number;
+  elements: boolean;
+  /** The manifest's price model: `per_image`, `per_second`, `per_megapixel` or `flat`. */
+  price_unit: string;
+  /** False while the manifest names no vendor model id: the daemon refuses to submit it. */
+  runnable: boolean;
+  /** The manifest carries `unverified_p0`: nothing about it was checked against the vendor yet. */
+  unverified: boolean;
+}
+
+/** A route's health on the daemon's board (T83/T85): degraded routes are shown and never routed to. */
+export type RouteHealth = "ok" | "degraded" | "down" | "suspended";
+
+/** A route as the Wave 9 daemon lists it: the T35 summary plus its health on the board. */
+export type HealthRoute = EngineRouteSummary & { health?: RouteHealth };
+
+/** An engine as the Wave 9 daemon lists it: the T35 summary plus capabilities and route health, all optional. */
+export type EngineEntry = Omit<EngineSummary, "routes"> & {
+  capabilities?: Partial<EngineCapabilities>;
+  routes: HealthRoute[];
+};
+
+/** The engine's capabilities, or null when the daemon sent none (the build's fallback catalogue). */
+export function capabilitiesOf(engine: EngineSummary | undefined): Partial<EngineCapabilities> | null {
+  const caps = (engine as unknown as EngineEntry | undefined)?.capabilities;
+  return caps && typeof caps === "object" ? caps : null;
+}
+
+/** False only when the daemon says so: an engine without capabilities is assumed runnable (the daemon decides). */
+export const isRunnable = (engine: EngineSummary | undefined): boolean => capabilitiesOf(engine)?.runnable !== false;
+
+export const NOT_RUNNABLE_TITLE = "model id unknown until the P0 smoke test";
+
+export interface EngineHealth {
+  /** `ok`, or the reading worth showing: `degraded` (amber), `suspended` (red, not selectable) or `down` (red). */
+  status: RouteHealth;
+  /** The routes the reading came from (`atlas`, `gemini`, ...). */
+  routes: string[];
+}
+
+/** Route health over the routes this project may use (active, allowed grade): suspended only when every one is,
+ * degraded when any one is (the router skips it, another route may still serve), down when none has a signal. */
+export function engineHealth(engine: EngineSummary, custody: ProjectCustody | null): EngineHealth {
+  const ok = allowedGrades(custody);
+  const routes = (engine.routes as HealthRoute[]).filter(
+    (r) => (r.status ?? "active") === "active" && ok.includes(effectiveGrade(r)),
+  );
+  const named = (rs: HealthRoute[]) => rs.map((r) => r.route_id ?? r.provider);
+  const health = (r: HealthRoute): RouteHealth => r.health ?? "ok";
+  if (routes.length === 0) return { status: "ok", routes: [] };
+  if (routes.every((r) => health(r) === "suspended")) return { status: "suspended", routes: named(routes) };
+  const degraded = routes.filter((r) => health(r) === "degraded");
+  if (degraded.length > 0) return { status: "degraded", routes: named(degraded) };
+  if (routes.every((r) => health(r) === "down" || health(r) === "suspended")) return { status: "down", routes: named(routes) };
+  return { status: "ok", routes: [] };
+}
+
+/** Why an engine cannot be picked right now, or null when it can. */
+export function unavailableReason(engine: EngineSummary, custody: ProjectCustody | null): string | null {
+  if (!isRunnable(engine)) return NOT_RUNNABLE_TITLE;
+  const h = engineHealth(engine, custody);
+  if (h.status === "suspended") return `suspended on ${h.routes.join(", ")}: the daemon will not route to it`;
+  return null;
+}
+
+/** One Wilson-bounded engine card (`plate_engines.cards.Card.to_dict()` plus `steering`). */
+export interface EngineCard {
+  engine_id: string;
+  task: string;
+  shot_class: string | null;
+  n: number;
+  passes: number;
+  pass_rate: number;
+  wilson_lower_95: number;
+  determinism_var?: number | null;
+  mean_cost: number | null;
+  custody?: string;
+  /** n has reached the router's threshold: this card ranks engines. */
+  steering: boolean;
+}
+
+function toCard(raw: unknown): EngineCard | null {
+  if (!isObj(raw) || typeof raw.engine_id !== "string" || typeof raw.n !== "number") return null;
+  const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  return {
+    engine_id: raw.engine_id,
+    task: typeof raw.task === "string" ? raw.task : "",
+    shot_class: typeof raw.shot_class === "string" ? raw.shot_class : null,
+    n: raw.n,
+    passes: num(raw.passes) ?? 0,
+    pass_rate: num(raw.pass_rate) ?? 0,
+    wilson_lower_95: num(raw.wilson_lower_95) ?? 0,
+    determinism_var: num(raw.determinism_var),
+    mean_cost: num(raw.mean_cost),
+    custody: typeof raw.custody === "string" ? raw.custody : undefined,
+    steering: raw.steering === true,
+  };
+}
+
+/** `GET /engines/cards` for the node's task and shot class. A daemon without the route, or any failure, is no
+ * cards: the bar then shows the manifest facts alone. */
+export async function listCards(projectId: string, task?: string | null, shotClass?: string | null): Promise<EngineCard[]> {
+  const q = new URLSearchParams({ project_id: projectId });
+  if (task) q.set("task", task);
+  if (shotClass) q.set("shot_class", shotClass);
+  try {
+    const body = await fetchJson<unknown>(`/engines/cards?${q.toString()}`);
+    const list = Array.isArray(body) ? body : isObj(body) && Array.isArray(body.cards) ? body.cards : [];
+    return list.flatMap((c) => toCard(c) ?? []);
+  } catch {
+    return [];
+  }
+}
+
+/** The card the bar shows for an engine: a steering one first, then the one with the most runs. */
+export function cardFor(cards: readonly EngineCard[] | undefined, engineId: string): EngineCard | null {
+  const mine = (cards ?? []).filter((c) => c.engine_id === engineId && c.n > 0);
+  mine.sort((a, b) => Number(b.steering) - Number(a.steering) || b.n - a.n);
+  return mine[0] ?? null;
+}
+
+/** `quote_many`'s body: the quote body with `engine_ids` (2 to 5, distinct) instead of `engine_id`. */
+export type QuoteManyRequest = Omit<QuoteRequest, "engine_id"> & { engine_ids: string[] };
+
+export interface QuoteManyResponse {
+  group: string | null;
+  runs: RunWire[];
+  /** The daemon's sum of the quotes, when it sent one. */
+  totalUsd: number | null;
+}
+
+export const COMPARE_MIN = 2;
+export const COMPARE_MAX = 5;
+
+export async function quoteMany(projectId: string, nodeId: string, body: QuoteManyRequest): Promise<QuoteManyResponse> {
+  const res = await postJson<unknown>(`/projects/${enc(projectId)}/nodes/${enc(nodeId)}/quote_many`, body);
+  const runs = normaliseRuns(res);
+  const group = isObj(res) && typeof res.sibling_group === "string" ? res.sibling_group : null;
+  const total = isObj(res) && typeof res.total_usd === "number" && Number.isFinite(res.total_usd) ? res.total_usd : null;
+  return { group, runs, totalUsd: total };
+}
+
+/** The engine a run of a group was quoted on (`run.route.engine_id`), else its quote's model. */
+export function runEngineId(run: RunWire): string {
+  const route = (run as RunWire & { route?: { engine_id?: string | null } | null }).route;
+  return route?.engine_id ?? run.quote?.model ?? run.id;
+}
+
+/** The engine id a refused `quote_many` names (the daemon adds `engine_id` to the refusal body). */
+export function refusedEngine(err: unknown): string | null {
+  return err instanceof ApiError && isObj(err.body) && typeof err.body.engine_id === "string" ? err.body.engine_id : null;
 }

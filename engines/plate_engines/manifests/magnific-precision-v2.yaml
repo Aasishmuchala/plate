@@ -5,12 +5,16 @@
 # adapter smoke tests. Custody status "pending_written_terms" is treated as grade D by the router.
 # T7: params are the vendor FULL schema (advanced: true only hides a field in the UI drawer). price.usd is the
 # default-tier figure the router ranks on; price.by holds the tiers we know. Nothing is billed-price-verified yet.
+# T100 (decision 55, open question 24): Magnific's own documentation moved the API off the Freepik host to
+# https://api.magnific.com (header x-magnific-api-key, POST /v1/ai/image-upscaler-precision-v2); the adapter's class
+# constants follow. .freepik.com stays in allowed_hosts only because generated files may still be served from
+# Freepik's CDN (ai-statics.freepik.com) until the P0 smoke test shows the result host.
 id: magnific-precision-v2
 name: Magnific Precision v2
 version: unpinned
 pinned: false
 kind: upscale
-# Freepik API route POST /v1/ai/image-upscaler/precision (router plan T17); the model id string is not established.
+# Magnific API route POST /v1/ai/image-upscaler-precision-v2 (router plan T100); the model id is not established.
 model_id: null
 plate_upscale_forbidden: true
 flags: [unverified_p0]
@@ -19,10 +23,14 @@ inputs:
 outputs:
   - {name: image, type: image, required: true}
 params:
-  - {name: scale, type: int, default: 2, range: [2, 4]}
-  - {name: sharpen, type: int, range: [0, 100], advanced: true}
-  - {name: smart_grain, type: int, range: [0, 100], advanced: true}
-  - {name: ultra_detail, type: int, range: [0, 100], advanced: true}
+  # UNCONFIRMED: Magnific's documentation shows scale_factor 2 to 16; a 4x job failed on size in January 2026.
+  - {name: scale, type: int, default: 2, range: [2, 16]}
+  # The documented defaults, sent explicitly so a vendor-side default change never changes a take silently.
+  - {name: sharpen, type: int, default: 7, range: [0, 100], advanced: true}
+  - {name: smart_grain, type: int, default: 7, range: [0, 100], advanced: true}
+  - {name: ultra_detail, type: int, default: 30, range: [0, 100], advanced: true}
+# UNCONFIRMED: Magnific's documented caps (input 6 MP; output 50 MP); the adapter refuses past either.
+limits: {max_input_mp: 6, max_output_mp: 50}
 price:
   model: per_image
   usd: 0.32
@@ -37,12 +45,12 @@ licence:
 allowed_tasks: [upscale_ai_layers]
 routes:
   - provider: magnific
-    endpoint: unknown
+    endpoint: https://api.magnific.com
     region: unknown
     custody_grade: D
     custody_status: pending_written_terms
     terms_hash: unknown
     upload_visibility: unknown
     same_model_fallback_of: null
-    allowed_hosts: [.freepik.com]
+    allowed_hosts: [.magnific.com, .freepik.com]
     note: "Terms and upload behaviour not yet established; AI layers only, never the plate."

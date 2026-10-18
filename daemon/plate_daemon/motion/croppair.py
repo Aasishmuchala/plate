@@ -1,20 +1,24 @@
-"""CropPair generator: the start and end frames of a push-in, cut from ONE approved still (router plan T43).
+"""CropPair generator: the start and end frames of a move, cut from ONE approved still (router plan T43, T94).
 
 `make_pair(approved_still16, cx, cy, z0, z1, engine_size)` cuts the two crops with `plate_gates.croppair.cut_crops`
 (amphi-plaza geometry: even sizes, centred on (cx, cy), clamped inside the frame, native pixels), brings both to the
 SAME frame, encodes them as house 8-bit sRGB PNGs (`plate_pixels.egress.encode_png8`: ICC embedded, metadata
 stripped) and returns
 
-    {start_png, end_png, boxes, sizemap, push_ratio, ...}
+    {start_png, end_png, boxes, sizemap, push_ratio, direction, mode, ...}
 
 Rules this module enforces (they are doctrine, not options):
 
 - Source view only. Both frames are crops of the same still, so the engine only interpolates between two real
-  crops; no camera is invented and `1.0 <= z0 < z1 <= 3.0` (a push-in goes in, never out).
-- The plate is never upscaled. The shared frame is the END crop's native size (the smaller crop), shrunk further
-  only when `engine_size` is a smaller envelope; the start crop is brought down to it with `cv2.INTER_AREA`. When the
-  engine's frame is larger than the crop the frame is sent at native size and the engine's own output is bigger
-  (`note: native_below_engine_size`). `engine_size` of 0 x 0 (the "auto" size Kling reports) means no envelope.
+  crops; no camera is invented and `1.0 <= z0, z1 <= 3.0`. The move is recorded as `direction`: `in` (a push-in,
+  z0 < z1, the default), `out` (a pull-back, z0 > z1: the caller asks for it with `allow_out`, so a swapped pair is
+  never silently a reveal) or `locked` (z0 == z1 with `allow_equal`: a locked tripod, or a slider drift when an end
+  centre (cx1, cy1) slides the end crop).
+- The plate is never upscaled. The shared frame is the SMALLER crop's native size (the end crop of a push-in, the
+  start crop of a pull-back), shrunk further only when `engine_size` is a smaller envelope; the larger crop is
+  brought down to it with `cv2.INTER_AREA`. When the engine's frame is larger than the crop the frame is sent at
+  native size and the engine's own output is bigger (`note: native_below_engine_size`). `engine_size` of 0 x 0 (the
+  "auto" size Kling reports) means no envelope.
 - "The SAME scale factor" of the plan reads as the same target frame for both crops: start and end land at one
   size, so the push the engine sees is exactly `z1 / z0` (`push_ratio`; `measured_push_ratio` is `w0 / w1` of the
   even-rounded boxes). The per-crop scale (`scale_start`, `scale_end`) is recorded next to it.
@@ -24,6 +28,10 @@ Rules this module enforces (they are doctrine, not options):
 `sizemap` is `{engine_size, start, end}` with `start`/`end` the egress `SizeMap` dicts (region = the crop's box in
 plate pixels, `pad_mode` overscan), so the same ingress maths that restores stills describes where each frame sits.
 `store_pair` puts the two PNGs in the project CAS and `node_record` is what the Motion/CropPair node carries.
+
+`make_two_stills(start16, end16, engine_size)` is the same record for two approved stills of one camera (a time of
+day change, decision 49): whole-frame crops at z = 1 of each, the same envelope rule, `mode: two_stills`. The two
+stills must be the same size.
 """
 
 from __future__ import annotations
@@ -34,7 +42,8 @@ from typing import Any
 import cv2
 import numpy as np
 
-from plate_gates.croppair import Z_MAX, Z_MIN, cut_crops
+from plate_gates.croppair import Z_MAX, Z_MIN, box_for, cut_crops
+from plate_gates.croppair import direction as zoom_direction
 from plate_pixels.egress import QUANTISERS, SizeMap, encode_png8
 from plate_pixels.sizes import EngineSize, same_aspect
 
@@ -44,6 +53,7 @@ __all__ = [
     "Z_MIN",
     "centre_px",
     "make_pair",
+    "make_two_stills",
     "node_record",
     "store_pair",
 ]
@@ -89,10 +99,11 @@ def _engine_wh(engine_size: Any) -> tuple[int, int]:
     return w, h
 
 
-def _target_size(end_box: Box, env: tuple[int, int]) -> tuple[int, int]:
-    """The shared frame: the end crop's native size; when the engine envelope is smaller, the envelope itself if its
-    aspect agrees with the crop's (the egress "exact" mode, within 0.5 %), else the crop shrunk uniformly to fit it."""
-    _, _, w1, h1 = end_box
+def _target_size(small_box: Box, env: tuple[int, int]) -> tuple[int, int]:
+    """The shared frame: the smaller crop's native size; when the engine envelope is smaller, the envelope itself if
+    its aspect agrees with the crop's (the egress "exact" mode, within 0.5 %), else the crop shrunk uniformly to fit
+    it."""
+    _, _, w1, h1 = small_box
     ew, eh = env
     if ew == 0 or (ew >= w1 and eh >= h1):
         return w1, h1
@@ -117,6 +128,17 @@ def _resample(crop: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return cv2.resize(crop, (tw, th), interpolation=cv2.INTER_AREA)
 
 
+def _still_array(still: Any, what: str) -> np.ndarray:
+    arr = np.asarray(still)
+    if arr.ndim != 3 or arr.shape[2] != 3 or arr.shape[0] < 2 or arr.shape[1] < 2:
+        raise CropPairError(f"{what} must be H x W x 3 RGB, got shape {arr.shape}")
+    if arr.dtype == np.float64:
+        arr = arr.astype(np.float32)
+    if arr.dtype not in (np.uint8, np.uint16, np.float32):
+        raise CropPairError(f"{what} must be uint8, uint16 or float, got {arr.dtype}")
+    return arr
+
+
 def make_pair(
     approved_still16: np.ndarray,
     cx: float,
@@ -126,29 +148,34 @@ def make_pair(
     engine_size: Any = None,
     *,
     quantise: str = "de00",
+    cx1: float | None = None,
+    cy1: float | None = None,
+    allow_equal: bool = False,
+    allow_out: bool = False,
 ) -> dict[str, Any]:
-    """The push-in pair from an approved still (display-referred RGB, H x W x 3: uint16 from the 16-bit master, or
-    uint8 / float in [0, 1]). `cx`, `cy` are source pixels (see `centre_px` for recipe fractions). Raises ValueError
-    for a zoom pair outside `1.0 <= z0 < z1 <= 3.0` (cut_crops) and CropPairError for an unusable still or size."""
-    arr = np.asarray(approved_still16)
-    if arr.ndim != 3 or arr.shape[2] != 3 or arr.shape[0] < 2 or arr.shape[1] < 2:
-        raise CropPairError(f"the approved still must be H x W x 3 RGB, got shape {arr.shape}")
-    if arr.dtype == np.float64:
-        arr = arr.astype(np.float32)
-    if arr.dtype not in (np.uint8, np.uint16, np.float32):
-        raise CropPairError(f"the approved still must be uint8, uint16 or float, got {arr.dtype}")
+    """The crop pair from an approved still (display-referred RGB, H x W x 3: uint16 from the 16-bit master, or
+    uint8 / float in [0, 1]). `cx`, `cy` (and the end centre `cx1`, `cy1`, default the start's) are source pixels
+    (see `centre_px` for recipe fractions). Raises ValueError for a zoom pair outside [1.0, 3.0], an equal pair
+    without `allow_equal` or a pull-back (z0 > z1) without `allow_out`, and CropPairError for an unusable still or
+    size."""
+    arr = _still_array(approved_still16, "the approved still")
     if quantise not in QUANTISERS:
         raise CropPairError(f"quantise must be one of {QUANTISERS}, got {quantise!r}")
+    if z0 > z1 and not allow_out:
+        raise ValueError(
+            f"zoom pair {z0} -> {z1} is a pull-back: a push-in goes in unless the move asks for out (allow_out)"
+        )
     H, W = arr.shape[:2]
-    start_crop, end_crop, boxes = cut_crops(arr, cx, cy, z0, z1)
+    start_crop, end_crop, boxes = cut_crops(arr, cx, cy, z0, z1, allow_equal=allow_equal, cx1=cx1, cy1=cy1)
     env = _engine_wh(engine_size)
-    tw, th = _target_size(boxes[1], env)
+    small = boxes[1] if boxes[1][2] <= boxes[0][2] else boxes[0]  # the tighter crop sets the frame
+    tw, th = _target_size(small, env)
     start = _resample(np.asarray(start_crop), (tw, th))
     end = _resample(np.asarray(end_crop), (tw, th))
     start_png = encode_png8(start, quantise)
     end_png = encode_png8(end, quantise)
 
-    native = (tw, th) == (boxes[1][2], boxes[1][3])
+    native = (tw, th) == (small[2], small[3])
     note = "native_below_engine_size" if native and env != (0, 0) and (env[0] > tw or env[1] > th) else ""
     if env != (0, 0) and (tw, th) == env:
         mode = "exact"
@@ -173,19 +200,53 @@ def make_pair(
         ).to_dict()
 
     zoom = {"z0": float(z0), "z1": float(z1), "cx": float(cx), "cy": float(cy)}
+    if cx1 is not None or cy1 is not None:  # a slider drift: the end crop has its own centre
+        zoom.update(cx1=float(cx if cx1 is None else cx1), cy1=float(cy if cy1 is None else cy1))
+    return _record(
+        start_png,
+        end_png,
+        boxes,
+        maps,
+        scales,
+        size=(tw, th),
+        source=(W, H),
+        zoom=zoom,
+        note=note,
+        mode="croppair",
+        direction=zoom_direction(z0, z1),
+    )
+
+
+def _record(
+    start_png: bytes,
+    end_png: bytes,
+    boxes: Sequence[Box],
+    maps: Mapping[str, dict[str, Any]],
+    scales: Mapping[str, float],
+    *,
+    size: tuple[int, int],
+    source: tuple[int, int],
+    zoom: Mapping[str, float],
+    note: str,
+    mode: str,
+    direction: str,
+) -> dict[str, Any]:
     boxes_t: list[Box] = [tuple(int(v) for v in b) for b in boxes]  # type: ignore[misc]
+    W, H = source
     return {
         "start_png": start_png,
         "end_png": end_png,
         "boxes": boxes_t,
-        "sizemap": {"engine_size": EngineSize(tw, th).to_dict(), "start": maps["start"], "end": maps["end"]},
-        "push_ratio": float(z1) / float(z0),
+        "sizemap": {"engine_size": EngineSize(*size).to_dict(), "start": maps["start"], "end": maps["end"]},
+        "push_ratio": float(zoom["z1"]) / float(zoom["z0"]),
         "measured_push_ratio": boxes[0][2] / boxes[1][2],
         "scale_start": scales["start"],
         "scale_end": scales["end"],
-        "size": (tw, th),
+        "size": size,
         "source_size": (W, H),
-        "zoom": zoom,
+        "zoom": dict(zoom),
+        "mode": mode,
+        "direction": direction,
         "reconform": {
             "method": "none",
             "zoompan": False,
@@ -197,6 +258,59 @@ def make_pair(
         },
         "note": note,
     }
+
+
+def make_two_stills(
+    start16: np.ndarray, end16: np.ndarray, engine_size: Any = None, *, quantise: str = "de00"
+) -> dict[str, Any]:
+    """The start/end record for two approved stills of one camera: each still's whole frame (the z = 1 crop, even
+    sizes) brought to one frame by the same envelope rule as `make_pair` (never upscaled). Raises CropPairError when
+    the stills differ in size (`end_size`) or one is unusable."""
+    a = _still_array(start16, "the start still")
+    b = _still_array(end16, "the end still")
+    if a.shape[:2] != b.shape[:2]:
+        raise CropPairError(
+            f"the end still is {b.shape[1]} x {b.shape[0]}, the start {a.shape[1]} x {a.shape[0]}: two stills of "
+            "one camera are the same size"
+        )
+    if quantise not in QUANTISERS:
+        raise CropPairError(f"quantise must be one of {QUANTISERS}, got {quantise!r}")
+    H, W = a.shape[:2]
+    box = box_for(W, H, W / 2.0, H / 2.0, 1.0)
+    env = _engine_wh(engine_size)
+    tw, th = _target_size(box, env)
+    x0, y0, w, h = box
+    frames = [_resample(np.ascontiguousarray(img[y0 : y0 + h, x0 : x0 + w]), (tw, th)) for img in (a, b)]
+    native = (tw, th) == (w, h)
+    note = "native_below_engine_size" if native and env != (0, 0) and (env[0] > tw or env[1] > th) else ""
+    mode = "exact" if env != (0, 0) and (tw, th) == env else "arbitrary"
+    sm = SizeMap(
+        src=(W, H),
+        pad=(0, 0, 0, 0),
+        scale=tw / w,
+        dst=(tw, th),
+        region=(x0, y0, x0 + w, y0 + h),
+        pad_mode="overscan",
+        mode=mode,
+        engine_size=EngineSize(tw, th).to_dict(),
+        synthetic=(0, 0, 0, 0),
+        note=note,
+        quantise=quantise,
+    ).to_dict()
+    zoom = {"z0": 1.0, "z1": 1.0, "cx": W / 2.0, "cy": H / 2.0}
+    return _record(
+        encode_png8(frames[0], quantise),
+        encode_png8(frames[1], quantise),
+        (box, box),
+        {"start": sm, "end": dict(sm)},
+        {"start": tw / w, "end": tw / w},
+        size=(tw, th),
+        source=(W, H),
+        zoom=zoom,
+        note=note,
+        mode="two_stills",
+        direction="locked",
+    )
 
 
 def store_pair(cas: Any, pair: Mapping[str, Any]) -> dict[str, str]:
@@ -216,6 +330,8 @@ def node_record(pair: Mapping[str, Any], keys: Mapping[str, str]) -> dict[str, A
         "boxes": [list(b) for b in pair["boxes"]],
         "push_ratio": pair["push_ratio"],
         "measured_push_ratio": pair["measured_push_ratio"],
+        "mode": pair.get("mode", "croppair"),
+        "direction": pair.get("direction", "in"),
         "size": list(pair["size"]),
         "source_size": list(pair["source_size"]),
         "zoom": dict(pair["zoom"]),

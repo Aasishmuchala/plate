@@ -37,13 +37,17 @@ over a plate with foreground is the failure this node exists to prevent.
 
 The matte, the person plate and the sent still go into the project's CAS; the caller owns the ledger, the run
 state and the quote (a STAFFAGE take costs about USD 0.10 per second of shot).
+
+`run` is `plan_take` (steps 1 and 2, and the egress PNG of step 3: nothing leaves) then `start_take` (the staging and
+the STAFFAGE job, polled to its end) then the still composite. People in motion (`plate_daemon.people_video`, T105)
+uses the first two as they are and reads the whole take (`read_layer_frames`) instead of one frame of it.
 """
 
 from __future__ import annotations
 
 import math
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -80,13 +84,20 @@ __all__ = [
     "PeopleParams",
     "PeopleResult",
     "Placed",
+    "TakePlan",
     "accept_take",
     "composite_person",
     "fit_ground_plane",
+    "layer_fps",
     "occluder_mask",
+    "occlusion_weight",
     "parse_params",
+    "plan_take",
+    "read_layer_frames",
     "resolve_person_depth",
     "run",
+    "shadow_layer",
+    "start_take",
 ]
 
 BG_Z = 1e9  # packet Z at or above this (V-Ray's 1e10 background) is "no geometry"
@@ -509,6 +520,47 @@ def shadow_strength(base_f: np.ndarray, person_f: np.ndarray, matte: np.ndarray,
     return np.clip(s, 0.0, SHADOW_CAP)
 
 
+def occlusion_weight(z_m: np.ndarray, person_depth_m: float) -> np.ndarray:
+    """float32 (H, W): how much of the person shows at each pixel (1 where nothing is nearer than her, 0 behind
+    the packet's nearer geometry, anti-aliased on the occluder's edge). The person's alpha is her matte times this."""
+    return (1.0 - _soft(occluder_mask(z_m, person_depth_m))).astype(np.float32)
+
+
+def shadow_layer(
+    base16: np.ndarray,
+    person16: np.ndarray,
+    matte: np.ndarray,
+    z_m: np.ndarray,
+    person_depth_m: float,
+    *,
+    foot_y: float | None = None,
+    cam: Cam | None = None,
+    plane: GroundPlane | None = None,
+    reach_px: int | None = None,
+) -> np.ndarray:
+    """float32 (H, W): the ground shadow STAFFAGE drew (`shadow_strength`), hidden where the packet puts something
+    nearer than the ground the shadow falls on (the ground plane's depth, else the person's depth at or above the
+    foot row)."""
+    h = base16.shape[0]
+    base_f = base16.astype(np.float32) / 65535.0
+    person_f = person16.astype(np.float32) / 65535.0
+    s = shadow_strength(base_f, person_f, matte, reach_px or shadow_reach_px(h))
+    if not s.any():
+        return s
+    if plane is not None and cam is not None:
+        ground = ground_depth_map(cam, plane, matte.shape)
+        ground = np.where(np.isfinite(ground), ground, person_depth_m)
+    else:
+        # without a ground plane, geometry nearer than the person counts only at or above the foot row
+        # (the ground in front of her lies below it and is always "nearer")
+        ground = np.full(matte.shape, person_depth_m, np.float32)
+        if foot_y is not None:
+            ground[int(math.ceil(foot_y)) :] = -np.inf
+    with np.errstate(invalid="ignore"):
+        hidden = np.asarray(z_m < (ground - np.maximum(OCC_TOL_MIN_M, OCC_TOL_REL * ground)))
+    return (s * (1.0 - _soft(hidden))).astype(np.float32)
+
+
 @dataclass
 class Placed:
     """The pure composite: `out16` differs from the base only where `footprint` is True."""
@@ -545,26 +597,22 @@ def composite_person(
     person_f = person16.astype(np.float32) / 65535.0
     matte = np.where(matte < MATTE_EPS, 0.0, np.clip(matte, 0.0, 1.0)).astype(np.float32)
 
-    occ = occluder_mask(z_m, person_depth_m)
-    alpha = matte * (1.0 - _soft(occ))
+    alpha = matte * occlusion_weight(z_m, person_depth_m)
     occluded = (matte > 0) & (alpha <= 0)
 
     s = np.zeros((h, w), np.float32)
     if shadow:
-        s = shadow_strength(base_f, person_f, matte, reach_px or shadow_reach_px(h))
-        if s.any():
-            if plane is not None and cam is not None:
-                ground = ground_depth_map(cam, plane, (h, w))
-                ground = np.where(np.isfinite(ground), ground, person_depth_m)
-            else:
-                # without a ground plane, geometry nearer than the person counts only at or above the foot row
-                # (the ground in front of her lies below it and is always "nearer")
-                ground = np.full((h, w), person_depth_m, np.float32)
-                if foot_y is not None:
-                    ground[int(math.ceil(foot_y)) :] = -np.inf
-            with np.errstate(invalid="ignore"):
-                hidden = np.asarray(z_m < (ground - np.maximum(OCC_TOL_MIN_M, OCC_TOL_REL * ground)))
-            s = s * (1.0 - _soft(hidden))
+        s = shadow_layer(
+            base16,
+            person16,
+            matte,
+            z_m,
+            person_depth_m,
+            foot_y=foot_y,
+            cam=cam,
+            plane=plane,
+            reach_px=reach_px,
+        )
 
     out_f = base_f * (1.0 - s[..., None])
     out_f = out_f * (1.0 - alpha[..., None]) + person_f * alpha[..., None]
@@ -614,6 +662,50 @@ def read_layer(path: Path, frame: int | str) -> np.ndarray:
             code="staffage_output",
         )
     return _decode(path) if path.suffix.lower() in IMAGE_SUFFIXES else _video_frame(path, frame)
+
+
+def read_layer_frames(path: Path) -> Iterator[np.ndarray]:
+    """Every frame of a STAFFAGE output in order, as cv2 BGR(A)/gray arrays (an image is one frame). One frame
+    is decoded at a time, so a 4K take never sits in memory whole."""
+    path = Path(path)
+    if not path.is_file():
+        raise PeopleError(
+            f"STAFFAGE reported {path.name}, which cannot be read from here (it hands files over by path)",
+            code="staffage_output",
+        )
+    if path.suffix.lower() in IMAGE_SUFFIXES:
+        yield _decode(path)
+        return
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            raise PeopleError(
+                f"STAFFAGE's output {path.name} is not a readable video", code="staffage_output"
+            )
+        n = 0
+        while True:
+            ok, img = cap.read()
+            if not ok or img is None:
+                break
+            n += 1
+            yield img
+        if n == 0:
+            raise PeopleError(f"STAFFAGE's output {path.name} has no frames", code="staffage_output")
+    finally:
+        cap.release()
+
+
+def layer_fps(path: Path) -> float | None:
+    """The frame rate of a STAFFAGE video output, or None for an image (or a container that reports none)."""
+    path = Path(path)
+    if path.suffix.lower() in IMAGE_SUFFIXES:
+        return None
+    cap = cv2.VideoCapture(str(path))
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS)) if cap.isOpened() else 0.0
+    finally:
+        cap.release()
+    return fps if math.isfinite(fps) and fps > 0 else None
 
 
 def to_rgb(img: np.ndarray) -> np.ndarray:
@@ -773,27 +865,48 @@ def _find_cast(film: Mapping[str, Any], wanted: str) -> str | None:
     return None
 
 
-def run(
+@dataclass
+class TakePlan:
+    """What `plan_take` settled before anything leaves the box: the node's parameters, the custody grade of the
+    route, the still and the egress PNG STAFFAGE will get (with its size map), the camera, the packet's Z in metres
+    and where the person stands in it. Deterministic: planning the same node on the same still again gives the
+    same plan (People in motion re-plans at NORMALIZING instead of storing Z)."""
+
+    params: PeopleParams
+    manifest: dict[str, Any]
+    root: Any
+    legend: Any
+    run_id: str
+    egress_run: EgressRun
+    route: dict[str, Any]
+    grade: str
+    base16: np.ndarray
+    cam: Cam
+    z_m: np.ndarray
+    person_depth_m: float
+    depth_source: str
+    ground_plane: GroundPlane | None
+    png: bytes
+    sizemap: pixels_egress.SizeMap
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (int(self.base16.shape[0]), int(self.base16.shape[1]))
+
+
+def plan_take(
     project: Any,
     node: Any,
     packet: Any,
     approved_still: Any,
     *,
-    client: StaffageClient | None = None,
     settings: StaffageSettings | None = None,
-    stage_dir: Path | str | None = None,
     run_id: str | None = None,
     depth_m: np.ndarray | None = None,
-    log: OutboundLog | None = None,
-    gate_fn: Callable[..., Any] | None = None,
-    poll_s: float = 5.0,
-    timeout_s: float = 25 * 60.0,
-    sleep: Callable[[float], None] | None = None,
-) -> PeopleResult:
-    """Place a person in `approved_still` (see the module docstring). `project` is a `projects.Project`; `node` the
-    canvas node (`params` per `parse_params`); `packet` a `pipeline.PacketView` or anything with `manifest`, `root`,
-    `legend`, `editable_ids()` and `id_mask()`; `approved_still` an RGB array (uint8, uint16 or float) or a mapping
-    with `rgb`. `depth_m` overrides the packet's Z (metres; background +inf or <= 0), the only source for Tier C."""
+) -> TakePlan:
+    """Steps 1 and 2 of the module docstring and the egress PNG of step 3: custody and the leak scan first, then
+    the parameters, the still, the packet's Z and the person's depth. Nothing is written and nothing is sent."""
     params = parse_params(node)
     settings = settings or StaffageSettings.load()
     manifest = dict(getattr(packet, "manifest", None) or {})
@@ -834,19 +947,57 @@ def run(
             f"person depth {person_depth:.2f} m is outside {MIN_DEPTH_M} to {MAX_DEPTH_M} m", code="bad_depth"
         )
 
-    # 3. the still goes out as egress makes it, under an opaque name, and STAFFAGE gets the job
+    # 3. (first half) the still as egress makes it: 8-bit sRGB, metadata stripped, never upsampled
     png, sm = pixels_egress.prepare(base16, manifest, ANY_SIZE, mask=None, region_crop=False)
     png = strip_metadata_png(png)
+    return TakePlan(
+        params=params,
+        manifest=manifest,
+        root=root,
+        legend=legend,
+        run_id=run_id,
+        egress_run=egress_run,
+        route=route,
+        grade=grade.value,
+        base16=base16,
+        cam=cam,
+        z_m=z_m,
+        person_depth_m=person_depth,
+        depth_source=depth_source,
+        ground_plane=plane,
+        png=png,
+        sizemap=sm,
+        notes=notes,
+    )
+
+
+def start_take(
+    plan: TakePlan,
+    project: Any,
+    *,
+    client: StaffageClient | None = None,
+    settings: StaffageSettings | None = None,
+    stage_dir: Path | str | None = None,
+    log: OutboundLog | None = None,
+    poll_s: float = 5.0,
+    timeout_s: float = 25 * 60.0,
+    sleep: Callable[[float], None] | None = None,
+) -> tuple[dict[str, Any], Path]:
+    """Step 3 (second half): the planned PNG is staged under an opaque name, STAFFAGE gets a film, the plate, a
+    shot and the person job, and the job is polled by id to its end. Returns (the finished job, the staged
+    still); the job names `platePath` and `mattePath`, stills or video."""
+    params, cam = plan.params, plan.cam
+    settings = settings or StaffageSettings.load()
     stage = Path(stage_dir) if stage_dir is not None else app_home() / "cache" / "staffage"
     stage.mkdir(parents=True, exist_ok=True)
     opaque = new_opaque_id()
     staged = stage / f"{opaque}.png"
-    staged.write_bytes(png)
+    staged.write_bytes(plan.png)
 
     if log is None and hasattr(project, "root"):
         log = OutboundLog.for_project(project.root)
     client = client or StaffageClient(settings.base_url, timeout_s=settings.timeout_s)
-    client.attach(run=egress_run, route=route, log=log)
+    client.attach(run=plan.egress_run, route=plan.route, log=log)
 
     film_id = params.film_id
     cast_id: str | None = None
@@ -856,7 +1007,7 @@ def run(
             cast_id = _find_cast(film, params.cast)
     else:
         film_id = str(client.create_film(opaque)["id"])
-    camera = manifest.get("camera") or {}
+    camera = plan.manifest.get("camera") or {}
     client.register_plate(
         opaque,
         staged,
@@ -868,7 +1019,7 @@ def run(
     if shot_id is None:
         media = client.ingest_media(staged)
         shot_id = str(client.add_shot(film_id, staged, media, name=opaque)["id"])
-    placement = _framing_sentence(params, person_depth, cam)
+    placement = _framing_sentence(params, plan.person_depth_m, cam)
     prompt = params.prompt
     if prompt is None and cast_id is None:
         prompt = build_person_prompt(
@@ -892,6 +1043,49 @@ def run(
         raise PeopleError(
             "STAFFAGE finished the job without a plate and a matte", code="staffage_output", job=job
         )
+    return job, staged
+
+
+def run(
+    project: Any,
+    node: Any,
+    packet: Any,
+    approved_still: Any,
+    *,
+    client: StaffageClient | None = None,
+    settings: StaffageSettings | None = None,
+    stage_dir: Path | str | None = None,
+    run_id: str | None = None,
+    depth_m: np.ndarray | None = None,
+    log: OutboundLog | None = None,
+    gate_fn: Callable[..., Any] | None = None,
+    poll_s: float = 5.0,
+    timeout_s: float = 25 * 60.0,
+    sleep: Callable[[float], None] | None = None,
+) -> PeopleResult:
+    """Place a person in `approved_still` (see the module docstring). `project` is a `projects.Project`; `node` the
+    canvas node (`params` per `parse_params`); `packet` a `pipeline.PacketView` or anything with `manifest`, `root`,
+    `legend`, `editable_ids()` and `id_mask()`; `approved_still` an RGB array (uint8, uint16 or float) or a mapping
+    with `rgb`. `depth_m` overrides the packet's Z (metres; background +inf or <= 0), the only source for Tier C."""
+    settings = settings or StaffageSettings.load()
+    plan = plan_take(project, node, packet, approved_still, settings=settings, run_id=run_id, depth_m=depth_m)
+    job, staged = start_take(
+        plan,
+        project,
+        client=client,
+        settings=settings,
+        stage_dir=stage_dir,
+        log=log,
+        poll_s=poll_s,
+        timeout_s=timeout_s,
+        sleep=sleep,
+    )
+    params, base16, notes, sm = plan.params, plan.base16, plan.notes, plan.sizemap
+    manifest, root, legend, z_m = plan.manifest, plan.root, plan.legend, plan.z_m
+    cam, plane = plan.cam, plan.ground_plane
+    person_depth, depth_source = plan.person_depth_m, plan.depth_source
+    h, w = plan.shape
+    png, run_id = plan.png, plan.run_id
 
     # 4. its plate and matte, back onto the still's grid
     plate_layer = read_layer(Path(job["platePath"]), params.frame)
@@ -965,7 +1159,7 @@ def run(
         person_depth_m=person_depth,
         depth_source=depth_source,
         ground_plane=plane,
-        grade=grade.value,
+        grade=plan.grade,
         run_id=run_id,
         job=job,
         registration=rep,

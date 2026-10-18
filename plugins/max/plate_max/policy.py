@@ -6,7 +6,9 @@ signage; everything else, and everything unlabelled, stays locked. The class rul
 same list written into the manifest's policy.class_rules, so plate_spec.validate_legend can re-check
 every class_source=rule entry against them. lint() is the Send gate: the policy checks (unlabelled
 share, locked/editable overlap) plus the scene checks that must pass before a render is worth
-starting (scaled, shifted or hidden camera, no V-Ray, node names that break file names). Stdlib only.
+starting (scaled, shifted or hidden camera, no V-Ray, node names that break file names). With
+level_and_crop (decision 58) a two-point camera that bridge.camera_level can send as a level pinhole
+is a SHIFTED_CAMERA warning instead of a blocking problem. Stdlib only.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import digest
+from .bridge import camera_level
 from .rt import runtime
 
 EDITABLE_PREFIXES = ("VEG_", "SKY", "PEOPLE", "WATER", "ENT_", "GRASS")
@@ -139,12 +142,20 @@ def _problem(code: str, node: str | None, detail: str) -> dict[str, Any]:
 class LintReport(list):
     """What lint() returns. As a list it is the blocking messages (strings), exactly as before: empty
     means Send may proceed. It also carries passed, unlabelled_share (None when no coverage was
-    given) and problems, a list of {code, node, detail}; report["passed"] style reads work too."""
+    given), problems, a list of {code, node, detail}, and warnings in the same shape (what does not
+    block: a camera Send levels and crops); report["passed"] style reads work too. as_dict() lists
+    "warnings" only when there are some."""
 
-    def __init__(self, problems: list[dict[str, Any]], unlabelled_share: float | None):
+    def __init__(
+        self,
+        problems: list[dict[str, Any]],
+        unlabelled_share: float | None,
+        warnings: list[dict[str, Any]] | None = None,
+    ):
         super().__init__(p["detail"] for p in problems)
         self.problems = problems
         self.unlabelled_share = unlabelled_share
+        self.warnings = list(warnings or [])
 
     @property
     def passed(self) -> bool:
@@ -155,13 +166,18 @@ class LintReport(list):
         return [p["code"] for p in self.problems]
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "passed": self.passed,
             "unlabelled_share": self.unlabelled_share,
             "problems": [dict(p) for p in self.problems],
         }
+        if self.warnings:
+            out["warnings"] = [dict(w) for w in self.warnings]
+        return out
 
     def __getitem__(self, key):  # type: ignore[override]
+        if key == "warnings":
+            return [dict(w) for w in self.warnings]
         if isinstance(key, str):
             return self.as_dict()[key]
         return super().__getitem__(key)
@@ -183,29 +199,62 @@ def lens_problems(cam: dict[str, Any]) -> list[str]:
     return why
 
 
-def camera_problems(cam: dict[str, Any], hidden: bool = False) -> list[dict[str, Any]]:
-    """SCALED_CAMERA, SHIFTED_CAMERA and HIDDEN_CAMERA for one camera_digest()."""
+def level_plan(cam: dict[str, Any]) -> tuple[camera_level.LevelPlan | None, str]:
+    """camera_level.assess() at the digest's own render size: (plan, "") when Send can level and
+    crop the camera, (None, why) when it stays refused."""
+    resolution = cam.get("resolution")
+    if not resolution:
+        return None, "the render size is unreadable"
+    return camera_level.assess(cam, int(resolution[0]), int(resolution[1]))
+
+
+def camera_checks(
+    cam: dict[str, Any], hidden: bool = False, level_and_crop: bool = False
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(problems, warnings) for one camera_digest(): SCALED_CAMERA, SHIFTED_CAMERA, HIDDEN_CAMERA.
+    With level_and_crop, a shifted or tilted camera that camera_level can plan is a SHIFTED_CAMERA
+    warning (Send renders the level pinhole and crops it); one it cannot stays a problem, saying why."""
     name = str(cam.get("name"))
     out: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
     if cam.get("world_from_camera") is not None:
         problem = digest.rotation_error(cam["world_from_camera"])
         if problem:
             out.append(_problem(SCALED_CAMERA, name, f"camera {name}: {problem}"))
     why = lens_problems(cam)
-    if why:
+    level, reason = level_plan(cam) if why and level_and_crop else (None, "")
+    if level is not None:
+        warnings.append(
+            _problem(
+                SHIFTED_CAMERA,
+                name,
+                f"camera {name} uses {', '.join(why)}: Send renders it as a level pinhole at "
+                f"{level.width}x{level.render_height} and crops the {level.width}x{level.height} frame at "
+                f"y {level.safe_y} ({level.note.split(';')[0]})",
+            )
+        )
+    elif why:
+        tail = f"; level-and-crop does not apply: {reason}" if reason else ""
         out.append(
             _problem(
                 SHIFTED_CAMERA,
                 name,
                 f"camera {name} uses {', '.join(why)}: Shot Packet v0.1 is unshifted, untilted and "
-                "undistorted only (spec/PACKET.md 3.3); zero them before sending",
+                f"undistorted only (spec/PACKET.md 3.3); zero them before sending{tail}",
             )
         )
     if hidden:
         out.append(
             _problem(HIDDEN_CAMERA, name, f"camera {name} is hidden (or on a hidden layer): unhide it")
         )
-    return out
+    return out, warnings
+
+
+def camera_problems(
+    cam: dict[str, Any], hidden: bool = False, level_and_crop: bool = False
+) -> list[dict[str, Any]]:
+    """The blocking half of camera_checks()."""
+    return camera_checks(cam, hidden, level_and_crop)[0]
 
 
 def renderer_problems(renderer: str | None) -> list[dict[str, Any]]:
@@ -246,12 +295,15 @@ def lint(
     camera_hidden: bool = False,
     node_names: list[str] | tuple[str, ...] | None = None,
     renderer: str | None = None,
+    level_and_crop: bool = False,
 ) -> LintReport:
     """Blocking problems (an empty report means Send may proceed). coverage maps an id to the share
     of the frame it covers at rank 0. The scene checks run only for what is passed: camera (a
     camera_digest(); camera_hidden says whether the node is hidden), node_names, renderer (the
-    current renderer's class name; None skips the V-Ray check, "" means unreadable)."""
+    current renderer's class name; None skips the V-Ray check, "" means unreadable). level_and_crop
+    (the recipe's, decision 58) turns a camera Send can level and crop into a warning."""
     problems: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
     share: float | None = None
     if policy is not None:
         coverage = coverage or {}
@@ -282,10 +334,12 @@ def lint(
     if renderer is not None:
         problems += renderer_problems(renderer)
     if camera is not None:
-        problems += camera_problems(camera, camera_hidden)
+        blocking, warned = camera_checks(camera, camera_hidden, level_and_crop)
+        problems += blocking
+        warnings += warned
     if node_names:
         problems += name_problems(node_names)
-    return LintReport(problems, share)
+    return LintReport(problems, share, warnings)
 
 
 def lint_scene(
@@ -293,10 +347,12 @@ def lint_scene(
     policy: dict[str, Any] | None = None,
     coverage: dict[str, float] | None = None,
     max_unlabelled_share: float = DEFAULT_MAX_UNLABELLED_SHARE,
+    level_and_crop: bool = False,
 ) -> LintReport:
     """lint() over the open scene: reads the camera, its hidden state, the renderer and the node
     names through pymxs. Without policy and coverage (before any render exists) it runs the scene
-    checks only; the unlabelled share needs the render's Cryptomatte coverage. Raises
+    checks only; the unlabelled share needs the render's Cryptomatte coverage. level_and_crop: see
+    lint() (off by default: a camera is refused unless the caller levels it). Raises
     digest.CameraNotFound for an unknown camera."""
     rt = runtime()
     cam = digest.camera_digest(camera_name)
@@ -316,4 +372,5 @@ def lint_scene(
         camera_hidden=hidden,
         node_names=names,
         renderer=renderer,
+        level_and_crop=level_and_crop,
     )

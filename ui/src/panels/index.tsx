@@ -1,6 +1,6 @@
-// The panel area App mounts (T36): drop-to-restore prompt, a tab per panel (projects, history, gate, custody, timer)
-// and the verdict keys, which stay visible on every tab because the keys are global. State shared between panels
-// lives in `./store`; nothing here owns the graph, which stays in `useGraphStore`.
+// The panel area App mounts (T36): drop-to-restore prompt, a tab per panel (projects, history, gate, custody, timer,
+// and T102's spend and settings) and the verdict keys, which stay visible on every tab because the keys are global.
+// State shared between panels lives in `./store`; nothing here owns the graph, which stays in `useGraphStore`.
 
 import { type ReactElement, useEffect } from "react";
 import { useGraphStore } from "../store";
@@ -9,6 +9,8 @@ import { DropPrompt } from "./DropRestore";
 import { GatePanel } from "./GatePanel";
 import { HistoryPanel } from "./HistoryPanel";
 import { ProjectPanel } from "./ProjectPanel";
+import { SettingsPanel } from "./SettingsPanel";
+import { SpendPanel } from "./SpendPanel";
 import { type PanelTab, usePanelsStore } from "./store";
 import { S } from "./theme";
 import { TimerPanel } from "./TimerPanel";
@@ -20,6 +22,8 @@ const TABS: readonly { id: PanelTab; label: string }[] = [
   { id: "gate", label: "Gate" },
   { id: "custody", label: "Custody" },
   { id: "timer", label: "Timer" },
+  { id: "spend", label: "Spend" },
+  { id: "settings", label: "Settings" },
 ];
 
 function Active({ tab }: { tab: PanelTab }): ReactElement {
@@ -34,6 +38,10 @@ function Active({ tab }: { tab: PanelTab }): ReactElement {
       return <CustodyPanel />;
     case "timer":
       return <TimerPanel />;
+    case "spend":
+      return <SpendPanel />;
+    case "settings":
+      return <SettingsPanel />;
   }
 }
 

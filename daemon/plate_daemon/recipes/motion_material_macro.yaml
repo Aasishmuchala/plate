@@ -1,0 +1,30 @@
+# Motion recipe (T94): Material Macro (library shot as10). A near-imperceptible push-in, 1.0 -> 1.12, both ends crops
+# of one approved close-up or detail still (it never turns a wide plate into a macro: past the still's own detail
+# the engine would be inventing texture). Prompt law: motion only; no pace words under the end pin; negative prompt
+# under 30 words.
+schema: 1
+id: motion_material_macro
+title: Material macro
+kind: motion_croppair
+library: as10
+engine: kling-o3-4k
+shot_class: detail
+croppair:
+  z0: 1.0
+  z1: 1.12
+  center: [0.5, 0.5]
+motion:
+  move: push_in
+  start_end: true
+  duration_s: 5
+  camera_fixed: false
+params:
+  n: 1
+mask:
+  editable_classes: []
+  region: none
+  lock_rest: false
+prompt: |-
+  Shot 1: extreme close-up on the material, a near-imperceptible push-in at constant speed. The camera advances from the first frame to the last frame; the framing is set by those two frames. Razor-thin depth of field on the material; light plays across the texture as clouds pass unseen; dust drifts through a sliver of light. Hypnotic and tactile.
+  SCENE LOCKS: the material and its texture identical to the source, no boiling, no crawl; the drift stays under two centimetres; nothing enters frame; no other camera movement.
+negative_prompt: texture boiling, texture crawl, morphing, warping grain, flicker, new objects, people, text, logos, camera shake, extra movement

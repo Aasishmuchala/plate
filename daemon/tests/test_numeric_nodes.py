@@ -258,7 +258,8 @@ def _check(report: dict[str, Any], metric_id: str) -> dict[str, Any]:
 
 def test_install_is_idempotent_and_kinds_are_the_five(env):
     assert install(env.pipeline) is env.runner and env.pipeline.node_runner is env.runner
-    assert KINDS == {"Set", "Recolour", "LightMix", "Light", "Scout"}
+    # T93 (Wave 9) adds the numeric Comp, Colour, Atmosphere and Sky: test_numeric_nodes_wave9.py covers them.
+    assert KINDS == {"Set", "Recolour", "LightMix", "Light", "Scout", "Comp", "Colour", "Atmosphere", "Sky"}
     assert canvas_rules.NODE_KINDS and KINDS <= set(canvas_rules.NODE_KINDS)
 
 

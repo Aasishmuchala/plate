@@ -19,6 +19,11 @@ its tooltip saying MAXGAFFER_MISSING, while MaxGaffer is not installed in this M
                           options.reference_path, apply, rerender_packet superseding the old packet
   actions.scout.run(out_root, daemon_base, options) -> [result]: the scout poses as temporary
                           cameras with previews (options.keep leaves them in the scene)
+Send + quote is send_packet.run and then, per camera whose packet the daemon ingested (its event log
+followed up to QUOTE_INGEST_WAIT_S), POST /api/v0/projects/{pid}/templates/apply {template_id:
+"edit_chain", packet_ids: [id], engine_id, recipe (the preset), quote: true, auto_approve} (decision 53):
+the daemon lays an Edit chain on the canvas per packet and quotes it; auto_approve approves only under
+the project's per-run auto cap, so anything over waits for the artist in the canvas.
 options is an ActionOptions (a dict that also reads as attributes): recipes {camera: recipe},
 progress callable(done, total, message), backup False, project_id (the scene's project binding),
 custody ({nda, allowed_grades} of that project once its custody is set) and supersedes ({camera:
@@ -27,8 +32,10 @@ camera, ok, packet_id, errors, and maybe status_code, events_url, ingest, code, 
 through by result_dict). A recipe is the CameraRecipe field set: camera, engine_id, preset,
 safe_frame {x,y,w,h} | None, overscan_aspect | None, editable_classes, extra_elements; it reaches the
 actions as a plate_max.recipes.CameraRecipe when that module exists, else as a plain dict of those
-fields. engine_id and preset are hints for the artist only: they never leave Max (the canvas's Make
-bar picks the engine), which is why the dock labels them "hint (not sent)".
+fields. engine_id and preset leave Max only through Send + quote (the templates/apply body after the
+ingest); a plain Send carries neither and the canvas's Make bar picks the engine for every other edit,
+which is why the dock labels them "used by Send + quote". A recipe may also carry level_and_crop
+(default true, decision 58): lint and Send then treat a two-point camera as a level-and-crop packet.
 
 Project binding: the project a scene sends into is the dock's Project combo (GET /api/v0/projects),
 kept in <scene>.plate.json next to the .max file under "project_id"; without one, config.json's
@@ -69,6 +76,22 @@ SCENE_PROJECT_KEY = "project_id"  # the key of <scene>.plate.json the project bi
 PROJECTS_PATH = "/api/v0/projects"
 PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")  # the schema's slug ($defs/slug)
 HERO_SCAN_LIMIT = 20
+# Send + quote (decision 53): the graph template every ingested packet is laid out with, how long the
+# packet's event log is followed for the ingest, and the apply route (quoting every Edit takes a while).
+QUOTE_TEMPLATE_ID = "edit_chain"
+QUOTE_INGEST_WAIT_S = 60.0
+QUOTE_TIMEOUT_S = 30.0
+TEMPLATES_APPLY_PATH = "/api/v0/projects/{project_id}/templates/apply"
+APPROVED_STATES = (
+    "APPROVED",
+    "QUEUED",
+    "STAGING",
+    "SUBMITTED",
+    "RUNNING",
+    "FETCHING",
+    "NORMALIZING",
+    "GATING",
+)
 # Result fields result_dict passes through when an action sets them (T75's send answers among them).
 PASS_THROUGH = ("status_code", "events_url", "ingest", "code", "warnings", "preview", "label")
 
@@ -188,6 +211,77 @@ def result_message(name: str, result: Mapping[str, Any]) -> tuple[str, bool]:
     if status == 202 or ingest == "ingesting":
         return f"{name}: {camera}: Sent, ingesting (packet {packet_id})", False
     return f"{name}: {camera} sent (packet {packet_id})", False
+
+
+def usd_text(value: Any) -> str:
+    """A dollar figure for the log: at least two decimals, three when the third is not zero (0.039)."""
+    try:
+        number = float(value or 0.0)
+    except (TypeError, ValueError):
+        number = 0.0
+    text = f"{number:.3f}"
+    return text[:-1] if text.endswith("0") else text
+
+
+def apply_body(packet_id: str, recipe: Mapping[str, Any], auto_approve: bool = False) -> dict[str, Any]:
+    """The templates/apply body Send + quote posts for one ingested packet: the Edit chain template,
+    the recipe's engine and its preset as the recipe id (left out when empty), quote on."""
+    body: dict[str, Any] = {"template_id": QUOTE_TEMPLATE_ID, "packet_ids": [str(packet_id)]}
+    engine = str(recipe.get("engine_id") or "").strip()
+    preset = str(recipe.get("preset") or "").strip()
+    if engine:
+        body["engine_id"] = engine
+    if preset:
+        body["recipe"] = preset
+    body["quote"] = True
+    body["auto_approve"] = bool(auto_approve)
+    return body
+
+
+def quote_summary(answer: Any, auto_approve: bool = False) -> dict[str, Any]:
+    """{line, error, usd, runs, refused, awaiting} from a templates/apply answer: "quoted <usd> USD ·
+    waiting for approval", "approved · running" (auto-approved under the cap, every run past QUOTED),
+    or "not quoted: <why>" when every Edit was refused."""
+    body = answer if isinstance(answer, Mapping) else {}
+    runs = [r for r in body.get("runs") or [] if isinstance(r, Mapping)]
+    refused = [r for r in body.get("refused") or [] if isinstance(r, Mapping)]
+    waiting = [w for w in body.get("awaiting_approval") or [] if isinstance(w, Mapping)]
+    usd = body.get("total_usd")
+    if usd is None:
+        usd = sum(float(r.get("cost_usd_quoted") or 0.0) for r in runs)
+    out: dict[str, Any] = {
+        "usd": float(usd or 0.0),
+        "runs": [str(r.get("id")) for r in runs if r.get("id")],
+        "refused": [dict(r) for r in refused],
+        "awaiting": [dict(w) for w in waiting],
+        "error": False,
+    }
+    if not runs:
+        why = "; ".join(
+            f"{r.get('error') or 'refused'}" + (f" ({r['detail']})" if r.get("detail") else "")
+            for r in refused
+        )
+        out.update(line=f"not quoted: {why or 'the template made no Edit to quote'}", error=True)
+        return out
+    approved = all(str(r.get("state") or "") in APPROVED_STATES for r in runs)
+    if auto_approve and not waiting and approved:
+        out["line"] = "approved · running"
+    else:
+        line = f"quoted {usd_text(out['usd'])} USD · waiting for approval"
+        if auto_approve and waiting:
+            codes = sorted({str(w.get("error") or "refused") for w in waiting})
+            line += f" (auto-approve refused: {', '.join(codes)})"
+        out["line"] = line
+    if refused:
+        out["line"] += f"; {len(refused)} Edit(s) refused"
+    return out
+
+
+def quote_message(name: str, result: Mapping[str, Any]) -> tuple[str, bool]:
+    """The dock's log line for a Send + quote row: "<name>: <camera>: <quote_line>", and whether it is
+    an error."""
+    camera = result.get("camera") or "?"
+    return f"{name}: {camera}: {result.get('quote_line')}", bool(result.get("quote_error"))
 
 
 def custody_text(custody: Mapping[str, Any] | None) -> str:
@@ -310,6 +404,9 @@ class Controller(Protocol):
     def make_poller(self, **hooks: Any) -> Any: ...  # a plate_max.jobs.Poller, or None
     def lint(self, camera: str) -> dict[str, Any]: ...  # LintReport.as_dict()
     def send_packet(self, cameras: list[str], progress: Progress) -> list[dict[str, Any]]: ...
+    def send_and_quote(
+        self, cameras: list[str], progress: Progress, auto_approve: bool = False
+    ) -> list[dict[str, Any]]: ...  # each result also carries quote_line (and quote, quote_error)
     def batch_cameras(self, cameras: list[str], progress: Progress) -> list[dict[str, Any]]: ...
     def receive(self, path: str, mode: str) -> tuple[bool, str]: ...
     def send_motion(
@@ -332,6 +429,18 @@ def _frame(value: Any) -> int | None:
         return int(round(float(raw)))
     except (TypeError, ValueError):
         return None
+
+
+def _error_text(body: Any) -> str:
+    """What a refusal body says: its error/detail, its errors list, or the body itself."""
+    if isinstance(body, Mapping):
+        parts = [str(body[k]) for k in ("error", "detail") if body.get(k)]
+        errors = body.get("errors")
+        if isinstance(errors, list):
+            parts += [str(e) for e in errors]
+        if parts:
+            return ": ".join(parts)
+    return str(body)
 
 
 def _failed(camera: str, why: str, code: str | None = None) -> dict[str, Any]:
@@ -365,6 +474,7 @@ class LiveController:
         self._project: str | None = None  # the binding, resolved for _project_scene
         self._project_scene: str | None = None
         self.supersede_last = False
+        self.quote_ingest_wait_s = QUOTE_INGEST_WAIT_S  # Send + quote: how long the ingest is followed
 
     # ---- capabilities
     @staticmethod
@@ -419,9 +529,14 @@ class LiveController:
             out.append({"name": str(node.name), "class": cls, "hidden": hidden})
         return sorted(out, key=lambda c: c["name"].lower())
 
+    def level_and_crop(self, camera: str) -> bool:
+        """The camera's recipe.level_and_crop (default true): lint shows a two-point camera Send can
+        level and crop as a warning, not a block."""
+        return bool(self._recipes.get(camera, {}).get("level_and_crop", True))
+
     def lint(self, camera: str) -> dict[str, Any]:
         try:
-            return policy.lint_scene(camera).as_dict()
+            return policy.lint_scene(camera, level_and_crop=self.level_and_crop(camera)).as_dict()
         except Exception as exc:  # noqa: BLE001 a missing camera or odd scene is a lint failure, not a crash
             return {
                 "passed": False,
@@ -651,6 +766,62 @@ class LiveController:
     def send_packet(self, cameras: list[str], progress: Progress) -> list[dict[str, Any]]:
         return self._run(CAP_SEND_PACKET, cameras, progress)
 
+    def send_and_quote(
+        self, cameras: list[str], progress: Progress, auto_approve: bool = False
+    ) -> list[dict[str, Any]]:
+        """Send Packet, then the canvas's Edit chain quoted for every packet the daemon ingested
+        (decision 53): send_packet.run, the packet's event log followed up to quote_ingest_wait_s while
+        it is still ingesting, then POST templates/apply (apply_body) in the scene's project. Every
+        result gains quote_line ("quoted 0.04 USD · waiting for approval", "approved · running" or
+        "not quoted: ..."), quote_error and quote (quote_summary). The daemon calls go through io."""
+        results = self.send_packet(cameras, progress)
+        cfg = load_config()
+        project = self.project_id()
+        for result in results:
+            result.update(self._quote(result, cfg, project, auto_approve, progress))
+        return results
+
+    def _quote(
+        self,
+        result: dict[str, Any],
+        cfg: dict[str, Any],
+        project: str,
+        auto_approve: bool,
+        progress: Progress | None,
+    ) -> dict[str, Any]:
+        camera = str(result.get("camera") or "")
+        packet_id = result.get("packet_id")
+
+        def refused(why: str) -> dict[str, Any]:
+            return {"quote_line": f"not quoted: {why}", "quote_error": True, "quote": None}
+
+        if not result.get("ok") or not packet_id:
+            return refused("the send failed")
+        ingest = str(result.get("ingest") or "")
+        if ingest.startswith("failed"):
+            return refused(f"the ingest {ingest}")
+        if ingest != "ingested":
+            events = str(result.get("events_url") or transport.events_url_for(str(packet_id)))
+            if progress is not None:
+                progress(0, 0, f"{camera}: waiting for the daemon to ingest {packet_id}")
+            wait = float(self.quote_ingest_wait_s)
+            state = self.io(lambda: transport.follow_ingest(events, cfg, window_s=wait))
+            ingest = str(state.get("ingest") or "ingesting")
+            result["ingest"] = ingest
+            if ingest != "ingested":
+                tail = f" ({state['problem']})" if state.get("problem") else ""
+                return refused(f"the ingest is {ingest} after {wait:g} s{tail}: quote it from the canvas")
+        body = apply_body(str(packet_id), self.recipe(camera), auto_approve)
+        path = TEMPLATES_APPLY_PATH.format(project_id=project)
+        try:
+            answer = self.io(lambda: transport.post_json(path, body, cfg, timeout_s=QUOTE_TIMEOUT_S))
+        except transport.UnexpectedStatus as exc:
+            return refused(f"HTTP {exc.status_code}: {_error_text(exc.body)}")
+        except transport.TransportError as exc:
+            return refused(f"daemon: {exc}")
+        summary = quote_summary(answer, auto_approve)
+        return {"quote_line": summary["line"], "quote_error": summary["error"], "quote": summary}
+
     def batch_cameras(self, cameras: list[str], progress: Progress) -> list[dict[str, Any]]:
         return self._run(CAP_BATCH, cameras, progress)
 
@@ -773,6 +944,7 @@ class FakeController:
         self.supersede_last = False
         self.poller: Any = None
         self.poller_hooks: dict[str, Any] = {}
+        self.quote_line: str | None = None  # Send + quote's line; None: quoted, or approved when auto
 
     def capabilities(self) -> set[str]:
         return set(self._capabilities)
@@ -879,6 +1051,22 @@ class FakeController:
         for i, cam in enumerate(cameras, 1):
             progress(i, len(cameras), f"sent {cam}")
         return self._ok_results(cameras)
+
+    def send_and_quote(
+        self, cameras: list[str], progress: Progress, auto_approve: bool = False
+    ) -> list[dict[str, Any]]:
+        self._act("send_and_quote", list(cameras), bool(auto_approve))
+        for i, cam in enumerate(cameras, 1):
+            progress(i, len(cameras), f"sent {cam}")
+        out = [dict(r) for r in self._ok_results(cameras)]
+        default = "approved · running" if auto_approve else "quoted 0.04 USD · waiting for approval"
+        for r in out:
+            if not r.get("ok"):
+                r.update(quote_line="not quoted: the send failed", quote_error=True)
+            else:
+                line = self.quote_line or default
+                r.update(quote_line=line, quote_error=line.startswith("not quoted"))
+        return out
 
     def batch_cameras(self, cameras: list[str], progress: Progress) -> list[dict[str, Any]]:
         self._act("batch_cameras", list(cameras))

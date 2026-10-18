@@ -10,11 +10,17 @@ send_packet.run once per camera, so the preflight runs again at the start of eve
 Per camera, in this order (any failure stops that camera, records why, and moves on to the next):
 
   colour    bridge.colour.detect_colour_pipeline(): an unknown mode stops before anything renders
-  lint      policy.lint_scene(): scaled / shifted / hidden camera, no V-Ray, node names with ':'
+  lint      policy.lint_scene(): scaled / shifted / hidden camera, no V-Ray, node names with ':'. With
+            recipe.level_and_crop (default true, decision 58) a tilt-corrected or vertically shifted
+            camera that bridge.camera_level can plan is a SHIFTED_CAMERA warning, not a refusal
   backup    bridge.safety.backup() when options.backup (before the scene is touched)
   preflight every legend record that will be hashed in memory is checked against the payload limit
             (PAYLOAD_TOO_LARGE names the node and the size): nothing oversize reaches the hash step
   elements  bridge.elements.ensure_default_set() + ensure_optin(recipe.extra_elements)
+  level     a two-point camera (level-and-crop): camera_level.plan() at the hero frame, then a
+            temporary level copy of the camera (camera_level.levelled) is what renders, width x
+            (height + 2 ceil(|dy|)), with the original frame as an off-centre safe_frame; the manifest
+            camera is the level one under the camera's own name, overscan.note says where it came from
   render    bridge.render.render_packet_frame() into a local staging folder, at the recipe's overscan
             (plan_frame: the dimension that is short of the engine aspect grows, the original frame
             stays centred as safe_frame; a frame that grows wider also widens the film gate or fov
@@ -55,7 +61,7 @@ from typing import Any
 
 from .. import PACKET_VERSION, autotag, digest, packet, policy, transport
 from .. import legend as legend_mod
-from ..bridge import colour, elements, hashing, render, safety
+from ..bridge import camera_level, colour, elements, hashing, render, safety
 from ..bridge.scene import current_frame, get_camera, rt_attr, scene_path, set_prop
 from ..config import DEFAULT_DAEMON_URL, load_config
 from ..exr_header import (
@@ -76,7 +82,8 @@ from ..rt import runtime
 BEAUTY_NAME = "beauty.exr"
 DISPLAY_NAME = "display.tif"
 STAGING_PREFIX = "plate-render-"
-FX_TOLERANCE = 1e-6  # relative: a widened overscan must keep the pixel scale exactly
+FX_TOLERANCE = 1e-6  # relative: a widened overscan or a level render must keep the pixel scale exactly
+LEVEL_AND_CROP_DEFAULT = True  # recipe.level_and_crop when nothing sets it (decision 58)
 DATA_ELEMENTS_FLOAT = ("zdepth", "cryptomatte_object", "cryptomatte_material", "world_position")
 REQUIRED_ELEMENTS = ("beauty", *elements.DEFAULT_ELEMENTS)
 OK_STATUS = (200, 202)
@@ -190,6 +197,7 @@ OPTION_KEYS = (
     "vfb_corrections_baked",
     "post_timeout_s",
     "ingest_follow_s",
+    "level_and_crop",
 )
 
 
@@ -218,14 +226,16 @@ def notify_progress(progress: Progress | None, done: int, total: int, message: s
 @dataclass(frozen=True)
 class FramePlan:
     """The frame Send renders: width x height, the deliverable safe_frame inside it ({x, y, width,
-    height}), the overscan block for the manifest (None without one) and widen, the factor the
-    horizontal field of view grows by (1.0 unless the frame grew wider)."""
+    height}), the overscan block for the manifest (None without one), widen, the factor the
+    horizontal field of view grows by (1.0 unless the frame grew wider), and level, the
+    level-and-crop plan when the camera is rendered as a level pinhole."""
 
     width: int
     height: int
     safe_frame: dict[str, int]
     overscan: dict[str, str] | None
     widen: float = 1.0
+    level: camera_level.LevelPlan | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -234,6 +244,7 @@ class FramePlan:
             "safe_frame": dict(self.safe_frame),
             "overscan": dict(self.overscan) if self.overscan else None,
             "widen": self.widen,
+            "level": self.level.as_dict() if self.level else None,
         }
 
 
@@ -259,32 +270,89 @@ def _ratio(width: int, height: int) -> str:
     return f"{int(width) // g}:{int(height) // g}"
 
 
-def plan_frame(width: int, height: int, recipe: CameraRecipe) -> FramePlan:
+def plan_frame(
+    width: int, height: int, recipe: CameraRecipe, level: camera_level.LevelPlan | None = None
+) -> FramePlan:
     """The rendered frame for a recipe over the scene's render size width x height. recipe.safe_frame
     ({x, y, w, h} in scene pixels, default the whole frame) moves with the overscan offset. A partial
     safe frame without an overscan aspect records the frame's own aspect as engine_aspect (the
-    manifest needs an overscan block for any partial safe frame, PACKET.md 3.4)."""
+    manifest needs an overscan block for any partial safe frame, PACKET.md 3.4).
+
+    level (camera_level.plan of the same width x height): the frame to grow is the level render,
+    width x level.render_height, with the scene frame at y level.safe_y inside it; the overscan
+    block is always written and its note starts with level.note."""
     width, height = int(width), int(height)
     rect = recipe.safe_frame or {"x": 0, "y": 0, "w": width, "h": height}
     if rect["x"] + rect["w"] > width or rect["y"] + rect["h"] > height:
         raise RecipeError(f"safe_frame {rect} lies outside the {width}x{height} render")
+    if level is not None and (level.width, level.height) != (width, height):
+        raise ValueError(f"level plan is for {level.width}x{level.height}, the render is {width}x{height}")
+    base_w, base_h = width, height
+    lift = 0
+    if level is not None:
+        base_h, lift = level.render_height, level.safe_y
+    notes: list[str] = [level.note] if level is not None else []
     if recipe.overscan_aspect:
-        new_w, new_h, ox, oy = overscan_size(width, height, recipe.overscan_aspect)
+        new_w, new_h, ox, oy = overscan_size(base_w, base_h, recipe.overscan_aspect)
         overscan: dict[str, str] | None = {"engine_aspect": recipe.overscan_aspect}
-        if (new_w, new_h) != (width, height):
-            overscan["note"] = (
-                f"{width}x{height} frame rendered inside {new_w}x{new_h} ({recipe.overscan_aspect}) "
+        if (new_w, new_h) != (base_w, base_h):
+            notes.append(
+                f"{base_w}x{base_h} frame rendered inside {new_w}x{new_h} ({recipe.overscan_aspect}) "
                 "so engines see real context instead of padding"
             )
     else:
-        new_w, new_h, ox, oy = width, height, 0, 0
+        new_w, new_h, ox, oy = base_w, base_h, 0, 0
         whole = rect == {"x": 0, "y": 0, "w": width, "h": height}
-        overscan = None if whole else {"engine_aspect": _ratio(width, height), "note": "recipe safe frame"}
-    safe = {"x": rect["x"] + ox, "y": rect["y"] + oy, "width": rect["w"], "height": rect["h"]}
-    return FramePlan(new_w, new_h, safe, overscan, widen=new_w / width)
+        if level is not None:
+            overscan = {"engine_aspect": _ratio(base_w, base_h)}
+        elif whole:
+            overscan = None
+        else:
+            overscan = {"engine_aspect": _ratio(width, height), "note": "recipe safe frame"}
+    if overscan is not None and notes:
+        overscan["note"] = "; ".join(notes)
+    safe = {"x": rect["x"] + ox, "y": rect["y"] + lift + oy, "width": rect["w"], "height": rect["h"]}
+    return FramePlan(new_w, new_h, safe, overscan, widen=new_w / base_w, level=level)
 
 
 # --------------------------------------------------------------------------- scene state for the render
+
+
+def _level_plan(
+    camera: str, cam0: dict[str, Any], width: int, height: int, frame: Any
+) -> camera_level.LevelPlan | None:
+    """camera_level.plan() of the camera as it is at the hero frame (lint read the current time). A
+    camera that is shifted or tilted there but cannot be planned stops at lint with SHIFTED_CAMERA."""
+    if not policy.lens_problems(cam0):
+        return None
+    level, why = camera_level.assess(cam0, width, height)
+    if level is None:
+        detail = (
+            f"camera {camera} at frame {frame} is shifted or tilted: level-and-crop does not apply ({why})"
+        )
+        raise SendAbort(
+            "lint", f"lint: {detail}", [{"code": policy.SHIFTED_CAMERA, "node": camera, "detail": detail}]
+        )
+    return level
+
+
+@contextmanager
+def _levelled(
+    node: Any, level: camera_level.LevelPlan | None, frame: Any, warnings: list[str]
+) -> Iterator[Any]:
+    """The node to render: node itself, or for a level plan the temporary level copy of it
+    (camera_level.make_level_copy; a LevelError is SendAbort("render", ...)), deleted afterwards."""
+    if level is None:
+        yield node
+        return
+    try:
+        clone = camera_level.make_level_copy(node, level, frame)
+    except camera_level.LevelError as exc:
+        raise SendAbort("render", f"level-and-crop: {exc}") from exc
+    try:
+        yield clone
+    finally:
+        camera_level.drop_level_copy(clone, warnings)
 
 
 @contextmanager
@@ -621,6 +689,23 @@ def _supersedes(options: Any, camera: str) -> str | None:
 # --------------------------------------------------------------------------- recipes
 
 
+def level_and_crop_on(camera: str, recipe: Any, options: Any) -> bool:
+    """recipe.level_and_crop (default LEVEL_AND_CROP_DEFAULT, true): the recipe's own field when its
+    type has one, else the key on the recipe the caller handed over (options.recipes[camera], a dict
+    or an object; CameraRecipe has no such field yet, so a dict keeps it), else
+    options.level_and_crop. False keeps the v0.1 refusal of a tilted or shifted camera."""
+    given = (option(options, "recipes") or {}).get(camera)
+    for source in (recipe, given):
+        value = (
+            source.get("level_and_crop")
+            if isinstance(source, dict)
+            else getattr(source, "level_and_crop", None)
+        )
+        if value is not None:
+            return bool(value)
+    return bool(option(options, "level_and_crop", LEVEL_AND_CROP_DEFAULT))
+
+
 def recipe_for(camera: str, options: Any, saved: dict[str, CameraRecipe] | None = None) -> CameraRecipe:
     """options.recipes[camera] (a CameraRecipe or a dict of its fields), else the scene sidecar's,
     else the default recipe. Raises RecipeError for a recipe that must not be used."""
@@ -754,9 +839,11 @@ def _send_one(
         raise SendAbort("colour", f"colour: {exc}") from exc
 
     step("lint")
-    report = policy.lint_scene(camera)
+    level_on = level_and_crop_on(camera, recipe, options)
+    report = policy.lint_scene(camera, level_and_crop=level_on)
     if not report.passed:
         raise SendAbort("lint", "lint: " + "; ".join(report), report.problems)
+    result.warnings.extend(f"{w['code']}: {w['detail']}" for w in report.warnings)
 
     if option(options, "backup", False):
         step("backup")
@@ -772,7 +859,7 @@ def _send_one(
         journal.record("recipe", camera, detail=f"{recipe.engine_id} {recipe.preset}".strip())
     try:
         _render_and_write(
-            result, recipe, node, detected, colour_block, out_root, config, options, step, journal
+            result, recipe, node, detected, colour_block, out_root, config, options, step, journal, level_on
         )
     except SendAbort as abort:
         if journal is not None:
@@ -799,6 +886,7 @@ def _render_and_write(
     options: Any,
     step: Callable[[str], None],
     journal: safety.Journal | None,
+    level_on: bool = False,
 ) -> None:
     camera = result.camera
 
@@ -828,30 +916,40 @@ def _render_and_write(
 
     scene = digest.scene_digest()  # at the scene's own render size, with the elements in place
     base_w, base_h = int(rt_attr("renderWidth")), int(rt_attr("renderHeight"))
-    try:
-        plan = plan_frame(base_w, base_h, recipe)
-    except (RecipeError, ValueError) as exc:
-        raise SendAbort("recipe", f"recipe: {exc}") from exc
-    result.frame = plan.as_dict()
     frame = option(options, "frame")
     if frame is None:
         frame = current_frame()
     cam0 = digest.camera_digest(camera, frame=frame)
+    level = _level_plan(camera, cam0, base_w, base_h, frame) if level_on else None
+    try:
+        plan = plan_frame(base_w, base_h, recipe, level)
+    except (RecipeError, ValueError) as exc:
+        raise SendAbort("recipe", f"recipe: {exc}") from exc
+    result.frame = plan.as_dict()
+    if level is not None:
+        note("level", level.note)
 
     staging = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=option(options, "staging_dir")))
     try:
-        with _render_size(plan.width, plan.height), _widened(node, cam0, plan.widen) as widened:
+        with (
+            _render_size(plan.width, plan.height),
+            _levelled(node, level, frame, result.warnings) as render_node,
+            _widened(render_node, cam0, plan.widen) as widened,
+        ):
             cam = digest.camera_digest(
-                camera, frame=frame, recipe=recipe.digest_recipe(plan.safe_frame, plan.overscan)
+                str(render_node.name) if level is not None else camera,
+                frame=frame,
+                recipe=recipe.digest_recipe(plan.safe_frame, plan.overscan),
             )
-            if widened:
+            if level is not None:
+                cam["name"] = camera  # the manifest names the artist's camera, not the temporary copy
+            if widened or level is not None:
                 fx0 = (cam0.get("intrinsics_px") or {}).get("fx")
                 fx1 = (cam.get("intrinsics_px") or {}).get("fx")
                 if not fx0 or not fx1 or abs(fx1 - fx0) > FX_TOLERANCE * fx0:
-                    raise SendAbort(
-                        "render",
-                        f"overscan: widening the camera ({widened}) changed the pixel scale {fx0} -> {fx1}",
-                    )
+                    what = f"widening the camera ({widened})" if widened else "the level render"
+                    raise SendAbort("render", f"overscan: {what} changed the pixel scale {fx0} -> {fx1}")
+            if widened:
                 result.warnings.append(f"overscan widened the camera for the render: {widened}")
             result.warnings.extend(f"camera: {w}" for w in cam.get("warnings") or [])
             hero = cam.get("hero_frame")
@@ -860,7 +958,7 @@ def _render_and_write(
             step("render")
             try:
                 rr = render.render_packet_frame(
-                    node, staging / BEAUTY_NAME, staging / DISPLAY_NAME, plan.width, plan.height, hero
+                    render_node, staging / BEAUTY_NAME, staging / DISPLAY_NAME, plan.width, plan.height, hero
                 )
             except render.RenderFailed as exc:
                 raise SendAbort("render", f"render: {exc}") from exc
@@ -1033,7 +1131,7 @@ def run(
             refused[names[-1]] = str(exc)
             continue
         names.append(rec.camera)
-        recipes[rec.camera] = rec
+        recipes[rec.camera] = subject if isinstance(subject, dict) else rec  # a dict keeps level_and_crop
     opts["recipes"] = recipes
     options = opts
 

@@ -1,0 +1,30 @@
+# Motion recipe (T94): Vegetation Breeze (library shot as14). A locked tripod: the end crop is the start crop, so the
+# gust settles back onto the approved frame and the camera-lock gate measures the hold. Prompt law: motion only; no
+# pace words under the end pin; negative prompt under 30 words.
+schema: 1
+id: motion_vegetation_breeze
+title: Vegetation breeze
+kind: motion_croppair
+library: as14
+engine: kling-o3-4k
+shot_class: medium
+croppair:
+  z0: 1.0
+  z1: 1.0
+  center: [0.5, 0.5]
+  direction: locked
+motion:
+  move: locked_tripod
+  start_end: true
+  duration_s: 5
+  camera_fixed: true
+params:
+  n: 1
+mask:
+  editable_classes: []
+  region: none
+  lock_rest: false
+prompt: |-
+  Shot 1: medium shot through the planting toward the building, locked-off camera. Wind crosses the gardens in visible waves: the trees, grasses and palms move with real mass and lag, leaves turning light and dark, a gust arriving, peaking and settling back onto the first frame. Behind the moving green, the building stands perfectly calm and sharp.
+  SCENE LOCKS: architecture, materials and framing identical to the source; plants sway in place and never change shape or species; the wind is the only event; no camera movement.
+negative_prompt: camera movement, zoom, pan, morphing plants, changing species, warping geometry, flicker, texture crawl, new objects, people, text, logos

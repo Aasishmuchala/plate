@@ -22,7 +22,17 @@ export function checkConnection(c: Connection): ConnectVerdict {
   if (!source || !target) return { ok: false, code: "UNKNOWN_NODE", message: "unknown node" };
   const typed = checkHandles(source.data.kind, c.sourceHandle, target.data.kind, c.targetHandle);
   if (!typed.ok) return { ok: false, code: typed.code, message: typed.message };
-  const rules = validateEdge({ nodes, edges }, { id: `${c.source}->${c.target}`, source: c.source, target: c.target });
+  // Pass the resolved ports: VIDEO_LOCKED and the reference rules decide by handle (T81).
+  const rules = validateEdge(
+    { nodes, edges },
+    {
+      id: `${c.source}->${c.target}`,
+      source: c.source,
+      target: c.target,
+      sourceHandle: typed.sourceHandle,
+      targetHandle: typed.targetHandle,
+    },
+  );
   if (!rules.ok) return { ok: false, code: rules.code, message: rules.message };
   return { ok: true, connection: { ...c, sourceHandle: typed.sourceHandle, targetHandle: typed.targetHandle } };
 }

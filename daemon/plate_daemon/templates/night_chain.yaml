@@ -1,0 +1,33 @@
+# Plate -> LightMix(dusk) -> Mask -> Edit(night_relight_changelist, image from LightMix) -> Export.
+# The Edit's image edge comes from the LightMix, so the relit plate is what the engine re-lights further
+# (the pipeline's Edit-on-upstream base, T92). The Mask still hangs off the packet.
+schema: 1
+id: night_chain
+title: Night chain (dusk LightMix, change-list Edit)
+set: false
+nodes:
+  - suffix: plate
+    kind: Plate
+  - suffix: lightmix
+    kind: LightMix
+    params:
+      preset: dusk
+    inputs:
+      packet: "$packet"
+  - suffix: mask
+    kind: Mask
+    params:
+      classes: [sky, vegetation, people]
+    inputs:
+      source: "$packet"
+  - suffix: edit
+    kind: Edit
+    params:
+      recipe: night_relight_changelist
+    inputs:
+      image: lightmix
+      mask: mask
+  - suffix: export
+    kind: Export
+    inputs:
+      media: edit

@@ -415,6 +415,23 @@ describe("typed handles and rule refusals", () => {
     expect(within(screen.getByTestId("node-Motion")).getByTestId("node-refusal")).toHaveTextContent("motion is locked");
   });
 
+  it("passes the ports to the rules, so a packet edge into Motion is not video-locked", () => {
+    // Regression: the connect path used to drop sourceHandle/targetHandle, so VIDEO_LOCKED (which decides
+    // by port since T81) treated every edge into Motion as a still and refused the Plate packet wire.
+    mockFetch(() => undefined);
+    useGraphStore.getState().loadProject({
+      schema: 1,
+      nodes: [
+        { id: "p", kind: "Plate", label: "Plate", packetId: "pk", tier: "A" },
+        { id: "mo", kind: "Motion", label: "Motion" },
+      ],
+      edges: [],
+    });
+    mountCanvas();
+    const verdict = checkConnection(conn("p", "mo", "packet", "packet"));
+    expect(verdict).toMatchObject({ ok: true });
+  });
+
   it("turns a drop that isValidConnection refused into the refusal message", () => {
     const state = {
       isValid: false,

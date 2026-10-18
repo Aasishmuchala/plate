@@ -1,22 +1,31 @@
 """`plate`: run / gate / export / reindex / gc / pack / smoke over the daemon's own modules (router plan T34), and
-review / import / deliver / timer / spend over the wave 8 libraries (T78).
+review / import / deliver / timer / spend over the wave 8 libraries (T78); cards / estimate / doctor / recipes and
+the batch forms of run, export, review and spend are wave 9 (T103).
 
-    plate run <recipe.yaml|id> --project <dir> --packet <id|dir> [--engine ID] [--n N]
+    plate run <recipe.yaml|id> --project <dir> (--packet <id|dir> | --packets a,b,c) [--engine ID] [--n N]
               [--approve auto|human] [--envelope USD] [--shot-class C] [--param K=V]
               [--nda] [--allow-grades C0,C1,C2]            (the last two only when the project is new)
     plate gate <plate> <candidate> [--packet DIR] [--out report.json]
     plate export <run_id> --to <dir> --format tiff16|png16|exr [--override-reason TEXT] [--name N] [--project DIR]
+    plate export --runs r1,r2 --to <dir> [--format F] [--name-pattern P] [--project P]
+    plate export --project P --accepted --to <dir> [--format F] [--name-pattern P]
     plate reindex <project> [--verify]
     plate gc <project> [--dry-run] [--min-age-hours H]
     plate pack <project> --out <zip> [--full] [--max-blob-mb MB]
     plate smoke [--live --budget-usd N --engines a,b] [--out report.json]
-    plate review <project> --runs r1,r2 [--watermark REVIEW] [--out dir] [--max-width PX] [--title T] [--reply-to ADDR]
+    plate review <project> (--runs r1,r2 | --all-exportable) [--watermark REVIEW] [--out dir] [--max-width PX]
+                 [--title T] [--reply-to ADDR]
     plate import <file> --project <dir|id> --packet <id|dir> [--node ID] [--source higgsfield|runway|manual]
                  [--cost-usd X] [--note TEXT]
     plate deliver <run_id> --format prores4444|hevc|exr_sequence|av1_retag|fcpxml --to <dir>
                   [--name N] [--override-reason TEXT] [--project DIR]
     plate timer start|stop <deliverable_id> [--project P]     plate timer today [--project P]
-    plate spend <project> [--since ISO]
+    plate spend (<project> | --all-projects) [--since ISO] [--by engine|day|week]
+    plate cards [--project P] [--task T] [--shot-class C]
+    plate estimate --engine ID --task T --shot-class C (--count N | --seconds S) [--project P] [--param K=V]
+    plate doctor
+    plate recipes list [--project P]
+    plate recipes save <recipe.yaml> --scope studio|project [--project P] [--overwrite]
 
 `<project>` is a project folder or a project id this machine knows.
 
@@ -39,6 +48,27 @@ it is gated against the packet, ledgered and exportable like any other, and prin
 `timer` is the one command that talks to a running daemon (`POST /timer`, `GET /timer/today`, urllib, the
 bearer token from the install's config, loopback addresses only; `PLATE_DAEMON_URL` or `PLATE_PORT` says
 where). `spend` prints `Ledger.summarize` of the project's `runs.jsonl` per engine.
+
+Wave 9 (T103), all of it over modules that already exist:
+
+- `run --packets a,b,c` lays one chain per packet with `graph_build.chain_for_packet` (one column each), then
+  quotes, asks and runs each packet under the same `--approve` rules; one `--envelope` is a ceiling for the whole
+  command. It prints a line per packet with the run id and the verdict, and exits 2 if any run ended GATE_FAIL.
+  A packet that is refused (custody, a cap, a no) or cannot be run is a line of its own and the others go on.
+- `cards` is `GET /engines/cards` and `estimate` prices one cell: the engine's quote for `--count` outputs (or
+  `--seconds` of video) divided by the cell's Wilson lower bound; with no card it says so and divides by 1.
+  Without `--project` both read the ledgers of every project this machine knows.
+- `export --runs` / `--accepted` is the batch export (`routes.export_batch.export_many`): each run goes through the
+  single export's guards and one that cannot leave never stops the rest. `review --all-exportable` takes every
+  DONE (or overridden GATE_FAIL) still of the project that the review guard lets through.
+- `spend --by day|week` and `--all-projects` fold the ledgers with `routes.spend.spend_report`; the `cost per
+  accepted` column shows once the window holds an accepted take (before that the table is the T78 one).
+- `doctor` only looks (it always exits 0): git HEAD against origin/main, the Max startup script against the
+  installed copy (config.json `startup_dir`, `PLATE_MAX_STARTUP_DIR`, else the default Max 2026 profile folder),
+  the built UI, ffmpeg and ffprobe, the pixels worker and the token. `recipes` lists and saves runnable recipes.
+- `smoke` knows the Magnific Precision v2 route as a live-only case (a 128 px PNG, an image expected back): the
+  vendor's address and model id are unconfirmed and nothing is recorded, so the fixture smoke skips it with that
+  reason and it does not count among the adapters ok.
 
 `run` follows the doctrine rules in code: the packet's plate is the only starting point (no text-to-image), the
 engine never sees more than egress prepared, and the quote is printed and approved before a byte leaves.
@@ -65,6 +95,7 @@ import inspect
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -75,13 +106,14 @@ import zipfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TextIO
 
 import httpx
 
-from . import __version__, canvas_rules, recipes
+from . import __version__, canvas_rules, graph_build, recipes
 from .cas import CAS
 from .config import PROJECT_ID_RE, ConfigError, Settings, host_port
 from .custody import CustodyViolation
@@ -92,7 +124,7 @@ from .fsutil import replace_with_retry, temp_sibling, write_json_atomic
 from .imports import import_file
 from .index import Index, RebuildError
 from .ingest import PacketConflict, PacketInvalid, begin_ingest, finish_ingest, prepare_ingest
-from .ledger import Ledger
+from .ledger import Ledger, LedgerError
 from .lock import ProjectLocked
 from .machine import DuplicateRequest, IllegalTransition, RunNotFound, get_run, transition
 from .pipeline import FAKE_ENGINE_ID, PacketView, Pipeline, PipelineError
@@ -353,21 +385,27 @@ def _existing_project(session: Session, ref: str) -> Project | None:
         raise CliExit(EXIT_USAGE, f"{ref}: {e}") from e
 
 
+def _check_same_project(prepared: Any, project: Project) -> None:
+    if prepared.project_id != project.project_id:
+        raise CliExit(
+            EXIT_USAGE,
+            f"packet {prepared.packet_id} belongs to project {prepared.project_id!r}, "
+            f"but {project.root} is project {project.project_id!r}",
+        )
+
+
 def _open_project(session: Session, args: argparse.Namespace, prepared: Any | None) -> Project:
     """The project folder: the one that exists, else a new one made from the packet's project id."""
     project = _existing_project(session, args.project)
     if project is None:
         if prepared is None:
             raise CliExit(
-                EXIT_USAGE, f"{args.project}: no project here; pass --packet <folder> to create one"
+                EXIT_USAGE,
+                f"{args.project}: no project here; pass --packet <folder> (or --packets) to create one",
             )
         project = _create_project(session, Path(args.project).resolve(), prepared.project_id, args)
-    if prepared is not None and prepared.project_id != project.project_id:
-        raise CliExit(
-            EXIT_USAGE,
-            f"packet {prepared.packet_id} belongs to project {prepared.project_id!r}, "
-            f"but {project.root} is project {project.project_id!r}",
-        )
+    if prepared is not None:
+        _check_same_project(prepared, project)
     session.index.set_project_root(project.project_id, project.root, project.custody)
     return project
 
@@ -501,6 +539,101 @@ def _router_check(
     return {"mode": mode, "verdict": verdict, **numbers}
 
 
+def _packet_summary(pv: PacketView, packet_id: str, project_id: str) -> dict[str, Any]:
+    """What `graph_build` reads of `GET /packets/{id}/summary`: the packet's tier and camera, and its legend
+    entries with `editable` / `locked` resolved by the packet's policy (the route's own resolution)."""
+    manifest = pv.manifest
+    editable, locked = set(pv.editable_ids()), set(pv.locked_ids())
+    entries = [
+        {
+            "id": e.get("id"),
+            "kind": e.get("kind"),
+            "name": e.get("name"),
+            "class": e.get("class"),
+            "editable": e.get("id") in editable,
+            "locked": e.get("id") in locked,
+        }
+        for e in ((pv.legend or {}).get("entries") or [])
+        if isinstance(e, dict)
+    ]
+    return {
+        "packet_id": packet_id,
+        "project_id": project_id,
+        "shot_id": manifest.get("shot_id"),
+        "tier": pv.tier,
+        "camera": manifest.get("camera"),
+        "legend": {"entries": entries},
+    }
+
+
+def _chain_template(recipe: RunnableRecipe, mask: dict[str, Any] | None) -> dict[str, Any]:
+    """The chain `plate run` lays for one packet, as a `graph_build` template: Plate -> (Mask) -> Edit. The Edit
+    takes the plate as its base image and the Mask, when there is one, as its mask."""
+    nodes: list[dict[str, Any]] = [{"suffix": "plate", "kind": "Plate"}]
+    edit_inputs = {"image": "$plate"}
+    if mask is not None:
+        entry: dict[str, Any] = {"suffix": "mask", "kind": "Mask", "inputs": {"source": "$packet"}}
+        classes = [str(c) for c in (recipe.mask.get("editable_classes") or [])]
+        if "params" in mask and classes:
+            entry["params"] = {"classes": classes}  # graph_build picks the ids; _set_mask pins them
+        nodes.append(entry)
+        edit_inputs["mask"] = "mask"
+    nodes.append(
+        {
+            "suffix": "edit",
+            "kind": "Edit",
+            "label": recipe.title,
+            "params": {"region_crop": (recipe.mask or {}).get("region") == "mask_bbox"},
+            "inputs": edit_inputs,
+        }
+    )
+    return {"id": "cli_run", "title": recipe.title, "set": False, "nodes": nodes}
+
+
+def _fields(node: dict[str, Any]) -> dict[str, Any]:
+    """The dict a node's own fields live in: `data` for a node the UI saved, the node itself for one built here."""
+    data = node.get("data")
+    return data if isinstance(data, dict) else node
+
+
+def _set_mask(node: dict[str, Any], mask: dict[str, Any]) -> None:
+    """Put the Mask node's fields (`params.ids` or `outputHash`) on `node`, keeping what else it carries."""
+    fields = _fields(node)
+    params = dict(fields.get("params") or {})
+    if "params" in mask:
+        params["ids"] = list(mask["params"]["ids"])
+        fields.pop("outputHash", None)
+    else:
+        params.pop("ids", None)
+        fields["outputHash"] = mask["outputHash"]
+    if params:
+        fields["params"] = params
+    else:
+        fields.pop("params", None)
+
+
+def _existing_chain(
+    graph: dict[str, Any], packet_id: str, recipe: RunnableRecipe, wants_mask: bool
+) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+    """The Edit (and its Mask) an earlier `plate run` of this recipe left on this packet's Plate: a re-run is a
+    new attempt of the same node, not a second chain. The Edit is told by its label (the recipe's title) and
+    its Plate; a chain whose Mask is there or not differently from what this run needs is not reused."""
+    g = canvas_rules.as_graph(graph)
+    raw = {n.get("id"): n for n in graph["nodes"] if isinstance(n, dict)}
+    kinds = {n["id"]: n.get("kind") for n in g.nodes}
+    for node in g.nodes:
+        if node.get("kind") != "Edit" or node.get("label") != recipe.title:
+            continue
+        if not any(p.get("packetId") == packet_id for p in canvas_rules.upstream_plates(g, node["id"])):
+            continue
+        masks = [
+            e["source"] for e in g.edges if e["target"] == node["id"] and kinds.get(e["source"]) == "Mask"
+        ]
+        if bool(masks) == wants_mask:
+            return raw[node["id"]], (raw[masks[0]] if masks else None)
+    return None
+
+
 def _graph_for(
     project: Project,
     packet_id: str,
@@ -509,42 +642,40 @@ def _graph_for(
     engine_id: str,
     mask: dict[str, Any] | None,
 ) -> str:
-    """Add the Plate (once per packet), an optional Mask and the recipe's Edit node; returns the Edit id.
+    """Add the packet's chain (Plate once, an optional Mask and the recipe's Edit) with
+    `graph_build.chain_for_packet`, one column right of what the graph holds; returns the Edit id. A recipe
+    already run on this packet reuses its Edit and Mask, so the run is another attempt of the same node.
     `mask` is the Mask node's fields (`params.ids` or `outputHash`); None leaves the packet's policy to decide."""
     graph = json.loads(json.dumps(project.graph))
-    nodes, edges = graph["nodes"], graph["edges"]
-    plate = next((n for n in nodes if n.get("kind") == "Plate" and n.get("packetId") == packet_id), None)
-    if plate is None:
-        plate = {
-            "id": f"plate-{packet_id[-8:].lower()}",
-            "kind": "Plate",
-            "packetId": packet_id,
-            "tier": pv.tier,
-            "label": "Plate",
+    found = _existing_chain(graph, packet_id, recipe, mask is not None)
+    if found is not None:
+        edit, mask_node = found
+        fields = _fields(edit)
+        fields["params"] = {
+            **(fields.get("params") or {}),
+            "engine": engine_id,
+            "region_crop": (recipe.mask or {}).get("region") == "mask_bbox",
         }
-        nodes.append(plate)
-    src = plate["id"]
-    tag = recipe.id.replace("_", "-")
-    edit_id = f"edit-{tag}"
-    if mask is not None:
-        mask_id = f"mask-{tag}"
-        nodes[:] = [n for n in nodes if n.get("id") != mask_id] + [
-            {"id": mask_id, "kind": "Mask", "label": "Mask", **mask}
-        ]
-        edges[:] = [e for e in edges if e.get("target") != mask_id] + [
-            {"id": f"{src}->{mask_id}", "source": src, "target": mask_id}
-        ]
-        src = mask_id
-    edit = {
-        "id": edit_id,
-        "kind": "Edit",
-        "label": recipe.title,
-        "params": {"engine": engine_id, "region_crop": (recipe.mask or {}).get("region") == "mask_bbox"},
-    }
-    nodes[:] = [n for n in nodes if n.get("id") != edit_id] + [edit]
-    edges[:] = [e for e in edges if e.get("target") != edit_id] + [
-        {"id": f"{src}->{edit_id}", "source": src, "target": edit_id}
-    ]
+        if mask is not None and mask_node is not None:
+            _set_mask(mask_node, mask)
+        edit_id = str(edit["id"])
+    else:
+        before = {str(n.get("id")) for n in graph["nodes"] if isinstance(n, dict)}
+        try:
+            graph = graph_build.chain_for_packet(
+                graph,
+                _packet_summary(pv, packet_id, project.project_id),
+                template=_chain_template(recipe, mask),
+                engine_id=engine_id,
+                column=graph_build.next_column(graph),
+            )
+        except graph_build.GraphBuildError as e:
+            raise CliExit(EXIT_USAGE, f"cannot lay the chain for {packet_id}: {e}") from e
+        added = [n for n in graph["nodes"] if str(n.get("id")) not in before]
+        edit = next(n for n in added if n.get("kind") == "Edit")
+        if mask is not None:
+            _set_mask(next(n for n in added if n.get("kind") == "Mask"), mask)
+        edit_id = str(edit["id"])
     problems = canvas_rules.check_nodes(graph) or canvas_rules.validate_graph(graph)
     if problems:
         raise CliExit(
@@ -586,37 +717,85 @@ def _approved(session: Session, how: str, total: float, n: int) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-def cmd_run(session: Session, args: argparse.Namespace) -> int:
-    recipe = _load_recipe(args.recipe)
-    fake = fake_engine_from_env(session.env)
-    engine_id = _engine_choice(session, args.engine or recipe.engine, fake)
-    n = args.n if args.n is not None else int(recipe.params.get("n") or 1)
-    if n < 1:
-        raise CliExit(EXIT_USAGE, "--n must be at least 1")
-    if args.envelope is not None and args.envelope <= 0:
-        raise CliExit(EXIT_USAGE, "--envelope must be a positive USD amount")
-    shot_class = args.shot_class or recipe.shot_class
-    pipeline = session.pipeline(fake)
+@dataclass
+class _PacketOutcome:
+    """What one packet of a `plate run` came to: the runs it started, or why it started none."""
 
-    prepared = None
-    if Path(args.packet).is_dir():
-        try:
-            prepared = prepare_ingest(Path(args.packet).resolve())
-        except PacketInvalid as e:
-            raise CliExit(EXIT_USAGE, f"packet {args.packet}: {'; '.join(e.errors[:5])}") from e
-    project = _open_project(session, args, prepared)
+    ref: str
+    packet_id: str | None = None
+    states: dict[str, RunState] = field(default_factory=dict)
+    error: str | None = None
+    code: int | None = None
+
+
+# What ends one packet of a `--packets` run without ending the others: a refusal (custody, a cap, a no), a packet
+# that cannot be ingested or quoted, a run that cannot be recorded. Anything else is a bug and stops the command.
+PACKET_ERRORS: tuple[type[BaseException], ...] = (
+    CliExit,
+    CustodyViolation,
+    DuplicateRequest,
+    EnvelopeRequired,  # EnvelopeExceeded and AutoApprovalDenied are subclasses
+    IllegalTransition,
+    PacketConflict,
+    PacketInvalid,
+    PipelineError,
+    ProjectLocked,
+    QuoteExpired,
+    QuoteNotFound,
+)
+
+
+def _packet_refs(args: argparse.Namespace) -> list[str]:
+    """`--packet X` or `--packets a,b,c` as a list of ids and folders (a repeat is run once)."""
+    if bool(args.packet) == bool(args.packets):
+        raise CliExit(EXIT_USAGE, "give --packet <id|folder>, or --packets a,b,c (not both)")
+    raw = [args.packet] if args.packet else args.packets.split(",")
+    refs = list(dict.fromkeys(r.strip() for r in raw if r.strip()))
+    if not refs:
+        raise CliExit(EXIT_USAGE, "--packets needs at least one packet id or folder")
+    return refs
+
+
+def _prepare_packet(ref: str) -> Any | None:
+    """The validated packet folder `ref` names, or None when `ref` is the id of an ingested packet."""
+    if not Path(ref).is_dir():
+        return None
+    try:
+        return prepare_ingest(Path(ref).resolve())
+    except PacketInvalid as e:
+        raise CliExit(EXIT_USAGE, f"packet {ref}: {'; '.join(e.errors[:5])}") from e
+
+
+@dataclass
+class _RunPlan:
+    """What every packet of one `plate run` shares."""
+
+    args: argparse.Namespace
+    pipeline: Pipeline
+    project: Project
+    recipe: RunnableRecipe
+    engine_id: str
+    shot_class: str
+    n: int
+    prompt: str
+    params: Mapping[str, Any]
+    multi: bool
+    # the one envelope of a command that named --envelope, made with the first quote and used by every packet
+    envelope_id: str | None = None
+
+
+def _run_packet(
+    session: Session, plan: _RunPlan, ref: str, prepared: Any | None, outcome: _PacketOutcome
+) -> None:
+    """One packet: ingest (or find) it, lay its chain, quote, ask, run. Fills `outcome.states`; a refusal or a
+    problem is raised."""
+    args, pipeline, project, recipe = plan.args, plan.pipeline, plan.project, plan.recipe
+    engine_id, n = plan.engine_id, plan.n
     pid = project.project_id
-    packet_id = _packet_in_project(session, pipeline, project, args.packet, prepared)
+    packet_id = _packet_in_project(session, pipeline, project, ref, prepared)
+    outcome.packet_id = packet_id
     pv = pipeline.packet(pid, packet_id)
-    _router_check(session, recipe, pv, shot_class)
-
-    sheet = ProjectSheet.from_dict((project.doc.get("settings") or {}).get("project_sheet"))
-    prompt = recipes.assemble_runnable(recipe, sheet)
-    left = recipes.unfilled_count(prompt)
-    if left:
-        session.warn(
-            f"{left} [TOKEN](s) in the prompt are unfilled: set settings.project_sheet in project.json"
-        )
+    _router_check(session, recipe, pv, plan.shot_class)
 
     mask: dict[str, Any] | None = None
     ids = _mask_ids(recipe, pv)
@@ -628,6 +807,82 @@ def cmd_run(session: Session, args: argparse.Namespace) -> int:
         session.say("mask: the whole frame (the packet's locked ids stay locked)")
     edit_id = _graph_for(project, packet_id, pv, recipe, engine_id, mask)
 
+    body = {
+        "engine_id": engine_id,
+        "packet_id": packet_id,
+        "prompt": plan.prompt,
+        "params": dict(plan.params),
+        "attempt": _next_attempt(session, pid, edit_id, packet_id),
+        "region_crop": recipe.mask.get("region") == "mask_bbox",
+    }
+    with session.index.project(pid) as conn:
+        run, quote = pipeline.quote_node(conn, pid, edit_id, body)
+        runs = [run]
+        if n > 1:
+            runs = fan_out(conn, run.id, n, now=utcnow())
+            for r in runs[1:]:
+                session.index.remember(r.id, pid)
+                pipeline.after(conn, pid, r.id, RunState.DRAFT)
+        _show_quote(session, run, quote, n)
+        envelope_id = plan.envelope_id
+        if args.envelope is not None and envelope_id is None:
+            envelope_id = plan.envelope_id = create_envelope(
+                conn,
+                owner="user:cli",
+                max_total_usd=args.envelope,
+                max_per_run_usd=args.envelope,
+                ttl_s=ENVELOPE_TTL_S,
+                now=utcnow(),
+            ).id
+            session.index.remember(envelope_id, pid)
+            what = "the whole command" if plan.multi else "this run"
+            session.say(f"  envelope {envelope_id}: at most {usd(args.envelope)} for {what}")
+        try:
+            if not _approved(session, args.approve, quote.price_usd * n, n):
+                raise CliExit(EXIT_REFUSED, "not approved: nothing was sent")
+            approved = pipeline.approve(conn, pid, run.id, args.approve, envelope_id, reason="plate run")
+        except PACKET_ERRORS:
+            for r in runs:  # a refused quote is not left to expire in the index
+                if get_run(conn, r.id).state is RunState.QUOTED:
+                    transition(
+                        conn, r.id, RunState.CANCELLED, actor="human", reason="not approved at the CLI"
+                    )
+                    pipeline.after(conn, pid, r.id, RunState.QUOTED)
+            raise
+        for r in approved:
+            pipeline.queue(conn, pid, r.id)
+    session.say(f"running {len(approved)} run(s) in this process ...")
+    outcome.states = {r.id: pipeline.execute(r.id, pid) for r in approved}
+
+
+def cmd_run(session: Session, args: argparse.Namespace) -> int:
+    recipe = _load_recipe(args.recipe)
+    refs = _packet_refs(args)
+    fake = fake_engine_from_env(session.env)
+    engine_id = _engine_choice(session, args.engine or recipe.engine, fake)
+    n = args.n if args.n is not None else int(recipe.params.get("n") or 1)
+    if n < 1:
+        raise CliExit(EXIT_USAGE, "--n must be at least 1")
+    if args.envelope is not None and args.envelope <= 0:
+        raise CliExit(EXIT_USAGE, "--envelope must be a positive USD amount")
+    shot_class = args.shot_class or recipe.shot_class
+    pipeline = session.pipeline(fake)
+
+    # every packet folder is read, and agrees on its project, before a project is made or a byte is sent
+    prepared = [_prepare_packet(ref) for ref in refs]
+    project = _open_project(session, args, next((p for p in prepared if p is not None), None))
+    for p in prepared:
+        if p is not None:
+            _check_same_project(p, project)
+    pid = project.project_id
+
+    sheet = ProjectSheet.from_dict((project.doc.get("settings") or {}).get("project_sheet"))
+    prompt = recipes.assemble_runnable(recipe, sheet)
+    left = recipes.unfilled_count(prompt)
+    if left:
+        session.warn(
+            f"{left} [TOKEN](s) in the prompt are unfilled: set settings.project_sheet in project.json"
+        )
     params = _parse_params(args.param)
     manifest = pipeline.manifests.get(engine_id)
     declared = {p.name for p in manifest.params} if manifest is not None else set()
@@ -642,57 +897,31 @@ def cmd_run(session: Session, args: argparse.Namespace) -> int:
             f"note: the {recipe.params['repair_pass']!r} repair pass is a follow-up run, not part of this one"
         )
 
-    body = {
-        "engine_id": engine_id,
-        "packet_id": packet_id,
-        "prompt": prompt,
-        "params": params,
-        "attempt": _next_attempt(session, pid, edit_id, packet_id),
-        "region_crop": recipe.mask.get("region") == "mask_bbox",
-    }
-    with session.index.project(pid) as conn:
-        run, quote = pipeline.quote_node(conn, pid, edit_id, body)
-        runs = [run]
-        if n > 1:
-            runs = fan_out(conn, run.id, n, now=utcnow())
-            for r in runs[1:]:
-                session.index.remember(r.id, pid)
-                pipeline.after(conn, pid, r.id, RunState.DRAFT)
-        _show_quote(session, run, quote, n)
-        envelope_id = None
-        if args.envelope is not None:
-            envelope_id = create_envelope(
-                conn,
-                owner="user:cli",
-                max_total_usd=args.envelope,
-                max_per_run_usd=args.envelope,
-                ttl_s=ENVELOPE_TTL_S,
-                now=utcnow(),
-            ).id
-            session.index.remember(envelope_id, pid)
-            session.say(f"  envelope {envelope_id}: at most {usd(args.envelope)} for this run")
+    plan = _RunPlan(
+        args, pipeline, project, recipe, engine_id, shot_class, n, prompt, params, multi=len(refs) > 1
+    )
+    multi = plan.multi
+    outcomes: list[_PacketOutcome] = []
+    for ref, prep in zip(refs, prepared, strict=True):
+        outcome = _PacketOutcome(ref)
+        outcomes.append(outcome)
         try:
-            if not _approved(session, args.approve, quote.price_usd * n, n):
-                raise CliExit(EXIT_REFUSED, "not approved: nothing was sent")
-            approved = pipeline.approve(conn, pid, run.id, args.approve, envelope_id, reason="plate run")
-        except (CliExit, CustodyViolation, AutoApprovalDenied, EnvelopeExceeded, EnvelopeRequired):
-            for r in runs:  # a refused quote is not left to expire in the index
-                if get_run(conn, r.id).state is RunState.QUOTED:
-                    transition(
-                        conn, r.id, RunState.CANCELLED, actor="human", reason="not approved at the CLI"
-                    )
-                    pipeline.after(conn, pid, r.id, RunState.QUOTED)
-            raise
-        for r in approved:
-            pipeline.queue(conn, pid, r.id)
-    session.say(f"running {len(approved)} run(s) in this process ...")
-    states = {r.id: pipeline.execute(r.id, pid) for r in approved}
-    return _report_runs(session, pid, states)
+            _run_packet(session, plan, ref, prep, outcome)
+        except PACKET_ERRORS as e:
+            if not multi:
+                raise
+            outcome.error, outcome.code = str(e) or type(e).__name__, _code_for(e)
+            session.warn(f"packet {outcome.packet_id or ref}: {outcome.error}")
+    if not multi:
+        return _report_runs(session, pid, outcomes[0].states)
+    return _report_packets(session, pid, outcomes)
 
 
-def _report_runs(session: Session, pid: str, states: dict[str, RunState]) -> int:
-    done: list[str] = []
-    gate_fail: list[str] = []
+def _describe_runs(
+    session: Session, pid: str, states: Mapping[str, RunState]
+) -> list[tuple[str, RunState, str]]:
+    """(run id, state, the one line that says how it ended) for each run, in order."""
+    out: list[tuple[str, RunState, str]] = []
     with session.index.project(pid) as conn:
         for rid in states:
             r = get_run(conn, rid)
@@ -706,11 +935,19 @@ def _report_runs(session: Session, pid: str, states: dict[str, RunState]) -> int
                 line += f", report {r.gate_report_path}"
             if r.state in (RunState.FAILED, RunState.REFUSED, RunState.CANCELLED, RunState.EXPIRED):
                 line += f" ({r.error})"
-            session.say(line)
-            if r.state is RunState.DONE:
-                done.append(r.id)
-            elif r.state is RunState.GATE_FAIL:
-                gate_fail.append(r.id)
+            out.append((r.id, r.state, line))
+    return out
+
+
+def _report_runs(session: Session, pid: str, states: dict[str, RunState]) -> int:
+    done: list[str] = []
+    gate_fail: list[str] = []
+    for rid, state, line in _describe_runs(session, pid, states):
+        session.say(line)
+        if state is RunState.DONE:
+            done.append(rid)
+        elif state is RunState.GATE_FAIL:
+            gate_fail.append(rid)
     if done:
         session.say(f"next: plate export {done[0]} --to <folder> --format tiff16")
         return EXIT_OK
@@ -720,6 +957,37 @@ def _report_runs(session: Session, pid: str, states: dict[str, RunState]) -> int
         )
         return EXIT_GATE_FAIL
     return EXIT_ERROR
+
+
+def _report_packets(session: Session, pid: str, outcomes: Sequence[_PacketOutcome]) -> int:
+    """One line per run, led by its packet (a packet that did not run gets a line saying why). Exit 2 when any run
+    ended GATE_FAIL, else 3 for a refusal, 4 for a packet that could not start, 1 for a run that failed."""
+    done: list[str] = []
+    gate_fail: list[str] = []
+    codes: list[int] = []
+    for o in outcomes:
+        label = o.packet_id or o.ref
+        if o.error is not None:
+            session.say(f"packet {label}: not run ({o.error})")
+            codes.append(o.code or EXIT_ERROR)
+            continue
+        for rid, state, line in _describe_runs(session, pid, o.states):
+            session.say(f"packet {label}: {line}")
+            if state is RunState.DONE:
+                done.append(rid)
+            elif state is RunState.GATE_FAIL:
+                gate_fail.append(rid)
+            else:
+                codes.append(EXIT_ERROR)
+    if done:
+        session.say(f"next: plate export --runs {','.join(done)} --to <folder> --format tiff16")
+    if gate_fail:
+        session.say(
+            f'the gates failed on {len(gate_fail)} run(s); `plate export {gate_fail[0]} --override-reason "..."` '
+            "ships one on the record"
+        )
+        return EXIT_GATE_FAIL
+    return next((c for c in (EXIT_REFUSED, EXIT_USAGE, EXIT_ERROR) if c in codes), EXIT_OK)
 
 
 # ---------------------------------------------------------------------------- plate gate
@@ -850,6 +1118,21 @@ def _locate(session: Session, run_id: str, project_ref: str | None) -> tuple[str
 
 
 def cmd_export(session: Session, args: argparse.Namespace) -> int:
+    if sum([bool(args.run_id), bool(args.runs), bool(args.accepted)]) != 1:
+        raise CliExit(
+            EXIT_USAGE,
+            "give one run id, or --runs r1,r2, or --accepted (with --project): exactly one of them",
+        )
+    if args.run_id:
+        if args.name_pattern:
+            raise CliExit(
+                EXIT_USAGE, "--name-pattern names a batch (--runs, --accepted); --name names one file"
+            )
+        return _export_one(session, args)
+    return _export_batch(session, args)
+
+
+def _export_one(session: Session, args: argparse.Namespace) -> int:
     from .export import recorded_override
 
     pid, project_dir = _locate(session, args.run_id, args.project)
@@ -894,6 +1177,82 @@ def cmd_export(session: Session, args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------- plate reindex / gc / pack
+
+
+def _fresh_index(session: Session, project: Project) -> None:
+    """Rebuild this machine's index of the project from its folder when it has none yet (the accepts and
+    overrides a batch reads live there; the rebuild replays them from the ledger)."""
+    if not session.index.db_path(project.project_id).is_file():
+        with held(project.root):
+            session.index.rebuild_from_project(project.root)
+
+
+def _export_batch(session: Session, args: argparse.Namespace) -> int:
+    from .routes.export_batch import DEFAULT_PATTERN, export_many
+
+    if args.override_reason:
+        raise CliExit(
+            EXIT_USAGE,
+            "a batch export has no typed override: record one per run first (`plate export <run_id> "
+            "--override-reason ...`), then export the batch",
+        )
+    if args.name:
+        raise CliExit(EXIT_USAGE, "--name names one file; a batch is named with --name-pattern")
+    run_ids: list[str] | None = None
+    if args.accepted:
+        if not args.project:
+            raise CliExit(
+                EXIT_USAGE, "--accepted needs --project <dir|id>: the accepted runs of which project?"
+            )
+        project = _load_project(session, args.project)
+        _fresh_index(session, project)
+        pid = project.project_id
+    else:
+        run_ids = list(dict.fromkeys(r.strip() for r in args.runs.split(",") if r.strip()))
+        if not run_ids:
+            raise CliExit(EXIT_USAGE, "--runs needs at least one run id (r1,r2)")
+        if args.project:
+            project = _load_project(session, args.project)
+            _runs_indexed(session, project, run_ids)
+            pid = project.project_id
+        else:
+            homes = {rid: session.index.locate_run(rid) for rid in run_ids}
+            lost = next((rid for rid, home in homes.items() if home is None), None)
+            if lost is not None:
+                raise CliExit(
+                    EXIT_USAGE,
+                    f"run {lost} is not in this machine's index; name its folder with --project <dir>",
+                )
+            if len(set(homes.values())) != 1:
+                raise CliExit(
+                    EXIT_USAGE,
+                    f"these runs belong to {len(set(homes.values()))} projects: export one project at a time",
+                )
+            pid = str(next(iter(homes.values())))
+    result = export_many(
+        session.pipeline(),
+        pid,
+        out_dir=Path(args.to).resolve(),
+        run_ids=run_ids,
+        accepted=bool(args.accepted),
+        fmt=args.format,
+        name_pattern=args.name_pattern or DEFAULT_PATTERN,
+        by="human",
+    )
+    for row in result["exported"]:
+        session.say(f"exported {row['path']}")
+        session.say(f"gate report {row['sidecar']}")
+    for row in result["refused"]:
+        code = f" ({row['code']})" if row.get("code") else ""
+        session.warn(f"not exported: run {row['run_id']}: {row['error']}{code}: {row.get('detail', '')}")
+    exported, refused = len(result["exported"]), len(result["refused"])
+    if args.accepted and not exported and not refused:
+        session.say(f"{pid}: no accepted runs yet, nothing exported")
+    else:
+        session.say(f"exported {exported} run(s) to {Path(args.to).resolve()}; {refused} refused")
+    if any(row.get("code") == "GATE_FAIL" for row in result["refused"]):
+        return EXIT_GATE_FAIL
+    return EXIT_ERROR if refused else EXIT_OK
 
 
 def cmd_reindex(session: Session, args: argparse.Namespace) -> int:
@@ -1095,7 +1454,8 @@ class SmokeCase:
     `plate_engines/contract` its recordings live in, `prefer` name fragments that pick the right answer when
     several recordings share a path; `keys` are groups of environment variables of which one must be set for a
     live call. A vendor model id the manifest does not know yet (`unverified_p0`) is filled in for the fixtures
-    only: the live smoke is where it gets confirmed."""
+    only: the live smoke is where it gets confirmed. A `live_only` case has no recording (the vendor's answer
+    is not established yet); the fixture smoke skips it and says why."""
 
     engine_id: str
     provider: str
@@ -1104,6 +1464,8 @@ class SmokeCase:
     keys: tuple[tuple[str, ...], ...] = ()
     fixture_model_id: str | None = None
     fixture_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    live_only: str | None = None  # why there is no recorded answer: the case is skipped on fixtures
+    image_px: int | None = None  # send a PNG this many pixels square instead of the fixture room (a tiny one)
 
 
 SMOKE_CASES: tuple[SmokeCase, ...] = (
@@ -1127,6 +1489,14 @@ SMOKE_CASES: tuple[SmokeCase, ...] = (
     ),
     SmokeCase("seedance-2.5-i2v", "byteplus", ("byteplus",), ("i2v_a",), (("ARK_API_KEY",),)),
     SmokeCase("seedance-2.5-i2v", "wavespeed", ("wavespeed",), ("i2v_a",), (("WAVESPEED_API_KEY",),)),
+    SmokeCase(
+        "magnific-precision-v2",
+        "magnific",
+        (),
+        keys=(("MAGNIFIC_API_KEY", "FREEPIK_API_KEY"),),
+        live_only="the vendor's address and model id are unconfirmed (flag unverified_p0), nothing is recorded",
+        image_px=128,
+    ),
 )
 SMOKE_CASE_BY_ROUTE = {(c.engine_id, c.provider): c for c in SMOKE_CASES}
 FIXTURE_ENV_EXTRA = {"GOOGLE_CLOUD_PROJECT": "plate-test"}
@@ -1204,9 +1574,10 @@ def fixture_env(case: SmokeCase) -> Iterator[None]:
                 os.environ[k] = old
 
 
-def smoke_png() -> bytes:
+def smoke_png(square_px: int | None = None) -> bytes:
     """The smoke image: the committed Blender fixture room when the repo has it, else a gradient (client
-    imagery never enters the repo or a smoke)."""
+    imagery never enters the repo or a smoke). `square_px` shrinks it to a square that size, for an engine
+    that is billed by the pixel."""
     import cv2
     import numpy as np
 
@@ -1218,6 +1589,8 @@ def smoke_png() -> bytes:
     else:
         ramp = np.linspace(0, 255, 640, dtype=np.uint8)[None, :, None]
         rgb = np.repeat(np.repeat(ramp, 360, axis=0), 3, axis=2)
+    if square_px is not None:
+        rgb = cv2.resize(rgb, (square_px, square_px), interpolation=cv2.INTER_AREA)
     ok, buf = cv2.imencode(".png", np.ascontiguousarray(rgb[..., ::-1]))
     if not ok:
         raise CliExit(EXIT_ERROR, "could not encode the smoke image")
@@ -1397,6 +1770,8 @@ def cmd_smoke(
                     row.detail = "no recorded minimum-cost call for this adapter yet"
                     if manifest.model_id is None and route.model_slug is None:
                         row.detail += "; the manifest has no vendor model id yet (flag unverified_p0)"
+                elif not live and case.live_only:
+                    row.detail = f"live only: {case.live_only}"
                 elif live and (missing := [g for g in case.keys if not any(session.env.get(v) for v in g)]):
                     row.detail = "set " + " and ".join("/".join(g) for g in missing)
                 elif not live and manifest.model_id is None and case.fixture_model_id is None:
@@ -1474,8 +1849,15 @@ def _smoke_one(
         kwargs["staging_dir"] = tmp / f"stage-{manifest.id}-{route.route_id}"
     try:
         with contextlib.nullcontext() if live else fixture_env(case):
-            adapter = cls(use, route, factory(case, manifest, route, live), **kwargs)
-            inputs = smoke_inputs(use, png, still)
+            transport = factory(case, manifest, route, live)
+            if case.live_only and isinstance(
+                transport, ReplayTransport
+            ):  # a recording stands in: it has no answer
+                row.status, row.detail = "skipped", f"live only: {case.live_only}"
+                session.say(row.line())
+                return False
+            adapter = cls(use, route, transport, **kwargs)
+            inputs = smoke_inputs(use, smoke_png(case.image_px) if case.image_px else png, still)
             params = min_cost_params(use)
             if live and hasattr(adapter, "model_name"):
                 adapter.model_name()  # raises ModelIdUnknown: a live call never sends a placeholder
@@ -1543,26 +1925,70 @@ def _runs_indexed(session: Session, project: Project, run_ids: Sequence[str]) ->
         raise CliExit(EXIT_USAGE, f"run {lost[0]} is not a run of project {project.project_id}")
 
 
+def _exportable_takes(session: Session, project: Project, ctx: Any) -> tuple[list[str], dict[str, Any]]:
+    """The runs a review bundle can show, oldest first, with their sources: every DONE (or overridden GATE_FAIL)
+    run of the project that the review guard lets through and that has a still in the CAS. A run that is
+    exportable but cannot be shown (previs, a video take, no output) is skipped with the reason printed."""
+    from .review_bundle import ReviewError
+    from .routes import ApiError
+    from .routes.review import check_reviewable, take_source
+    from .routes.runs import run_view
+
+    pid = project.project_id
+    _fresh_index(session, project)
+    ids: list[str] = []
+    sources: dict[str, Any] = {}
+    with session.index.project(pid) as conn:
+        for row in conn.execute("SELECT id FROM runs ORDER BY created_utc, id").fetchall():
+            rid = row[0]
+            if not run_view(conn, rid)["exportable"]:
+                continue
+            run = get_run(conn, rid)
+            manifest = ctx.pipeline.manifests.get(run.route.engine_id)
+            if manifest is not None and str(manifest.kind).startswith(("video", "local_video")):
+                session.say(f"skipped {rid}: video takes are not in review bundles yet (stills only)")
+                continue
+            try:
+                check_reviewable(conn, run, project.root)
+                sources[rid] = take_source(ctx, run)
+            except ApiError as e:
+                session.say(f"skipped {rid}: not reviewable ({e.body.get('code') or e.body.get('error')})")
+            except ReviewError as e:
+                session.say(f"skipped {rid}: {e}")
+            else:
+                ids.append(rid)
+    return ids, sources
+
+
 def cmd_review(session: Session, args: argparse.Namespace) -> int:
     from .review_bundle import ReviewError, export_review
     from .routes import ApiError
     from .routes.review import check_reviewable, take_source
 
+    if args.all_exportable == bool(args.runs):
+        raise CliExit(EXIT_USAGE, "give --runs r1,r2, or --all-exportable (not both)")
     project = _load_project(session, args.project)
     pid = project.project_id
-    run_ids = list(dict.fromkeys(r.strip() for r in args.runs.split(",") if r.strip()))
-    if not run_ids:
-        raise CliExit(EXIT_USAGE, "--runs needs at least one run id (r1,r2)")
-    _runs_indexed(session, project, run_ids)
     ctx = SimpleNamespace(cas_for=session.cas_for, pipeline=session.pipeline())  # all `take_source` reads
+    sources: dict[str, Any] = {}
+    if args.all_exportable:
+        run_ids, sources = _exportable_takes(session, project, ctx)
+        if not run_ids:
+            raise CliExit(EXIT_USAGE, f"{pid} has no exportable run a review bundle can show yet")
+    else:
+        run_ids = list(dict.fromkeys(r.strip() for r in args.runs.split(",") if r.strip()))
+        if not run_ids:
+            raise CliExit(EXIT_USAGE, "--runs needs at least one run id (r1,r2)")
+        _runs_indexed(session, project, run_ids)
     out_dir = Path(args.out).resolve() if args.out else project.review_dir
     options: dict[str, Any] = {"reply_to": args.reply_to}
     if args.title is not None:
         options["title"] = args.title
     try:
-        sources = {}
         with session.index.project(pid) as conn:
             for rid in run_ids:
+                if rid in sources:
+                    continue  # --all-exportable already checked it
                 run = get_run(conn, rid)
                 check_reviewable(
                     conn, run, project.root
@@ -1781,50 +2207,130 @@ def cmd_timer(session: Session, args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------- plate spend
 
 
-def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
-    """Left-aligned first column, right-aligned numbers, two spaces between."""
+def _table(header: Sequence[str], rows: Sequence[Sequence[str]], left: int = 1) -> list[str]:
+    """The first `left` columns left-aligned (names), the rest right-aligned (numbers), two spaces between."""
     widths = [max(len(str(r[i])) for r in [header, *rows]) for i in range(len(header))]
 
     def line(cells: Sequence[str]) -> str:
-        rest = [str(c).rjust(w) for c, w in zip(cells[1:], widths[1:], strict=True)]
-        return "  ".join([str(cells[0]).ljust(widths[0]), *rest]).rstrip()
+        parts = [
+            str(c).ljust(w) if i < left else str(c).rjust(w)
+            for i, (c, w) in enumerate(zip(cells, widths, strict=True))
+        ]
+        return "  ".join(parts).rstrip()
 
     return [line(header), *(line(r) for r in rows)]
 
 
+def _namespaced(pid: str, rec: Mapping[str, Any]) -> dict[str, Any]:
+    """A ledger record with its run id (and gate report path) led by the project, so two projects' runs can
+    never fold into one when their ledgers are read together."""
+    out = dict(rec)
+    for key in ("run_id", "gate_report"):
+        if isinstance(out.get(key), str) and out[key]:
+            out[key] = f"{pid}/{out[key]}"
+    return out
+
+
+def _project_ledgers(session: Session, project_ref: str | None) -> list[tuple[str, Path]]:
+    """(project id, folder) of the named project, or of every project this machine knows."""
+    if project_ref is not None:
+        root = resolve_project(session, project_ref)
+        return [(Project.load(root).project_id, root)]
+    return [(h["project_id"], Path(h["root"])) for h in session.pipeline().project_list()]
+
+
+def _ledger_records(session: Session, project_ref: str | None) -> list[dict[str, Any]]:
+    """The ledger records of one project as they are, or of every project with run ids namespaced."""
+    out: list[dict[str, Any]] = []
+    for pid, root in _project_ledgers(session, project_ref):
+        try:
+            records = Ledger(root).records()
+        except (LedgerError, OSError) as e:
+            if project_ref is not None:
+                raise
+            session.warn(f"{pid}: ledger not read ({e})")
+            continue
+        out.extend(records if project_ref is not None else (_namespaced(pid, r) for r in records))
+    return out
+
+
+def _spend_per_accepted(billed: float, quoted: float, accepted: int) -> str:
+    """The billed figure (the quoted one while nothing is billed yet) over the accepted takes."""
+    spent = billed if billed > 0 else quoted
+    return f"{spent / accepted:.4f}" if accepted else "-"
+
+
 def cmd_spend(session: Session, args: argparse.Namespace) -> int:
-    root = resolve_project(session, args.project)
-    project = Project.load(root)
-    ledger = Ledger(root)
+    from .routes.spend import spend_report
+
+    if bool(args.project) == bool(args.all_projects):
+        raise CliExit(EXIT_USAGE, "give a project (folder or id), or --all-projects")
     try:
-        summary = ledger.summarize(args.since)
+        since = parse_iso(args.since)
     except ValueError as e:  # a --since that is not an ISO date or time
         raise CliExit(EXIT_USAGE, f"--since {args.since!r}: {e}") from e
-    records = ledger.records()
-    rows = [
-        [
-            engine,
-            str(b["generations"]),
-            f"{b['spent_usd_quoted']:.4f}",
-            f"{b['spent_usd_billed']:.4f}",
-            str(b["accepted"]),
-        ]
-        for engine, b in summary["by_engine"].items()
-    ]
-    rows.append(
-        [
-            "total",
-            str(summary["generations"]),
-            f"{summary['spent_usd_quoted']:.4f}",
-            f"{summary['spent_usd_billed']:.4f}",
-            str(summary["accepted"]),
-        ]
+    if args.all_projects:
+        title = f"spend for all projects ({len(_project_ledgers(session, None))})"
+        records = _ledger_records(session, None)
+    else:
+        title = f"spend for {Project.load(resolve_project(session, args.project)).project_id}"
+        records = _ledger_records(session, args.project)
+    report = spend_report(records, args.by, since)
+    show_cpa = report["accepted"] > 0  # the T78 table until there is something accepted to divide by
+
+    def money(quoted: float, billed: float, accepted: int, per_accepted: str) -> list[str]:
+        cells = [f"{quoted:.4f}", f"{billed:.4f}", str(accepted)]
+        return [*cells, per_accepted] if show_cpa else cells
+
+    total = money(
+        report["spent_usd_quoted"],
+        report["spent_usd_billed"],
+        report["accepted"],
+        _spend_per_accepted(report["spent_usd_billed"], report["spent_usd_quoted"], report["accepted"]),
     )
-    session.say(f"spend for {project.project_id}" + (f" since {args.since}" if args.since else ""))
-    for text in _table(["engine", "runs", "quoted USD", "billed USD", "accepted"], rows):
+    if args.by == "engine":
+        header, left = ["engine", "runs", "quoted USD", "billed USD", "accepted"], 1
+        rows = [
+            [
+                engine,
+                str(b["generations"]),
+                *money(
+                    b["spent_usd_quoted"],
+                    b["spent_usd_billed"],
+                    b["accepted"],
+                    _spend_per_accepted(b["spent_usd_billed"], b["spent_usd_quoted"], b["accepted"]),
+                ),
+            ]
+            for engine, b in report["by_engine"].items()
+        ]
+        rows.append(["total", str(report["generations"]), *total])
+    else:
+        header, left = [args.by, "engine", "runs", "quoted USD", "billed USD", "accepted"], 2
+        rows = [
+            [
+                s["bucket"],
+                s["engine_id"],
+                str(s["runs"]),
+                *money(
+                    s["quoted_usd"],
+                    s["billed_usd"],
+                    s["accepted"],
+                    "-" if s["cost_per_accepted"] is None else f"{s['cost_per_accepted']:.4f}",
+                ),
+            ]
+            for s in report["series"]
+        ]
+        rows.append(["total", "", str(report["generations"]), *total])
+    if show_cpa:
+        header.append("per accepted USD")
+    session.say(
+        title
+        + (f" since {args.since}" if args.since else "")
+        + (f" by {args.by}" if args.by != "engine" else "")
+    )
+    for text in _table(header, rows, left):
         session.say(text)
     # An imported take never reaches `submitted`, so `summarize` does not count it; what was declared is shown.
-    since = parse_iso(args.since)
     declared = [
         r
         for r in records
@@ -1834,8 +2340,330 @@ def cmd_spend(session: Session, args: argparse.Namespace) -> int:
         and (since is None or ((at := parse_iso(r.get("at"))) is not None and at >= since))
     ]
     if declared:
-        total = sum(float(r.get("cost_usd_quoted") or 0) for r in declared)
-        session.say(f"not in the table: {len(declared)} imported take(s), {usd(total)} declared")
+        spent = sum(float(r.get("cost_usd_quoted") or 0) for r in declared)
+        session.say(f"not in the table: {len(declared)} imported take(s), {usd(spent)} declared")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------- plate cards / estimate
+
+
+def _cards(session: Session, project_ref: str | None) -> list[Any]:
+    """The engine cards folded from the ledger of one project, or of every project this machine knows."""
+    from plate_engines.cards import from_ledger
+
+    from .routes.engines import _verdicts
+
+    records = _ledger_records(session, project_ref)
+    return from_ledger(records, _verdicts(records))
+
+
+def _scope(session: Session, project_ref: str | None) -> str:
+    if project_ref is None:
+        return "all projects"
+    return Project.load(resolve_project(session, project_ref)).project_id
+
+
+def cmd_cards(session: Session, args: argparse.Namespace) -> int:
+    cards = [
+        c
+        for c in _cards(session, args.project)
+        if (args.task is None or c.task == args.task)
+        and (args.shot_class is None or c.shot_class == args.shot_class)
+    ]
+    session.say(f"engine cards for {_scope(session, args.project)}")
+    rows = [
+        [
+            c.engine_id,
+            c.task,
+            c.shot_class or "-",
+            str(c.n),
+            str(c.passes),
+            f"{c.wilson_lower_95:.4f}",
+            f"{c.mean_cost:.4f}" if c.mean_cost is not None else "-",
+            "yes" if c.steering() else "no",
+        ]
+        for c in cards
+    ]
+    header = ["engine", "task", "shot_class", "n", "pass", "lower95", "mean_usd", "steering"]
+    for text in _table(header, rows, 3):
+        session.say(text)
+    if not rows:
+        session.say("no cards yet: a card needs runs with a gate verdict (pass or fail) in the ledger")
+    return EXIT_OK
+
+
+def cmd_estimate(session: Session, args: argparse.Namespace) -> int:
+    from .quotes import DURATION_PARAMS, FAKE_PRICE_USD, build_quote
+
+    if (args.count is not None and args.count < 1) or (args.seconds is not None and not args.seconds > 0):
+        raise CliExit(EXIT_USAGE, "--count must be at least 1 and --seconds more than 0")
+    params = _parse_params(args.param)
+    manifest = session.pipeline().manifests.get(args.engine)
+    if args.engine == FAKE_ENGINE_ID:
+        if args.seconds is not None:
+            raise CliExit(EXIT_USAGE, f"{args.engine} is priced per output: use --count")
+        unit, custody, status = FAKE_PRICE_USD, "C0", "fake"
+    elif manifest is None:
+        known = sorted(session.pipeline().manifests)
+        raise CliExit(EXIT_USAGE, f"unknown engine {args.engine!r}; the manifests define {known}")
+    else:
+        if args.seconds is not None:
+            if manifest.price.model != "per_second":
+                unit_word = {"per_image": "image", "per_megapixel": "megapixel"}.get(
+                    manifest.price.model, "request"
+                )
+                raise CliExit(
+                    EXIT_USAGE, f"{args.engine} is priced per {unit_word}, not per second: use --count"
+                )
+            name = next((p.name for p in manifest.params if p.name in DURATION_PARAMS), DURATION_PARAMS[0])
+            params[name] = args.seconds
+        try:
+            quote = build_quote(manifest, None, {}, params)
+        except ValueError as e:
+            hint = " (it is priced per second: use --seconds)" if manifest.price.model == "per_second" else ""
+            raise CliExit(EXIT_USAGE, f"cannot price {args.engine}: {e}{hint}") from e
+        unit, custody, status = quote.price_usd, quote.custody_grade, quote.price_status
+    count = 1 if args.seconds is not None else args.count
+    total = unit * count
+    each = f"{usd(unit)} for {args.seconds:g} s" if args.seconds is not None else f"{usd(unit)} each"
+    cell = (args.engine, args.task, args.shot_class)
+    card = next((c for c in _cards(session, args.project) if c.key == cell), None)
+    session.say(f"estimate for {args.engine}: task {args.task}, shot class {args.shot_class}")
+    session.say(
+        f"  quote {each}"
+        + (f"; {count} x = {usd(total)}" if count > 1 else "")
+        + f" (custody {custody}, price {status})"
+    )
+    if card is None:
+        session.say("  no card for this cell: dividing by 1")
+        rate = 1.0
+    else:
+        steer = "steering" if card.steering() else "not steering yet, fewer than 20 runs"
+        session.say(f"  card: n {card.n}, {card.passes} passed, lower95 {card.wilson_lower_95:.4f} ({steer})")
+        rate = card.wilson_lower_95
+    if rate <= 0:
+        session.say("  expected USD per accepted output: unbounded (the card's lower bound is 0)")
+        return EXIT_OK
+    session.say(f"  expected USD per accepted output: {unit / rate:.4f}")
+    if count > 1:
+        session.say(f"  expected USD for {count} accepted outputs: {total / rate:.4f}")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------- plate doctor
+
+# the Max profile folder the installer targets by default (docs/windows.md)
+DOCTOR_MAX_PROFILE = "2026 - 64bit"
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _git_out(*argv: str) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(REPO_ROOT), *argv],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _doctor_git() -> tuple[str, str]:
+    head = _git_out("rev-parse", "HEAD")
+    if head is None:
+        return "warn", "git was not found on PATH"
+    if head.returncode != 0:
+        return "info", "this is not a git checkout"
+    mine = head.stdout.strip()
+    remote = _git_out("rev-parse", "--verify", "--quiet", "origin/main")
+    if remote is None or remote.returncode != 0 or not remote.stdout.strip():
+        return "info", f"HEAD {mine[:8]}; no remote (origin/main is not known here)"
+    theirs = remote.stdout.strip()
+    if theirs == mine:
+        return "ok", f"HEAD {mine[:8]} is origin/main"
+    counts = _git_out("rev-list", "--left-right", "--count", "HEAD...origin/main")
+    ahead = behind = "?"
+    if counts is not None and counts.returncode == 0 and len(counts.stdout.split()) == 2:
+        ahead, behind = counts.stdout.split()
+    return "warn", f"HEAD {mine[:8]} is not origin/main {theirs[:8]} (ahead {ahead}, behind {behind})"
+
+
+def _installed_startup(env: Mapping[str, str], cfg: Mapping[str, Any]) -> Path | None:
+    """Where the installer put the Max startup script: config.json `startup_dir`, else `PLATE_MAX_STARTUP_DIR`,
+    else the default Max profile folder under %LOCALAPPDATA% (None when this machine has none)."""
+    folder = cfg.get("startup_dir") or env.get("PLATE_MAX_STARTUP_DIR")
+    if not folder and env.get("LOCALAPPDATA"):
+        folder = (
+            Path(env["LOCALAPPDATA"])
+            / "Autodesk"
+            / "3dsMax"
+            / DOCTOR_MAX_PROFILE
+            / "ENU"
+            / "scripts"
+            / "startup"
+        )
+    return Path(str(folder)) / "plate_startup.py" if folder else None
+
+
+def _doctor_startup(env: Mapping[str, str], cfg: Mapping[str, Any]) -> tuple[str, str]:
+    source = REPO_ROOT / "plugins" / "max" / "startup" / "plate_startup.py"
+    if not source.is_file():
+        return "warn", f"{source} is missing from this checkout"
+    target = _installed_startup(env, cfg)
+    if target is None or not target.is_file():
+        return "info", "not installed (plugins/max/scripts/install.ps1 puts it in Max's startup folder)"
+    if sha256(source.read_bytes()).digest() == sha256(target.read_bytes()).digest():
+        return "ok", f"same as the installed copy ({target})"
+    return "warn", f"differs from the installed copy {target}: run plugins/max/scripts/install.ps1 again"
+
+
+def _doctor_ui(env: Mapping[str, str]) -> tuple[str, str]:
+    dist = Path(env["PLATE_UI_DIST"]) if env.get("PLATE_UI_DIST") else REPO_ROOT / "ui" / "dist"
+    index = dist / "index.html"
+    if index.is_file():
+        return "ok", f"{index} is there"
+    return "warn", f"{index} is missing: build the UI (npm run build in ui/; scripts/bootstrap does it)"
+
+
+def _doctor_tool(finder: Callable[[], str]) -> tuple[str, str]:
+    from .delivery.guard import ToolMissing
+
+    try:
+        return "ok", finder()
+    except ToolMissing as e:
+        return "warn", str(e)
+
+
+def _doctor_token(paths: Any, cfg: Mapping[str, Any]) -> tuple[str, str, str | None]:
+    """(status, text, the token or None); the token itself is never printed."""
+    if paths.token_file is not None:
+        try:
+            token = paths.token_file.read_text(encoding="utf-8-sig").strip()
+        except (OSError, ValueError):
+            return "warn", f"PLATE_TOKEN_FILE {paths.token_file} cannot be read", None
+        if not token:
+            return "warn", f"PLATE_TOKEN_FILE {paths.token_file} is empty", None
+        return "ok", f"PLATE_TOKEN_FILE {paths.token_file}", token
+    if cfg.get("token"):
+        return "ok", f"config.json {paths.config_path}", str(cfg["token"])
+    if paths.config_path.is_file():
+        return "warn", f"{paths.config_path} holds no token (the daemon adds one on its next start)", None
+    return "info", f"no {paths.config_path} yet (the daemon makes one on its first start)", None
+
+
+def _doctor_pixels(env: Mapping[str, str], paths: Any, token: str | None) -> tuple[str, str]:
+    from .pixels_client import DEFAULT_PORT, INPROC_ENV, PORT_ENV, PixelsClient
+
+    if not token:
+        return "info", "not checked: there is no token to ask with yet"
+    client = PixelsClient(
+        SimpleNamespace(token=token, home=paths.home),  # type: ignore[arg-type]  # only .token and .home are read
+        inproc=env.get(INPROC_ENV) == "1",
+        port=int(env.get(PORT_ENV) or DEFAULT_PORT),
+    )
+    mode = client.status()
+    if mode == "unavailable":
+        return "warn", (
+            f"unavailable: nothing answers on 127.0.0.1:{client.port} "
+            f"(python -m plate_pixels, or set {INPROC_ENV}=1)"
+        )
+    return "ok", mode if mode == "inproc" else f"{mode} (127.0.0.1:{client.port})"
+
+
+def cmd_doctor(session: Session, args: argparse.Namespace) -> int:
+    """Look, never change anything, never fail: every check that cannot run says so in its row."""
+    from . import config as plate_config
+    from .delivery import tools
+
+    paths = plate_config.Paths.from_env(session.env)
+    cfg = _read_json_object(paths.config_path)
+    token_row = _doctor_token(paths, cfg)
+    checks: list[tuple[str, Callable[[], tuple[str, str]]]] = [
+        ("git", _doctor_git),
+        ("max startup script", lambda: _doctor_startup(session.env, cfg)),
+        ("ui build", lambda: _doctor_ui(session.env)),
+        ("ffmpeg", lambda: _doctor_tool(tools.ffmpeg_path)),
+        ("ffprobe", lambda: _doctor_tool(tools.ffprobe_path)),
+        ("pixels worker", lambda: _doctor_pixels(session.env, paths, token_row[2])),
+        ("token", lambda: token_row[:2]),
+    ]
+    rows: list[list[str]] = []
+    for name, check in checks:
+        try:
+            status, text = check()
+        except Exception as e:  # a check that cannot run is a row, not a crash
+            status, text = "warn", f"check failed: {type(e).__name__}: {e}"
+        rows.append([name, f"{status:<4}  {text}"])
+    for text in _table(["check", "result"], rows, 2):
+        session.say(text)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------- plate recipes
+
+
+@contextmanager
+def _plate_home(session: Session) -> Iterator[None]:
+    """`recipes` finds the studio folder through the process environment: point it at this session's home."""
+    home = str(session.settings.home)
+    old = os.environ.get("PLATE_HOME")
+    if old == home:
+        yield
+        return
+    os.environ["PLATE_HOME"] = home
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("PLATE_HOME", None)
+        else:
+            os.environ["PLATE_HOME"] = old
+
+
+def cmd_recipes(session: Session, args: argparse.Namespace) -> int:
+    project_dir = resolve_project(session, args.project) if args.project else None
+    with _plate_home(session):
+        if args.recipes_cmd == "list":
+            entries = recipes.runnable_entries(project_dir)
+            rows = [[r.id, r.kind, r.engine, r.shot_class or "-", r.origin, r.title] for r in entries]
+            for text in _table(["id", "kind", "engine", "shot_class", "origin", "title"], rows, 6):
+                session.say(text)
+            return EXIT_OK
+        return _save_recipe(session, args, project_dir)
+
+
+def _save_recipe(session: Session, args: argparse.Namespace, project_dir: Path | None) -> int:
+    import yaml
+
+    if args.scope == "project" and project_dir is None:
+        raise CliExit(EXIT_USAGE, "--scope project needs --project <dir|id>: whose recipe folder?")
+    file = Path(args.yaml)
+    try:
+        doc = yaml.safe_load(file.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError) as e:
+        raise CliExit(EXIT_USAGE, f"{file}: cannot read it ({e})") from e
+    except yaml.YAMLError as e:
+        raise CliExit(EXIT_USAGE, f"{file}: not valid YAML ({e})") from e
+    recipe = recipes.parse_runnable(doc, args.scope)  # RecipeError -> exit 4, as for a file on disk
+    manifests = session.pipeline().manifests
+    if recipe.engine not in manifests:
+        raise CliExit(
+            EXIT_USAGE, f"engine {recipe.engine!r} is not an engine manifest; known: {sorted(manifests)}"
+        )
+    path = recipes.save_runnable(doc, args.scope, project_dir, overwrite=args.overwrite)
+    session.say(f"saved recipe {recipe.id} ({args.scope}) at {path}")
     return EXIT_OK
 
 
@@ -1853,7 +2681,8 @@ class _Parser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     p = _Parser(
         prog="plate",
-        description="PLATE command line: run, gate, export, reindex, gc, pack, smoke, review, import, deliver, timer, spend.",
+        description="PLATE command line: run, gate, export, reindex, gc, pack, smoke, review, import, deliver, timer, "
+        "spend, cards, estimate, doctor, recipes.",
     )
     p.add_argument("--version", action="version", version=f"plate {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="command", parser_class=_Parser)
@@ -1861,15 +2690,23 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run", help="quote, approve and run a recipe on a packet")
     r.add_argument("recipe", help="a recipe id (night_relight_changelist) or a recipe .yaml file")
     r.add_argument("--project", required=True, help="the project folder (made from the packet if it is new)")
+    r.add_argument("--packet", help="a packet folder to ingest, or the id of an ingested packet")
     r.add_argument(
-        "--packet", required=True, help="a packet folder to ingest, or the id of an ingested packet"
+        "--packets",
+        metavar="a,b,c",
+        help="several packets (folders or ids) of the project, one chain each, quoted and run in turn",
     )
     r.add_argument("--engine", help="engine id, instead of the recipe's")
     r.add_argument("--n", type=int, help="best-of-N under one quote (default: the recipe's)")
     r.add_argument(
         "--approve", choices=("auto", "human"), default="human", help="human waits for y (default)"
     )
-    r.add_argument("--envelope", type=float, metavar="USD", help="hard spending ceiling for this run")
+    r.add_argument(
+        "--envelope",
+        type=float,
+        metavar="USD",
+        help="hard spending ceiling for this command (all its packets)",
+    )
     r.add_argument("--shot-class", choices=SHOT_CLASSES, help="what kind of shot this is (the router check)")
     r.add_argument("--param", action="append", default=[], metavar="NAME=VALUE", help="an engine parameter")
     r.add_argument("--nda", action="store_true", help="a new project is NDA (C0 and C1 routes only)")
@@ -1885,9 +2722,15 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--engine", help="engine label for the report")
 
     e = sub.add_parser(
-        "export", help="write a run's gated result as tiff16, png16 or exr, with its gate report"
+        "export",
+        help="write a run's (or a batch of runs') gated result as tiff16, png16 or exr, with its gate report",
     )
-    e.add_argument("run_id")
+    e.add_argument("run_id", nargs="?", help="one run (or use --runs / --accepted for a batch)")
+    e.add_argument(
+        "--runs", metavar="r1,r2", help="a batch: these runs, each through the single export's guards"
+    )
+    e.add_argument("--accepted", action="store_true", help="a batch: every accepted run of --project")
+    e.add_argument("--name-pattern", metavar="PATTERN", help="batch file names (default {node}_{run8})")
     e.add_argument("--to", required=True, help="the output folder")
     e.add_argument("--format", choices=tuple(EXPORT_FORMATS), default="tiff16")
     e.add_argument(
@@ -1921,7 +2764,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     v = sub.add_parser("review", help="a client review bundle (static HTML A/B wipe) of finished takes")
     v.add_argument("project")
-    v.add_argument("--runs", required=True, help="comma-separated run ids")
+    v.add_argument("--runs", help="comma-separated run ids")
+    v.add_argument(
+        "--all-exportable",
+        action="store_true",
+        help="every DONE (or overridden) still the review guard allows",
+    )
     v.add_argument("--watermark", default=DEFAULT_WATERMARK, help="text across every proxy (default REVIEW)")
     v.add_argument("--out", help="output folder (default: the project's review/ folder)")
     v.add_argument(
@@ -1967,9 +2815,44 @@ def build_parser() -> argparse.ArgumentParser:
     td = tsub.add_parser("today", help="today's recorded minutes per deliverable")
     td.add_argument("--project", help="only this project (folder or id)")
 
-    y = sub.add_parser("spend", help="a project's spend per engine, from its ledger")
-    y.add_argument("project")
+    y = sub.add_parser("spend", help="a project's spend per engine, day or week, from its ledger")
+    y.add_argument("project", nargs="?", help="the project (folder or id)")
+    y.add_argument("--all-projects", action="store_true", help="every project this machine knows")
+    y.add_argument("--by", choices=("engine", "day", "week"), default="engine", help="how to bucket the rows")
     y.add_argument("--since", metavar="ISO", help="only records from this date or time (2026-10-01)")
+
+    cd = sub.add_parser(
+        "cards", help="engine cards: pass rate with its Wilson bound per engine, task, shot class"
+    )
+    cd.add_argument("--project", help="one project (folder or id); default: every project on this machine")
+    cd.add_argument("--task", help="only this task")
+    cd.add_argument("--shot-class", choices=SHOT_CLASSES, help="only this shot class")
+
+    es = sub.add_parser(
+        "estimate", help="expected USD per accepted output: the quote over the card's lower bound"
+    )
+    es.add_argument("--engine", required=True, help="engine id")
+    es.add_argument("--task", required=True, help="the task (relight, people, ...)")
+    es.add_argument("--shot-class", required=True, choices=SHOT_CLASSES)
+    how = es.add_mutually_exclusive_group(required=True)
+    how.add_argument("--count", type=int, metavar="N", help="how many outputs (images)")
+    how.add_argument("--seconds", type=float, metavar="S", help="how many seconds of video")
+    es.add_argument("--project", help="read the cards of this project (folder or id); default: every project")
+    es.add_argument("--param", action="append", default=[], metavar="NAME=VALUE", help="a priced parameter")
+
+    sub.add_parser(
+        "doctor", help="check the install: git, Max startup script, UI build, ffmpeg, pixels worker, token"
+    )
+
+    rc = sub.add_parser("recipes", help="list and save runnable recipes")
+    rsub = rc.add_subparsers(dest="recipes_cmd", required=True, metavar="list|save", parser_class=_Parser)
+    rl = rsub.add_parser("list", help="shipped, studio and (with --project) project recipes")
+    rl.add_argument("--project", help="also this project's own recipes (folder or id)")
+    rs = rsub.add_parser("save", help="validate a recipe .yaml and save it to the studio or a project")
+    rs.add_argument("yaml", help="the recipe file")
+    rs.add_argument("--scope", required=True, choices=("studio", "project"))
+    rs.add_argument("--project", help="the project (folder or id): the folder of --scope project")
+    rs.add_argument("--overwrite", action="store_true", help="replace a recipe of the same id")
     return p
 
 
@@ -1985,6 +2868,10 @@ COMMANDS: dict[str, Callable[[Session, argparse.Namespace], int]] = {
     "deliver": cmd_deliver,
     "timer": cmd_timer,
     "spend": cmd_spend,
+    "cards": cmd_cards,
+    "estimate": cmd_estimate,
+    "doctor": cmd_doctor,
+    "recipes": cmd_recipes,
 }
 # Errors whose code is not 1, in order: the first matching class wins.
 ERROR_CODES: tuple[tuple[type[BaseException], int], ...] = (
@@ -2000,6 +2887,17 @@ ERROR_CODES: tuple[tuple[type[BaseException], int], ...] = (
     (FileNotFoundError, EXIT_USAGE),
 )
 PIPELINE_RUNTIME_CODES = {"packet_changed", "packet_not_ready", "unpriceable"}
+
+
+def _code_for(e: BaseException) -> int:
+    """The exit code an error ends the command with (what `main` answers; a `--packets` run uses it per packet)."""
+    if isinstance(e, CliExit):
+        return e.code
+    if isinstance(e, PipelineError):
+        return EXIT_ERROR if e.code in PIPELINE_RUNTIME_CODES else EXIT_USAGE
+    if isinstance(e, (QuoteExpired, QuoteNotFound, IllegalTransition, DuplicateRequest, ProjectLocked)):
+        return EXIT_ERROR
+    return next((code for cls, code in ERROR_CODES if isinstance(e, cls)), EXIT_ERROR)
 
 
 def _soften_stream(stream: Any) -> None:

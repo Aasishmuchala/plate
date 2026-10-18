@@ -1,10 +1,13 @@
 // History: the project's runs, newest first. A click selects the run as the candidate and its producing node on the
 // canvas. State, engine, price, gate verdict and time come straight from the daemon's Run records.
+// T101: the click also opens the run in the viewer (B = its output, A = its plate); shift-click sets A only. A row on
+// a side of the viewer carries an A or B chip.
 
-import type { ReactElement } from "react";
+import type { MouseEvent, ReactElement } from "react";
+import { useRunStore } from "../canvas/runStore";
 import { PathResolver } from "./DropRestore";
 import { formatTime, formatUsd, shortId } from "./format";
-import { focusRun } from "./restore";
+import { openRunInViewer, setRunAsA } from "./restore";
 import { usePanelsStore, VERDICT_LABEL } from "./store";
 import { C, S, STATUS_COLOR, tint } from "./theme";
 import type { RunRow } from "./types";
@@ -34,6 +37,10 @@ export function HistoryPanel(): ReactElement {
   const projectId = usePanelsStore((s) => s.runsProjectId);
   const loadRuns = usePanelsStore((s) => s.loadRuns);
   const dropKind = usePanelsStore((s) => s.drop.kind);
+  const sideA = useRunStore((s) => (s.compare?.a.kind === "run" ? (s.compare.a.runId ?? null) : null));
+  const sideB = useRunStore((s) => (s.compare?.b?.kind === "run" ? (s.compare.b.runId ?? null) : null));
+  const open = (run: RunRow) => (e: MouseEvent<HTMLButtonElement>) =>
+    e.shiftKey ? setRunAsA(run) : openRunInViewer(run);
 
   return (
     <section style={S.section} aria-label="History" data-testid="history-panel">
@@ -60,21 +67,29 @@ export function HistoryPanel(): ReactElement {
           const verdict = run.gate_report?.verdict;
           const given = verdicts[run.id];
           const price = run.cost_usd_billed ?? run.quote?.price_usd;
+          const side = sideA === run.id ? "A" : sideB === run.id ? "B" : null;
           return (
             <li key={run.id}>
               <button
                 type="button"
-                style={{ ...S.item, width: "100%", ...(selected === run.id ? { borderColor: C.accent } : {}) }}
+                style={{ ...S.item, width: "100%", border: `1px solid ${selected === run.id ? C.accent : C.line}` }}
                 aria-pressed={selected === run.id}
                 data-testid="history-run"
                 data-run-id={run.id}
-                onClick={() => focusRun(run)}
+                data-side={side ?? undefined}
+                title="open in the viewer against its plate (shift-click: set as A)"
+                onClick={open(run)}
               >
                 <span style={S.row}>
                   <span style={tint(stateColor(run.state))} data-testid="run-state">
                     {run.state}
                   </span>
                   <span style={S.mono}>{run.route?.engine_id ?? "no engine"}</span>
+                  {side ? (
+                    <span style={tint(C.accent)} data-testid="run-side">
+                      {side}
+                    </span>
+                  ) : null}
                 </span>
                 <span style={{ ...S.row, ...S.muted }}>
                   <span title={run.id}>{shortId(run.id)}</span>

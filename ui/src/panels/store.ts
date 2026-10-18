@@ -23,7 +23,8 @@ import {
 import type { Restore } from "./subgraph";
 import type { ResolveResult, RunDetail, RunRow, VerdictName } from "./types";
 
-export type PanelTab = "project" | "history" | "gate" | "custody" | "timer";
+/** The panel tabs; `spend` and `settings` are T102's. */
+export type PanelTab = "project" | "history" | "gate" | "custody" | "timer" | "spend" | "settings";
 
 export const RATER_KEY = "plate.rater";
 export const DEFAULT_RATER = "human";

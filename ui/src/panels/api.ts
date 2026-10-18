@@ -4,7 +4,7 @@
 // `{runs: [...]}` and one that returns `[...]` both work. Nothing here invents a route the plan does not list except
 // `POST /runs/{id}/gate/rescore`, which is called out in the T36 report.
 
-import { ApiError, fetchJson, postJson } from "../api";
+import { ApiError, apiUrl, CLIENT_HEADER, CLIENT_ID, fetchJson, getToken, postJson, putJson } from "../api";
 import type { LoadableGraph } from "../nodeTypes";
 import type {
   CreateProjectBody,
@@ -228,4 +228,324 @@ export async function resolveAsset(path: string): Promise<ResolveResult> {
   const res = await postJson<unknown>("/assets/resolve", { path });
   if (!isRecord(res) || typeof res.content_hash !== "string") throw new Error("the daemon returned no match");
   return res as unknown as ResolveResult;
+}
+
+// ---------------------------------------------------------------------------------------------------- T102: settings
+
+/** One Project Sheet field in form order (`recipes/project_sheet.yaml`): the default is the input's placeholder. */
+export interface SheetField {
+  key: string;
+  lensbook_key?: string;
+  default: string;
+}
+
+/** `GET /projects/{id}/settings` (T88). */
+export interface ProjectSettings {
+  project_sheet: Record<string, string>;
+  sheet_fields: SheetField[];
+  default_engine: Record<string, string>;
+  auto_carry_over: boolean;
+  policy: Record<string, unknown>;
+}
+
+/** `PUT /projects/{id}/settings`: each key it carries replaces the stored one (a sheet field left out is its default). */
+export interface SettingsPut {
+  project_sheet?: Record<string, string>;
+  default_engine?: Record<string, string>;
+  auto_carry_over?: boolean;
+}
+
+const textMap = (v: unknown): Record<string, string> =>
+  isRecord(v) ? Object.fromEntries(Object.entries(v).filter(([, x]) => typeof x === "string") as [string, string][]) : {};
+
+function toSettings(raw: unknown): ProjectSettings {
+  if (!isRecord(raw)) throw new Error("the daemon returned no project settings");
+  const fields = asList<unknown>(raw.sheet_fields).flatMap((f): SheetField[] =>
+    isRecord(f) && typeof f.key === "string"
+      ? [{ key: f.key, lensbook_key: typeof f.lensbook_key === "string" ? f.lensbook_key : undefined, default: typeof f.default === "string" ? f.default : "" }]
+      : [],
+  );
+  return {
+    project_sheet: textMap(raw.project_sheet),
+    sheet_fields: fields,
+    default_engine: textMap(raw.default_engine),
+    auto_carry_over: raw.auto_carry_over !== false,
+    policy: isRecord(raw.policy) ? raw.policy : {},
+  };
+}
+
+export async function getProjectSettings(projectId: string): Promise<ProjectSettings> {
+  return toSettings(await fetchJson<unknown>(`/projects/${enc(projectId)}/settings`));
+}
+
+export async function putProjectSettings(projectId: string, body: SettingsPut): Promise<ProjectSettings> {
+  return toSettings(await putJson<unknown>(`/projects/${enc(projectId)}/settings`, body));
+}
+
+// ---------------------------------------------------------------------------------------------------- T102: templates
+
+/** One row of `GET /templates` (T95): `nodes` per packet's chain, `set` when it ends in one Set over every Edit. */
+export interface TemplateSummary {
+  id: string;
+  title: string;
+  nodes: number;
+  set: boolean;
+  origin?: string;
+}
+
+export async function listTemplates(projectId: string | null): Promise<TemplateSummary[]> {
+  const body = await fetchJson<unknown>(`/templates${projectId ? `?project_id=${enc(projectId)}` : ""}`);
+  return asList<unknown>(body, "templates").flatMap((t): TemplateSummary[] =>
+    isRecord(t) && typeof t.id === "string"
+      ? [
+          {
+            id: t.id,
+            title: typeof t.title === "string" && t.title !== "" ? t.title : t.id,
+            nodes: typeof t.nodes === "number" ? t.nodes : 0,
+            set: t.set === true,
+            origin: typeof t.origin === "string" ? t.origin : undefined,
+          },
+        ]
+      : [],
+  );
+}
+
+/** The fields of a `GET /projects/{id}/packets` row the template form shows. */
+export interface PacketChoice {
+  packet_id: string;
+  shot_id?: string;
+  camera_name?: string;
+  tier?: string;
+  received_utc?: string;
+}
+
+/** The project's ingested packets, oldest first (as the daemon orders them). */
+export async function listProjectPackets(projectId: string): Promise<PacketChoice[]> {
+  const body = await fetchJson<unknown>(`/projects/${enc(projectId)}/packets`);
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v !== "" ? v : undefined);
+  return asList<unknown>(body, "packets").flatMap((p): PacketChoice[] =>
+    isRecord(p) && typeof p.packet_id === "string"
+      ? [{ packet_id: p.packet_id, shot_id: str(p.shot_id), camera_name: str(p.camera_name), tier: str(p.tier), received_utc: str(p.received_utc) }]
+      : [],
+  );
+}
+
+/** The fields of a `GET /recipes` row the template form offers. */
+export interface RecipeChoice {
+  id: string;
+  title: string;
+  kind?: string;
+  engine?: string;
+}
+
+export async function listRecipeChoices(projectId: string | null): Promise<RecipeChoice[]> {
+  const body = await fetchJson<unknown>(`/recipes${projectId ? `?project_id=${enc(projectId)}` : ""}`);
+  return asList<unknown>(body, "recipes").flatMap((r): RecipeChoice[] =>
+    isRecord(r) && typeof r.id === "string"
+      ? [
+          {
+            id: r.id,
+            title: typeof r.title === "string" && r.title !== "" ? r.title : r.id,
+            kind: typeof r.kind === "string" ? r.kind : undefined,
+            engine: typeof r.engine === "string" ? r.engine : undefined,
+          },
+        ]
+      : [],
+  );
+}
+
+/** `POST /projects/{id}/templates/apply`. */
+export interface ApplyTemplateBody {
+  template_id: string;
+  packet_ids: string[];
+  engine_id?: string;
+  recipe?: string;
+  quote: boolean;
+  auto_approve: boolean;
+}
+
+export interface ApplyRefusal {
+  node: string;
+  error: string;
+  detail?: string;
+}
+
+export interface ApplyResult {
+  nodes_added: number;
+  edits: string[];
+  runs: RunRow[];
+  total_usd: number;
+  refused: ApplyRefusal[];
+  awaiting_approval: ApplyRefusal[];
+  /** The graph as the daemon stored it, when it sent it. */
+  graph: LoadableGraph | null;
+}
+
+const refusals = (v: unknown): ApplyRefusal[] =>
+  asList<unknown>(v).flatMap((r): ApplyRefusal[] =>
+    isRecord(r) && typeof r.node === "string"
+      ? [{ node: r.node, error: typeof r.error === "string" ? r.error : "refused", detail: typeof r.detail === "string" ? r.detail : undefined }]
+      : [],
+  );
+
+export async function applyTemplate(projectId: string, body: ApplyTemplateBody): Promise<ApplyResult> {
+  const res = await postJson<unknown>(`/projects/${enc(projectId)}/templates/apply`, body);
+  if (!isRecord(res)) throw new Error("the daemon returned nothing for the template");
+  const g = res.graph;
+  const graph =
+    isRecord(g) && Array.isArray(g.nodes) && Array.isArray(g.edges) ? ({ schema: 1, nodes: g.nodes, edges: g.edges } as LoadableGraph) : null;
+  return {
+    nodes_added: typeof res.nodes_added === "number" ? res.nodes_added : 0,
+    edits: asList<unknown>(res.edits).filter((e): e is string => typeof e === "string"),
+    runs: asList<RunRow>(res.runs).filter((r) => isRecord(r) && typeof r.id === "string"),
+    total_usd: typeof res.total_usd === "number" ? res.total_usd : 0,
+    refused: refusals(res.refused),
+    awaiting_approval: refusals(res.awaiting_approval),
+    graph,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------- T102: spend
+
+export type SpendBy = "engine" | "day" | "week";
+
+/** One `series` row of `GET /projects/{id}/spend` (T88): one bucket (a week here) of one engine. */
+export interface SpendRow {
+  bucket: string;
+  engine_id: string;
+  runs: number;
+  quoted_usd: number;
+  billed_usd: number;
+  accepted: number;
+  /** Billed (quoted while nothing is billed) over accepted; null when nothing was accepted. */
+  cost_per_accepted: number | null;
+}
+
+export interface SpendReport {
+  by: string;
+  spent_usd_quoted: number | null;
+  spent_usd_billed: number | null;
+  generations: number | null;
+  accepted: number | null;
+  series: SpendRow[];
+  /** `GET /spend?all_projects=1`: the projects folded in. */
+  projects?: string[];
+}
+
+const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+
+function toSpend(raw: unknown): SpendReport {
+  if (!isRecord(raw)) throw new Error("the daemon returned no spend report");
+  const series = asList<unknown>(raw.series).flatMap((r): SpendRow[] =>
+    isRecord(r) && typeof r.engine_id === "string"
+      ? [
+          {
+            bucket: typeof r.bucket === "string" ? r.bucket : "unknown",
+            engine_id: r.engine_id,
+            runs: num(r.runs) ?? 0,
+            quoted_usd: num(r.quoted_usd) ?? 0,
+            billed_usd: num(r.billed_usd) ?? 0,
+            accepted: num(r.accepted) ?? 0,
+            cost_per_accepted: num(r.cost_per_accepted),
+          },
+        ]
+      : [],
+  );
+  const projects = asList<unknown>(raw.projects, "project_ids").filter((p): p is string => typeof p === "string");
+  return {
+    by: typeof raw.by === "string" ? raw.by : "week",
+    spent_usd_quoted: num(raw.spent_usd_quoted),
+    spent_usd_billed: num(raw.spent_usd_billed),
+    generations: num(raw.generations),
+    accepted: num(raw.accepted),
+    series,
+    ...(projects.length > 0 ? { projects } : {}),
+  };
+}
+
+export async function getProjectSpend(projectId: string, by: SpendBy = "week"): Promise<SpendReport> {
+  return toSpend(await fetchJson<unknown>(`/projects/${enc(projectId)}/spend?by=${by}`));
+}
+
+/** Every project's spend; the daemon refuses this without the explicit `all_projects=1`. */
+export async function getAllSpend(by: SpendBy = "week"): Promise<SpendReport> {
+  return toSpend(await fetchJson<unknown>(`/spend?all_projects=1&by=${by}`));
+}
+
+// ---------------------------------------------------------------------------------------------------- T102: session, health, docs
+
+/** `GET /session`: what this daemon was started with. */
+export interface SessionInfo {
+  daemon_version?: string;
+  packet_versions?: string[];
+  packets_dirs: string[];
+  projects_dir: string | null;
+  dev?: boolean;
+  cas_copy?: boolean;
+  router_mode?: string;
+}
+
+/** `GET /health` plus the optional fields a later daemon adds (router mode, nightly, which key env vars are set). */
+export interface HealthInfo {
+  ok?: boolean;
+  daemon_version?: string;
+  stub_engine?: boolean;
+  pixels?: unknown;
+  router_mode?: string;
+  nightly?: unknown;
+  /** The names of the vendor key env vars that are set; never their values. Null when /health does not say. */
+  keys_set: string[] | null;
+}
+
+const strList = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+
+export async function getSession(): Promise<SessionInfo> {
+  const raw = await fetchJson<unknown>("/session");
+  if (!isRecord(raw)) throw new Error("the daemon returned no session");
+  return {
+    daemon_version: typeof raw.daemon_version === "string" ? raw.daemon_version : undefined,
+    packet_versions: strList(raw.packet_versions),
+    packets_dirs: strList(raw.packets_dirs),
+    projects_dir: typeof raw.projects_dir === "string" ? raw.projects_dir : null,
+    dev: typeof raw.dev === "boolean" ? raw.dev : undefined,
+    cas_copy: typeof raw.cas_copy === "boolean" ? raw.cas_copy : undefined,
+    router_mode: typeof raw.router_mode === "string" ? raw.router_mode : undefined,
+  };
+}
+
+/** Key env var names from `/health`: a list of names, or a `{NAME: set?}` map (only the set ones are kept). */
+export function keyNames(raw: unknown): string[] | null {
+  if (Array.isArray(raw)) return strList(raw);
+  if (isRecord(raw)) return Object.entries(raw).filter(([, v]) => v === true).map(([k]) => k);
+  return null;
+}
+
+export async function getHealthInfo(): Promise<HealthInfo> {
+  const raw = await fetchJson<unknown>("/health");
+  if (!isRecord(raw)) throw new Error("the daemon returned no health");
+  const keys = raw.keys_set ?? raw.env_keys ?? raw.keys ?? raw.api_keys;
+  return {
+    ok: typeof raw.ok === "boolean" ? raw.ok : undefined,
+    daemon_version: typeof raw.daemon_version === "string" ? raw.daemon_version : undefined,
+    stub_engine: typeof raw.stub_engine === "boolean" ? raw.stub_engine : undefined,
+    pixels: raw.pixels,
+    router_mode: typeof raw.router_mode === "string" ? raw.router_mode : undefined,
+    nightly: raw.nightly,
+    keys_set: keyNames(keys),
+  };
+}
+
+/** The docs route a manual is served at (`GET /api/v0/docs/{name}`, token-gated). */
+export const docUrl = (name: string): string => apiUrl(`/docs/${name.split("/").map(enc).join("/")}`);
+
+/** A doc's raw Markdown, fetched with the token (a new tab cannot send the bearer header itself). */
+export async function fetchDocText(name: string): Promise<string> {
+  const headers = new Headers({ Accept: "text/markdown, text/plain" });
+  headers.set(CLIENT_HEADER, CLIENT_ID);
+  const token = getToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const res = await fetch(docUrl(name), { headers });
+  const text = await res.text();
+  if (!res.ok) throw new ApiError(res.status, text, `GET ${docUrl(name)} -> ${res.status}`);
+  return text;
 }

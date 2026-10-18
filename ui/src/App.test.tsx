@@ -28,10 +28,10 @@ const mount = () =>
   );
 
 describe("App", () => {
-  it("renders the placeholder canvas without throwing and lists Plate, Comp, Gate", () => {
+  it("renders the empty canvas without throwing: no placeholder nodes, the empty state instead (T98)", () => {
     mount();
-    const items = screen.getAllByTestId("node-item").map((li) => li.textContent);
-    expect(items).toEqual(["Plate", "Comp", "Gate"]);
+    expect(screen.queryAllByTestId("node-item")).toHaveLength(0);
+    expect(screen.getByTestId("empty-state")).toBeInTheDocument();
   });
 
   it("shows the Make bar as a pending quote, never a price", () => {

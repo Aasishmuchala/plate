@@ -1,0 +1,28 @@
+# Plate -> Mask(sky, planting, people) -> Edit -> Judge -> Export, one column per packet.
+# The Mask hangs off the packet (a Cryptomatte pick); the Edit takes the plate as its base. Judge and Export read
+# the Edit's take. Apply with an engine and a recipe or prompt, or fill them in on the Edit afterwards.
+schema: 1
+id: edit_chain
+title: Edit chain (sky, planting, people)
+set: false
+nodes:
+  - suffix: plate
+    kind: Plate
+  - suffix: mask
+    kind: Mask
+    params:
+      classes: [sky, vegetation, people]
+    inputs:
+      source: "$packet"
+  - suffix: edit
+    kind: Edit
+    inputs:
+      mask: mask
+  - suffix: judge
+    kind: Judge
+    inputs:
+      candidate: edit
+  - suffix: export
+    kind: Export
+    inputs:
+      media: edit

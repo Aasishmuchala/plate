@@ -58,6 +58,31 @@ What `quote_node` decides before a run row exists (wave 8, decisions 33, 34, 40 
   the idempotency key. `inputs.subgraph` snapshots the node and its ancestors as project.json holds them.
 - Ledger. `quoted` and `submitted` records carry `data.model`, `data.task`, `data.shot_class` and
   `data.repeat_key` (the BLAKE3 of that same canonical tuple, 16 hex) for the engine cards and reconcile.
+
+Wave 9 (router plan T92; decisions 46, 47, 50, 51, 54 and 55):
+
+- References. The Reference nodes wired to an Edit's `refs` input become `inputs.reference_images`
+  (`[{hash, role, node}]`, edge order), refused at the quote with 422 `references_unsupported` (the engine
+  declares no `reference_images` input), `too_many_references` (over its `max_items`) or `reference_missing`
+  (not in the project's CAS). The vendor gets each as an 8-bit PNG re-encoded from the CAS (no metadata), never
+  longer than the engine's largest legal side (INTER_AREA, never enlarged), under an opaque name; the
+  `submitted` record lists their hashes. A reference is an engine input only: the composite stays mask-locked.
+- Base. An Edit whose `image` input is fed by a take (any node but a Plate) starts from that take's
+  `outputHash` (`inputs.base`, `base_node`, `base_run`), 422 `no_base` when it has none in the CAS. Egress
+  sends the base, the composite lands on the base, the text lock restores from the plate, and the gates score
+  against the plate inside the union of this mask, the base run's and what the base changed
+  (`normalized.mask_union_key`), so outside the union the output is the plate bit for bit.
+- Mask to engines. An engine whose manifest declares a `mask` input (and whose adapter takes one) gets the
+  staged mask in the egress geometry (`inputs.mask`, 0/255 grey PNG; `normalized.mask_sent`).
+- Recipe tokens. `params.tokens` (`{"[TOKEN]": text}`) override a recipe's token defaults
+  (`inputs.recipe_tokens`); recipes resolve from the project's folder, then the studio's, then the package.
+- Pinned size map. A run whose `inputs.staging` holds `sizemap` and `png_key` is staged from them (only the mask
+  is recomputed), so a re-composite lands where its parent's region crop did.
+- Ingress hooks. `Pipeline.ingress_hooks` (`[(name, fn(run, bytes, staged, packet) -> (bytes, record))]`) run on
+  the engine's bytes before `ingress.restore`; records land in `normalized.ingress_hooks`, a raising hook fails
+  the run with `reason_code ingress_hook:<name>`.
+- Degraded routes. `health_board()` marks every route `route_tracker.degraded()` names as `degraded` (never
+  routed to); the quote's router reasons name each degraded route of the engine.
 """
 
 from __future__ import annotations
@@ -94,7 +119,7 @@ from .db import loads
 from .idempotency import canonical_json
 from .index import Index, packet_entry
 from .ledger import Ledger
-from .machine import create_run, get_run, transition
+from .machine import annotate, create_run, get_run, transition
 from .models import Quote, Run, RunCreate
 from .projects import Project, ProjectError
 from .quotes import approve as approve_one
@@ -110,11 +135,14 @@ __all__ = [
     "CustodyViolation",
     "FAKE_ENGINE_ID",
     "FAKE_ROUTE",
+    "IngressHook",
     "PacketView",
     "Pipeline",
     "PipelineError",
     "QUOTABLE_KINDS",
+    "REFERENCE_INPUT",
     "STAGING_KEY",
+    "Staged",
     "StagedEngine",
     "UNSET_CUSTODY",
     "adapter_class",
@@ -171,6 +199,15 @@ DEFAULT_POLL_INTERVAL_S = 2.0
 DEFAULT_POLL_TIMEOUT_S = 3600.0
 STAGE_CACHE = 8
 PACKET_CACHE = 2
+# Wave 9 (T92): reference images (decision 46), the Edit-on-upstream base (decision 47), ingress hooks (55).
+REFERENCE_INPUT = "reference_images"
+REFERENCE_HANDLE = "refs"
+REFERENCE_ROLES = ("style", "object", "sky", "person", "swatch")
+DEFAULT_REFERENCE_ROLE = "style"
+BASE_HANDLE = "image"
+MASK_INPUT = "mask"
+INGRESS_HOOK_CODE = "ingress_hook"
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 ADAPTER_MODULES = (
     "gemini",
     "openai_images",
@@ -292,6 +329,50 @@ def _mask_png(mask: np.ndarray) -> bytes:
     if not ok:
         raise ValueError("cv2 could not encode the mask")
     return bytes(buf)
+
+
+def _opaque_name(data: bytes) -> str:
+    """What a vendor sees as a file name: the bytes' own digest (no project, packet or camera name)."""
+    return f"{blake3(data).hexdigest()[:26]}.png"
+
+
+def _image_size(data: bytes) -> tuple[int, int] | None:
+    """(width, height) of an image: a PNG's IHDR, else a decode; None when the bytes are not an image."""
+    if len(data) >= 24 and data[:8] == _PNG_SIGNATURE and data[12:16] == b"IHDR":
+        w, h = struct.unpack(">II", data[16:24])
+        return int(w), int(h)
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
+    return None if img is None else (int(img.shape[1]), int(img.shape[0]))
+
+
+def _plain(record: Any) -> dict[str, Any]:
+    """A hook's record as JSON-safe data (it is stored in `normalized`)."""
+    if record is None:
+        return {}
+    out = json.loads(json.dumps(record, default=str))
+    return out if isinstance(out, dict) else {"value": out}
+
+
+def _edge_landing(
+    source_kind: Any, target_kind: Any, edge: Mapping[str, Any]
+) -> tuple[str | None, str | None]:
+    """(the type an edge carries, the input id it lands on), resolved through `canvas_rules.PORTS` as the rules
+    resolve a missing handle: the source's first output, the target's first input that takes that type."""
+    outs = (
+        (canvas_rules.PORTS.get(source_kind) or {}).get("outputs", ()) if isinstance(source_kind, str) else ()
+    )
+    sh = edge.get("sourceHandle")
+    out = next((p for p in outs if p[0] == sh), None) if sh else (outs[0] if outs else None)
+    etype = out[1] if out is not None else None
+    ins = (
+        (canvas_rules.PORTS.get(target_kind) or {}).get("inputs", ()) if isinstance(target_kind, str) else ()
+    )
+    th = edge.get("targetHandle")
+    if th:
+        port = next((p for p in ins if p[0] == th), None)
+    else:
+        port = next((p for p in ins if etype is not None and etype in p[2]), ins[0] if ins else None)
+    return etype, (port[0] if port is not None else None)
 
 
 # ---------------------------------------------------------------------------- the packet as the pipeline reads it
@@ -491,6 +572,10 @@ class Staged:
     opaque_name: str
 
 
+# A NORMALIZING hook (decision 55): the engine's raw bytes in, (bytes, a record for `normalized`) out.
+IngressHook = Callable[[Run, bytes, Staged, PacketView], tuple[bytes, dict[str, Any]]]
+
+
 # ---------------------------------------------------------------------------- engines behind the worker
 
 
@@ -550,14 +635,20 @@ class AdapterBridge:
         from plate_engines.adapters.base import Staged as EngineStaged
 
         inputs = dict(payload.get("inputs") or {})
-        img = inputs.get("image")
-        if isinstance(img, Mapping) and "b64" in img:
-            inputs["image"] = {
-                **{k: v for k, v in img.items() if k != "b64"},
-                "bytes": base64.b64decode(img["b64"]),
-            }
+        for name in ("image", MASK_INPUT):
+            if name in inputs:
+                inputs[name] = self._as_bytes(inputs[name])
+        if isinstance(inputs.get(REFERENCE_INPUT), list):
+            inputs[REFERENCE_INPUT] = [self._as_bytes(r) for r in inputs[REFERENCE_INPUT]]
         params = self.adapter.validate_params(dict(payload.get("params") or {}))
         return self.adapter.submit(EngineStaged(inputs=inputs, params=params))
+
+    @staticmethod
+    def _as_bytes(item: Any) -> Any:
+        """An image input as the adapters read it: the payload's `b64` decoded into `bytes`."""
+        if isinstance(item, Mapping) and "b64" in item:
+            return {**{k: v for k, v in item.items() if k != "b64"}, "bytes": base64.b64decode(item["b64"])}
+        return item
 
     def poll(self, provider_job_id: str) -> PollResult:
         st = self.adapter.poll(provider_job_id)
@@ -644,6 +735,11 @@ class Pipeline:
         self._egress: dict[str, Any] = {}
         self._ranked: set[str] = set()
         self._health: tuple[Any, dict[str, Any]] | None = None
+        # Decision 55: applied in order to the engine's bytes before ingress.restore (T100 adds the upscaler).
+        self.ingress_hooks: list[tuple[str, IngressHook]] = []
+        self._hook_failed: dict[tuple[str, int], str] = {}  # (run, attempt) -> the reason code step() records
+        # route_health.Tracker (T85/T107 attach it); None: no route is ever marked degraded.
+        self.route_tracker: Any = None
 
     # ------------------------------------------------------------------ projects
 
@@ -781,7 +877,55 @@ class Pipeline:
 
     def health_board(self) -> dict[str, Any]:
         """Decision 44: every active route of the loaded manifests is `ok` (`assumed ok: no canary signal
-        yet`), then the alert logs' suspensions apply. Rebuilt when an alert file changes."""
+        yet`), then the alert logs' suspensions apply (rebuilt when an alert file changes), then decision 51:
+        every route the `route_tracker` reports is `degraded` (shown, never routed to). A down or suspended
+        entry already on the board says more and is kept."""
+        board = self._alert_board()
+        degraded = self.degraded_routes()
+        if not degraded:
+            return board
+        from plate_engines.health import HealthBoard, status_of
+
+        marked = HealthBoard(board, clock=self.clock)
+        for key, d in degraded.items():
+            cur = board.get(key)
+            if cur is not None and status_of(cur) not in ("ok", "degraded"):
+                continue
+            marked.set(
+                key,
+                "degraded",
+                reason=f"degraded: {d.get('failures')} consecutive provider failures since {d.get('since')} "
+                f"(last: {d.get('reason') or 'unknown'})",
+            )
+        return marked.as_mapping()
+
+    def degraded_routes(self) -> dict[str, dict[str, Any]]:
+        """`route_tracker.degraded()` (`{"<engine>/<route>": {failures, since, reason}}`), or {} without a
+        tracker. A tracker that cannot be read degrades nothing; the warning says so."""
+        tracker = getattr(self, "route_tracker", None)
+        if tracker is None:
+            return {}
+        try:
+            return {str(k): dict(v) for k, v in (tracker.degraded() or {}).items()}
+        except Exception as e:
+            log.warning("route health not read: %s", e)
+            return {}
+
+    def degraded_reasons(self, engine_id: str, health: Mapping[str, Any] | None = None) -> list[str]:
+        """`health: <key> degraded: ...` for every degraded entry of this engine (its own key or a route's)."""
+        from plate_engines.health import reason_of, status_of
+
+        if health is None and not self.degraded_routes():
+            return []  # nothing is degraded: no need to build the board (a local quote loads no manifests)
+        board = self.health_board() if health is None else health
+        return [
+            f"health: {key} {reason_of(entry)}"
+            for key, entry in sorted(board.items())
+            if (key == engine_id or key.startswith(f"{engine_id}/")) and status_of(entry) == "degraded"
+        ]
+
+    def _alert_board(self) -> dict[str, Any]:
+        """The manifests' active routes assumed ok, with the alert logs' suspensions (cached on the files)."""
         from plate_engines.health import AlertLog, HealthBoard
 
         stamp_parts = []
@@ -892,6 +1036,7 @@ class Pipeline:
         entry = health.get(f"{manifest.id}/{choice.route_id}")
         if entry is not None and getattr(entry, "reason", "") == ASSUMED_OK:
             reasons.append(f"health: {manifest.id}/{choice.route_id} {ASSUMED_OK}")
+        reasons.extend(self.degraded_reasons(manifest.id, health))
         return choice, reasons
 
     def pick_route(
@@ -915,6 +1060,7 @@ class Pipeline:
             route["reasons"] = [
                 f"local: {engine_id} runs in this process ({grade.value}); no vendor route is involved",
                 f"doctrine: task {task!r} on a {shot_class} shot",
+                *self.degraded_reasons(engine_id),
             ]
             return route
         manifest = self.manifests.get(engine_id)
@@ -1017,8 +1163,9 @@ class Pipeline:
 
     # ------------------------------------------------------------------ the prompt
 
-    def load_recipe(self, ref: Any) -> Any:
-        """A runnable still recipe by id, or by a `.yaml` path (`recipes.load_runnable`)."""
+    def load_recipe(self, ref: Any, project_id: str | None = None) -> Any:
+        """A runnable still recipe by id (the project's `recipes/` folder, then the studio's, then the package:
+        decision 50), or by a `.yaml` path (`recipes.load_runnable`)."""
         from . import recipes
 
         if not isinstance(ref, str) or not (
@@ -1026,7 +1173,7 @@ class Pipeline:
         ):
             raise PipelineError(f"recipe {ref!r}: a recipe id or a .yaml path", code="unknown_recipe")
         try:
-            r = recipes.load_runnable(ref)
+            r = recipes.load_runnable(ref, project_dir=self.project_dir(project_id) if project_id else None)
         except recipes.RecipeError as e:
             raise PipelineError(str(e), code="unknown_recipe") from e
         if r.kind not in ("still_edit", "still_rephotograph"):
@@ -1054,7 +1201,8 @@ class Pipeline:
         recipe: Any,
     ) -> tuple[str | None, str | None, str | None]:
         """(prompt, prompt_source, negative_prompt). Explicit > recipe (decision 33); a recipe is composed by
-        the LLM when the Anthropic route's custody allows it, else filled from the Project Sheet alone."""
+        the LLM when the Anthropic route's custody allows it, else filled from the Project Sheet alone. The
+        node's `params.tokens` (decision 50) override the recipe's token defaults on both paths."""
         explicit = body.get("prompt") or params_node.get("prompt")
         if isinstance(explicit, str) and explicit.strip():
             return explicit, "explicit", None
@@ -1066,7 +1214,8 @@ class Pipeline:
             sheet = recipes.ProjectSheet.from_dict((project.doc.get("settings") or {}).get("project_sheet"))
         except recipes.RecipeError as e:
             raise PipelineError(str(e), code="bad_project_sheet") from e
-        text = recipes.assemble_runnable(recipe, sheet)
+        tokens = self.recipe_tokens(body, params_node)
+        text = recipes.assemble_runnable(recipe, sheet, overrides=tokens or None)
         negative = recipe.negative_prompt or recipes.DEFAULT_NEGATIVE_PROMPT
         try:
             client = self.llm_client(project.project_id, self.allowed_grades(project.project_id, pv.manifest))
@@ -1074,7 +1223,9 @@ class Pipeline:
                 from .llm import composer
 
                 facts = composer.facts_from_packet(pv.manifest, pv.legend)
-                out = composer.compose(recipe, sheet, facts, intent=recipe.title, client=client)
+                out = composer.compose(
+                    recipe, sheet, facts, intent=recipe.title, client=client, overrides=tokens or None
+                )
                 if out.llm_used:
                     return out.prompt, "composed", out.negative_prompt
                 if out.llm_error:
@@ -1082,6 +1233,26 @@ class Pipeline:
         except Exception as e:  # a composer that cannot answer (unrecorded prompt) never blocks a quote
             log.info("composer not used for %s: %s: %s", recipe.id, type(e).__name__, e)
         return text, "recipe", negative
+
+    @staticmethod
+    def recipe_tokens(body: Mapping[str, Any], params_node: Mapping[str, Any]) -> dict[str, str]:
+        """`params.tokens` (`{"[TOKEN]": text}`): the quote body's params, else the node's; {} when neither
+        names any. Keys are the literal bracketed token texts the recipe uses (422 `bad_tokens` otherwise)."""
+        body_params = body.get("params") if isinstance(body.get("params"), Mapping) else {}
+        raw = (
+            body_params.get("tokens") if body_params.get("tokens") is not None else params_node.get("tokens")
+        )
+        if raw is None:
+            return {}
+        if not isinstance(raw, Mapping) or not all(
+            isinstance(k, str) and k.startswith("[") and k.endswith("]") and isinstance(v, str)
+            for k, v in raw.items()
+        ):
+            raise PipelineError(
+                'params.tokens must map literal "[TOKEN]" texts to text, e.g. {"[SEASON]": "winter"}',
+                code="bad_tokens",
+            )
+        return {str(k): str(v) for k, v in raw.items()}
 
     def _engine_manifest_for(self, engine_id: str) -> Any:
         if engine_id == FAKE_ENGINE_ID or engine_id in self.engines:
@@ -1195,6 +1366,151 @@ class Pipeline:
                     code="mask_size",
                 )
 
+    def reference_inputs(
+        self, project_id: str, graph: Any, node_id: str, engine_id: str
+    ) -> list[dict[str, Any]]:
+        """Decision 46: the Reference nodes wired to the node's `refs` input (an edge whose `targetHandle` is
+        `refs`, or whose source is a Reference), in edge order, as `[{hash, role, node}]`. Refused before any
+        run row, in this order: 422 `references_unsupported` (the engine declares no `reference_images`
+        input), `too_many_references` (over its `max_items`), `reference_missing` (no image, or not in this
+        project's CAS); `bad_reference` for a non-Reference on `refs` or an unknown role."""
+        g = canvas_rules.as_graph(graph)
+        by_id = {n["id"]: n for n in g.nodes}
+        refs: list[dict[str, Any]] = []
+        for e in g.edges:
+            src = by_id.get(e["source"]) if e["target"] == node_id else None
+            if src is None or (e.get("targetHandle") != REFERENCE_HANDLE and src.get("kind") != "Reference"):
+                continue
+            if src.get("kind") != "Reference":
+                raise PipelineError(
+                    f"{src['id']} is a {src.get('kind')} node; the refs input takes Reference nodes only",
+                    code="bad_reference",
+                    node=src["id"],
+                )
+            params = src.get("params") if isinstance(src.get("params"), Mapping) else {}
+            role = params.get("role") or DEFAULT_REFERENCE_ROLE
+            if role not in REFERENCE_ROLES:
+                raise PipelineError(
+                    f"Reference node {src['id']}: role {role!r} is not one of {list(REFERENCE_ROLES)}",
+                    code="bad_reference",
+                    node=src["id"],
+                )
+            refs.append({"hash": params.get("referenceHash"), "role": role, "node": src["id"]})
+        if not refs:
+            return []
+        item = self._declared(engine_id, "inputs", REFERENCE_INPUT)
+        if item is None:
+            raise PipelineError(
+                f"{engine_id} takes no reference images ({len(refs)} wired to {node_id}); unwire them or pick "
+                f"an engine whose manifest declares {REFERENCE_INPUT}",
+                code="references_unsupported",
+                references=len(refs),
+            )
+        cap = item.get("max_items") if isinstance(item, Mapping) else getattr(item, "max_items", None)
+        if cap is not None and len(refs) > int(cap):
+            raise PipelineError(
+                f"{len(refs)} reference images wired to {node_id}; {engine_id} takes at most {int(cap)}",
+                code="too_many_references",
+                references=len(refs),
+                max_items=int(cap),
+            )
+        cas = self.cas_for(project_id)
+        for r in refs:
+            key = r["hash"]
+            if not isinstance(key, str) or not _HEX64.match(key):
+                raise PipelineError(
+                    f"Reference node {r['node']} has no image; upload one (POST /assets?kind=reference)",
+                    code="reference_missing",
+                    node=r["node"],
+                )
+            if not cas.exists(key):
+                raise PipelineError(
+                    f"reference {key[:12]} of node {r['node']} is not in this project's CAS; upload it again",
+                    code="reference_missing",
+                    node=r["node"],
+                )
+        return refs
+
+    def plate_size(self, pv: PacketView) -> tuple[int, int]:
+        """(width, height) of the packet's display master: the manifest's file entry, else the decoded plate."""
+        entry = pv.files.get(pv.plate_role) or {}
+        w, h = entry.get("width"), entry.get("height")
+        if isinstance(w, int) and isinstance(h, int):
+            return w, h
+        ph, pw = pv.plate16().shape[:2]
+        return int(pw), int(ph)
+
+    def base_input(
+        self, conn: Any, project_id: str, graph: Any, node_id: str, pv: PacketView
+    ) -> dict[str, Any] | None:
+        """Decision 47: an Edit whose `image` input is fed by a take (any node but a Plate) starts from it:
+        `{base: <its outputHash>, base_node, base_run}` (`base_run` the latest DONE run of that node whose first
+        output is the hash, else None). None when a Plate (or nothing) feeds `image`: nothing changes. 422
+        `no_base` when the take has no output in the CAS (an Edit never silently falls back to the plate),
+        `bad_base` when the source is not a still, `ambiguous_base` for two takes, `base_size` for a take that
+        is not the plate's size."""
+        g = canvas_rules.as_graph(graph)
+        by_id = {n["id"]: n for n in g.nodes}
+        target = by_id.get(node_id) or {}
+        takes: list[dict[str, Any]] = []
+        for e in g.edges:
+            src = by_id.get(e["source"]) if e["target"] == node_id else None
+            if src is None:
+                continue
+            etype, port = _edge_landing(src.get("kind"), target.get("kind"), e)
+            if port != BASE_HANDLE or src.get("kind") == "Plate":
+                continue
+            if etype != "image16":
+                raise PipelineError(
+                    f"{src['id']} ({src.get('kind')}) sends {etype or 'nothing'}; the image input takes a still",
+                    code="bad_base",
+                    node=src["id"],
+                )
+            if all(t["id"] != src["id"] for t in takes):
+                takes.append(src)
+        if not takes:
+            return None
+        if len(takes) > 1:
+            raise PipelineError(
+                f"{node_id}: {', '.join(t['id'] for t in takes)} all feed its image input; wire one take",
+                code="ambiguous_base",
+            )
+        src = takes[0]
+        key = src.get("outputHash")
+        cas = self.cas_for(project_id)
+        if not isinstance(key, str) or not _HEX64.match(key) or not cas.exists(key):
+            raise PipelineError(
+                f"{src['id']} has no output in this project's CAS; make and pick a take first (an Edit never "
+                "silently falls back to the plate)",
+                code="no_base",
+                node=src["id"],
+            )
+        size = _image_size(cas.read_bytes(key))
+        want = self.plate_size(pv)
+        if size != want:
+            shown = f"{size[0]} x {size[1]}" if size else "not an image"
+            raise PipelineError(
+                f"the take {key[:12]} of {src['id']} is {shown}; the plate is {want[0]} x {want[1]}",
+                code="base_size",
+                node=src["id"],
+            )
+        return {"base": key, "base_node": src["id"], "base_run": self.base_run_for(conn, src["id"], key)}
+
+    @staticmethod
+    def base_run_for(conn: Any, node_id: str, key: str) -> str | None:
+        """The latest DONE run of `node_id` whose first output is `key`, or None."""
+        for row in conn.execute(
+            "SELECT id, normalized FROM runs WHERE node_id = ? AND state = ? ORDER BY updated_utc DESC, id DESC",
+            (node_id, S.DONE.value),
+        ):
+            try:
+                outs = (loads(row[1]) or {}).get("outputs") or []
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if outs and outs[0] == key:
+                return str(row[0])
+        return None
+
     def next_attempt(
         self,
         conn: Any,
@@ -1229,8 +1545,11 @@ class Pipeline:
         """A canvas node -> a QUOTED run. Refusals, all before a run row exists: 404 project or node; 422 rules,
         mask, engine, task (`router_refused:<code>`) and `prompt_required`; 409 packet not ingested,
         `retired_pin`, `pin_conflict` and `render_it` (blocking mode); `CustodyViolation` (403) when no route of
-        the engine is allowed. Body (all optional): engine_id, route_id, packet_id, task, shot_class, recipe,
-        prompt, params, preset, region_crop, feather_px, priority, attempt (server-side when absent)."""
+        the engine is allowed; after the mask, the base (`no_base`, `bad_base`, `ambiguous_base`, `base_size`)
+        and the references (`references_unsupported`, `too_many_references`, `reference_missing`). Body (all
+        optional): engine_id, route_id, packet_id, task, shot_class, recipe, prompt, params (`params.tokens`
+        fills a recipe's tokens and never reaches the engine), preset, region_crop, feather_px, priority,
+        attempt (server-side when absent)."""
         now = now or self.clock()
         project = self.load_project(project_id)
         if project is None:
@@ -1259,7 +1578,7 @@ class Pipeline:
         pv = self.packet(project_id, packet_id)
         params_node = node.get("params") if isinstance(node.get("params"), Mapping) else {}
         recipe_ref = body.get("recipe") or params_node.get("recipe")
-        recipe = self.load_recipe(recipe_ref) if recipe_ref else None
+        recipe = self.load_recipe(recipe_ref, project_id) if recipe_ref else None
         engine_id = (
             body.get("engine_id")
             or params_node.get("engine")
@@ -1299,8 +1618,15 @@ class Pipeline:
         }
         mask = self.mask_spec(g, node_id, pv)
         self.check_mask_keys(project_id, mask, pv)
+        base = self.base_input(conn, project_id, g, node_id, pv)
+        references = self.reference_inputs(project_id, g, node_id, engine_id)
         inputs: dict[str, Any] = {"plate": pv.plate_hash, "mask": mask, STAGING_KEY: staging}
+        if base is not None:
+            inputs.update(base)
+        if references:
+            inputs[REFERENCE_INPUT] = references
         params = dict(body.get("params") or {})
+        params.pop("tokens", None)  # recipe text, not an engine parameter
         prompt, prompt_source, negative = self.resolve_prompt(project, pv, body, params_node, recipe)
         if prompt is None and self.prompt_required(engine_id):
             raise PipelineError(
@@ -1312,6 +1638,9 @@ class Pipeline:
             inputs["prompt_source"] = prompt_source
         if recipe is not None:
             inputs["recipe_id"] = recipe.id
+            tokens = self.recipe_tokens(body, params_node)
+            if tokens and prompt_source in ("recipe", "composed"):
+                inputs["recipe_tokens"] = tokens
         if (
             negative
             and "negative_prompt" not in params
@@ -1441,7 +1770,10 @@ class Pipeline:
         return manifest
 
     def stage(self, run: Run, cas: CAS | None = None) -> Staged:
-        """egress.prepare for this run (deterministic, cached; recomputed after a restart)."""
+        """egress.prepare for this run (deterministic, cached; recomputed after a restart). The source is the
+        run's base when it has one (decision 47), else the plate; a pinned size map and PNG
+        (`inputs.staging.sizemap` + `png_key`, decision 54) are reused as they are, only the mask is
+        recomputed."""
         key = (run.id, run.attempt)
         with self._lock:
             hit = self._staged.get(key)
@@ -1456,21 +1788,25 @@ class Pipeline:
             raise PipelineError(f"packet {pv.packet_id}: the plate is not the one this run was quoted on")
         opts = run.inputs.get(STAGING_KEY) or {}
         mask = self.editable_mask(run, pv, cas)
-        png, sm = pixels_egress.prepare(
-            pv.plate16(),
-            pv.manifest,
-            self.engine_manifest(run),
-            mask=mask,
-            region_crop=bool(opts.get("region_crop")),
-        )
-        digest = blake3(png).hexdigest()
+        pinned = self.pinned_egress(opts, pv, cas)
+        if pinned is not None:
+            png, sm, png_key = pinned
+        else:
+            png, sm = pixels_egress.prepare(
+                self.base_image(run, pv, cas) if run.inputs.get("base") else pv.plate16(),
+                pv.manifest,
+                self.engine_manifest(run),
+                mask=mask,
+                region_crop=bool(opts.get("region_crop")),
+            )
+            png_key = cas.put_bytes(png, "png")
         staged = Staged(
             png=png,
             sizemap=sm,
             mask=mask,
-            png_key=cas.put_bytes(png, "png"),
+            png_key=png_key,
             mask_key=cas.put_bytes(_mask_png(mask), "png"),
-            opaque_name=f"{digest[:26]}.png",
+            opaque_name=_opaque_name(png),
         )
         with self._lock:
             self._staged[key] = staged
@@ -1478,8 +1814,119 @@ class Pipeline:
                 self._staged.popitem(last=False)
         return staged
 
+    def pinned_egress(
+        self, opts: Mapping[str, Any], pv: PacketView, cas: CAS
+    ) -> tuple[bytes, Any, str] | None:
+        """(png, SizeMap, png_key) from `inputs.staging.sizemap` and `png_key` when both are there, else None.
+        The PNG must be in the CAS at the size map's sent size, and the size map must be of this plate."""
+        sm_doc, png_key = opts.get("sizemap"), opts.get("png_key")
+        if not isinstance(sm_doc, Mapping) or not isinstance(png_key, str):
+            return None
+        from plate_pixels.egress import SizeMap
+
+        if not _HEX64.match(png_key) or not cas.exists(png_key):
+            raise PipelineError(
+                f"the pinned egress PNG {png_key[:12]} is not in the project's CAS", code="pinned_png_missing"
+            )
+        try:
+            sm = SizeMap.from_dict(sm_doc)
+        except (KeyError, TypeError, ValueError) as e:
+            raise PipelineError(f"the pinned size map is not a size map: {e}", code="bad_sizemap") from e
+        png = cas.read_bytes(png_key)
+        if sm.src != self.plate_size(pv) or _image_size(png) != sm.dst:
+            raise PipelineError(
+                f"the pinned size map maps {sm.src[0]} x {sm.src[1]} to {sm.dst[0]} x {sm.dst[1]}; it does not fit "
+                f"this plate and its PNG",
+                code="bad_sizemap",
+            )
+        return png, sm, png_key
+
+    def base_image(self, run: Run, pv: PacketView, cas: CAS) -> np.ndarray:
+        """The run's base take as uint16 RGB at the plate's size (decision 47)."""
+        key = run.inputs.get("base")
+        if not isinstance(key, str) or not cas.exists(key):
+            raise PipelineError(
+                f"the base {str(key)[:12]} is not in this project's CAS (an Edit never silently falls back to the "
+                "plate)",
+                code="no_base",
+            )
+        img = decode_png16(cas.read_bytes(key))
+        plate = pv.plate16()
+        if img.shape != plate.shape:
+            raise PipelineError(
+                f"the base {key[:12]} is {img.shape[1]} x {img.shape[0]}; the plate is {plate.shape[1]} x "
+                f"{plate.shape[0]}",
+                code="base_size",
+            )
+        return img
+
+    def sends_mask(self, run: Run) -> bool:
+        """Does the engine get the staged mask? Its manifest declares a `mask` input and whatever speaks it
+        takes one: a `plate_engines` adapter without `NATIVE_MASK` refuses a mask outright (PLATE composites
+        inside the mask instead), so the mask goes only where it is understood."""
+        eid = run.route.engine_id
+        if self._declared(eid, "inputs", MASK_INPUT) is None:
+            return False
+        if eid == FAKE_ENGINE_ID or eid in self.engines:
+            return bool(getattr(self.engines.get(eid, self.engine), "NATIVE_MASK", True))
+        manifest = self.manifests.get(eid)
+        rid = run.route_dict.get("route_id") or run.route.provider
+        route = (
+            next((r for r in manifest.routes if r.route_id == rid), None) if manifest is not None else None
+        )
+        cls = adapter_class(manifest, route) if route is not None else None
+        return cls is not None and bool(getattr(cls, "NATIVE_MASK", True))
+
+    @staticmethod
+    def engine_mask(staged: Staged) -> bytes:
+        """The staged mask in the egress geometry, so it registers with the sent PNG: the size map's padded
+        content box (the mask's own pixels inside the frame, 0 = keep beyond it), resampled to the sent size
+        with INTER_NEAREST; a 0/255 grey PNG."""
+        sm = staged.sizemap
+        m = np.where(staged.mask, 255, 0).astype(np.uint8)
+        h, w = m.shape
+        x0, y0, x1, y1 = sm.padded_rect
+        out = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        ix0, iy0, ix1, iy1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+        if ix1 > ix0 and iy1 > iy0:
+            out[iy0 - y0 : iy1 - y0, ix0 - x0 : ix1 - x0] = m[iy0:iy1, ix0:ix1]
+        if (out.shape[1], out.shape[0]) != tuple(sm.dst):
+            out = cv2.resize(out, tuple(sm.dst), interpolation=cv2.INTER_NEAREST)
+        ok, buf = cv2.imencode(".png", out)
+        if not ok:
+            raise ValueError("cv2 could not encode the engine mask")
+        return bytes(buf)
+
+    def largest_side(self, run: Run) -> int | None:
+        """The longest side the engine takes (its largest legal preset, else its arbitrary envelope), or None."""
+        from plate_pixels.sizes import legal_sizes
+
+        legal = legal_sizes(self.engine_manifest(run))
+        if legal:
+            return max(max(s.width, s.height) for s in legal)
+        return legal.arbitrary.max_side if legal.arbitrary is not None else None
+
+    @staticmethod
+    def reference_png(data: bytes, max_side: int | None) -> bytes:
+        """A reference as the vendor gets it: decoded as 8-bit colour and re-encoded as a PNG (pixels only, so
+        nothing of any metadata survives), its longest side at most `max_side` (INTER_AREA, never enlarged)."""
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if img is None or img.size == 0:
+            raise PipelineError("a reference image in the CAS is not decodable", code="bad_reference")
+        h, w = img.shape[:2]
+        if max_side is not None and max(w, h) > max_side:
+            k = max_side / max(w, h)
+            size = (max_side, max(1, round(h * k))) if w >= h else (max(1, round(w * k)), max_side)
+            img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".png", np.ascontiguousarray(img))
+        if not ok:
+            raise ValueError("cv2 could not encode the reference")
+        return bytes(buf)
+
     def vendor_payload(self, run: Run, staged: Staged, seed_payload: Mapping[str, Any]) -> dict[str, Any]:
-        """What the engine receives: the egress PNG under an opaque name, the prompt, the params."""
+        """What the engine receives: the egress PNG under an opaque name, the prompt, the params; the staged
+        mask in the same geometry when the engine takes one; the reference images, each under its own opaque
+        name (decision 46)."""
         image = {
             "b64": base64.b64encode(staged.png).decode("ascii"),
             "mime": "image/png",
@@ -1490,6 +1937,30 @@ class Pipeline:
         inputs: dict[str, Any] = {"image": image}
         if isinstance(run.inputs.get("prompt"), str):
             inputs["prompt"] = run.inputs["prompt"]
+        if self.sends_mask(run):
+            mask_png = self.engine_mask(staged)
+            inputs[MASK_INPUT] = {
+                "b64": base64.b64encode(mask_png).decode("ascii"),
+                "mime": "image/png",
+                "name": _opaque_name(mask_png),
+                "role": "mask",
+            }
+        refs = run.inputs.get(REFERENCE_INPUT)
+        if refs:
+            cas = self.cas_for(run.project_id)
+            side = self.largest_side(run)
+            sent = []
+            for r in refs:
+                data = self.reference_png(cas.read_bytes(r["hash"]), side)
+                sent.append(
+                    {
+                        "b64": base64.b64encode(data).decode("ascii"),
+                        "mime": "image/png",
+                        "name": _opaque_name(data),
+                        "role": r.get("role") or DEFAULT_REFERENCE_ROLE,
+                    }
+                )
+            inputs[REFERENCE_INPUT] = sent
         payload: dict[str, Any] = {
             "engine_id": run.route.engine_id,
             "inputs": inputs,
@@ -1572,20 +2043,67 @@ class Pipeline:
         crypto = pv.crypto("object") if pv.tier == "A" else None
         return textlock.masks(to_uint8(plate16), pv.legend or {}, crypto, self.ocr)
 
+    def apply_ingress_hooks(
+        self, run: Run, data: bytes, staged: Staged, pv: PacketView
+    ) -> tuple[bytes, dict[str, Any] | None]:
+        """Decision 55: `ingress_hooks` in order on the engine's raw bytes. Returns the bytes and
+        `{name: record}` (None when there are no hooks). A raising hook (or one that returns no bytes) stops the
+        run: `PipelineError` with code `ingress_hook:<name>`, which `step` records as the run's reason code."""
+        if not self.ingress_hooks:
+            return data, None
+        records: dict[str, Any] = {}
+        for name, hook in list(self.ingress_hooks):
+            code = f"{INGRESS_HOOK_CODE}:{name}"
+            try:
+                out, record = hook(run, data, staged, pv)
+                if not isinstance(out, (bytes, bytearray)) or not out:
+                    raise TypeError(f"returned {type(out).__name__}, not image bytes")
+            except Exception as e:
+                with self._lock:
+                    self._hook_failed[(run.id, run.attempt)] = code
+                raise PipelineError(
+                    f"ingress hook {name} failed: {type(e).__name__}: {e}"[:500], code=code
+                ) from e
+            data = bytes(out)
+            records[name] = _plain(record)
+        return data, records
+
+    def prior_mask(self, run: Run, pv: PacketView, cas: CAS, base16: np.ndarray) -> np.ndarray:
+        """What the base already changed (decision 47): its run's `mask_union_key`, else its `mask_key`, together
+        with the pixels where the base differs from the plate. For a pipeline take the difference lies inside
+        its masks; for a take made elsewhere (no DONE run behind it, or a node whose stored mask does not cover
+        its own upstream) the difference is what the chain changed, so this run is never failed for it."""
+        plate16 = pv.plate16()
+        h, w = plate16.shape[:2]
+        prior = np.any(base16 != plate16, axis=2)
+        rid = run.inputs.get("base_run")
+        if isinstance(rid, str):
+            try:
+                with self.index.project(run.project_id) as conn:
+                    norm = get_run(conn, rid).normalized or {}
+                key = norm.get("mask_union_key") or norm.get("mask_key")
+                if isinstance(key, str) and cas.exists(key):
+                    prior |= self._grey_mask(cas, key, w, h)
+            except Exception as e:  # the pixel difference alone is never smaller than what changed
+                log.warning("mask of base run %s not read for %s: %s", rid, run.id, e)
+        return prior
+
     def normalize(self, run: Run, cas: CAS) -> dict[str, Any]:
-        """NORMALIZING: the engine's bytes back onto the plate, composited inside the mask, text locked."""
+        """NORMALIZING: the engine's bytes (after the ingress hooks) back onto the plate, or onto the run's base
+        (decision 47), composited inside the mask, text locked from the plate."""
         from plate_gates import composite, textlock
         from plate_pixels import ingress
 
         pv = self.packet(run.project_id, run.packet_id)
         staged = self.stage(run, cas)
         plate16 = pv.plate16()
-        restored, rep = ingress.restore(
-            cas.read_bytes(run.result_key), staged.sizemap, plate16, ring_mask=~staged.mask
-        )
+        base_key = run.inputs.get("base")
+        under = self.base_image(run, pv, cas) if base_key else plate16
+        raw, hooks = self.apply_ingress_hooks(run, cas.read_bytes(run.result_key), staged, pv)
+        restored, rep = ingress.restore(raw, staged.sizemap, under, ring_mask=~staged.mask)
         opts = run.inputs.get(STAGING_KEY) or {}
         feather = float(opts.get("feather_px") or DEFAULT_FEATHER_PX)
-        comp = composite.composite_masked(plate16, restored, staged.mask, feather_px=feather)
+        comp = composite.composite_masked(under, restored, staged.mask, feather_px=feather)
         lock = self.text_lock(pv, plate16)
         if lock.any():
             comp = textlock.apply(plate16, comp, lock)
@@ -1606,7 +2124,7 @@ class Pipeline:
             "region",
             "sizemap_mode",
         )
-        return {
+        out: dict[str, Any] = {
             "outputs": [out_key],
             "raw_key": run.result_key,
             "egress_key": staged.png_key,
@@ -1620,7 +2138,16 @@ class Pipeline:
             },
             "textlock_px": int(lock.sum()),
             "lineage": embedded,
+            "mask_sent": self.sends_mask(run),
         }
+        if hooks is not None:
+            out["ingress_hooks"] = hooks
+        if base_key:
+            union = staged.mask | self.prior_mask(run, pv, cas, under)
+            out["base"] = base_key
+            out["mask_union_key"] = cas.put_bytes(_mask_png(union), "png")
+            out["composite"]["mask_union_share"] = float(union.mean())
+        return out
 
     def _record_phash(self, project_id: str, cas: CAS, key: str) -> None:
         """The output's perceptual hash in the index, so a re-encoded copy dropped later still resolves
@@ -1678,7 +2205,8 @@ class Pipeline:
         return f"gates/{run.id}.{n}.json"
 
     def gate(self, run: Run, cas: CAS) -> GateOutcome:
-        """GATING: score the stored output; the report is versioned in the project's gates/ folder."""
+        """GATING: score the stored output against the plate, inside the run's mask or, on a base (decision 47),
+        inside the union of the chain's masks; the report is versioned in the project's gates/ folder."""
         from . import gating
 
         norm = run.normalized or {}
@@ -1688,6 +2216,13 @@ class Pipeline:
         pv = self.packet(run.project_id, run.packet_id)
         staged = self.stage(run, cas)
         out16 = decode_png16(cas.read_bytes(outputs[0]))
+        mask = staged.mask
+        extra: dict[str, Any] = {"textlock_px": norm.get("textlock_px"), "output": outputs[0]}
+        if isinstance(norm.get("mask_union_key"), str):
+            h, w = out16.shape[:2]
+            mask = self._grey_mask(cas, norm["mask_union_key"], w, h)
+        if norm.get("base"):
+            extra["base_hash"] = norm["base"]
         report = gating.run_gates(
             pv.plate16(),
             out16,
@@ -1695,12 +2230,12 @@ class Pipeline:
             pv.legend,
             pv.tier,
             {"id": run.route.engine_id, "version": str(run.route_dict.get("model_version") or "") or None},
-            mask=staged.mask,
+            mask=mask,
             registration=norm.get("ingress"),
             depth_fn=self.depth_fn,
             edges=pv.edges(),
             crypto_material=pv.crypto("material") if pv.tier == "A" else None,
-            extra_metrics={"textlock_px": norm.get("textlock_px"), "output": outputs[0]},
+            extra_metrics=extra,
         )
         project_dir = self.project_dir(run.project_id)
         svc = self.report_service(run.project_id)
@@ -1748,6 +2283,11 @@ class Pipeline:
             normalize_fn=self.normalize if pipeline_run else None,
             gate_fn=self.gate if pipeline_run else None,
         )
+        with self._lock:
+            hook_code = self._hook_failed.pop((run.id, run.attempt), None)
+        if hook_code is not None and after is S.FAILED:
+            # The worker records any normalize failure as normalize_error; an ingress hook is named instead.
+            annotate(conn, run_id, expect=S.FAILED, reason_code=hook_code)
         if after is not before:
             self.after(conn, project_id, run_id, before)
         return after
@@ -1964,6 +2504,9 @@ class Pipeline:
         elif kind == "submitted":
             rec["provider_job_id"] = run.provider_job_id
             data["idempotency_key"] = run.idempotency_key
+            refs = run.inputs.get(REFERENCE_INPUT)
+            if refs:  # decision 46: what else left with the plate
+                data["references"] = [r.get("hash") for r in refs if isinstance(r, Mapping)]
         elif kind == "fetched":
             rec["provider_job_id"] = run.provider_job_id
             data["result_key"] = run.result_key

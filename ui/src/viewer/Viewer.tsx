@@ -4,6 +4,9 @@
 // Keys while the viewer has focus: ` toggle A/B, [ ] wipe ({ } fine), 1 100%, f fit, d diff, e edges, h heatmap,
 // t tiles, arrows pan, + / - zoom, ? key list. Dragging pans (or moves the wipe line when grabbed); the wheel zooms
 // about the cursor; double-click goes fit <-> 100%. Without WebGL2 the frame stays and says so: never a blank box.
+// T101: a `W × H` chip per side is always on (the decoded size once loaded, else the declared one; `badge-size` still
+// flags a mismatch), and the HUD has Enlarge (only when the host gives `onEnlarge`) and Fullscreen buttons. The
+// viewer keeps `e` and `f` for edges and fit while it has focus; App binds them to enlarge and fullscreen outside it.
 
 import {
   type CSSProperties,
@@ -71,6 +74,12 @@ export interface ViewerProps {
   /** |A - B| multiplier in diff mode (linear light, before the display OETF). */
   diffGain?: number;
   onChange?: (change: ViewerChange) => void;
+  /** Shows the HUD's Enlarge button; the host decides what enlarging means (App: the viewer fills the canvas). */
+  onEnlarge?: () => void;
+  /** The host's enlarged state, for the button's pressed look. */
+  enlarged?: boolean;
+  /** The HUD's Fullscreen button; without it the button toggles the page's fullscreen (`toggleFullscreen`). */
+  onFullscreen?: () => void;
   className?: string;
   style?: CSSProperties;
   ref?: Ref<ViewerHandle>;
@@ -129,6 +138,17 @@ const S: Record<string, CSSProperties> = {
     letterSpacing: "0.04em",
   },
   chip: { padding: "2px 6px", background: C.panel, border: `1px solid ${C.line}`, color: C.text, borderRadius: 3 },
+  hudButton: {
+    padding: "2px 6px",
+    background: C.panel,
+    border: `1px solid ${C.line}`,
+    color: C.text,
+    borderRadius: 3,
+    font: "inherit",
+    letterSpacing: "inherit",
+    cursor: "pointer",
+    pointerEvents: "auto",
+  },
   centre: {
     position: "absolute",
     inset: 0,
@@ -182,6 +202,41 @@ const S: Record<string, CSSProperties> = {
 };
 
 const ALL_SLOTS: SlotKey[] = ["a", "b", "plateEdges", "candEdges", "heat"];
+
+/**
+ * Toggle the page's fullscreen (`document.documentElement.requestFullscreen()`), guarded for browsers and test DOMs
+ * without the Fullscreen API. Returns false when there was nothing to call.
+ */
+export function toggleFullscreen(): boolean {
+  if (typeof document === "undefined") return false;
+  const quiet = (p: unknown) => {
+    if (p && typeof (p as Promise<void>).catch === "function") (p as Promise<void>).catch(() => {});
+  };
+  try {
+    if (document.fullscreenElement) {
+      if (typeof document.exitFullscreen !== "function") return false;
+      quiet(document.exitFullscreen());
+      return true;
+    }
+    const root = document.documentElement as HTMLElement & { requestFullscreen?: () => Promise<void> };
+    if (typeof root.requestFullscreen !== "function") return false;
+    quiet(root.requestFullscreen());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The size a source declares; an 8-bit source with no known size declares a 1×1 placeholder, which is not one. */
+function declaredSize(src: ImageSource | undefined): { width: number; height: number } | null {
+  if (!src) return null;
+  if (src.encoding === "srgb8" && src.width <= 1 && src.height <= 1) return null;
+  return { width: src.width, height: src.height };
+}
+
+/** Keeps the HUD's buttons from starting a pan or a double-click zoom on the viewer underneath. */
+const stopPointer = (e: { stopPropagation: () => void }) => e.stopPropagation();
+
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const devicePixelRatioNow = () => (typeof window !== "undefined" && window.devicePixelRatio) || 1;
 
@@ -245,6 +300,7 @@ export function Viewer(props: ViewerProps): ReactElement {
   const [focused, setFocused] = useState(false);
   const [showKeys, setShowKeys] = useState(false);
   const [grabbing, setGrabbing] = useState(false);
+  const [decoded, setDecoded] = useState<Partial<Record<"a" | "b", { width: number; height: number }>>>({});
   const [state, dispatch] = useReducer(viewerReducer, props, (p) =>
     initialViewState({
       mode: p.mode,
@@ -319,6 +375,7 @@ export function Viewer(props: ViewerProps): ReactElement {
     (r, px) => {
       r.setImage("a", px);
       if (px) dispatch({ type: "layout", image: { width: px.width, height: px.height } });
+      setDecoded((d) => ({ ...d, a: px ? { width: px.width, height: px.height } : undefined }));
     },
     setStatus,
     [a?.url, a?.encoding, a?.width, a?.height, a?.data],
@@ -327,7 +384,10 @@ export function Viewer(props: ViewerProps): ReactElement {
     renderer,
     "b",
     b ? (signal) => loadImage(b, signal) : null,
-    (r, px) => r.setImage("b", px),
+    (r, px) => {
+      r.setImage("b", px);
+      setDecoded((d) => ({ ...d, b: px ? { width: px.width, height: px.height } : undefined }));
+    },
     setStatus,
     [b?.url, b?.encoding, b?.width, b?.height, b?.data],
   );
@@ -579,6 +639,16 @@ export function Viewer(props: ViewerProps): ReactElement {
             : MODE_LABEL[mode];
   const zoomText = mode === "tiles" ? "100%" : `${Math.round(scale * 1000) / 10}%${state.zoom === "fit" ? " fit" : ""}`;
   const sizeMismatch = a && b && (a.width !== b.width || a.height !== b.height);
+  // A source that changed drops its decoded size until it loads again.
+  const sizeA = (decoded.a && status.a?.state === "ready" ? decoded.a : null) ?? declaredSize(a);
+  const sizeB = b ? ((decoded.b && status.b?.state === "ready" ? decoded.b : null) ?? declaredSize(b)) : null;
+  const sizes = (
+    [
+      ["a", sizeA],
+      ["b", sizeB],
+    ] as const
+  ).filter((e): e is readonly ["a" | "b", { width: number; height: number }] => e[1] !== null);
+  const fullscreen = props.onFullscreen ?? toggleFullscreen;
   const errors = ALL_SLOTS.flatMap((k) => {
     const s = status[k];
     return s?.state === "error" ? [`${k}: ${s.message}`] : [];
@@ -671,6 +741,18 @@ export function Viewer(props: ViewerProps): ReactElement {
           <span style={S.chip} data-testid="viewer-zoom">
             {zoomText}
           </span>
+          {sizes.map(([side, size]) => (
+            <span
+              key={side}
+              style={{ ...S.chip, color: C.muted }}
+              data-testid="viewer-size"
+              data-side={side}
+              title={`${side === "a" ? labelA : labelB}: ${size.width} × ${size.height} px`}
+            >
+              {b ? `${side.toUpperCase()} ` : ""}
+              {size.width} × {size.height}
+            </span>
+          ))}
           {gpu.status === "ok" && !gpu.float ? (
             <span
               style={{ ...S.chip, color: WARN, borderColor: WARN }}
@@ -689,6 +771,31 @@ export function Viewer(props: ViewerProps): ReactElement {
             <span style={{ ...S.chip, color: C.muted }}>loading {loading.join(", ")}…</span>
           ) : null}
           <span style={{ flex: 1 }} />
+          {props.onEnlarge ? (
+            <button
+              type="button"
+              style={S.hudButton}
+              data-testid="viewer-enlarge"
+              aria-pressed={props.enlarged === true}
+              title={props.enlarged ? "back to the canvas (Esc)" : "fill the canvas area (e outside the viewer)"}
+              onPointerDown={stopPointer}
+              onDoubleClick={stopPointer}
+              onClick={props.onEnlarge}
+            >
+              {props.enlarged ? "Restore" : "Enlarge"}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            style={S.hudButton}
+            data-testid="viewer-fullscreen"
+            title="fullscreen (f outside the viewer)"
+            onPointerDown={stopPointer}
+            onDoubleClick={stopPointer}
+            onClick={() => fullscreen()}
+          >
+            Fullscreen
+          </button>
           <span style={{ ...S.chip, color: C.muted }} aria-hidden="true">
             ?
           </span>

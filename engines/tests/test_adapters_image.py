@@ -472,7 +472,7 @@ def mag_task(status: str, generated: list[str] | None = None) -> dict[str, Any]:
     }
 
 
-MAG_BASE = "https://api.freepik.com/v1/ai/image-upscaler/precision"
+MAG_BASE = "https://api.magnific.com/v1/ai/image-upscaler-precision-v2"
 
 
 def mag_inputs(seed: int, role: str = "ai_layer") -> dict[str, Any]:
@@ -1272,13 +1272,21 @@ def test_magnific_request_is_the_documented_json(manifests, magnific_replay, sta
     job = adapter.submit(staged(adapter, mag_inputs(1), {"scale": 2, "sharpen": 10}))
     assert job == "mag-a"
     call = magnific_replay.served[0]
+    # T100 (decision 55): Magnific's documented move off the Freepik host.
     assert (call.method, call.host, call.path) == (
         "POST",
-        "api.freepik.com",
-        "/v1/ai/image-upscaler/precision",
+        "api.magnific.com",
+        "/v1/ai/image-upscaler-precision-v2",
     )
-    assert call.headers["x-freepik-api-key"] == KEYS["MAGNIFIC_API_KEY"]
-    assert json.loads(call.body) == {"image": b64(synth_png(1)), "scale_factor": 2, "sharpen": 10}
+    assert call.headers["x-magnific-api-key"] == KEYS["MAGNIFIC_API_KEY"]
+    # The manifest's documented defaults go on the wire explicitly (T100: smart_grain 7, ultra_detail 30).
+    assert json.loads(call.body) == {
+        "image": b64(synth_png(1)),
+        "scale_factor": 2,
+        "sharpen": 10,
+        "smart_grain": 7,
+        "ultra_detail": 30,
+    }
 
 
 def test_magnific_poll_lifecycle_and_output_depends_on_input(manifests, magnific_replay, stage_dir):
@@ -1315,7 +1323,7 @@ def test_magnific_quote_size_is_the_upscaled_size_and_scale_is_bounded(manifests
     q = adapter.quote(mag_inputs(1), {"scale": 4})
     assert (q.size.w, q.size.h) == (256, 144) and q.price_usd == pytest.approx(0.32)
     assert q.custody_grade == "D" and q.price_status == "unconfirmed"
-    for bad in (1, 5):
+    for bad in (1, 17):  # T100: the manifest range is [2, 16] (UNCONFIRMED)
         with pytest.raises(ParamError):
             adapter.quote(mag_inputs(1), {"scale": bad})
     with pytest.raises(InputError, match="image"):  # no text-to-image path

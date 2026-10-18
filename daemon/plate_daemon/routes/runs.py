@@ -15,13 +15,20 @@ best-of-N, export, envelopes.
   `daily_cap`, `unattended_cap`, 422 `envelope_required` / `envelope_exceeded`.
 - `POST /runs/{id}/cancel`, `POST /runs/{id}/fanout {n}` (a QUOTED run becomes sibling 0 of n under one
   quote; the list is returned), `GET /runs/{id}/gate[?n=]` (the stored report, `gates/<run>.<n>.json`,
-  with `n`, `versions` and `shipped`; 404 before gating).
+  with `n`, `versions`, `shipped` and `overlays`; 404 before gating).
+- `overlays` (T109, verification gap G1) is the report's `metrics.overlays` block lifted to the top: the hashes,
+  formats and sizes of what the viewer's `e` and `h` modes draw, stored in the project CAS at gate time and
+  served by `GET /assets/{hash}`: `edges_plate` and `edges_candidate` (8-bit grey PNGs, 255 = edge, the G-buffer
+  edge masks edge recall scored; Tier A only, else null) and `de00_map` (raw little-endian R16F at the output's
+  size, `gating` module docstring). null for a report written without them (gated before T109). Every request to
+  this router makes sure `Pipeline.gate` stores them (`gating.install`, idempotent), so a run approved here is
+  gated with them; the rescore stores them for its version too.
 - `POST /runs/{id}/gate/rescore`: the stored take scored again by today's gate code and thresholds, with the
   arguments `Pipeline.gate` passes (the plate from the packet, `outputs[0]`, the mask the compositor used
   read back from `normalized.mask_key`), written as the next version with `rescored_from`
   (`gate_reports.Service.rescore`); no version is ever rewritten, so a shipped report stays byte for byte
-  what shipped. 409 `no_report` when the run was never gated, `not_rescorable` for a take `Pipeline.gate`
-  did not score (numeric nodes, motion, carried-over layers).
+  what shipped, and with its own `overlays`. 409 `no_report` when the run was never gated, `not_rescorable`
+  for a take `Pipeline.gate` did not score (numeric nodes, motion, carried-over layers).
 - `POST /runs/{id}/override {reason, by}`: a GATE_FAIL run becomes exportable; the reason (10 characters at
   least) is in the run's event log and in a ledger `override` record with top-level `by` and `reason`.
   `POST /runs/{id}/accept {scrub_log_id, by?}`: a DONE (or overridden) take is accepted only against a
@@ -77,7 +84,16 @@ from ..states import RunState
 from ..worker import FanOutError, fan_out
 from . import API, ApiError, Ctx, ctx, custody_error, illegal, pipeline_error, require_token, run_project
 
-router = APIRouter(prefix=API, dependencies=[Depends(require_token)])
+
+def gate_overlays(request: Request) -> None:
+    """`Pipeline.gate` stores the viewer overlays (T109): `gating.install` on the app's pipeline, idempotent,
+    before any run this router starts is gated (imported lazily, as the rescore does)."""
+    from .. import gating
+
+    gating.install(ctx(request).pipeline)
+
+
+router = APIRouter(prefix=API, dependencies=[Depends(require_token), Depends(gate_overlays)])
 
 S = RunState
 APPROVER_PREFIXES = ("human", "auto", "agent")
@@ -361,7 +377,19 @@ def gate_route(request: Request, run_id: str, n: Annotated[int | None, Query(ge=
         run = get_run(conn, run_id)
     if run.gate_report is None or n is not None:
         raise ApiError(404, {"error": "no_report", "run_id": run_id, "state": run.state.value})
-    return {**run.gate_report, "n": None, "versions": [], "shipped": False}
+    return {
+        **run.gate_report,
+        "n": None,
+        "versions": [],
+        "shipped": False,
+        "overlays": _overlays(run.gate_report),
+    }
+
+
+def _overlays(report: dict[str, Any]) -> dict[str, Any] | None:
+    from ..gating import overlays_of
+
+    return overlays_of(report)
 
 
 def _stored_view(
@@ -374,12 +402,14 @@ def _stored_view(
         "versions": versions if versions is not None else svc.versions(run_id),
         "shipped": stored.shipped,
         "path": f"gates/{stored.path.name}",
+        "overlays": _overlays(stored.report),
     }
 
 
 def _rescore_report(c: Ctx, run: Run) -> Any:
     """`gating.run_gates` on the stored take with the arguments `Pipeline.gate` passes (pipeline.py); the mask
-    is the one the compositor used, read back from the CAS instead of re-staged."""
+    is the one the compositor used, read back from the CAS instead of re-staged. The viewer overlays go to the
+    project CAS as at gate time."""
     from .. import gating
 
     norm = run.normalized or {}
@@ -423,6 +453,7 @@ def _rescore_report(c: Ctx, run: Run) -> Any:
         edges=pv.edges(),
         crypto_material=pv.crypto("material") if pv.tier == "A" else None,
         extra_metrics={"textlock_px": norm.get("textlock_px"), "output": outputs[0]},
+        overlay_sink=cas,
     )
 
 

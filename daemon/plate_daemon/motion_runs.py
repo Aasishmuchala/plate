@@ -7,15 +7,23 @@ the numeric nodes, so `POST /projects/{id}/nodes/{node}/quote`, `POST /runs/{id}
 RUNNING, FETCHING, NORMALIZING, GATING, DONE or GATE_FAIL, every move published as `run.state` and ledgered (with
 `data.model`, `data.task` and `data.shot_class`, and `data.previs` on a previs run). Three flavours:
 
-    kling    A Motion or CropPair node on Kling start/end (`motion.kling_job`). Quote: the video lock first
-             (`check_unlocked`: 409 VIDEO_LOCKED before a pair is cut or a price exists), the pair cut from the
-             approved still (the upstream node's `outputHash` in the CAS) by `plan_from_still`, the Move policy
-             (a blocked move is 409 HIGH_RISK_MOVE), then `quote_motion` (custody before price: Atlas is grade D,
-             so an NDA project gets `CustodyViolation`, 403). The worker submits the plan's payload (start under
-             `image`, end under `image_tail`, opaque names), polls and fetches; the fetched clip goes into the CAS
-             as `.mp4` at once and NORMALIZING hands it to `run_motion`, which stores the two stills, reads the
-             clip's real frame rate and runs the video gates. Outputs `[clip, start, end]`; `normalized.timemap`
-             is the map the gates used; the gate report is the video gate report.
+    kling    A Motion or CropPair node on a start/end engine (`motion.kling_job`: Kling O3 4K, Kling v3 Pro,
+             Veo 3.1). Quote: the video lock first (`check_unlocked`: 409 VIDEO_LOCKED, naming the still, before a
+             pair is cut or a price exists; the end still is locked like the start), the pair cut from the
+             approved still on the `image` input (its `outputHash` in the CAS) by `plan_from_still`, or, with a
+             still on the `end` input, `plan_two_stills` between the two (the end must come from the same packet,
+             or a packet with the same `camera.name` and `scene_hash`, else 422 `end_frame_camera`). Reference
+             nodes on `elements` become the plan's elements (422 `elements_unsupported` on an engine without
+             them, 422 `reference_missing` for a hash not in the CAS); every node parameter the engine's manifest
+             declares (`cfg_scale`, Veo's `aspect_ratio`) is a drawer parameter of the plan; `single_image`
+             sends no end frame (a held frame only). Then the Move policy (a blocked move is 409
+             HIGH_RISK_MOVE) and `quote_motion` (custody before price: Atlas and Veo are grade D, so an NDA
+             project gets `CustodyViolation`, 403). The worker submits the plan's payload (start under `image`,
+             end under `image_tail`, opaque names), polls and fetches; the fetched clip goes into the CAS as
+             `.mp4` at once and NORMALIZING hands it to `run_motion`, which stores the stills, reads the clip's
+             real frame rate and runs the video gates. Outputs `[clip, start, end]` (`[clip, start]` for a
+             single-image take); `normalized.timemap` is the map the gates used; the gate report is the video
+             gate report.
     previs   A Motion node with `params.previs` (or `mode: previs`, or the Seedance r2v engine, which only previs
              drives here): `motion.previs` plans the reference-to-video take (refs, clay reference, timing hints)
              and prices it; the worker submits, polls and fetches; the fetch burns the PREVIS watermark before
@@ -106,6 +114,37 @@ MOVE_DIALS = {
     "orbit_deg": ("orbit_deg", "orbitDeg"),
     "travel_cm": ("travel_cm", "travelCm", "sliderCm", "slider_cm"),
 }
+NOT_A_STILL = frozenset(
+    {"end", "elements", "refs", "clip", "sky", "layers", "mask"}
+)  # inputs that are not the start
+
+
+def input_of(g: Any, edge: Mapping[str, Any]) -> str | None:
+    """The input port an edge lands on, resolved as `canvas_rules` (and the UI's `checkHandles`) resolve it: the
+    named `targetHandle`, else the first input of the target that takes the source port's type (a Reference with no
+    handle lands on `elements` / `refs`, a Plate's beauty on `image`)."""
+    handle = edge.get("targetHandle")
+    if isinstance(handle, str) and handle:
+        return handle
+    kinds = {n["id"]: n.get("kind") for n in g.nodes}
+    outputs = (canvas_rules.PORTS.get(kinds.get(edge["source"])) or {}).get("outputs", ())
+    sh = edge.get("sourceHandle")
+    out = next((o for o in outputs if o[0] == sh), None) if sh else (outputs[0] if outputs else None)
+    inputs = (canvas_rules.PORTS.get(kinds.get(edge["target"])) or {}).get("inputs", ())
+    if out is not None:
+        hit = next((i for i in inputs if out[1] in i[2]), None)
+        if hit is not None:
+            return hit[0]
+    return inputs[0][0] if inputs else None
+
+
+def edges_by_input(g: Any, node_id: str) -> dict[str, list[dict[str, Any]]]:
+    """The node's incoming edges grouped by the input they land on, in edge order."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for e in g.edges:
+        if e["target"] == node_id:
+            out.setdefault(input_of(g, e) or "image", []).append(e)
+    return out
 
 
 def is_motion_run(run: Run) -> bool:
@@ -135,6 +174,13 @@ def _number(value: Any, what: str) -> float | None:
 def _blocked(e: kling_job.MotionBlocked) -> PipelineError:
     """The Move policy's refusal as the canvas names it: 409 HIGH_RISK_MOVE, the policy's verdict attached."""
     return PipelineError(str(e), code="HIGH_RISK_MOVE", status=409, **plain(e.extra))
+
+
+def _camera_of(manifest: Mapping[str, Any]) -> tuple[Any, Any]:
+    """(camera name, scene hash) of a packet manifest: two packets that share both shoot one camera."""
+    cam = manifest.get("camera") if isinstance(manifest.get("camera"), Mapping) else {}
+    scene = manifest.get("scene_hash") if isinstance(manifest.get("scene_hash"), Mapping) else {}
+    return cam.get("name"), scene.get("hex")
 
 
 def _sheet(project: Any) -> ProjectSheet:
@@ -483,7 +529,8 @@ class MotionRunner:
             raise PipelineError(v["message"], code=v["code"], violations=broken)
 
     def _plate(self, project_id: str, g: Any, node_id: str, body: Mapping[str, Any]) -> Any:
-        """The PacketView of the plate the node hangs off (the request's `packet_id`, else the nearest Plate)."""
+        """The PacketView of the plate the node hangs off (the request's `packet_id`, else the nearest Plate
+        upstream of `node_id`, which may be the start still rather than the video node)."""
         plates = canvas_rules.upstream_plates(g, node_id)
         packet_id = body.get("packet_id") or next(
             (p.get("packetId") for p in plates if p.get("packetId")), None
@@ -497,11 +544,9 @@ class MotionRunner:
     def _still(self, g: Any, node_id: str, pv: Any, cas: CAS, *, locked: bool) -> tuple[str | None, str, Any]:
         """(CAS key or None for the plate itself, source node id, uint16 RGB) of the still feeding the node: the
         upstream node's `outputHash` in this project's CAS, or the plate's display master when a Plate feeds it."""
-        by_id = {n["id"]: n for n in g.nodes}
-        incoming = [e for e in g.edges if e["target"] == node_id]
-        if not incoming:
+        source = self._start_source(g, node_id)
+        if source is None:
             raise PipelineError(f"node {node_id} has nothing upstream to start from", code="no_still")
-        source = by_id[incoming[0]["source"]]
         key = source.get("outputHash")
         if cas_has(cas, key):
             return key, source["id"], decode_png16(cas.read_bytes(key))
@@ -511,6 +556,106 @@ class MotionRunner:
         if locked:
             raise kling_job.MotionLocked(msg, node=node_id)
         raise PipelineError(msg, code="no_still")
+
+    @staticmethod
+    def _start_source(g: Any, node_id: str) -> dict[str, Any] | None:
+        """The node feeding the start still: the first edge on the `image` input, else the first incoming edge that
+        is not an end still, a reference or a clip (a Plate wired by its packet handle, as before)."""
+        by_id = {n["id"]: n for n in g.nodes}
+        ports = edges_by_input(g, node_id)
+        edges = ports.get("image") or [e for name, es in ports.items() if name not in NOT_A_STILL for e in es]
+        edges = [e for e in edges if (by_id.get(e["source"]) or {}).get("kind") != "Reference"]
+        return by_id.get(edges[0]["source"]) if edges else None
+
+    def _end_still(
+        self, project_id: str, g: Any, node_id: str, edges: list[dict[str, Any]], pv: Any, cas: CAS
+    ) -> dict[str, Any] | None:
+        """The still on the Motion node's `end` input: `{key, node, packet_id}`, or None when nothing is wired
+        there. Its output must be in the CAS (409 VIDEO_LOCKED naming it otherwise, as for the start) and it must
+        come from the start's camera: the same packet, or one with the same `camera.name` and `scene_hash` (422
+        `end_frame_camera`)."""
+        if not edges:
+            return None
+        if len(edges) > 1:
+            raise PipelineError(
+                f"{node_id} has {len(edges)} end stills; a move has one", code="params", node=node_id
+            )
+        by_id = {n["id"]: n for n in g.nodes}
+        source = by_id[edges[0]["source"]]
+        sid = str(source["id"])
+        key = source.get("outputHash")
+        if not cas_has(cas, key):
+            raise kling_job.MotionLocked(
+                f"the end still {sid} feeding {node_id} has no output in this project's CAS: make and approve it first",
+                node=node_id,
+                still=sid,
+            )
+        plates = canvas_rules.upstream_plates(g, sid)
+        end_packet = next((p.get("packetId") for p in plates if p.get("packetId")), None)
+        if end_packet != pv.packet_id:
+            epv = self.pipeline.packet(project_id, end_packet) if isinstance(end_packet, str) else None
+            same = epv is not None and _camera_of(epv.manifest) == _camera_of(pv.manifest)
+            if not same or _camera_of(pv.manifest) == (None, None):
+                raise PipelineError(
+                    f"the end still {sid} is from packet {end_packet} and the start from {pv.packet_id}: a move "
+                    "between two stills keeps one camera (same packet, or the same camera name and scene hash)",
+                    code="end_frame_camera",
+                    node=node_id,
+                    still=sid,
+                    start_packet=pv.packet_id,
+                    end_packet=end_packet,
+                )
+        return {"key": key, "node": sid, "packet_id": end_packet}
+
+    def _elements(
+        self, g: Any, node_id: str, edges: list[dict[str, Any]], engine_id: str, cas: CAS
+    ) -> list[dict[str, Any]]:
+        """The Reference nodes on the `elements` input as `[{name, hash, node}]`, in edge order. Refused before any
+        byte is read when the engine takes no elements (422 `elements_unsupported`), then for a reference whose
+        picture is not in the project's CAS (422 `reference_missing`)."""
+        if not edges:
+            return []
+        manifest = self.pipeline.manifests.get(engine_id)
+        if manifest is not None and not any(i.name == "elements" for i in manifest.inputs):
+            raise PipelineError(
+                f"{engine_id} takes no elements; Kling O3 4K does", code="elements_unsupported", node=node_id
+            )
+        by_id = {n["id"]: n for n in g.nodes}
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for i, e in enumerate(edges):
+            ref = by_id[e["source"]]
+            rp = ref.get("params") if isinstance(ref.get("params"), Mapping) else {}
+            key = pick(rp, "referenceHash", "reference_hash") or ref.get("outputHash")
+            if not cas_has(cas, key):
+                raise PipelineError(
+                    f"reference {ref['id']} names no picture in this project's CAS ({key!r}); upload it first",
+                    code="reference_missing",
+                    node=ref["id"],
+                )
+            label = ref.get("label") if ref.get("label") not in (None, "", "Reference") else None
+            name = str(pick(rp, "name", "elementName", "element_name") or label or f"element{i + 1}").strip()
+            base, n = name, 2
+            while name in seen:  # the engine addresses elements by name: keep them distinct
+                name, n = f"{base}{n}", n + 1
+            seen.add(name)
+            out.append({"name": name, "hash": key, "node": ref["id"]})
+        return out
+
+    def _element_pngs(self, cas: CAS, spec: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """The spec's elements as `{name, png}` for the plan, re-encoded for the engine (deterministic)."""
+        return [
+            {
+                "name": el["name"],
+                "png": kling_job.element_png(
+                    cas.read_bytes(el["hash"]),
+                    spec["engine_id"],
+                    manifests=self.pipeline.manifests,
+                    resolution=spec.get("resolution"),
+                ),
+            }
+            for el in spec.get("elements") or ()
+        ]
 
     @staticmethod
     def _attempt(conn: Any, node_id: str, body: Mapping[str, Any]) -> int:
@@ -572,11 +717,26 @@ class MotionRunner:
     ) -> tuple[RunCreate, Quote, str]:
         pl = self.pipeline
         project_id, node_id, kind = project.project_id, str(node["id"]), str(node.get("kind"))
-        pv = self._plate(project_id, g, node_id, body)
+        start = self._start_source(g, node_id)
+        pv = self._plate(project_id, g, str(start["id"]) if start else node_id, body)
         cas = pl.cas_for(project_id)
         still_key, still_node, still16 = self._still(g, node_id, pv, cas, locked=True)
+        ports = edges_by_input(g, node_id)
+        end = self._end_still(project_id, g, node_id, ports.get("end", []), pv, cas)
         engine_id = body.get("engine_id") or pick(params, "engine_id", "engineId", "engine")
         engine_id = str(engine_id or kling_job.DEFAULT_ENGINE)
+        elements = self._elements(g, node_id, ports.get("elements", []), engine_id, cas)
+        manifest = pl.manifests.get(engine_id)
+        declared = {p.name for p in manifest.params} if manifest is not None else set()
+        extra = {k: params[k] for k in sorted(declared - kling_job.PLAN_PARAMS) if params.get(k) is not None}
+        single = pick(params, "single_image", "singleImage")
+        if single is not None and not isinstance(single, bool):
+            raise PipelineError(f"single_image must be true or false, got {single!r}", code="params")
+        if single and end is not None:
+            raise PipelineError(
+                "single_image sends the start frame alone; unwire the end still or drop single_image",
+                code="params",
+            )
         move_params: dict[str, Any] = {}
         for name, spellings in MOVE_DIALS.items():
             value = _number(pick(params, *spellings), name)
@@ -598,16 +758,25 @@ class MotionRunner:
             except Exception as e:  # the router informs the policy; it is never why a quote cannot be made
                 log.warning("router verdict for %s/%s not measured: %s", project_id, node_id, e)
         cx, cy = _number(pick(params, "cx"), "cx"), _number(pick(params, "cy"), "cy")
+        cx1, cy1 = _number(pick(params, "cx1", "cxEnd"), "cx1"), _number(pick(params, "cy1", "cyEnd"), "cy1")
         z0 = _number(pick(params, "z0", "zoomStart", "zoom_start"), "z0")
         z1 = _number(pick(params, "z1", "zoomEnd", "zoom_end"), "z1")
         seed = pick(params, "seed")
+        default_recipe = kling_job.TWO_STILLS_RECIPE if end is not None else kling_job.DEFAULT_RECIPE
         motion_spec = {
             "flavour": "kling",
             "kind": kind,
             "still": still_key,
             "still_node": still_node,
-            "recipe": str(pick(params, "recipe") or body.get("recipe") or kling_job.DEFAULT_RECIPE),
+            "end_still": end["key"] if end else None,
+            "end_node": end["node"] if end else None,
+            "end_packet": end["packet_id"] if end else None,
+            "elements": elements,
+            "extra_params": plain(extra),
+            "single_image": single,
+            "recipe": str(pick(params, "recipe") or body.get("recipe") or default_recipe),
             "centre": [cx, cy] if cx is not None and cy is not None else None,
+            "centre_end": [cx1, cy1] if cx1 is not None and cy1 is not None else None,
             "zoom": [z0, z1] if z0 is not None and z1 is not None else None,
             "engine_id": engine_id,
             "move_kind": pick(params, "move", "move_kind", "moveKind"),
@@ -625,7 +794,8 @@ class MotionRunner:
             plan, g, pl.manifests, allowed, route_id=body.get("route_id"), now=now
         )
         cas.put_bytes(plan.start_png, "png")
-        cas.put_bytes(plan.end_png, "png")
+        if plan.end_png is not None:
+            cas.put_bytes(plan.end_png, "png")
         spec = kling_job.to_run_create(
             plan, project_id, pv.packet_id, route, attempt=self._attempt(conn, node_id, body)
         )
@@ -638,18 +808,25 @@ class MotionRunner:
             STAGING_KEY: {"node_kind": kind, "motion": True, "region_crop": False},
             SPEC_KEY: plain(motion_spec),
         }
+        if end is not None:
+            inputs["end_still"] = end["key"]
         spec = spec.model_copy(
             update={"inputs": inputs, "priority": Priority.parse(body.get("priority") or "interactive")}
         )
+        pair = kling_job.pair_summary(plan.pair)
+        how = "two stills" if pair["mode"] == "two_stills" else f"{pair['direction']} crop pair"
+        if plan.single_image:
+            how += ", single image"
         reason = (
             f"{kind} on {quote.provider}/{quote.model} {quote.region} {quote.custody_grade}, "
-            f"{plan.duration_s} s, {quote.price_usd:.4f} USD ({plan.move['risk']} risk move)"
+            f"{plan.duration_s} s, {quote.price_usd:.4f} USD ({plan.move['risk']} risk move, {how})"
         )
         return spec, quote, reason
 
     def _plan_kling(
         self, project: Any, pv: Any, node_id: str, spec: Mapping[str, Any], still16: Any
     ) -> kling_job.MotionPlan:
+        cas = self.pipeline.cas_for(project.project_id)
         kwargs: dict[str, Any] = {
             "recipe": spec.get("recipe") or kling_job.DEFAULT_RECIPE,
             "node_id": node_id,
@@ -659,15 +836,24 @@ class MotionRunner:
             "move_params": dict(spec.get("move_params") or {}),
             "router_verdict": spec.get("router"),
             "tier": pv.tier,
+            "extra_params": dict(spec.get("extra_params") or {}),
         }
         for name in ("prompt", "negative_prompt", "seed", "resolution", "move_kind", "shot_s"):
             if spec.get(name) is not None:
                 kwargs[name] = spec[name]
-        if spec.get("centre"):
-            kwargs["centre"] = list(spec["centre"])
-        if spec.get("zoom"):
-            kwargs["zoom"] = (float(spec["zoom"][0]), float(spec["zoom"][1]))
         try:
+            kwargs["elements"] = self._element_pngs(cas, spec)
+            if spec.get("end_still"):  # two approved stills of one camera
+                end16 = decode_png16(cas.read_bytes(spec["end_still"]))
+                return kling_job.plan_two_stills(still16, end16, **kwargs)
+            if spec.get("centre"):
+                kwargs["centre"] = list(spec["centre"])
+            if spec.get("centre_end"):
+                kwargs["centre_end"] = list(spec["centre_end"])
+            if spec.get("zoom"):
+                kwargs["zoom"] = (float(spec["zoom"][0]), float(spec["zoom"][1]))
+            if spec.get("single_image") is not None:
+                kwargs["single_image"] = bool(spec["single_image"])
             return kling_job.plan_from_still(still16, **kwargs)
         except kling_job.MotionBlocked as e:
             raise _blocked(e) from e
@@ -1126,7 +1312,7 @@ class MotionRunner:
         record.pop("gate", None)
         return plain(
             {
-                "outputs": [res.video_key, res.start_key, res.end_key],
+                "outputs": [k for k in (res.video_key, res.start_key, res.end_key) if k is not None],
                 "clip": res.video_key,
                 "start": res.start_key,
                 "end": res.end_key,
@@ -1242,6 +1428,9 @@ class MotionRunner:
         }
         if flavour_of(run) == "previs":
             data["previs"] = True
+        elements = run.inputs.get("elements")
+        if isinstance(elements, list) and elements:
+            data["elements"] = [e.get("hash") for e in elements if isinstance(e, Mapping)]
         return {k: v for k, v in data.items() if v is not None}
 
     def _after(

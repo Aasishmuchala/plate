@@ -250,9 +250,12 @@ def test_recipes_list_carries_origin_group_task_and_tokens(client, auth):
 def test_recipes_kind_filter(client, auth):
     rows = client.get(f"{API}/recipes", params={"kind": "still_rephotograph"}, headers=auth).json()
     assert {r["id"] for r in rows} == {"sunburst_rephotograph_close", "imperfections_close"}
-    assert [
+    motion = [
         r["id"] for r in client.get(f"{API}/recipes", params={"kind": "motion_croppair"}, headers=auth).json()
-    ] == ["croppair_pushin"]
+    ]
+    assert "croppair_pushin" in motion and "motion_time_of_day" in motion  # T94 ships the motion recipes
+    shipped = [r for r in recipes.list_runnable() if recipes.load_runnable(r).kind == "motion_croppair"]
+    assert motion == shipped
     assert client.get(f"{API}/recipes", params={"kind": "banner"}, headers=auth).status_code == 422
 
 

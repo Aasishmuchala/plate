@@ -198,7 +198,8 @@ def test_presets_are_default_plus_the_recipes_naming_the_engine(client, auth):
         "imperfections_close",
         "sunburst_rephotograph_close",
     ]
-    assert got["kling-o3-4k"]["presets"] == ["default", "croppair_pushin"]
+    assert got["kling-o3-4k"]["presets"] == ["default", *by_engine["kling-o3-4k"]]  # T94: the motion recipes
+    assert "croppair_pushin" in got["kling-o3-4k"]["presets"]
     assert got["flux-3-image"]["presets"] == ["default"]
     named = {recipes.load_runnable(r).engine for r in recipes.list_runnable()}
     assert named <= set(got)  # every recipe points at an engine the catalogue lists

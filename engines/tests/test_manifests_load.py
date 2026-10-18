@@ -330,8 +330,9 @@ def test_params_are_the_full_schema_with_advanced_flags(manifests):
 
 def test_magnific_and_veo_details(manifests):
     mag = manifests["magnific-precision-v2"]
-    assert mag.plate_upscale_forbidden and next(p for p in mag.params if p.name == "scale").range == [2, 4]
-    assert mag.routes[0].allowed_hosts == [".freepik.com"]
+    # T100 (decision 55): scale 2 to 16 (UNCONFIRMED) on api.magnific.com; Freepik's CDN may still serve results.
+    assert mag.plate_upscale_forbidden and next(p for p in mag.params if p.name == "scale").range == [2, 16]
+    assert mag.routes[0].allowed_hosts == [".magnific.com", ".freepik.com"]
     veo = {p.name: p for p in manifests["veo-3.1"].params}
     assert veo["duration"].range == [4, 8] and veo["resolution"].enum == ["720p", "1080p"]
     assert veo["generate_audio"].default is False

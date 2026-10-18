@@ -3,15 +3,31 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { UNSEEN_GEOMETRY_LABEL, type Graph } from "./nodeTypes";
 import { createInitialGraph, graphFromWire, graphToWire, useGraphStore } from "./store";
 
+/** The graph these tests start from (the seed's old placeholder; since T98 the store itself starts empty). */
+const SEED: Graph = {
+  schema: 1,
+  nodes: [
+    { kind: "Plate", id: "plate-1", label: "Plate", packetId: "unlinked", tier: "A", position: { x: 0, y: 80 } } as Graph["nodes"][number],
+    { kind: "Comp", id: "comp-1", label: "Comp", position: { x: 260, y: 80 } } as Graph["nodes"][number],
+    { kind: "Gate", id: "gate-1", label: "Gate", position: { x: 520, y: 80 } } as Graph["nodes"][number],
+  ],
+  edges: [
+    { id: "plate-1->comp-1", source: "plate-1", target: "comp-1", sourceHandle: null, targetHandle: null },
+    { id: "comp-1->gate-1", source: "comp-1", target: "gate-1", sourceHandle: null, targetHandle: null },
+  ],
+};
+
 beforeEach(() => {
   useGraphStore.setState(createInitialGraph());
+  useGraphStore.getState().loadProject(SEED);
 });
 
 const conn = (source: string, target: string): Connection => ({ source, target, sourceHandle: null, targetHandle: null });
 const state = () => useGraphStore.getState();
 
 describe("graph store", () => {
-  it("starts as Plate -> Comp -> Gate", () => {
+  it("starts empty with no project (T98); the seed loads as Plate -> Comp -> Gate", () => {
+    expect(createInitialGraph()).toMatchObject({ projectId: null, nodes: [], edges: [], saveState: "saved", savedAt: null });
     const { nodes, edges, lastRefusal } = state();
     expect(nodes.map((n) => n.data.kind)).toEqual(["Plate", "Comp", "Gate"]);
     expect(edges).toHaveLength(2);
