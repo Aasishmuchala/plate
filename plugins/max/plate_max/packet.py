@@ -11,7 +11,8 @@ hash_payloads the in-memory bytes that legend_bytes, camera_frames_bytes, scene_
 (digest.py) and view_hash_payload produce; file_ref_from_hashes turns an answer into a files{} entry
 and write_packet(hashes=) checks the manifest against it before anything is written. The schema's
 hash.algo stays "blake3". Validation of the result against the schema is plate_spec's job and runs
-in the tests, not here.
+in the tests, not here. Every JSON file is written strict (fsutil.dump_json_bytes, allow_nan=False):
+a NaN or infinity that slipped past the lint raises ValueError instead of a manifest that is not JSON.
 """
 
 from __future__ import annotations
@@ -229,8 +230,17 @@ def build_camera_block(cam: dict[str, Any], kind: str = "still") -> dict[str, An
     pa = float(cam.get("pixel_aspect") or 1.0)
     focal, film = float(cam["focal_mm"]), float(cam["film_gate_mm"])
     zoom = float(cam.get("zoom_factor") or 1.0)
-    if focal <= 0 or film <= 0 or zoom <= 0:
-        raise ManifestError("camera focal length, film gate and zoom must be positive")
+    for label, value in (
+        ("focal length", focal),
+        ("film gate", film),
+        ("zoom factor", zoom),
+        ("f-number", float(cam["f_number"])),
+    ):
+        if not (math.isfinite(value) and value > 0):
+            raise ManifestError(
+                f"camera {cam['name']}: {label} {value!r}: focal length, film gate, zoom and f-number "
+                "must be positive finite numbers"
+            )
 
     # full float precision: the spec checks fx to 0.01% and the FOV to 0.005 degrees
     derived = intrinsics(focal, film, zoom, width, height, pa)
@@ -247,6 +257,11 @@ def build_camera_block(cam: dict[str, Any], kind: str = "still") -> dict[str, An
     elif exp.get("ev") is not None:
         exposure = {"mode": "ev", "ev100": round(float(exp["ev"]), 4)}
     elif iso and shutter:
+        for label, value in (("ISO", iso), ("shutter", shutter)):
+            if not (math.isfinite(float(value)) and float(value) > 0):
+                raise ManifestError(
+                    f"camera {cam['name']}: exposure {label} {value!r} must be a positive finite number"
+                )
         ev100 = math.log2(f_number**2 / shutter) - math.log2(iso / 100.0)
         exposure = {
             "mode": "physical",
@@ -460,7 +475,7 @@ def build_manifest(
     if kind not in ("still", "motion"):
         raise ManifestError("kind must be 'still' or 'motion'")
     for label, value in (("project_id", project_id), ("shot_id", shot_id)):
-        if not SLUG_RE.match(value):
+        if not SLUG_RE.fullmatch(value):
             raise ManifestError(f"{label} {value!r} is not a lower-case slug (use slugify)")
     if not PACKET_ID_RE.match(str(legend.get("packet_id"))):
         raise ManifestError("legend.packet_id is not a pkt_ + 26 character ULID (use new_packet_id)")

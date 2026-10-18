@@ -4,6 +4,10 @@ Unit tests drive the engine through the adapter protocol; the pipeline tests run
 packet `fixtures/packets/room_a`, where an echoed result registers to the plate (DONE) and a result shifted 6 px
 is camera drift (GATE_FAIL). The last test is the other half of the FLUX 3 sizes change: a quote for
 `flux-3-image` no longer answers `no_sizes`.
+
+T130: with a journal the echo sources persist beside it (`<journal>.echo/<job_id>.png`) and are reloaded on
+construction, so a restarted fake echoes the same bytes; the `ResultExpired` path stays for a job whose file is
+gone. The live-daemon kill in FETCHING is in `test_stress_wave12_worker.py`.
 """
 
 from __future__ import annotations
@@ -188,18 +192,51 @@ def test_the_journal_keeps_the_hashes_not_the_image(tmp_path):
     assert len(job["inputs_hash"]) == 64 and len(job["params_hash"]) == 64 and job["has_image"] is True
 
 
-def test_a_restarted_engine_keeps_echo_but_needs_the_image_again(tmp_path):
+def test_a_restarted_engine_echoes_the_same_bytes_from_beside_the_journal(tmp_path):
+    """T130 (was: the restart lost the image and needed a resubmit): the source is persisted and reloaded."""
     png = png_of(ramp())
-    e = FakeEngine(echo=True, shift_px=4, journal=tmp_path / "fake.json")
+    journal = tmp_path / "fake.json"
+    e = FakeEngine(echo=True, shift_px=4, journal=journal)
     job = e.submit(payload_of(png), "k1")
+    assert (tmp_path / "fake.json.echo" / f"{job}.png").read_bytes() == png
+    first = e.fetch(f"fake://results/{job}")
     again = e.restarted()
-    assert again.echo is True and again.shift_px == 4
-    with pytest.raises(ResultExpired, match="resubmit"):
-        again.fetch(f"fake://results/{job}")
-    # The pipeline's re-submit of the same key finds the same job and hands the image back.
-    assert again.submit(payload_of(png), "k1") == job
-    out = decode(again.fetch(f"fake://results/{job}"))
+    assert again.echo is True and again.shift_px == 4 and job in again._echo_src  # reloaded on construction
+    assert again.fetch(f"fake://results/{job}") == first
+    out = decode(first)
     assert np.array_equal(out[:, 4:], decode(png)[:, :-4])
+    # A brand-new instance over the same journal (a restarted daemon) echoes the same bytes too.
+    assert FakeEngine(echo=True, shift_px=4, journal=journal).fetch(f"fake://results/{job}") == first
+    # The re-submit of the same key still finds the same job and does not rewrite the file.
+    assert again.submit(payload_of(png), "k1") == job and again.job_count == 1
+
+
+def test_a_job_whose_echo_file_is_gone_still_raises_result_expired(tmp_path):
+    png = png_of(ramp())
+    e = FakeEngine(echo=True, journal=tmp_path / "fake.json")
+    job = e.submit(payload_of(png), "k1")
+    (tmp_path / "fake.json.echo" / f"{job}.png").unlink()
+    with pytest.raises(ResultExpired, match="resubmit"):
+        FakeEngine(echo=True, journal=tmp_path / "fake.json").fetch(f"fake://results/{job}")
+
+
+def test_the_persisted_echo_sources_are_bounded_like_the_memory_ones(tmp_path):
+    png = png_of(ramp())
+    e = FakeEngine(echo=True, journal=tmp_path / "fake.json")
+    jobs = [e.submit(payload_of(png), f"k{i}") for i in range(ECHO_KEEP + 3)]
+    folder = tmp_path / "fake.json.echo"
+    assert sorted(p.stem for p in folder.glob("*.png")) == sorted(jobs[-ECHO_KEEP:])
+    assert not list(folder.glob("*.tmp")) and not list(folder.glob(".*"))  # atomic writes leave no temp files
+    with pytest.raises(ResultExpired):
+        FakeEngine(echo=True, journal=tmp_path / "fake.json").fetch(f"fake://results/{jobs[0]}")
+
+
+def test_without_a_journal_nothing_is_written_and_a_restart_keeps_the_provider_copy(tmp_path):
+    png = png_of(ramp())
+    e = FakeEngine(echo=True)
+    job = e.submit(payload_of(png), "k1")
+    assert e.echo_dir is None and list(tmp_path.iterdir()) == []
+    assert e.restarted().fetch(f"fake://results/{job}") == png
 
 
 def test_only_the_newest_jobs_are_held_in_memory():

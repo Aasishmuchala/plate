@@ -25,13 +25,21 @@ not parse, or a last line that ends in `\\n` but does not parse, is damage and f
 `kind` is a closed set (`KINDS`); later tasks extend it here (T38 added `verdict`, `llm` and `scrub`: a human
 Ship/Fix/Render-it call, a Claude composer or judge call, and a logged scrub of a take). Fields outside the
 shape go under `data`.
+
+Reading is memoised per `Ledger` instance on the file's `(st_size, st_mtime_ns)`: `records()` re-reads only
+when the file is not exactly what this instance last saw, and `append` extends the memo with the record it
+sealed. Records that must not be lost while the file cannot be written (a read-only mount, the project lock
+held for longer than `lock_timeout_s`) go to the `ledger_outbox` table of the project index with
+`enqueue_outbox`; `drain_outbox` appends them, in order, once the ledger is writable again (Decision 73).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -44,8 +52,11 @@ from typing import Any
 
 from blake3 import blake3
 
+from .db import tx
 from .lock import ProjectLocked, project_lock
 from .timeutil import iso, parse_iso, utcnow
+
+log = logging.getLogger(__name__)
 
 RUNS_JSONL = "runs.jsonl"
 TORN_SUFFIX = ".torn"
@@ -113,6 +124,13 @@ STR_FIELDS = (
     "reason",
 )
 DECISIONS = ("accepted", "rerolled")
+# A run with one of these records, or a provider job id, was submitted even if its `submitted` record is
+# missing (Decision 73).
+SUBMITTED_EVIDENCE_KINDS = frozenset({"fetched", "gated", "done"})
+# Engines that never call a vendor: an import, a carried-over layer, a numeric or plugin node, a local
+# recomposite. Their `done` records carry a made-up job id and cost nothing, so the evidence rule above
+# does not apply to them; only an explicit `submitted` record would count (none is ever written).
+LOCAL_ENGINE_PREFIXES = ("import:", "carry-over", "plate-numeric", "plate-plugin", "local-recomposite")
 HEX = frozenset("0123456789abcdef")
 
 
@@ -233,6 +251,16 @@ class _Tail:
     hash: str
 
 
+@dataclass
+class _Memo:
+    """What `read()` returned for the file as it was at `(size, mtime_ns)`."""
+
+    size: int
+    mtime_ns: int
+    records: list[dict[str, Any]]
+    problems: list[str]
+
+
 _THREAD_LOCKS: dict[str, threading.RLock] = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
 
@@ -260,6 +288,54 @@ def _cost(value: Any, name: str, *, allow_negative: bool) -> float:
     return float(value)
 
 
+def normalise_record(record: Mapping[str, Any], clock: Callable[[], datetime] = utcnow) -> dict[str, Any]:
+    """The caller-supplied fields of a record, checked and in plain JSON form (what `append` seals)."""
+    unknown = sorted(set(record) - set(FIELD_ORDER))
+    if unknown:
+        raise LedgerError(f"unknown ledger field(s) {unknown}: put extra detail under 'data'")
+    reserved = sorted(set(record) & RESERVED)
+    if reserved:
+        raise LedgerError(f"{reserved} are set by the ledger, not the caller")
+    kind = record.get("kind")
+    if kind not in KINDS:
+        raise LedgerError(f"kind {kind!r} is not one of {sorted(KINDS)}")
+    out: dict[str, Any] = {}
+    at = record.get("at")
+    if at is None:
+        at = clock()
+    if isinstance(at, str):
+        try:
+            at = parse_iso(at)
+        except ValueError as e:
+            raise LedgerError(f"at {record['at']!r} is not an ISO-8601 time") from e
+    if not isinstance(at, datetime):
+        raise LedgerError("at must be a datetime or an ISO-8601 string")
+    out["at"] = iso(at)
+    out["kind"] = kind
+    for name in STR_FIELDS:
+        v = record.get(name)
+        if v is None:
+            continue
+        if not isinstance(v, str) or not v:
+            raise LedgerError(f"{name} must be a non-empty string")
+        out[name] = v
+    if record.get("cost_usd_quoted") is not None:
+        out["cost_usd_quoted"] = _cost(record["cost_usd_quoted"], "cost_usd_quoted", allow_negative=False)
+    if record.get("cost_usd_billed") is not None:  # a refund or credit is a negative bill
+        out["cost_usd_billed"] = _cost(record["cost_usd_billed"], "cost_usd_billed", allow_negative=True)
+    gate_report = record.get("gate_report")
+    if gate_report is not None:
+        if not isinstance(gate_report, str | dict):
+            raise LedgerError("gate_report must be a path or id string, or a summary object")
+        out["gate_report"] = _jsonable(gate_report, "gate_report")
+    data = record.get("data")
+    if data is not None:
+        if not isinstance(data, dict):
+            raise LedgerError("data must be an object")
+        out["data"] = _jsonable(data, "data")
+    return out
+
+
 class Ledger:
     """`Ledger(project_dir)`: the append-only, hash-chained `runs.jsonl` of one project folder."""
 
@@ -277,6 +353,7 @@ class Ledger:
         self._lock = lock  # a held projects.Lock (anything with `.held`), if the caller has one
         self._clock = clock
         self._tail: _Tail | None = None
+        self._memo: _Memo | None = None
         self.repairs: list[str] = []  # torn tails this instance moved aside
 
     # ------------------------------------------------------------------ write side
@@ -308,50 +385,7 @@ class Ledger:
             yield
 
     def _normalise(self, record: Mapping[str, Any]) -> dict[str, Any]:
-        unknown = sorted(set(record) - set(FIELD_ORDER))
-        if unknown:
-            raise LedgerError(f"unknown ledger field(s) {unknown}: put extra detail under 'data'")
-        reserved = sorted(set(record) & RESERVED)
-        if reserved:
-            raise LedgerError(f"{reserved} are set by the ledger, not the caller")
-        kind = record.get("kind")
-        if kind not in KINDS:
-            raise LedgerError(f"kind {kind!r} is not one of {sorted(KINDS)}")
-        out: dict[str, Any] = {}
-        at = record.get("at")
-        if at is None:
-            at = self._clock()
-        if isinstance(at, str):
-            try:
-                at = parse_iso(at)
-            except ValueError as e:
-                raise LedgerError(f"at {record['at']!r} is not an ISO-8601 time") from e
-        if not isinstance(at, datetime):
-            raise LedgerError("at must be a datetime or an ISO-8601 string")
-        out["at"] = iso(at)
-        out["kind"] = kind
-        for name in STR_FIELDS:
-            v = record.get(name)
-            if v is None:
-                continue
-            if not isinstance(v, str) or not v:
-                raise LedgerError(f"{name} must be a non-empty string")
-            out[name] = v
-        if record.get("cost_usd_quoted") is not None:
-            out["cost_usd_quoted"] = _cost(record["cost_usd_quoted"], "cost_usd_quoted", allow_negative=False)
-        if record.get("cost_usd_billed") is not None:  # a refund or credit is a negative bill
-            out["cost_usd_billed"] = _cost(record["cost_usd_billed"], "cost_usd_billed", allow_negative=True)
-        gate_report = record.get("gate_report")
-        if gate_report is not None:
-            if not isinstance(gate_report, str | dict):
-                raise LedgerError("gate_report must be a path or id string, or a summary object")
-            out["gate_report"] = _jsonable(gate_report, "gate_report")
-        data = record.get("data")
-        if data is not None:
-            if not isinstance(data, dict):
-                raise LedgerError("data must be an object")
-            out["data"] = _jsonable(data, "data")
-        return out
+        return normalise_record(record, self._clock)
 
     def _tail_state(self) -> tuple[_Tail, bool]:
         """(last chained record's seq and hash, whether the file lacks its final newline). Re-reads the
@@ -392,6 +426,8 @@ class Ledger:
         body_in = {**(record or {}), **fields}
         norm = self._normalise(body_in)
         with _thread_lock(self.path), self._writer():
+            memo_current = self._memo_matches_disk()
+            repairs = len(self.repairs)
             tail, needs_newline = self._tail_state()
             seq = tail.seq + 1
             body = {"v": VERSION, "seq": seq, "prev_hash": tail.hash, **norm}
@@ -408,22 +444,63 @@ class Ledger:
                 os.fsync(fh.fileno())
             st = self.path.stat()
             self._tail = _Tail(st.st_size, st.st_mtime_ns, seq, sealed)
+            if memo_current and len(self.repairs) == repairs:  # nothing else changed: extend, do not re-read
+                memo = self._memo or _Memo(0, 0, [], [])
+                memo.records.append(json.loads(line))
+                memo.size, memo.mtime_ns = st.st_size, st.st_mtime_ns
+                self._memo = memo
+            else:
+                self._memo = None
             return rec
 
     # ------------------------------------------------------------------ read side
 
+    def _memo_matches_disk(self) -> bool:
+        """The memo describes the file exactly as it is now (a missing file and no memo count as empty)."""
+        try:
+            st = self.path.stat()
+        except FileNotFoundError:
+            return self._memo is None
+        return self._memo is not None and (self._memo.size, self._memo.mtime_ns) == (
+            st.st_size,
+            st.st_mtime_ns,
+        )
+
+    def _snapshot(self) -> _Memo:
+        """The parsed file, re-read only when `(st_size, st_mtime_ns)` is not what the memo was taken at.
+        The stat comes from the open handle before the read, so a file that grows meanwhile only makes
+        the next call re-read; it can never pair old content with a new key."""
+        with _thread_lock(self.path):
+            try:
+                with open(self.path, "rb") as fh:
+                    st = os.fstat(fh.fileno())
+                    memo = self._memo
+                    if memo is not None and (memo.size, memo.mtime_ns) == (st.st_size, st.st_mtime_ns):
+                        return memo
+                    data = fh.read()
+            except FileNotFoundError:
+                self._memo = None
+                return _Memo(0, 0, [], [])
+            records: list[dict[str, Any]] = []
+            problems: list[str] = []
+            for ln in _scan(data):
+                if ln.rec is not None:
+                    records.append(ln.rec)
+                elif ln.torn:
+                    problems.append(f"{RUNS_JSONL}:{ln.no}: torn last line skipped")
+                else:
+                    problems.append(f"{RUNS_JSONL}:{ln.no}: {ln.error or 'unreadable line'} skipped")
+            self._memo = _Memo(st.st_size, st.st_mtime_ns, records, problems)
+            return self._memo
+
     def read(self) -> tuple[list[dict[str, Any]], list[str]]:
-        """(records, problems). A torn last line is skipped and reported; so is any unreadable line."""
-        records: list[dict[str, Any]] = []
-        problems: list[str] = []
-        for ln in _scan(_read_bytes(self.path)):
-            if ln.rec is not None:
-                records.append(ln.rec)
-            elif ln.torn:
-                problems.append(f"{RUNS_JSONL}:{ln.no}: torn last line skipped")
-            else:
-                problems.append(f"{RUNS_JSONL}:{ln.no}: {ln.error or 'unreadable line'} skipped")
-        return records, problems
+        """(records, problems). A torn last line is skipped and reported; so is any unreadable line.
+
+        Memoised (see the module docstring). The list and each record's top level are copies; the nested
+        `data` objects are shared with the memo, so treat them as read-only."""
+        with _thread_lock(self.path):  # an `append` on another thread extends the memo's list in place
+            memo = self._snapshot()
+            return [dict(r) for r in memo.records], list(memo.problems)
 
     def records(self) -> list[dict[str, Any]]:
         return self.read()[0]
@@ -511,7 +588,14 @@ class RunView:
 
     @property
     def submitted(self) -> bool:
-        return "submitted" in self.kinds
+        """The run reached the vendor. A lost `submitted` record (the ledger was unwritable at that moment)
+        must not erase the spend, so a provider job id or any later kind is evidence enough, except on an
+        engine that never calls a vendor (`LOCAL_ENGINE_PREFIXES`)."""
+        if "submitted" in self.kinds:
+            return True
+        if self.engine_id and self.engine_id.startswith(LOCAL_ENGINE_PREFIXES):
+            return False
+        return bool(self.provider_job_ids) or not self.kinds.isdisjoint(SUBMITTED_EVIDENCE_KINDS)
 
     @property
     def provider_job_id(self) -> str | None:
@@ -645,3 +729,74 @@ def summarize_records(records: list[dict[str, Any]], since: datetime | str | Non
         "by_engine": out(by_engine),
         "by_custody": out(by_custody),
     }
+
+
+# ---------------------------------------------------------------------------- the outbox
+
+
+def enqueue_outbox(
+    conn: sqlite3.Connection, record: Mapping[str, Any], *, clock: Callable[[], datetime] = utcnow
+) -> int:
+    """Park a record the ledger could not take (read-only file, lock held too long) in the project index.
+
+    The record is checked now, exactly as `Ledger.append` would check it, and gets its `at` now if it has
+    none, so a bad record fails at the call site and a late one still carries the time it happened. Returns
+    the outbox row id. The row survives a daemon restart (it is in the index, not in memory)."""
+    norm = normalise_record(record, clock)
+    with tx(conn):
+        cur = conn.execute(
+            "INSERT INTO ledger_outbox (run_id, kind, record, created_utc) VALUES (?, ?, ?, ?)",
+            (norm.get("run_id"), norm["kind"], canonical_json(norm), iso(clock())),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def outbox_count(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM ledger_outbox").fetchone()[0])
+
+
+def drain_outbox(conn: sqlite3.Connection, ledger: Ledger) -> int:
+    """Append parked records to `ledger` in row order; returns how many were appended.
+
+    Each row is appended and deleted inside one `tx`, so a row leaves the outbox only with its record in
+    the ledger. The first failure bumps that row's `attempts`, stores `last_error` and stops, so later rows
+    never overtake it. If the append succeeded and only the delete failed, the delete is retried once
+    outside the transaction: a second drain must not append the same record twice (a `billed` line would
+    count twice). A hard kill between the two steps can still do that; it needs a power cut inside one
+    millisecond."""
+    appended = 0
+    while True:
+        row = conn.execute("SELECT id, record FROM ledger_outbox ORDER BY id LIMIT 1").fetchone()
+        if row is None:
+            return appended
+        row_id, wrote = row["id"], False
+        try:
+            rec = json.loads(row["record"])
+            with tx(conn):
+                ledger.append(rec)
+                wrote = True
+                conn.execute("DELETE FROM ledger_outbox WHERE id = ?", (row_id,))
+        except Exception as e:  # any failure parks the row again; SimulatedCrash is a BaseException
+            if wrote:
+                try:
+                    with tx(conn):
+                        conn.execute("DELETE FROM ledger_outbox WHERE id = ?", (row_id,))
+                    appended += 1
+                    continue
+                except sqlite3.Error:
+                    log.warning("ledger outbox row %s was appended but could not be deleted", row_id)
+            _note_outbox_failure(conn, row_id, e)
+            return appended
+        appended += 1
+
+
+def _note_outbox_failure(conn: sqlite3.Connection, row_id: int, error: Exception) -> None:
+    detail = f"{type(error).__name__}: {error}"[:500]
+    try:
+        with tx(conn):
+            conn.execute(
+                "UPDATE ledger_outbox SET attempts = attempts + 1, last_error = ? WHERE id = ?",
+                (detail, row_id),
+            )
+    except sqlite3.Error:  # the index is busy too; the row stays as it was and the next drain tries again
+        log.warning("could not record the failure of ledger outbox row %s: %s", row_id, detail)

@@ -12,6 +12,11 @@ What tier C is, honestly: there is no world, so the camera pose is identity; dep
 has no names to work from), which keeps every id LOCKED until a human labels it in the Mask node. A packet
 built by stub backends says so in its ``estimated`` block (``stub-<model>``, version ``stub``): a stub
 segmentation must never read as a measurement. A client consent record is required (decision 10).
+
+The plate is checked before it is decoded (router plan T137): a header that declares more than
+``TIERC_MAX_PIXELS`` (100 000 000) is ``imageio.TooManyPixels`` (a ``ValueError``; the daemon answers 422
+``too_many_pixels``), and a JPEG's EXIF Orientation is applied, so a phone photo is a portrait packet and not a
+sideways one.
 """
 
 from __future__ import annotations
@@ -37,11 +42,19 @@ from .backends import Backends, InputError
 from .licences import get as licence_get
 from .licences import licence_summary
 
-__all__ = ["ConsentRequired", "TierCError", "build_tier_c_packet", "new_packet_id", "write_label_png"]
+__all__ = [
+    "TIERC_MAX_PIXELS",
+    "ConsentRequired",
+    "TierCError",
+    "build_tier_c_packet",
+    "new_packet_id",
+    "write_label_png",
+]
 
 FILM_WIDTH_MM = 36.0
 FPS = 25
 MAX_UNLABELLED_SHARE = 0.05
+TIERC_MAX_PIXELS = 100_000_000  # declared width x height a client plate may ask the backends for
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _CLASSES = frozenset(
@@ -248,10 +261,10 @@ def build_tier_c_packet(
     if not isinstance(consent_record, str) or not consent_record.strip():
         raise ConsentRequired("a client consent record is required to build a tier C packet")
     for what, value in (("project_id", project_id), ("shot_id", shot_id)):
-        if not isinstance(value, str) or not _SLUG.match(value):
+        if not isinstance(value, str) or not _SLUG.fullmatch(value):  # `$` would let a trailing newline in
             raise ValueError(f"invalid {what} {value!r}: expected a lower-case slug [a-z0-9_-]")
     plate = Path(plate_path)
-    image = imageio.read(plate) if plate.is_file() else None
+    image = imageio.read(plate, max_pixels=TIERC_MAX_PIXELS) if plate.is_file() else None
     if image is None:
         raise InputError(f"cannot read the plate {str(plate)!r}")
     if image.bit_depth not in (8, 16) or image.encoding != "srgb":

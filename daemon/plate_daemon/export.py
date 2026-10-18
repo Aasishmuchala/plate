@@ -3,8 +3,8 @@
 DONE exports. GATE_FAIL is kept and flagged and exports only with `override=True` and a written reason of
 at least 10 non-blank characters; the override is appended to the run's append-only event log as
 `actor="human", reason="override: <reason>"` before the bytes are written. Every other state raises
-`NotExportable`. The blob is re-verified against its BLAKE3 key first and written atomically; an existing
-destination file is never overwritten.
+`NotExportable` (`status` 409 for a route). The blob is re-verified against its BLAKE3 key first and written
+atomically; an existing destination file is never overwritten.
 
 Two entry points share those rules:
 
@@ -18,6 +18,21 @@ Two entry points share those rules:
   sibling is shared by the formats of one take (tiff16 and exr of the same run and name): a second export adds
   its file to the block; a report that belongs to another run blocks the export. The image is written under a
   temp name and moved into place last; a lineage failure leaves nothing behind.
+
+The claim (router plan T127, decision 74). `export` claims its destination instead of checking it: once the
+temp image is written and its lineage embedded (and stale `.part`/temp siblings of the name, older than an
+hour, a kill -9's leftovers, are removed), it creates `dest` with `O_CREAT | O_EXCL`, so of any number of
+exports racing to one name, in one process or several, exactly one wins. A loser whose run's sidecar already
+named the file compares its temp image with it: the same bytes (the run exported again with the same format
+and framing; the lineage's `created_utc` is when the take reached its state, so a re-export is byte-identical)
+return `Exported(repeat=True)` with the sidecar untouched, for the caller to record; anything else is
+`NotExportable` ("exports never overwrite"). The winner claims a new sidecar the same way (another format of
+the name from another run cannot pair with it), writes it, then moves the image over its empty claim; a
+failure after the claim removes the claims (a shared sidecar gets its earlier bytes back), so a sidecar never
+names an image that is not there. Before any of it, when `project_dir` is given,
+`<project_dir>/gates` must take a file (`check_project_writable`): the caller marks the gate report shipped
+there afterwards, and a project folder that cannot take the mark refuses with `ProjectUnwritable` (`status`
+503) before a client file is written.
 
 Framing (router plan T114). When the run's packet declares `camera.safe_frame` (an overscan render, a
 level-and-crop packet, room_a's 2.39:1 band in a 16:9 frame), the safe-frame region is what leaves by default:
@@ -44,11 +59,15 @@ same tags back and converts to Rec.709 before it encodes.
 
 from __future__ import annotations
 
+import filecmp
 import json
+import os
 import re
 import sqlite3
+import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +79,7 @@ from .cas import CAS
 from .fsutil import replace_with_retry, temp_sibling, write_bytes_atomic, write_json_atomic
 from .machine import append_note, get_run, run_events
 from .models import Run
+from .projects import GATES_DIR
 from .states import RunState
 from .timeutil import iso, utcnow
 
@@ -83,7 +103,16 @@ INTEROP_CHROMATICITIES: dict[str, tuple[float, ...]] = {
 
 
 class NotExportable(Exception):
-    pass
+    """A run, or a destination, that may not take this export. `status` is what a route answers."""
+
+    status = 409
+
+
+class ProjectUnwritable(NotExportable):
+    """`<project_dir>/gates` cannot take a file, so the shipped mark could not follow the export: refused
+    before any client file is written."""
+
+    status = 503
 
 
 class SafeFrameError(NotExportable):
@@ -312,7 +341,8 @@ def take_framing(
 @dataclass(frozen=True)
 class Exported:
     """What `export` wrote: the image, its `.gate.json` sibling and the facts the CLI prints. `framing`
-    says which part of the take was written; `framing.record()` is what the sidecar and the ledger carry."""
+    says which part of the take was written; `framing.record()` is what the sidecar and the ledger carry.
+    `repeat` is True when the file was already there with exactly these bytes (nothing was written)."""
 
     run_id: str
     fmt: str
@@ -323,6 +353,79 @@ class Exported:
     lineage_embedded: bool
     report_ref: str | None
     framing: Framing = Framing()
+    repeat: bool = False
+
+
+# A temp or `.part` sibling of an export's name older than this is a dead export's leftover (a kill -9).
+STALE_SIBLING_S = 3600.0
+_HEX12 = r"\.[0-9a-f]{12}"
+
+
+def check_project_writable(project_dir: Path | str) -> None:
+    """Raise `ProjectUnwritable` unless `<project_dir>/gates` exists or can be made and takes a file: the
+    shipped mark is written there after an export, cutdown or delivery, so this runs before a client file."""
+    gates = Path(project_dir) / GATES_DIR
+    try:
+        gates.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=gates, prefix=".probe-"):
+            pass
+    except OSError as e:
+        raise ProjectUnwritable(f"{project_dir}/gates is not writable: nothing was exported") from e
+
+
+def _take_utc(conn: sqlite3.Connection, run: Run) -> str:
+    """When the take reached its state (the latest transition into it), for the lineage's `created_utc`: the
+    same run exported again embeds the same record, so the file is byte-identical."""
+    at = None
+    for ev in run_events(conn, run.id):
+        if ev.to_state is run.state and ev.from_state is not ev.to_state:
+            at = ev.at_utc
+    return iso(at or run.updated_utc)
+
+
+def sweep_stale(out_dir: Path, names: Sequence[str], *, older_than_s: float = STALE_SIBLING_S) -> list[Path]:
+    """Remove the hidden temp siblings of `names` in `out_dir` (`.<name>.<12 hex>...`, ending `.part`, `.tmp`
+    or the name's own suffix: what `temp_sibling`, the image writers and `lineage.embed` leave when the process
+    dies) that are older than `older_than_s`. A younger one may be another export in flight and stays. Returns
+    what was removed; a file that cannot be removed is left."""
+    patterns = []
+    for name in names:
+        ends = "|".join(dict.fromkeys(re.escape(e) for e in (".part", ".tmp", Path(name).suffix) if e))
+        patterns.append(re.compile(rf"\.\.?{re.escape(name)}{_HEX12}.*(?:{ends})"))
+    removed: list[Path] = []
+    cutoff = time.time() - older_than_s
+    try:
+        entries = list(os.scandir(out_dir))
+    except OSError:
+        return removed
+    for entry in entries:
+        if not entry.name.startswith(".") or not any(p.fullmatch(entry.name) for p in patterns):
+            continue
+        try:
+            if entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                os.unlink(entry.path)
+                removed.append(Path(entry.path))
+        except OSError:
+            continue
+    return removed
+
+
+def claim(dest: Path) -> bool:
+    """Create `dest` empty with `O_CREAT | O_EXCL` (closed at once): True for the one caller that made it,
+    False when it already exists. Any other OSError propagates."""
+    try:
+        fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o644)
+    except FileExistsError:
+        return False
+    os.close(fd)
+    return True
+
+
+def _same_bytes(a: Path, b: Path) -> bool:
+    try:
+        return filecmp.cmp(a, b, shallow=False)
+    except OSError:  # the other file went away (a racing export's claim it gave up)
+        return False
 
 
 def recorded_override(conn: sqlite3.Connection, run_id: str) -> str | None:
@@ -469,14 +572,15 @@ def export(
     `override` is the written reason (10 characters at least) that lets a GATE_FAIL run out; a reason recorded
     earlier on the run counts when none is given. `name` defaults to the run id. Raises `NotExportable` for a
     run that may not leave (GATE_FAIL without a reason, any state but DONE and GATE_FAIL, no result blob, a
-    blob that fails its hash, a destination that exists, a safe frame that cannot be placed: `SafeFrameError`)
-    and `ValueError` for an unknown format, name or working space. `working_space` (`lin_rec709` | `acescg`)
-    tags an EXR; the default is the packet's declared one. The packet's safe frame is cropped out unless
-    `full_frame`."""
+    blob that fails its hash, a destination that holds other bytes, a safe frame that cannot be placed:
+    `SafeFrameError`), `ProjectUnwritable` when `<project_dir>/gates` cannot take a file, and `ValueError` for
+    an unknown format, name or working space. A destination that already holds exactly these bytes is
+    `Exported(repeat=True)`, nothing written. `working_space` (`lin_rec709` | `acescg`) tags an EXR; the
+    default is the packet's declared one. The packet's safe frame is cropped out unless `full_frame`."""
     if fmt not in FORMATS:
         raise ValueError(f"unknown format {fmt!r}; use one of {', '.join(FORMATS)}")
     stem = name or run.id
-    if not NAME_RE.match(stem):
+    if not NAME_RE.fullmatch(stem):
         raise ValueError(
             f"export name {stem!r}: letters, digits, '.', '_' and '-' only (it is a Windows file name)"
         )
@@ -506,10 +610,10 @@ def export(
         raise NotExportable(f"run {run.id} has no result blob")
     if not cas.verify(key):
         raise NotExportable(f"result blob {key} is missing or fails its BLAKE3 check")
+    if project_dir is not None:  # the shipped mark goes there afterwards: refuse before a client file
+        check_project_writable(project_dir)
     dest = out_dir / f"{stem}{FORMATS[fmt]}"
     report_dest = out_dir / f"{stem}.gate.json"
-    if dest.exists():
-        raise NotExportable(f"{dest} already exists; exports never overwrite")
     earlier = _earlier_report(report_dest, run.id)
     rgb16 = _decode16(cas.read_bytes(key), f"result blob {key[:12]}")
     height, width = rgb16.shape[:2]
@@ -532,6 +636,19 @@ def export(
         engine_id=run.route.engine_id,
         engine_version=str(run.route_dict.get("model_version") or "") or None,
         gate_report=report_ref,
+        created_utc=_take_utc(conn, run),
+    )
+    overridden = run.state is RunState.GATE_FAIL
+    result = Exported(
+        run_id=run.id,
+        fmt=fmt,
+        path=dest,
+        report_path=report_dest,
+        overridden=overridden,
+        override_reason=reason if overridden else None,
+        lineage_embedded=True,
+        report_ref=report_ref,
+        framing=frame,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     # the temp name keeps the real extension: the writers and `lineage.embed` pick their codec by it
@@ -544,35 +661,49 @@ def export(
             raise NotExportable(
                 f"could not embed lineage in the {fmt} file ({e}); nothing was exported"
             ) from e
-        doc = dict(report)
-        doc["export"] = {
-            "run_id": run.id,
-            "files": [*((earlier or {}).get("files") or []), dest.name],
-            "state": run.state.value,
-            "override_reason": reason if run.state is RunState.GATE_FAIL else None,
-            "gate_report": report_ref,
-            "exported_utc": (earlier or {}).get("exported_utc") or iso(utcnow()),
-            **frame.record(),
-        }
-        if run.state is RunState.GATE_FAIL and recorded_override(conn, run.id) is None:
-            append_note(conn, run.id, kind="override", actor="human", reason=f"{OVERRIDE_PREFIX}{reason}")
-        write_json_atomic(report_dest, doc, indent=1)
+        sweep_stale(out_dir, (dest.name, report_dest.name))
+        if not claim(dest):  # the claim is the check: one winner per name, whatever races it
+            # a repeat: this run's sidecar already named the file (read before the claim) and the bytes match
+            listed = earlier is not None and dest.name in (earlier.get("files") or [])
+            if listed and _same_bytes(image_tmp, dest):
+                return replace(result, repeat=True)
+            raise NotExportable(f"{dest} already exists; exports never overwrite")
+        report_claimed = False
+        prior = None  # the shared sidecar's bytes, put back if this format does not land
         try:
+            if earlier is None:  # a new sidecar is claimed too: no other run's format can pair with it
+                report_claimed = claim(report_dest)
+                if not report_claimed:
+                    raise NotExportable(f"{report_dest} already exists; exports never overwrite")
+            else:
+                try:
+                    prior = report_dest.read_bytes()
+                except OSError as e:
+                    raise NotExportable(f"{report_dest} cannot be read ({e}); nothing was exported") from e
+            doc = dict(report)
+            doc["export"] = {
+                "run_id": run.id,
+                "files": [*((earlier or {}).get("files") or []), dest.name],
+                "state": run.state.value,
+                "override_reason": reason if overridden else None,
+                "gate_report": report_ref,
+                "exported_utc": (earlier or {}).get("exported_utc") or iso(utcnow()),
+                **frame.record(),
+            }
+            if overridden and recorded_override(conn, run.id) is None:
+                append_note(conn, run.id, kind="override", actor="human", reason=f"{OVERRIDE_PREFIX}{reason}")
+            write_json_atomic(report_dest, doc, indent=1)
             replace_with_retry(image_tmp, dest)
-        except OSError:
-            if earlier is None:  # a shared sibling written for another format stays
+        except BaseException:
+            dest.unlink(missing_ok=True)  # our empty claim: the name is free again
+            if report_claimed:
                 report_dest.unlink(missing_ok=True)
+            elif prior is not None:  # the sidecar another format of the take wrote says what it said
+                try:
+                    write_bytes_atomic(report_dest, prior)
+                except OSError:
+                    pass
             raise
     finally:
         image_tmp.unlink(missing_ok=True)
-    return Exported(
-        run_id=run.id,
-        fmt=fmt,
-        path=dest,
-        report_path=report_dest,
-        overridden=run.state is RunState.GATE_FAIL,
-        override_reason=reason if run.state is RunState.GATE_FAIL else None,
-        lineage_embedded=True,
-        report_ref=report_ref,
-        framing=frame,
-    )
+    return result

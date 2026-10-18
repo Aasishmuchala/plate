@@ -178,6 +178,18 @@ def test_seedance_default_resolution_is_480p_and_duration_is_still_required():
         quote(SEEDANCE, {"resolution": "1080P"})
 
 
+def test_a_count_is_a_whole_number_and_every_quantity_is_finite():
+    """Decision 80 (Wave 12): `candidate_count` / `num_images` / `n` must be an int of at least 1 (a bool is not
+    a count), and an infinite or NaN duration or megapixel figure is refused rather than priced."""
+    for bad in (0, -2, 0.5, 2.0, True, "2", float("inf")):
+        with pytest.raises(ValueError, match="whole number of at least 1"):
+            quote(GPT, {"quality": "high", "n": bad})
+    assert quote(GPT, {"quality": "high", "n": None}).price_usd == quote(GPT, {"quality": "high"}).price_usd
+    for bad in (float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="finite"):
+            quote(SEEDANCE, {"resolution": "480P", "duration": bad})
+
+
 # ---------------------------------------------------------------------------- matching rules
 
 

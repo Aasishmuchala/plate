@@ -8,6 +8,11 @@ import pytest
 
 from plate_max import config
 
+# Tokens are 16-256 printable ASCII characters (config.token_problem); these read as their role.
+FROM_CONFIG = "from-config-0123456789"
+FROM_FILE = "from-file-0123456789"
+STORED = "stored-0123456789abcdef"
+
 
 def test_save_and_load_round_trip(tmp_path, monkeypatch):
     path = tmp_path / "cfg" / "config.json"
@@ -26,8 +31,8 @@ def test_save_and_load_round_trip(tmp_path, monkeypatch):
 def test_load_tolerates_a_powershell_bom_and_garbage(tmp_path, monkeypatch):
     path = tmp_path / "config.json"
     monkeypatch.setenv("PLATE_CONFIG", str(path))
-    path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"token": "t"}).encode("utf-8"))
-    assert config.load_config()["token"] == "t"
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"token": STORED}).encode("utf-8"))
+    assert config.load_config()["token"] == STORED
     path.write_text("{not json", encoding="utf-8")
     assert config.load_config()["token"] == ""
 
@@ -135,53 +140,56 @@ def _token_file(tmp_path, monkeypatch, content: bytes, name="token.txt"):
 
 def test_token_file_wins_over_config_json(tmp_path, monkeypatch):
     monkeypatch.setenv("PLATE_CONFIG", str(tmp_path / "config.json"))
-    config.save_config({"token": "from-config", "daemon_url": "http://127.0.0.1:4610"})
-    assert config.load_config()["token"] == "from-config"
-    _token_file(tmp_path, monkeypatch, b"from-file\n")
+    config.save_config({"token": FROM_CONFIG, "daemon_url": "http://127.0.0.1:4610"})
+    assert config.load_config()["token"] == FROM_CONFIG
+    _token_file(tmp_path, monkeypatch, FROM_FILE.encode("ascii") + b"\n")
     cfg = config.load_config()
-    assert cfg["token"] == "from-file" and cfg["daemon_url"] == "http://127.0.0.1:4610"
+    assert cfg["token"] == FROM_FILE and cfg["daemon_url"] == "http://127.0.0.1:4610"
 
 
 def test_token_file_works_with_no_config_json_at_all(tmp_path, monkeypatch):
-    _token_file(tmp_path, monkeypatch, b"only-the-file")
-    assert config.load_config() == {"token": "only-the-file", "daemon_url": config.DEFAULT_DAEMON_URL}
+    _token_file(tmp_path, monkeypatch, b"only-the-file-0123456789")
+    assert config.load_config() == {
+        "token": "only-the-file-0123456789",
+        "daemon_url": config.DEFAULT_DAEMON_URL,
+    }
 
 
 def test_token_file_is_stripped_and_bom_tolerant(tmp_path, monkeypatch):
-    _token_file(tmp_path, monkeypatch, b"\xef\xbb\xbf  abc123 \r\n")
-    assert config.read_token_file() == "abc123"
+    _token_file(tmp_path, monkeypatch, b"\xef\xbb\xbf  abc123abc123abc123 \r\n")
+    assert config.read_token_file() == "abc123abc123abc123"
 
 
 @pytest.mark.parametrize("content", [b"", b"   \r\n", None])
 def test_an_empty_or_missing_token_file_falls_back_to_config_json(tmp_path, monkeypatch, content):
     monkeypatch.setenv("PLATE_CONFIG", str(tmp_path / "config.json"))
-    config.save_config({"token": "from-config"})
+    config.save_config({"token": FROM_CONFIG})
     if content is None:
         monkeypatch.setenv("PLATE_TOKEN_FILE", str(tmp_path / "does-not-exist"))
     else:
         _token_file(tmp_path, monkeypatch, content)
     assert config.read_token_file() is None
-    assert config.load_config()["token"] == "from-config"
+    assert config.load_config()["token"] == FROM_CONFIG
 
 
 def test_saving_never_writes_the_token_file_secret_into_config_json(tmp_path, monkeypatch):
     path = tmp_path / "config.json"
     monkeypatch.setenv("PLATE_CONFIG", str(path))
-    config.save_config({"token": "stored", "daemon_url": "http://127.0.0.1:4610"})
-    _token_file(tmp_path, monkeypatch, b"from-file")
+    config.save_config({"token": STORED, "daemon_url": "http://127.0.0.1:4610"})
+    _token_file(tmp_path, monkeypatch, FROM_FILE.encode("ascii"))
     cfg = config.load_config()
-    assert cfg["token"] == "from-file"
+    assert cfg["token"] == FROM_FILE
     cfg["repo_path"] = "D:\\plate"
     config.save_config(cfg)
     on_disk = json.loads(path.read_text(encoding="utf-8"))
-    assert on_disk["token"] == "stored" and on_disk["repo_path"] == "D:\\plate"
-    assert "from-file" not in path.read_text(encoding="utf-8")
+    assert on_disk["token"] == STORED and on_disk["repo_path"] == "D:\\plate"
+    assert FROM_FILE not in path.read_text(encoding="utf-8")
 
 
 def test_saving_with_no_stored_token_leaves_the_key_out(tmp_path, monkeypatch):
     path = tmp_path / "config.json"
     monkeypatch.setenv("PLATE_CONFIG", str(path))
-    _token_file(tmp_path, monkeypatch, b"from-file")
+    _token_file(tmp_path, monkeypatch, FROM_FILE.encode("ascii"))
     config.save_config(config.load_config())
     assert "token" not in json.loads(path.read_text(encoding="utf-8"))
 
@@ -189,6 +197,96 @@ def test_saving_with_no_stored_token_leaves_the_key_out(tmp_path, monkeypatch):
 def test_an_explicitly_different_token_is_saved_as_given(tmp_path, monkeypatch):
     path = tmp_path / "config.json"
     monkeypatch.setenv("PLATE_CONFIG", str(path))
-    _token_file(tmp_path, monkeypatch, b"from-file")
+    _token_file(tmp_path, monkeypatch, FROM_FILE.encode("ascii"))
     config.save_config({"token": "installer-wrote-this"})
     assert json.loads(path.read_text(encoding="utf-8"))["token"] == "installer-wrote-this"
+
+
+# ---- the token is checked where it is read
+
+
+@pytest.mark.parametrize(
+    ("token", "why"),
+    [
+        ("short", "5 characters long"),
+        ("x" * 257, "257 characters long"),
+        ("fedcba9876543210fedcba9876543210\n# rotated 2026-10-01", "whitespace"),
+        ("fedcba9876543210 fedcba9876543210", "whitespace"),
+        ("fedcba9876543210\tfedcba", "whitespace"),
+        ("fedcba9876543210fedcba98765432\u00e9", "not printable ASCII"),
+        ("fedcba9876543210\ufefffedcba9876543210", "not printable ASCII"),
+        ("fedcba9876543210\x7ffedcba9876543210", "not printable ASCII"),
+        (1234567890123456789, "not text"),
+    ],
+)
+def test_token_problem_names_why_without_the_token(token, why):
+    problem = config.token_problem(token)
+    assert problem is not None and why in problem
+    assert str(token) not in problem
+
+
+def test_good_tokens_pass():
+    for token in ("a" * 16, "x" * 256, "Zx-_.~!0123456789abcdef", "0123456789abcdef0123456789abcdef"):
+        assert config.token_problem(token) is None
+
+
+def test_a_token_file_with_a_rotated_line_gives_no_token_and_says_so_once(tmp_path, monkeypatch, caplog):
+    secret = "fedcba9876543210fedcba9876543210"
+    monkeypatch.setenv("PLATE_CONFIG", str(tmp_path / "config.json"))
+    config.save_config({"token": FROM_CONFIG, "daemon_url": "http://127.0.0.1:4610"})
+    _token_file(tmp_path, monkeypatch, (secret + "\n# rotated 2026-10-01\n").encode("ascii"))
+    config._reported.clear()
+    with caplog.at_level("WARNING", logger="plate_max.config"):
+        assert config.read_token_file() is None
+        cfg = config.load_config()
+        config.load_config()  # the poller reads it every tick: logged once
+    assert cfg["token"] is None  # never the stale config.json token
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages == [
+        "token source: PLATE_TOKEN_FILE: the token is not used because it has whitespace in it "
+        "(a space, a tab or a second line)"
+    ]
+    assert secret not in caplog.text and FROM_CONFIG not in caplog.text
+
+
+def test_a_malformed_config_json_token_gives_no_token(tmp_path, monkeypatch, caplog):
+    path = tmp_path / "config.json"
+    monkeypatch.setenv("PLATE_CONFIG", str(path))
+    bad = "fedcba9876543210fedcba9876543210\r\n"
+    path.write_text(
+        json.dumps({"token": bad, "daemon_url": "http://127.0.0.1:4610"}), encoding="utf-8", newline="\n"
+    )
+    config._reported.clear()
+    with caplog.at_level("WARNING", logger="plate_max.config"):
+        cfg = config.load_config()
+    assert cfg["token"] is None and cfg["daemon_url"] == "http://127.0.0.1:4610"
+    assert "token source: config.json:" in caplog.text and bad.strip() not in caplog.text
+    path.write_text(json.dumps({"token": None}), encoding="utf-8", newline="\n")
+    assert config.load_config()["token"] == ""  # null is no token, not a refused one
+
+
+def test_a_good_token_file_still_wins_over_a_malformed_config_json_token(tmp_path, monkeypatch):
+    path = tmp_path / "config.json"
+    monkeypatch.setenv("PLATE_CONFIG", str(path))
+    path.write_text(json.dumps({"token": "short"}), encoding="utf-8", newline="\n")
+    _token_file(tmp_path, monkeypatch, FROM_FILE.encode("ascii"))
+    assert config.load_config()["token"] == FROM_FILE
+
+
+def test_saving_never_writes_a_refused_token_over_the_file(tmp_path, monkeypatch):
+    path = tmp_path / "config.json"
+    monkeypatch.setenv("PLATE_CONFIG", str(path))
+    bad = "fedcba9876543210 with a space"
+    path.write_text(
+        json.dumps({"token": bad, "daemon_url": "http://127.0.0.1:4610"}), encoding="utf-8", newline="\n"
+    )
+    cfg = config.load_config()
+    assert cfg["token"] is None
+    cfg["repo_path"] = "D:\\plate"
+    config.save_config(cfg)
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["token"] == bad and on_disk["repo_path"] == "D:\\plate"  # left for the artist to fix
+    path.unlink()
+    _token_file(tmp_path, monkeypatch, b"two\nlines-of-token-here")
+    config.save_config(config.load_config())
+    assert "token" not in json.loads(path.read_text(encoding="utf-8"))

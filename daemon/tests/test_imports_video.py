@@ -424,3 +424,76 @@ def test_clip_refusals_leave_no_run_and_no_object(sync_settings, auth, tmp_path,
         # a manual clip is C0: an NDA project takes it
         r = _import(c, auth, path=str(good), packet_id=packet_id, source="manual")
         assert r.status_code == 201 and r.json()["state"] == "DONE", r.text
+
+
+# ---------------------------------------------------------------------------- what is a clip (router plan T137)
+
+
+def _one_frame_h264(path: Path) -> Path:
+    """A real 1-frame h264 mp4 (`ffmpeg -frames:v 1`), the attacker's second repro."""
+    png = path.with_suffix(".src.png")
+    assert cv2.imwrite(str(png), np.ascontiguousarray(_plate8()[..., ::-1]))
+    tools.run_ffmpeg(["-i", str(png), "-frames:v", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path)])
+    return path
+
+
+@needs_room_a
+def test_a_png_named_mp4_is_a_still_with_a_clip_suffix(sync_settings, auth, tmp_path):
+    _need_ffmpeg()
+    still = tmp_path / "still.mp4"
+    ok, buf = cv2.imencode(".png", np.ascontiguousarray(_plate8()[..., ::-1]))
+    assert ok
+    still.write_bytes(bytes(buf))
+    with _client(sync_settings) as c:
+        packet_id = _setup(c, auth)
+        before = _cas_count(c)
+        r = _import(c, auth, path=str(still), packet_id=packet_id, source="manual")
+        assert r.status_code == 422 and r.json()["error"] == "unreadable_video", r.text
+        assert "still image" in r.json()["detail"] and "clip suffix" in r.json()["detail"]
+        assert _runs(c, auth) == [] and _cas_count(c) == before
+
+
+@needs_room_a
+@pytest.mark.parametrize("make", ["mpeg4", "h264"])
+def test_a_clip_of_one_frame_is_refused(sync_settings, auth, tmp_path, make):
+    if make == "h264":
+        _need_ffmpeg("libx264")
+        one = _one_frame_h264(tmp_path / "one.mp4")
+    else:
+        _need_ffmpeg()
+        one = write_test_clip(tmp_path / "one.mp4", [_plate8()], FPS)
+    with _client(sync_settings) as c:
+        packet_id = _setup(c, auth)
+        before = _cas_count(c)
+        r = _import(c, auth, path=str(one), packet_id=packet_id, source="manual")
+        assert r.status_code == 422 and r.json()["error"] == "unreadable_video", r.text
+        assert "at least 2 frames" in r.json()["detail"] and "has 1" in r.json()["detail"]
+        assert _runs(c, auth) == [] and _cas_count(c) == before
+
+
+@needs_room_a
+def test_a_clip_of_two_frames_is_the_shortest_that_imports(sync_settings, auth, tmp_path):
+    _need_ffmpeg()
+    two = write_test_clip(tmp_path / "two.mp4", [_plate8()] * 2, FPS)
+    with _client(sync_settings) as c:
+        packet_id = _setup(c, auth)
+        r = _import(c, auth, path=str(two), packet_id=packet_id, source="manual")
+        assert r.status_code == 201, r.text
+        assert r.json()["state"] in {"DONE", "GATE_FAIL"}
+
+
+@pytest.mark.parametrize(
+    ("format_name", "still"),
+    [
+        ("png_pipe", True),
+        ("jpeg_pipe", True),
+        ("tiff_pipe", True),
+        ("webp_pipe", True),
+        ("image2", True),
+        ("mov,mp4,m4a,3gp,3g2,mj2", False),
+        ("matroska,webm", False),
+        ("gif", False),
+    ],
+)
+def test_ffprobes_format_name_decides_whether_a_container_is_a_still(format_name, still):
+    assert imports._is_still_container(format_name) is still

@@ -97,8 +97,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import inspect
 import json
+import math
 import os
 import re
 import subprocess
@@ -125,14 +127,16 @@ from .config import PROJECT_ID_RE, ConfigError, Settings, host_port
 from .custody import CustodyViolation
 from .engine_fake import FALSE_WORDS, FLAG_NAMES, TRUE_WORDS, FakeEngine
 from .export import FORMATS as EXPORT_FORMATS
-from .export import MIN_OVERRIDE_REASON, NotExportable, export
+from .export import MIN_OVERRIDE_REASON, OVERRIDE_PREFIX, NotExportable, export, recorded_override
 from .fsutil import replace_with_retry, temp_sibling, write_json_atomic
+from .gate_reports import NoReport
+from .gate_reports import Service as ReportService
 from .imports import import_file
 from .index import Index, RebuildError
 from .ingest import PacketConflict, PacketInvalid, begin_ingest, finish_ingest, prepare_ingest
 from .ledger import Ledger, LedgerError
 from .lock import ProjectLocked
-from .machine import DuplicateRequest, IllegalTransition, RunNotFound, get_run, transition
+from .machine import DuplicateRequest, IllegalTransition, RunNotFound, append_note, get_run, transition
 from .pipeline import FAKE_ENGINE_ID, PacketView, Pipeline, PipelineError
 from .projects import Lock, Project, ProjectError
 from .quotes import (
@@ -1147,6 +1151,7 @@ def cmd_export(session: Session, args: argparse.Namespace) -> int:
             EXIT_USAGE,
             "give one run id, or --runs r1,r2, or --accepted (with --project): exactly one of them",
         )
+    _check_out_dir(args.to)
     if args.run_id:
         if args.name_pattern:
             raise CliExit(
@@ -1156,9 +1161,33 @@ def cmd_export(session: Session, args: argparse.Namespace) -> int:
     return _export_batch(session, args)
 
 
-def _export_one(session: Session, args: argparse.Namespace) -> int:
-    from .export import recorded_override
+def _check_out_dir(raw: str) -> None:
+    """`--to` must be a folder this process can write to, or one it can create: a file, or a folder that refuses
+    a write, is a usage error here, before a ledger record or a byte is written. Nothing is created."""
+    path = Path(raw)
+    try:
+        if path.exists():
+            if not path.is_dir():
+                raise CliExit(EXIT_USAGE, f"--to must be a folder, got a file: {path}")
+            probe = path
+        else:  # export makes the folder: what has to take a write is its nearest existing ancestor
+            probe = next((p for p in path.parents if p.exists()), Path.cwd())
+            if not probe.is_dir():
+                raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR))
+        with tempfile.TemporaryFile(dir=probe):
+            pass
+    except OSError as e:
+        raise CliExit(EXIT_USAGE, f"cannot write to {path}: {e.strerror or e}") from e
 
+
+def _report_n(ref: str | None, run_id: str) -> int | None:
+    """n of a `gates/<run_id>.<n>.json` reference, else None (the latest)."""
+    stem = Path(ref).stem if ref else ""
+    head, _, n = stem.rpartition(".")
+    return int(n) if head == run_id and n.isdigit() else None
+
+
+def _export_one(session: Session, args: argparse.Namespace) -> int:
     pid, project_dir = _locate(session, args.run_id, args.project)
     pipeline = session.pipeline()
     with session.index.project(pid) as conn:
@@ -1166,8 +1195,25 @@ def _export_one(session: Session, args: argparse.Namespace) -> int:
             run = get_run(conn, args.run_id)
         except RunNotFound as e:
             raise CliExit(EXIT_USAGE, f"run {args.run_id} is not in project {pid}") from e
-        had_override = recorded_override(conn, run.id) is not None
         reason = args.override_reason
+        typed = (reason or "").strip() or None
+        # An override typed here, on a run that needs one, that says something the record does not yet: it is
+        # ledgered BEFORE any byte is written, and a ledger that cannot take it stops the export. (A reason
+        # too short to export is not recorded: `export` refuses it below.)
+        if (
+            run.state is RunState.GATE_FAIL
+            and typed is not None
+            and len(typed) >= MIN_OVERRIDE_REASON
+            and typed != recorded_override(conn, run.id)
+        ):
+            try:
+                pipeline.ledger(pid, "override", run, by="human", note=typed)
+            except PipelineError as e:
+                if e.status != 503:
+                    raise
+                raise CliExit(EXIT_REFUSED, "ledger unavailable: nothing exported") from e
+            # the ledger went first: a refusal above leaves no note behind that a retry would skip over
+            append_note(conn, run.id, kind="override", actor="human", reason=f"{OVERRIDE_PREFIX}{typed}")
         try:
             done = export(
                 run,
@@ -1182,22 +1228,30 @@ def _export_one(session: Session, args: argparse.Namespace) -> int:
             )
         except NotExportable as e:
             session.warn(f"not exported: {e}")
+            if (
+                getattr(e, "status", 409) >= 500
+            ):  # the project folder cannot take the shipped mark: not a gate
+                return EXIT_ERROR
             return EXIT_GATE_FAIL if run.state is RunState.GATE_FAIL else EXIT_ERROR
         except ValueError as e:
             raise CliExit(EXIT_USAGE, str(e)) from e
-        if done.overridden and not had_override:
-            pipeline.ledger(pid, "override", run, by="human", note=done.override_reason)
-        pipeline.ledger(
-            pid,
-            "export",
-            run,
-            data={
-                "dest_name": done.path.name,
-                "format": done.fmt,
-                "overridden": done.overridden,
-                **done.framing.record(),
-            },
-        )
+        repeat = bool(getattr(done, "repeat", False))  # the same bytes were already there (decision 74)
+        try:  # the version the sidecar copied; the report file itself is never touched
+            ReportService(project_dir).shipped(run.id, _report_n(done.report_ref, run.id))
+        except NoReport:  # a seed run's stub gate wrote no report file
+            pass
+        data: dict[str, Any] = {
+            "dest_name": done.path.name,
+            "format": done.fmt,
+            "overridden": done.overridden,
+            **done.framing.record(),
+        }
+        if repeat:
+            data["repeat"] = True
+        pipeline.ledger(pid, "export", run, data=data)
+    if repeat:
+        session.say(f"already exported (identical): {done.path}")
+        return EXIT_OK
     session.say(f"exported {done.path}")
     session.say(f"gate report {done.report_path}" + (f" (from {done.report_ref})" if done.report_ref else ""))
     if done.overridden:
@@ -2119,6 +2173,7 @@ def cmd_deliver(session: Session, args: argparse.Namespace) -> int:
     from .lineage import LineageError
     from .routes.delivery import deliver_run
 
+    _check_out_dir(args.to)
     pid, _project_dir = _locate(session, args.run_id, args.project)
     pipeline = session.pipeline()
     try:
@@ -2734,6 +2789,30 @@ def _save_recipe(session: Session, args: argparse.Namespace, project_dir: Path |
 # ---------------------------------------------------------------------------- parser and entry point
 
 
+USD_MAX = 1_000_000.0  # the daemon's own bound on a dollar amount (an envelope, a budget)
+
+
+def finite_float(lo: float, hi: float, what: str = "") -> Callable[[str], float]:
+    """An argparse `type=` for a number option: a finite float in [lo, hi]. `inf`, `nan`, `1e400` and anything
+    outside the range are refused with an `ArgumentTypeError` (a usage error, exit 4) instead of reaching the
+    code that would turn them into a traceback or an unlimited ceiling. `what` names the value in the message."""
+    label = f"{what} " if what else ""
+
+    def parse(text: str) -> float:
+        try:
+            value = float(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{label}{text!r} is not a number") from None
+        if not math.isfinite(value):
+            raise argparse.ArgumentTypeError(f"{label}{text!r} is not a finite number")
+        if not lo <= value <= hi:
+            raise argparse.ArgumentTypeError(f"{label}{text} is out of range: use {lo:g} to {hi:g}")
+        return value
+
+    parse.__name__ = "finite_float"  # argparse words a bad value after the type's name
+    return parse
+
+
 class _Parser(argparse.ArgumentParser):
     """argparse exits 2 on a usage error; here 2 means a gate failure, so a usage error is 4."""
 
@@ -2767,7 +2846,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     r.add_argument(
         "--envelope",
-        type=float,
+        type=finite_float(0.0, USD_MAX, "envelope"),
         metavar="USD",
         help="hard spending ceiling for this command (all its packets)",
     )
@@ -2815,19 +2894,30 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("gc", help="delete CAS blobs nothing references")
     c.add_argument("project")
     c.add_argument("--dry-run", action="store_true")
-    c.add_argument("--min-age-hours", type=float, default=GC_GRACE_HOURS, help="keep newer blobs (default 1)")
+    c.add_argument(
+        "--min-age-hours",
+        type=finite_float(0.0, 87_600.0, "min-age-hours"),
+        default=GC_GRACE_HOURS,
+        help="keep newer blobs (default 1)",
+    )
 
     k = sub.add_parser("pack", help="zip a project folder (blobs over 50 MB left out unless --full)")
     k.add_argument("project")
     k.add_argument("--out", required=True, help="the .zip to write (never overwritten)")
     k.add_argument("--full", action="store_true")
-    k.add_argument("--max-blob-mb", type=float, default=PACK_BLOB_LIMIT_MB)
+    k.add_argument(
+        "--max-blob-mb", type=finite_float(0.0, 10_000_000.0, "max-blob-mb"), default=PACK_BLOB_LIMIT_MB
+    )
 
     s = sub.add_parser(
         "smoke", help="every adapter's minimum-cost call: recorded fixtures, or --live with a budget"
     )
     s.add_argument("--live", action="store_true", help="real requests: needs PLATE_LIVE=1 and --budget-usd")
-    s.add_argument("--budget-usd", type=float, help="stop before the running total passes this")
+    s.add_argument(
+        "--budget-usd",
+        type=finite_float(0.0, USD_MAX, "budget-usd"),
+        help="stop before the running total passes this",
+    )
     s.add_argument("--engines", help="comma-separated engine ids (default: all)")
     s.add_argument("--out", help="also write the report JSON here")
 
@@ -2857,7 +2947,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     i.add_argument("--node", help="the graph node the take belongs to")
     i.add_argument("--source", choices=IMPORT_SOURCES, default="manual", help="where the file came from")
-    i.add_argument("--cost-usd", type=float, default=0.0, help="what the take cost, as declared (default 0)")
+    i.add_argument(
+        "--cost-usd",
+        type=finite_float(0.0, USD_MAX, "cost_usd"),
+        default=0.0,
+        help="what the take cost, as declared (default 0)",
+    )
     i.add_argument("--note", help="a note kept with the run")
 
     d = sub.add_parser(
@@ -2905,7 +3000,12 @@ def build_parser() -> argparse.ArgumentParser:
     es.add_argument("--shot-class", required=True, choices=SHOT_CLASSES)
     how = es.add_mutually_exclusive_group(required=True)
     how.add_argument("--count", type=int, metavar="N", help="how many outputs (images)")
-    how.add_argument("--seconds", type=float, metavar="S", help="how many seconds of video")
+    how.add_argument(
+        "--seconds",
+        type=finite_float(0.0, 86_400.0, "seconds"),
+        metavar="S",
+        help="how many seconds of video",
+    )
     es.add_argument("--project", help="read the cards of this project (folder or id); default: every project")
     es.add_argument("--param", action="append", default=[], metavar="NAME=VALUE", help="a priced parameter")
 

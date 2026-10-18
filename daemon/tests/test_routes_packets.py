@@ -206,7 +206,11 @@ def test_graph_writes_are_held_to_the_canvas_rules(sync_client):
         ).status_code
         == 201
     )
-    assert c.get("/api/v0/projects/p1/graph", headers=auth).json() == {"nodes": [], "edges": []}
+    assert c.get("/api/v0/projects/p1/graph", headers=auth).json() == {
+        "nodes": [],
+        "edges": [],
+        "revision": 0,
+    }
     plate = {"id": "p", "kind": "Plate", "packetId": "pkt_x", "tier": "A"}
     good = {
         "nodes": [plate, {"id": "e", "kind": "Edit"}, {"id": "x", "kind": "Export"}],

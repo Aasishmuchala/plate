@@ -128,8 +128,9 @@ def _saved(c: TestClient, auth: dict, graph: dict) -> dict:
 
 
 def _stored(settings: Settings) -> dict:
+    """The stored graph as the routes answer it: `revision` (project.json `graph_revision`, T128) beside it."""
     doc = json.loads((settings.projects_dir / PROJECT / "project.json").read_text(encoding="utf-8"))
-    return doc["graph"]
+    return {**doc["graph"], "revision": doc.get("graph_revision", 0)}
 
 
 def _node(graph: dict, node_id: str = "e") -> dict:
@@ -261,7 +262,7 @@ def test_picking_the_new_take_unapproves_the_node_and_holds_the_motion_edge_lock
 
     # Autosave never deadlocks: the same graph again (the UI never sends the flag) is stored again.
     again = _saved(c, auth, picked)
-    assert again["graph"] == stored and len(again["violations"]) == 1
+    assert again["graph"] == {**stored, "revision": stored["revision"] + 1} and len(again["violations"]) == 1
 
     # The flag is the server's: a client cannot clear it, nor set it on an edge that is not locked.
     cleared = copy.deepcopy(picked)

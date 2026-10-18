@@ -9,7 +9,18 @@ import sys
 
 import pytest
 
-from plate_daemon.projects import Lock, Project, ProjectError, ProjectLocked
+from plate_daemon.projects import (
+    GRAPH_MAX_BYTES,
+    GraphShapeError,
+    GraphTooLarge,
+    Lock,
+    Project,
+    ProjectError,
+    ProjectLocked,
+    check_custody,
+    check_graph,
+    mark_unset,
+)
 
 # The child reports its own pid: on Windows a venv's python.exe is a launcher whose child is the real
 # interpreter, so Popen.pid is not the pid that takes the lock.
@@ -60,6 +71,62 @@ def test_save_graph_is_atomic_and_reloads(tmp_path):
     assert [p.name for p in (tmp_path / "p").iterdir() if p.name.endswith(".tmp")] == []
     with pytest.raises(ProjectError):
         proj.save_graph({"nodes": "nope", "edges": []})
+
+
+def test_save_graph_counts_the_revision(tmp_path):
+    proj = Project.create(tmp_path / "p", "proj", {"nda": False})
+    assert proj.graph_revision == 0 and "graph_revision" not in proj.doc  # absent on a new project
+    proj.save_graph({"nodes": [], "edges": []})
+    proj.save_graph({"nodes": [{"id": "e", "kind": "Edit"}], "edges": []})
+    again = Project.load(tmp_path / "p")
+    assert again.graph_revision == 2 and "revision" not in again.graph
+    doc = json.loads((tmp_path / "p" / "project.json").read_text(encoding="utf-8"))
+    assert doc["graph_revision"] == 2
+    for bad in (-1, "2", True, 1.5):
+        doc["graph_revision"] = bad
+        (tmp_path / "p" / "project.json").write_text(json.dumps(doc), encoding="utf-8", newline="\n")
+        with pytest.raises(ProjectError, match="graph_revision"):
+            Project.load(tmp_path / "p")
+
+
+def test_unset_is_the_servers_mark_only(tmp_path):
+    for mark in (True, 1, "yes", False):
+        assert "unset" not in check_custody({"nda": False, "unset": mark})
+    assert check_custody({"nda": False, "region": "eu"})["region"] == "eu"  # other keys still pass
+    assert mark_unset({"nda": False, "allowed_grades": ["C0"]})["unset"] is True
+
+    # The packet-first path (pipeline.UNSET_CUSTODY): the server's literal true survives create and load ...
+    proj = Project.create(tmp_path / "a", "early", {"nda": False, "allowed_grades": ["C0"], "unset": True})
+    assert proj.custody["unset"] is True and Project.load(tmp_path / "a").custody["unset"] is True
+    # ... anything else is not the server's mark.
+    proj = Project.create(tmp_path / "b", "other", {"nda": False, "allowed_grades": ["C0"], "unset": 1})
+    assert "unset" not in proj.custody and "unset" not in Project.load(tmp_path / "b").custody
+
+
+def test_check_graph_holds_a_clients_graph_to_its_shape_and_size():
+    ok = {"nodes": [{"id": "p", "kind": "Plate"}, {"id": "e", "data": {"kind": "Edit"}}], "edges": []}
+    assert check_graph(ok) is ok
+    for nodes in (
+        [{"id": {}, "kind": "Plate"}],
+        [{"id": [], "kind": "Plate"}],
+        [{"id": "", "kind": "Plate"}],
+        [{"kind": "Plate"}],
+        [{"id": "p"}],
+        [{"id": "p", "data": {"kind": 3}}],
+    ):
+        with pytest.raises(GraphShapeError) as exc:
+            check_graph({"nodes": nodes, "edges": []})
+        assert exc.value.code == "UNKNOWN_NODE"
+    for edge in ({"source": "p"}, {"source": 1, "target": "e"}, {"from": "p", "to": "e"}):
+        with pytest.raises(GraphShapeError) as exc:
+            check_graph({"nodes": [], "edges": [edge]})
+        assert exc.value.code is None and isinstance(exc.value, ProjectError)
+    with pytest.raises(ProjectError):
+        check_graph({"nodes": "nope", "edges": []})
+    big = {"nodes": [{"id": "c", "kind": "Colour", "label": "x" * GRAPH_MAX_BYTES}], "edges": []}
+    with pytest.raises(GraphTooLarge, match="the limit is 4 MiB") as exc:
+        check_graph(big)
+    assert exc.value.size > GRAPH_MAX_BYTES and isinstance(exc.value, ProjectError)
 
 
 def test_load_rejects_bad_folders(tmp_path):

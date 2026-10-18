@@ -6,11 +6,19 @@ A project is a folder, possibly on the NAS, holding `project.json` (the graph an
 the machine that wrote it, so the box and a Mac can open the same project one at a time.
 
 `project.json` is `{schema: 1, project_id, created_utc, custody: {nda, allowed_grades}, engine_pins:
-{engine_id: version}, graph: {nodes: [], edges: []}, settings: {}}` and is rewritten atomically
+{engine_id: version}, graph: {nodes: [], edges: []}, settings: {}, graph_revision}` and is rewritten atomically
 (temp file + `os.replace` with retry, UTF-8, `\\n`). An NDA project allows only C0 and C1 routes.
 One writer at a time: hold `Lock(project_dir)` (`project.lock`, portalocker) around any write; a second
 holder gets `ProjectLocked(holder_host, holder_pid, since)`. `save_graph` does not take the lock itself
 because the daemon holds it for as long as the project is open.
+
+`graph_revision` (decision 77) counts the graph's saves: absent (0) on a new project, one more on every
+`save_graph`, so a client that read revision n and saves on top of n+1 is told (`PUT /graph` answers 409
+`graph_conflict`). `custody.unset` is the server's own mark (decision 79): `check_custody` strips it from
+whatever a client sends, and only a literal `true` written by the server (`mark_unset`, the packet-first
+project's `UNSET_CUSTODY`) survives `Project.create` and `Project.load`. `check_graph` is what the routes hold a
+client's graph to (objects with string ids and kinds, edges with string ends, at most `GRAPH_MAX_BYTES`); the
+folder itself only needs lists of objects, so a graph the server stored before those checks still loads.
 """
 
 from __future__ import annotations
@@ -38,17 +46,60 @@ ASSETS_DIR = "assets"
 GATES_DIR = "gates"
 REVIEW_DIR = "review"
 LOCK_NAME = "project.lock"
+UNSET = "unset"  # the server's mark on the custody of a project a packet made first
+GRAPH_MAX_BYTES = 4 * 1024 * 1024  # a client's graph, compact JSON: 4 MiB
+GRAPH_REVISION = "graph_revision"
 
-__all__ = ["Lock", "Project", "ProjectError", "ProjectLocked", "check_custody", "check_graph"]
+__all__ = [
+    "GRAPH_MAX_BYTES",
+    "GraphShapeError",
+    "GraphTooLarge",
+    "Lock",
+    "Project",
+    "ProjectError",
+    "ProjectLocked",
+    "check_custody",
+    "check_graph",
+    "mark_unset",
+]
 
 
 class ProjectError(ValueError):
     pass
 
 
+class GraphTooLarge(ProjectError):
+    """A graph over `GRAPH_MAX_BYTES` (the routes answer 422 `graph_too_large`)."""
+
+    def __init__(self, size: int):
+        self.size = size
+        super().__init__(f"graph is {size} bytes; the limit is 4 MiB")
+
+
+class GraphShapeError(ProjectError):
+    """A graph JSON allows and the canvas cannot hold. `code` is the canvas-rule code a node problem answers
+    with (UNKNOWN_NODE), None for an edge or the outer shape."""
+
+    def __init__(self, message: str, *, code: str | None = None, node: str | None = None):
+        self.code, self.node = code, node
+        super().__init__(message)
+
+
+def mark_unset(custody: dict[str, Any]) -> dict[str, Any]:
+    """The custody with the server's `unset` mark: a project a packet made before any human set its custody."""
+    return {**custody, UNSET: True}
+
+
+def _stored_custody(custody: Any) -> dict[str, Any]:
+    """`check_custody` for what the server itself writes or reads back: its literal `unset: true` is kept."""
+    out = check_custody(custody)
+    return mark_unset(out) if custody.get(UNSET) is True else out
+
+
 def check_custody(custody: Any) -> dict[str, Any]:
     """`{nda: bool, allowed_grades: [...]}`; allowed_grades defaults to C0/C1 for NDA work, else all four.
-    Unknown keys are kept (later tasks may add custody fields)."""
+    Unknown keys are kept (later tasks may add custody fields), except `unset`: that mark is the server's
+    (decision 79), so a client that sends it, as `true` or anything else, gets it dropped."""
     if not isinstance(custody, dict):
         raise ProjectError("custody must be an object {nda, allowed_grades}")
     nda = custody.get("nda")
@@ -67,13 +118,14 @@ def check_custody(custody: Any) -> dict[str, Any]:
             f"an NDA project allows {list(NDA_GRADES)} only, got {sorted(set(grades))}: NDA work never "
             "leaves for a C2 or D route"
         )
-    out = dict(custody)
+    out = {k: v for k, v in custody.items() if k != UNSET}
     out["nda"] = nda
     out["allowed_grades"] = [g for g in GRADES if g in set(grades)]
     return out
 
 
-def check_graph(graph: Any) -> dict[str, Any]:
+def _check_graph_lists(graph: Any) -> dict[str, Any]:
+    """The folder format's own floor: an object whose `nodes` and `edges` are lists of objects."""
     if not isinstance(graph, dict):
         raise ProjectError("graph must be an object {nodes, edges}")
     for key in ("nodes", "edges"):
@@ -81,6 +133,39 @@ def check_graph(graph: Any) -> dict[str, Any]:
         if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
             raise ProjectError(f"graph.{key} must be a list of objects")
     return graph
+
+
+def check_graph(graph: Any) -> dict[str, Any]:
+    """A client's graph, before any rule reads it: every node an object with a non-empty string `id` and a
+    string `kind` (read where the canvas rules read it: the node's `data` object when it has one, else the
+    node), every edge an object with string `source` and `target`, and at most `GRAPH_MAX_BYTES` as compact
+    JSON. `GraphShapeError` (UNKNOWN_NODE for a node) or `GraphTooLarge`, both `ProjectError`s."""
+    _check_graph_lists(graph)
+    for i, node in enumerate(graph["nodes"]):
+        nid = node.get("id")
+        if not isinstance(nid, str) or not nid:
+            raise GraphShapeError(
+                f"graph.nodes[{i}]: a node needs a string id, got {type(nid).__name__}", code="UNKNOWN_NODE"
+            )
+        fields = node["data"] if isinstance(node.get("data"), dict) else node
+        if not isinstance(fields.get("kind"), str):
+            raise GraphShapeError(
+                f"graph.nodes[{i}] ({nid!r}): a node needs a string kind", code="UNKNOWN_NODE", node=nid
+            )
+    for i, edge in enumerate(graph["edges"]):
+        if not isinstance(edge.get("source"), str) or not isinstance(edge.get("target"), str):
+            raise GraphShapeError(f"graph.edges[{i}]: an edge needs a string source and a string target")
+    size = len(json.dumps(graph, separators=(",", ":")).encode())
+    if size > GRAPH_MAX_BYTES:
+        raise GraphTooLarge(size)
+    return graph
+
+
+def _revision_of(doc: dict[str, Any]) -> int:
+    rev = doc.get(GRAPH_REVISION, 0)
+    if not isinstance(rev, int) or isinstance(rev, bool) or rev < 0:
+        raise ProjectError(f"{GRAPH_REVISION} must be a whole number of at least 0, got {rev!r}")
+    return rev
 
 
 def read_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
@@ -128,7 +213,7 @@ class Project:
             "schema": SCHEMA,
             "project_id": project_id,
             "created_utc": iso(now or utcnow()),
-            "custody": check_custody(custody),
+            "custody": _stored_custody(custody),
             "engine_pins": {},
             "graph": {"nodes": [], "edges": []},
             "settings": {},
@@ -156,8 +241,12 @@ class Project:
             check_project_id(doc.get("project_id"))
         except ValueError as e:
             raise ProjectError(f"{path}: {e}") from e
-        doc["custody"] = check_custody(doc.get("custody"))
-        check_graph(doc.get("graph"))
+        doc["custody"] = _stored_custody(doc.get("custody"))
+        _check_graph_lists(doc.get("graph"))
+        try:
+            _revision_of(doc)
+        except ProjectError as e:
+            raise ProjectError(f"{path}: {e}") from e
         for key in ("engine_pins", "settings"):
             if not isinstance(doc.get(key, {}), dict):
                 raise ProjectError(f"{path}: {key} must be an object")
@@ -185,6 +274,11 @@ class Project:
     @property
     def graph(self) -> dict[str, Any]:
         return self.doc["graph"]
+
+    @property
+    def graph_revision(self) -> int:
+        """How many times the graph was saved (0 when `project.json` has no `graph_revision` yet)."""
+        return _revision_of(self.doc)
 
     @property
     def engine_pins(self) -> dict[str, str]:
@@ -226,7 +320,9 @@ class Project:
         write_json_atomic(self.project_json, self.doc, indent=1)
 
     def save_graph(self, graph: dict[str, Any]) -> None:
-        self.doc["graph"] = copy.deepcopy(check_graph(graph))
+        """Store `graph` and count the save (`graph_revision` + 1)."""
+        self.doc["graph"] = copy.deepcopy(_check_graph_lists(graph))
+        self.doc[GRAPH_REVISION] = self.graph_revision + 1
         self.save()
 
     # ------------------------------------------------------------------ packets.json (by reference)

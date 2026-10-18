@@ -16,6 +16,11 @@ the EXR (tier A) and rejects a legend that omits a visible id, and `reapply_proj
 project's own class rules and lint threshold from `project.json` (`settings.policy`), the stricter result
 winning. Packets are immutable, so nothing is written back to the packet folder: corrections and the applied
 policy ride on the `ingest.done` event (`data.notes`, `data.policy`), which `effective_policy` reads back.
+
+Before those hooks `check_display_tiff` decodes the tier A display master through `plate_pixels.imageio` (the
+reader `PacketView.plate16` uses), so a TIFF the pipeline could not read fails the packet here with
+`display_tiff16: cannot decode (...)` instead of at the first quote. A `manifest.json` that is a symlink, or
+resolves outside the packet folder, is refused like a data file that escapes it.
 """
 
 from __future__ import annotations
@@ -70,6 +75,24 @@ class PreparedPacket:
         return self.manifest["project_id"]
 
 
+ESCAPES_MESSAGE = "path escapes the packet folder"  # plate_spec's wording for a data file that leaves it
+
+
+def manifest_escapes(root: Path) -> bool:
+    """True when `manifest.json` is a symlink or resolves outside the packet folder (a manifest planted to
+    point at some other file on the share). A missing manifest is not an escape: the validator reports it."""
+    mpath = root / "manifest.json"
+    try:
+        if mpath.is_symlink():
+            return True
+        mpath.resolve().relative_to(root.resolve())
+    except ValueError:
+        return True
+    except (OSError, RuntimeError):  # a symlink loop or an unreadable parent
+        return True
+    return False
+
+
 def prepare_ingest(path: Path | str) -> PreparedPacket:
     """Validate a packet folder and hash its manifest. Raises PacketInvalid."""
     path = Path(path)
@@ -77,6 +100,8 @@ def prepare_ingest(path: Path | str) -> PreparedPacket:
         raise PacketInvalid([f"packet_path must be an absolute folder path, got {str(path)!r}"])
     if not path.is_dir():
         raise PacketInvalid([f"packet folder not found: {path}"])
+    if manifest_escapes(path):
+        raise PacketInvalid([f"manifest.json: {ESCAPES_MESSAGE}"])
     mpath = path / "manifest.json"
     before = mpath.read_bytes() if mpath.is_file() else None
     errors = plate_spec.validate_packet_dir(path, check_files=True)
@@ -201,6 +226,41 @@ def _load_legend(root: Path, manifest: dict[str, Any]) -> dict[str, Any] | None:
     return doc if isinstance(doc, dict) else None
 
 
+MAX_DECODE_ERROR = 300  # characters of a decoder's message kept in the failure the sender reads
+
+
+def check_display_tiff(root: Path, manifest: dict[str, Any]) -> list[str]:
+    """Tier A: decode the first page of `display_tiff16` through `plate_pixels.imageio`, the reader
+    `PacketView.plate16` uses, so a master the pipeline could not read fails the ingest (`display_tiff16:
+    cannot decode (...)`) rather than the first quote. Any compression tifffile and imagecodecs decode is
+    accepted (none, Deflate, LZW, PackBits); a JPEG-family TIFF is refused: lossy bytes cannot be the
+    approved master. A transport-test placeholder payload has no pixels and is skipped, as the EXR is."""
+    ref = (manifest.get("files") or {}).get("display_tiff16")
+    if not isinstance(ref, dict) or ref.get("kind") != "file":
+        return []
+    path = root / ref["path"]
+    try:
+        with open(path, "rb") as fh:
+            if fh.read(len(PLACEHOLDER_MAGIC)) == PLACEHOLDER_MAGIC:
+                return []
+        import tifffile
+
+        from plate_pixels import imageio
+
+        with tifffile.TiffFile(path) as tf:
+            compression = tf.pages[0].compression
+        cname = str(getattr(compression, "name", compression))
+        if "JP" in cname.upper():
+            raise ValueError(
+                f"{cname}-compressed TIFF is refused; re-save with none, Deflate, LZW or PackBits"
+            )
+        imageio.read(path)
+    except Exception as e:  # tifffile, imagecodecs and cv2 each raise their own types for a bad file
+        text = (str(e) or type(e).__name__).replace("\n", " ")[:MAX_DECODE_ERROR]
+        return [f"display_tiff16: cannot decode ({text})"]
+    return []
+
+
 def _hex_of(entry_id: Any, prefix: str) -> int | None:
     if not isinstance(entry_id, str) or not entry_id.startswith(prefix + ":"):
         return None
@@ -219,6 +279,17 @@ def _rank0_shares(ranks: Any, cov: Any) -> dict[int, float]:
     uniq, inv = np.unique(r0, return_inverse=True)
     sums = np.bincount(inv.ravel(), weights=c0, minlength=len(uniq)) / max(r0.size, 1)
     return {int(u): float(v) for u, v in zip(uniq, sums, strict=True)}
+
+
+def _id_areas(ranks: Any, cov: Any, n_pixels: int) -> dict[int, float]:
+    """id -> coverage summed over every rank, as a fraction of the frame's pixels. One sort of the id array
+    and one weighted bincount: the cost does not grow with the number of ids (the per-id mask it replaces
+    scanned the whole array once per unlisted id)."""
+    import numpy as np
+
+    ids, inverse = np.unique(ranks, return_inverse=True)
+    sums = np.bincount(inverse.ravel(), weights=cov.ravel(), minlength=len(ids))
+    return {int(i): float(s) / n_pixels for i, s in zip(ids, sums, strict=True)}
 
 
 def recompute_coverage_from_cryptomatte(
@@ -246,8 +317,6 @@ def recompute_coverage_from_cryptomatte(
     legend = legend if legend is not None else _load_legend(root, manifest)
     if legend is None:
         return ["id_legend.json is missing or not a JSON object"]
-
-    import numpy as np
 
     from plate_pixels import exr as exr_io
 
@@ -284,9 +353,11 @@ def recompute_coverage_from_cryptomatte(
                 notes.append(f"pixel_share of {entry['id']} recomputed from the Cryptomatte: {old} -> {new}")
         if which != "object":
             continue
+        unlisted = sorted(exr_io.present_ids(ranks, cov, min_coverage=PRESENT_MIN_COVERAGE) - known)
+        areas = _id_areas(ranks, cov, n_pixels) if unlisted else {}  # one pass, then a lookup per id
         omitted, sliver = [], []
-        for rid in sorted(exr_io.present_ids(ranks, cov, min_coverage=PRESENT_MIN_COVERAGE) - known):
-            area = float(np.where(ranks == np.uint32(rid), cov, 0.0).sum(dtype=np.float64)) / n_pixels
+        for rid in unlisted:
+            area = areas.get(rid, 0.0)
             (omitted if area >= VISIBLE_MIN_SHARE else sliver).append((rid, area))
         errors.extend(f"legend omits visible id o:{rid:08x} ({area * 100:.2f}%)" for rid, area in omitted)
         notes.extend(
@@ -452,6 +523,9 @@ def finish_ingest(
     rec = get_packet(conn, packet_id)
     root = Path(rec["path"])
     try:
+        if manifest_escapes(root):  # swapped for a symlink since the packet was accepted
+            _fail(conn, packet_id, [f"manifest.json: {ESCAPES_MESSAGE}"])
+            return get_packet(conn, packet_id)
         mbytes = (root / "manifest.json").read_bytes()
         if hash_bytes(mbytes) != rec["manifest_blake3"]:
             _fail(conn, packet_id, ["manifest.json changed after the packet was accepted; re-send it"])
@@ -488,6 +562,10 @@ def finish_ingest(
                     "ingest.file",
                     {"relpath": rel, "role": role, "bytes": size, "blake3": digest},
                 )
+        undecodable = check_display_tiff(root, manifest)
+        if undecodable:
+            _fail(conn, packet_id, undecodable)
+            return get_packet(conn, packet_id)
         notes: list[str] = []
         applied: dict[str, Any] = {}
         legend = _load_legend(root, manifest)

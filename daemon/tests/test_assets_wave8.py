@@ -269,9 +269,13 @@ def test_mask_upload_refusals(ingested, monkeypatch):
     assert r.status_code == 404
     r = c.post(f"{url}?kind=mask&project_id=Bad Id", content=png, headers=auth)
     assert r.status_code == 422
-    r = c.post(f"{url}?kind=mask&project_id={PROJECT}", content=b"not an image", headers=auth)
-    assert r.status_code == 422 and r.json()["error"] == "bad_mask"
-    r = c.post(f"{url}?kind=mask&project_id={PROJECT}", content=b"", headers=auth)
+    # Bytes with no image header are judged on the header (T136): `bad_image`, before any decode.
+    for body in (b"not an image", b""):
+        r = c.post(f"{url}?kind=mask&project_id={PROJECT}", content=body, headers=auth)
+        assert r.status_code == 422, r.text
+        assert r.json() == {"error": "bad_image", "detail": "not a PNG/JPEG/WebP/BMP/TIFF header"}
+    # A PNG header that is fine on a body cv2 cannot read is still a mask refusal, after the decode.
+    r = c.post(f"{url}?kind=mask&project_id={PROJECT}", content=png[:40], headers=auth)
     assert r.status_code == 422 and r.json()["error"] == "bad_mask"
     r = c.post(
         f"{url}?kind=mask&project_id={PROJECT}", content=_png(_mask().astype(np.uint16) * 257), headers=auth

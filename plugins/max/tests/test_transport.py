@@ -21,6 +21,14 @@ from plate_max import PACKET_VERSION, PLUGIN_VERSION, SENDER, transport
 TOKEN = "0123456789abcdef0123456789abcdef"
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_waits(monkeypatch):
+    """/hash asks again after 1, 2 and 4 s (a daemon restart); the waits are not worth sitting through here."""
+    waits: list[float] = []
+    monkeypatch.setattr(transport, "_sleep", waits.append)
+    return waits
+
+
 class Stub:
     def __init__(self):
         self.health = {"ok": True, "daemon_version": "x", "packet_versions": ["0.1"]}
@@ -357,15 +365,17 @@ def test_a_path_left_out_of_the_answer_is_hash_refused(tmp_path):
         transport.hash_files([folder / "beauty.exr"], {"token": TOKEN, "daemon_url": url})
 
 
-def test_a_malformed_hash_answer_is_unexpected(tmp_path):
+def test_a_malformed_hash_answer_is_unexpected(tmp_path, _no_retry_waits):
     stub, folder = _stub_with_files(tmp_path)
     stub.hash_override = (200, {"nope": 1})
     with serve(stub) as url, pytest.raises(transport.UnexpectedStatus):
         transport.hash_files([folder / "beauty.exr"], {"token": TOKEN, "daemon_url": url})
+    assert _no_retry_waits == []  # a 200, however wrong, is never asked again
     stub.hash_override = (500, {"error": "boom"})
     with serve(stub) as url, pytest.raises(transport.UnexpectedStatus) as err:
         transport.hash_files([folder / "beauty.exr"], {"token": TOKEN, "daemon_url": url})
     assert err.value.status_code == 500
+    assert _no_retry_waits == list(transport.HASH_RETRY_DELAYS_S)  # a 5xx is asked three more times
 
 
 def test_hash_without_a_token_never_touches_the_network(tmp_path):

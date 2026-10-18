@@ -747,15 +747,26 @@ def test_batch_export_writes_two_files_with_sidecars_and_refuses_the_gate_fail_r
         )
         assert not (out / f"e3_{bad['id'][-8:]}.png").exists()
 
-        # exporting the same runs again never overwrites: both are refused, nothing changes
+        # exporting the same run again never overwrites (T127, decision 74): the file already holds exactly
+        # these bytes, so it is a repeat that writes nothing and is recorded as one
+        first = Path(body["exported"][0]["path"])
+        before = (first.read_bytes(), first.stat().st_mtime_ns)
         r = c.post(
             _export_url(), json={"run_ids": [a["id"]], "out_dir": str(out), "format": "png16"}, headers=auth
         )
-        assert (
-            r.status_code == 200
-            and r.json()["exported"] == []
-            and r.json()["refused"][0]["error"] == "not_exportable"
+        assert r.status_code == 200 and r.json()["refused"] == [], r.text
+        (again,) = r.json()["exported"]
+        assert again["run_id"] == a["id"] and again["repeat"] is True and Path(again["path"]) == first
+        assert (first.read_bytes(), first.stat().st_mtime_ns) == before
+        recs = _records(sync_settings, "export", a["id"])
+        assert len(recs) == 2 and "repeat" not in recs[0]["data"] and recs[1]["data"]["repeat"] is True
+        # another run onto that name is still refused
+        r = c.post(
+            _export_url(),
+            json={"run_ids": [b["id"]], "out_dir": str(out), "format": "png16", "name_pattern": first.stem},
+            headers=auth,
         )
+        assert r.json()["exported"] == [] and r.json()["refused"][0]["error"] == "not_exportable", r.text
 
         # an override recorded first lets the failed run out
         r = c.post(f"/api/v0/runs/{bad['id']}/override", json={"reason": REASON}, headers=auth)

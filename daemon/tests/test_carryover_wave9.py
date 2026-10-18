@@ -403,11 +403,11 @@ def _status(w: World) -> dict:
 def test_plugin_status_stamps_every_claiming_poll_and_counts_the_waiting_jobs(world):
     c, auth = world.client, world.auth
     assert c.get("/api/v0/plugin/status").status_code == 401
-    assert _status(world) == {"last_poll_utc": None, "queued": 0, "claimed": 0}
+    assert _status(world) == {"last_poll_utc": None, "queued": 0, "claimed": 0, "expired_claims": 0}
 
     r = c.post("/api/v0/plugin/jobs", json={"action": "receive", "run_id": world.run_id}, headers=auth)
     assert r.status_code == 201, r.text
-    assert _status(world) == {"last_poll_utc": None, "queued": 1, "claimed": 0}
+    assert _status(world) == {"last_poll_utc": None, "queued": 1, "claimed": 0, "expired_claims": 0}
 
     c.get("/api/v0/plugin/jobs?since=0", headers=auth)  # a look without claiming is not a dock
     assert _status(world)["last_poll_utc"] is None

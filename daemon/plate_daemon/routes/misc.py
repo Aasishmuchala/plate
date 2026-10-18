@@ -15,6 +15,10 @@
   A lineage claim from another project or another machine comes back with `run_id: null, known_run: false`.
 - `GET /projects/{id}/outbound?tail=50`: the last requests in the project's `outbound.jsonl`, one merged record
   per request (`{"entries": [...]}`), for the custody panel.
+
+Scrub, verdict and both timer actions reset the unattended clock (`Pipeline.touch_human`) only for a request
+carrying `X-Plate-Client: ui` (decision 71, `routes.projects.from_ui`): `plate timer` in a terminal, curl, MCP
+and the plugin never do, so a header-less timer start cannot lift the unattended cap.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from ..phash import DEFAULT_MAX_DISTANCE, PhashError, PhashIndex, resolve_drop
 from ..states import RunState
 from ..timer import HumanTimer, TimerError
 from . import API, ApiError, Ctx, ctx, require_token, run_project
+from .projects import from_ui
 from .runs import find_scrub
 from .tierc import project_or_404
 
@@ -143,7 +148,8 @@ def scrub_route(request: Request, run_id: str, body: ScrubBody) -> dict[str, Any
             },
         },
     )
-    c.pipeline.touch_human()
+    if from_ui(request):
+        c.pipeline.touch_human()
     c.pipeline.publish(
         pid, run_id, {"kind": "run.scrubbed", "run_id": run_id, "scrub_log_id": scrub_id, "full_scrub": full}
     )
@@ -214,7 +220,8 @@ def verdict_route(request: Request, run_id: str, body: VerdictBody) -> dict[str,
         raise ApiError(
             500, {"error": "labels_unwritable", "detail": str(e), "ledgered": True, "ledger_seq": rec["seq"]}
         ) from e
-    c.pipeline.touch_human()
+    if from_ui(request):
+        c.pipeline.touch_human()
     c.pipeline.publish(
         pid,
         run_id,
@@ -259,12 +266,14 @@ def timer_route(request: Request, body: TimerBody) -> dict[str, Any]:
             if body.project_id:
                 project_or_404(c, body.project_id)
             state = timer.start(body.deliverable_id, c.now(), body.project_id)
-            c.pipeline.touch_human()
+            if from_ui(request):
+                c.pipeline.touch_human()
             return {"ok": True, "action": "start", **state}
         done = timer.stop(body.deliverable_id, c.now())
     except TimerError as e:
         raise _timer_error(e) from e
-    c.pipeline.touch_human()
+    if from_ui(request):
+        c.pipeline.touch_human()
     return {"ok": True, "action": "stop", **done}
 
 

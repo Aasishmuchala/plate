@@ -7,9 +7,32 @@ phases, so a crash in between leaves an id recovery re-polls), SUBMITTED -> RUNN
 running or succeeded), RUNNING -> FETCHING / REFUSED / FAILED(timeout), FETCHING -> NORMALIZING (fetch the
 bytes into the CAS at once: result URLs expire), NORMALIZING -> GATING (`normalize_fn`, a stub by default),
 GATING -> DONE or GATE_FAIL (`gate_fn`; the stub fails only on `params.force_gate_fail`). A poll that shows
-no progress leaves the state alone; a poll that raises (an unknown job, a transport fault) fails the run as
+no progress leaves the state alone; a poll that raises an unknown job (any non-transport error) fails the run as
 `provider_poll_error` and never propagates. `run_to_completion` loops `step`, sleeping `poll_interval_s` between
 idle polls. A queued run whose request is identical to another run's is CANCELLED as `duplicate_request`.
+
+Vendor faults are classified, never guessed (router plan T130, decision 76):
+- Submit. Before the vendor is called, a project assets folder with less than `PLATE_MIN_FREE_MB` (default 256)
+  free fails the run `disk_full`, nothing sent. A submit that raised after the request may have left (an httpx
+  timeout, network or remote-protocol error, an error carrying `status >= 500`, an unreadable JSON answer) is
+  resolved like a lost submit response (`_resolve_unknown_submit`: lookup, idempotent re-stage, else FAILED
+  `submit_state_unknown`); a daemon-side refusal at staging (`PipelineError`, a `ValueError` such as
+  `ParamError` / `InputError`, a custody or egress refusal raised before a byte left) is FAILED `staging_error`;
+  neither is noted as a provider failure. Anything else stays `submit_error`, noted on the route.
+- Poll. Up to `POLL_FAULT_LIMIT - 1` consecutive transport faults (the submit tuple plus `ConnectionError` /
+  `OSError`) leave the state alone with a `poll_fault` note on the run's events; the `POLL_FAULT_LIMIT`th, or one
+  past the poll timeout, is `provider_poll_error`. A poll that answers resets the count.
+- Fetch. A `ResultExpired` URL is re-polled once; a fresh `result_url` is stored and fetched once. The bytes are
+  checked before the CAS: empty is `result_empty`, no known magic (`plate_pixels.imghdr`: an image or a clip)
+  is `result_not_image`, an image header over `PLATE_RESULT_MAX_PIXELS` is `result_too_large`. The one other
+  result the worker takes is a canonical JSON object, the marker the daemon's own engines (numeric, plugin,
+  judge, motion, people) hand over. The FETCHING -> NORMALIZING reason records `"<n> bytes, <magic>, <w>x<h>"`.
+- Cancel. `cancel_run` refuses a state with no CANCELLED exit at once, then waits at most `CANCEL_LOCK_WAIT_S`
+  for a step that holds the run (a stalled vendor call); past that the request is recorded and `CancelPending`
+  raised, and the step honours it as soon as the run sits in a cancellable state: at its end when the handler
+  left the state alone, else at the start of the next step (so the move it made is published and ledgered
+  first). A request the run can no longer honour (it reached FETCHING or a terminal state) is dropped with a
+  `cancel_dropped` note.
 
 `Runner(index, bus, adapters, gate_fn, normalize_fn)` drives every project of an `Index`: `tick()` advances
 runnable runs by priority, then age; a QUEUED run starts only while its route has fewer than `max_inflight`
@@ -29,8 +52,9 @@ never reached the provider and simply submits on its next step; an expired QUOTE
 Steps on one run are serialised by an in-process lock (the API's step and cancel routes run on a thread
 pool), and the daemon's app-data lock keeps a second process away.
 
-Route health (router plan T85): a failed submit and a poll that raises are provider failures, a fetch that
-returns bytes is a success; each is noted on a `route_health.Tracker` (`tracker.note_failure(engine_id,
+Route health (router plan T85): a failed submit, a poll that fails the run and a result that fails its checks
+are provider failures, a fetch that returns a valid result is a success; each is noted on a
+`route_health.Tracker` (`tracker.note_failure(engine_id,
 route_id, reason_code)` / `note_success(engine_id, route_id)`). The tracker is the `route_tracker=` argument of
 `step` / `run_to_completion` / `Runner`, else `engine.route_tracker`, else `engine.pipeline.route_tracker` (the
 pipeline's `StagedEngine` carries its pipeline), else none: with no tracker nothing is noted. A tracker fault is
@@ -41,6 +65,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -48,13 +74,26 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+import httpx
+
+from plate_pixels.imghdr import IMAGE_KINDS, header_size, magic, max_pixels
 
 from .adapter import PollResult, ResultExpired, lookup_fn, submit_is_idempotent
 from .cas import CAS
 from .db import tx
 from .idempotency import canonical_json, new_id
-from .machine import DuplicateRequest, IllegalTransition, annotate, create_run, get_run, transition
+from .machine import (
+    DuplicateRequest,
+    IllegalTransition,
+    annotate,
+    append_note,
+    create_run,
+    get_run,
+    transition,
+)
 from .models import Quote, Run, RunCreate
 from .quotes import expire_if_due, insert_quote
 from .states import (
@@ -80,9 +119,43 @@ DEFAULT_MAX_INFLIGHT = 2
 MAX_FAN_OUT = 16
 STUB_GATE_VERSION = "stub-0"
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+MiB = 1024 * 1024
+
+# Decision 76. Poll: this many consecutive transport faults end the run (the ones before it are tolerated).
+POLL_FAULT_LIMIT = 5
+# Cancel: how long a cancel waits for a step that holds the run before it is recorded as pending.
+CANCEL_LOCK_WAIT_S = 2.0
+# Submit: the free space a project's assets folder needs before anything is sent (PLATE_MIN_FREE_MB).
+MIN_FREE_ENV = "PLATE_MIN_FREE_MB"
+DISK_MIN_FREE_MB = 256
+DISK_MIN_FREE_BYTES = DISK_MIN_FREE_MB * MiB
+# A JSON marker (the daemon's own engines) is small; anything bigger that is not an image is not one.
+MARKER_MAX_BYTES = 16 * MiB
+
+# Errors raised after the request may have reached the vendor: the submit's outcome is unknown.
+TRANSPORT_FAULTS: tuple[type[BaseException], ...] = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+)
+POLL_TRANSPORT_FAULTS: tuple[type[BaseException], ...] = (*TRANSPORT_FAULTS, ConnectionError, OSError)
+# Daemon-side refusals raised before a byte leaves (matched by name: these modules import this one or sit in
+# plate_engines): a staging error, never a provider failure.
+STAGING_ERROR_NAMES = frozenset(
+    {
+        "PipelineError",
+        "CustodyViolation",
+        "EgressBlocked",
+        "HostNotAllowed",
+        "MissingTransport",
+        "LiveDisabled",
+    }
+)
 
 _locks_guard = threading.Lock()
 _run_locks: dict[str, threading.RLock] = {}
+_poll_faults: dict[str, int] = {}
+_cancel_requested: dict[str, tuple[str, str | None]] = {}
 
 
 class NotRunnable(Exception):
@@ -91,6 +164,16 @@ class NotRunnable(Exception):
 
 class FanOutError(ValueError):
     pass
+
+
+class CancelPending(Exception):
+    """The run is mid-step (a vendor call holds it): the cancel is recorded and lands when the step lets go."""
+
+    def __init__(self, run_id: str):
+        self.run_id = run_id
+        super().__init__(
+            f"run {run_id} is in the middle of a step; the cancel is recorded and happens as soon as it ends"
+        )
 
 
 @dataclass(frozen=True)
@@ -210,7 +293,68 @@ def _fail(c: _Ctx, run: Run, code: str, reason: str) -> RunState:
     return S.FAILED
 
 
-def _submit(c: _Ctx, run: Run, note: str = "") -> RunState:
+def _named(e: BaseException, names: frozenset[str]) -> bool:
+    return any(k.__name__ in names for k in type(e).__mro__)
+
+
+def _submit_outcome_unknown(e: BaseException) -> bool:
+    """The request may have reached the vendor: a transport fault after sending, a 5xx, an unreadable answer."""
+    if isinstance(e, (*TRANSPORT_FAULTS, json.JSONDecodeError)):
+        return True
+    status = getattr(e, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool) and status >= 500:
+        return True
+    return isinstance(e, httpx.HTTPStatusError) and e.response.status_code >= 500
+
+
+def _staging_error(e: BaseException) -> bool:
+    """A refusal on this side before anything left: the pipeline, a param or input check, custody, egress."""
+    return isinstance(e, ValueError) or _named(e, STAGING_ERROR_NAMES)
+
+
+def min_free_bytes() -> int:
+    """The free-space floor for a project's assets folder: `PLATE_MIN_FREE_MB` MiB, else 256 MiB (0 turns it off)."""
+    raw = os.environ.get(MIN_FREE_ENV, "").strip()
+    if not raw:
+        return DISK_MIN_FREE_BYTES
+    try:
+        mb = float(raw)
+    except ValueError:
+        log.warning("%s=%r is not a number of MiB; using %d", MIN_FREE_ENV, raw, DISK_MIN_FREE_MB)
+        return DISK_MIN_FREE_BYTES
+    return max(0, int(mb * MiB))
+
+
+def _free_under(folder: Path) -> tuple[Path, int] | None:
+    """(the folder measured, its free bytes): the nearest existing ancestor of `folder`; None if unmeasurable."""
+    probe = folder
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    try:
+        return probe, int(shutil.disk_usage(probe).free)
+    except OSError as e:
+        log.warning("free space under %s not measured: %s", probe, e)
+        return None
+
+
+def _disk_full(c: _Ctx, run: Run) -> RunState | None:
+    """FAILED `disk_full` when the project's assets folder is under the floor; None when the submit may go."""
+    floor = min_free_bytes()
+    if floor <= 0 or c.cas is None:
+        return None
+    measured = _free_under(c.cas.root)
+    if measured is None or measured[1] >= floor:
+        return None
+    where, free = measured
+    return _fail(
+        c,
+        run,
+        "disk_full",
+        f"{free // MiB} MiB free under {where}; the floor is {floor // MiB} MiB ({MIN_FREE_ENV}); nothing was sent",
+    )
+
+
+def _submit(c: _Ctx, run: Run, note: str = "", *, restage: bool = False) -> RunState:
     if c.cas is not None and run.payload_key and c.cas.has(run.payload_key):
         payload = json.loads(c.cas.read_bytes(run.payload_key).decode("utf-8"))
     else:
@@ -220,9 +364,23 @@ def _submit(c: _Ctx, run: Run, note: str = "") -> RunState:
     annotate(c.conn, run.id, expect=S.STAGING, submit_started_utc=c.clock())
     try:
         job_id = c.engine.submit(payload, run.idempotency_key)
-    except Exception as e:  # recorded as the failure reason
+    except Exception as e:  # classified: unknown outcome, a refusal on this side, or a provider failure
+        what = f"{type(e).__name__}: {e}"
+        if _submit_outcome_unknown(e):
+            if restage:  # the re-stage after a lost answer was lost too: stop here, never loop at the vendor
+                return _fail(
+                    c,
+                    run,
+                    "submit_state_unknown",
+                    f"the re-stage after a lost submit answer raised {what}; the provider may hold the job. "
+                    "Not resubmitting blind: check the provider, then re-run as a new attempt.",
+                )
+            log.warning("run %s: submit raised %s after the request may have left; resolving", run.id, what)
+            return _resolve_unknown_submit(c, run)[0]
+        if _staging_error(e):
+            return _fail(c, run, "staging_error", f"staging refused the run before anything was sent: {what}")
         _note_provider(c, run, False, "submit_error")
-        return _fail(c, run, "submit_error", f"submit raised {type(e).__name__}: {e}")
+        return _fail(c, run, "submit_error", f"submit raised {what}")
     if not isinstance(job_id, str) or not job_id.strip():
         _note_provider(c, run, False, "submit_error")
         return _fail(c, run, "submit_error", f"submit returned no job id ({job_id!r})")
@@ -256,7 +414,7 @@ def _resolve_unknown_submit(c: _Ctx, run: Run) -> tuple[RunState, str]:
         return _adopt(c, run, job_id, reason), "adopted"
     if submit_is_idempotent(c.engine):
         note = "re-staged with the same idempotency key after a lost submit response; "
-        new = _submit(c, run, note=note)
+        new = _submit(c, run, note=note, restage=True)
         return new, "restaged" if new is S.SUBMITTED else "failed"
     return (
         _fail(
@@ -306,17 +464,43 @@ def _staging(c: _Ctx, run: Run) -> RunState:
     if run.submit_started_utc is not None:
         # A previous submit may have reached the provider. Never call submit blind for this attempt.
         return _resolve_unknown_submit(c, run)[0]
+    full = _disk_full(c, run)  # the result has to land somewhere: refuse before anything is spent
+    if full is not None:
+        return full
     return _submit(c, run)
+
+
+def _poll_fault_tolerated(c: _Ctx, run: Run, e: BaseException) -> bool:
+    """Count a transport fault on this run's poll; True (and a `poll_fault` note) while it is under the limit."""
+    if not isinstance(e, POLL_TRANSPORT_FAULTS):
+        return False
+    with _locks_guard:
+        n = _poll_faults.get(run.id, 0) + 1
+        _poll_faults[run.id] = n
+    if n >= POLL_FAULT_LIMIT or _timed_out(run, c.clock(), c.poll_timeout_s):
+        return False
+    reason = f"poll fault {n} of {POLL_FAULT_LIMIT - 1} tolerated: {type(e).__name__}: {e}"
+    append_note(c.conn, run.id, kind="poll_fault", actor=c.actor, reason=reason[:500])
+    return True
 
 
 def _polling(c: _Ctx, run: Run) -> RunState:
     st = run.state
     try:
         res: PollResult = c.engine.poll(run.provider_job_id)
-    except Exception as e:  # an unknown job or a transport fault ends the run; it never unwinds the worker
+    except Exception as e:  # an unknown job, or one transport fault too many, ends the run; never unwinds it
+        if _poll_fault_tolerated(c, run, e):
+            return st
+        with _locks_guard:
+            faults = _poll_faults.pop(run.id, 0)
         # FAILED with the provider id kept: a job may exist, so the spend settles instead of refunding.
         _note_provider(c, run, False, "provider_poll_error")
-        return _fail(c, run, "provider_poll_error", f"{type(e).__name__}: {e}"[:500])
+        what = f"{type(e).__name__}: {e}"
+        if faults > 1 and isinstance(e, POLL_TRANSPORT_FAULTS):
+            what = f"{what} ({faults} consecutive poll faults)"
+        return _fail(c, run, "provider_poll_error", what[:500])
+    with _locks_guard:
+        _poll_faults.pop(run.id, None)
     _fault(c.engine, st, "after_effect")
     if res.status == "refused":
         transition(
@@ -344,20 +528,79 @@ def _polling(c: _Ctx, run: Run) -> RunState:
     return st
 
 
+def _is_marker(data: bytes) -> bool:
+    """A canonical JSON object: what the daemon's own engines hand the worker instead of pixels."""
+    if not data.startswith(b"{") or len(data) > MARKER_MAX_BYTES:
+        return False
+    try:
+        obj = json.loads(data.decode("utf-8"))
+        return isinstance(obj, dict) and canonical_json(obj) == data
+    except (ValueError, TypeError):
+        return False
+
+
+def _check_result(data: bytes) -> tuple[str, str] | tuple[None, str]:
+    """(failure code, reason) for a result that must not reach the CAS, else (None, what it is)."""
+    if not data:
+        return "result_empty", "the engine result is empty (0 bytes)"
+    kind = magic(data)
+    if kind is None:
+        if _is_marker(data):
+            return None, f"{len(data)} bytes, json marker"
+        return (
+            "result_not_image",
+            f"the result is {len(data)} bytes of {data[:8].hex()}, not an image or a clip",
+        )
+    size = header_size(data) if kind in IMAGE_KINDS else None
+    if size is None:
+        return None, f"{len(data)} bytes, {kind}"
+    w, h = size
+    cap = max_pixels()
+    if w * h > cap:
+        return (
+            "result_too_large",
+            f"the {kind} result declares {w}x{h} = {w * h} px; the cap is {cap} (PLATE_RESULT_MAX_PIXELS)",
+        )
+    return None, f"{len(data)} bytes, {kind}, {w}x{h}"
+
+
+def _refetch(c: _Ctx, run: Run, expired: ResultExpired) -> bytes | RunState:
+    """The stored result URL lapsed: poll once for a fresh one and fetch that once, else FAILED."""
+    try:
+        res = c.engine.poll(run.provider_job_id)
+    except Exception as e:  # the job cannot even be looked at again: the URL's expiry is the answer
+        return _fail(c, run, "result_url_expired", f"{expired}; the re-poll raised {type(e).__name__}: {e}")
+    fresh = res.result_url if res.status == "succeeded" else None
+    if not fresh or fresh == run.result_url:
+        return _fail(c, run, "result_url_expired", f"{expired}; a re-poll gave no fresh result URL")
+    annotate(c.conn, run.id, expect=S.FETCHING, result_url=fresh)
+    try:
+        return c.engine.fetch(fresh)
+    except ResultExpired as e:
+        return _fail(c, run, "result_url_expired", f"{e} (the fresh URL from a re-poll expired too)")
+    except Exception as e:  # recorded as the failure reason
+        return _fail(c, run, "fetch_error", f"fetch of the fresh URL raised {type(e).__name__}: {e}")
+
+
 def _fetching(c: _Ctx, run: Run) -> RunState:
     cas = _require_cas(c.cas)
     try:
         data = c.engine.fetch(run.result_url)
     except ResultExpired as e:
-        return _fail(c, run, "result_url_expired", str(e))
+        got = _refetch(c, run, e)
+        if isinstance(got, RunState):
+            return got
+        data = got
     except Exception as e:  # recorded as the failure reason
         return _fail(c, run, "fetch_error", f"fetch raised {type(e).__name__}: {e}")
+    code, what = _check_result(bytes(data))
+    if code is not None:  # checked before the CAS: a bomb or an error page is never stored or decoded
+        _note_provider(c, run, False, code)
+        return _fail(c, run, code, what)
     _note_provider(c, run, True)  # the route delivered a result: its run of failures is over
     key = cas.put_bytes(data, "png" if data[:8] == PNG_MAGIC else "bin")
     _fault(c.engine, S.FETCHING, "after_effect")
-    transition(
-        c.conn, run.id, S.NORMALIZING, actor=c.actor, reason=f"{len(data)} bytes into the CAS", result_key=key
-    )
+    transition(c.conn, run.id, S.NORMALIZING, actor=c.actor, reason=what, result_key=key)
     return S.NORMALIZING
 
 
@@ -442,6 +685,8 @@ def step(
         run = get_run(conn, run_id)
         st = run.state
         if st in TERMINAL or st not in WORKER_STATES:
+            if st in TERMINAL:
+                _forget(run_id)
             return st
         c = _Ctx(
             conn,
@@ -454,10 +699,17 @@ def step(
             gate_fn,
             tracker_of(engine, route_tracker),
         )
+        pending = _honour_cancel(c, run_id, st)  # recorded while the previous step held the run
+        if pending is not None:
+            return pending
         _fault(engine, st, "before")
         new = _HANDLERS[st](c, run)
         if new is not st:
             _fault(engine, st, "after_commit")
+        elif (pending := _honour_cancel(c, run_id, new)) is not None:
+            new = pending  # no move to publish first: the recorded cancel lands now
+        if new in TERMINAL:
+            _forget(run_id)
         return new
 
 
@@ -593,30 +845,76 @@ def recover_on_boot(
     return _recover(conn, lambda run: engine, clock, cas, skip, route_tracker)
 
 
+def _forget(run_id: str) -> None:
+    """Drop a finished run's poll-fault count and any cancel request it can no longer honour."""
+    with _locks_guard:
+        _poll_faults.pop(run_id, None)
+        _cancel_requested.pop(run_id, None)
+
+
+def _honour_cancel(c: _Ctx, run_id: str, state: RunState) -> RunState | None:
+    """Perform a cancel recorded while a step held the run; None when there is none. A request the run can no
+    longer honour (FETCHING onward has no CANCELLED exit) is dropped with a `cancel_dropped` note."""
+    with _locks_guard:
+        request = _cancel_requested.pop(run_id, None)
+    if request is None:
+        return None
+    actor, reason = request
+    if S.CANCELLED not in TRANSITIONS[state]:
+        if state not in TERMINAL:
+            note = f"a cancel by {actor} arrived mid-step; the run had reached {state.value}, which cannot be cancelled"
+            append_note(c.conn, run_id, kind="cancel_dropped", actor=actor, reason=note[:500])
+        return None
+    return _cancel_locked(c.conn, c.engine, run_id, actor, reason).state
+
+
+def _cancel_locked(conn: sqlite3.Connection, engine: Any, run_id: str, actor: str, reason: str | None) -> Run:
+    """The cancel itself, under the run lock: exactly one `engine.cancel` call for a job the provider has."""
+    run = get_run(conn, run_id)
+    if S.CANCELLED not in TRANSITIONS[run.state]:
+        raise IllegalTransition(run.state, S.CANCELLED)
+    notes = [reason] if reason else []
+    if run.provider_job_id:
+        notes.append(_best_effort_cancel(engine, run.provider_job_id))
+    elif run.state is S.STAGING and run.submit_started_utc is not None:
+        fn = lookup_fn(engine)
+        job_id = None
+        if fn is not None and run.idempotency_key:
+            try:
+                job_id = fn(run.idempotency_key)
+            except Exception:
+                job_id = None
+        if job_id:
+            notes.append(_best_effort_cancel(engine, job_id))
+        else:
+            notes.append("a submit may have reached the provider; its job could not be found to cancel")
+    out = transition(conn, run_id, S.CANCELLED, actor=actor, reason="; ".join(notes) or None)
+    _forget(run_id)
+    return out
+
+
 def cancel_run(
     conn: sqlite3.Connection, engine: Any, run_id: str, *, actor: str = "human", reason: str | None = None
 ) -> Run:
-    """Cancel a run; a run already at the provider gets exactly one `engine.cancel` call first."""
-    with run_lock(run_id):
-        run = get_run(conn, run_id)
-        if S.CANCELLED not in TRANSITIONS[run.state]:
-            raise IllegalTransition(run.state, S.CANCELLED)
-        notes = [reason] if reason else []
-        if run.provider_job_id:
-            notes.append(_best_effort_cancel(engine, run.provider_job_id))
-        elif run.state is S.STAGING and run.submit_started_utc is not None:
-            fn = lookup_fn(engine)
-            job_id = None
-            if fn is not None and run.idempotency_key:
-                try:
-                    job_id = fn(run.idempotency_key)
-                except Exception:
-                    job_id = None
-            if job_id:
-                notes.append(_best_effort_cancel(engine, job_id))
-            else:
-                notes.append("a submit may have reached the provider; its job could not be found to cancel")
-        return transition(conn, run_id, S.CANCELLED, actor=actor, reason="; ".join(notes) or None)
+    """Cancel a run; a run already at the provider gets exactly one `engine.cancel` call first.
+
+    A state with no CANCELLED exit (FETCHING onward, terminal) is `IllegalTransition` at once, before any lock.
+    A step that holds the run (a stalled submit or poll) is waited for `CANCEL_LOCK_WAIT_S` at most; then the
+    request is recorded for that step to perform and `CancelPending` is raised (the route answers 202)."""
+    run = get_run(conn, run_id)
+    if S.CANCELLED not in TRANSITIONS[run.state]:
+        raise IllegalTransition(run.state, S.CANCELLED)
+    lock = run_lock(run_id)
+    if not lock.acquire(timeout=CANCEL_LOCK_WAIT_S):
+        with _locks_guard:
+            _cancel_requested[run_id] = (actor, reason)
+        raise CancelPending(run_id)
+    try:
+        with _locks_guard:
+            _cancel_requested.pop(run_id, None)  # this call does it now
+        return _cancel_locked(conn, engine, run_id, actor, reason)
+    finally:
+        lock.release()
 
 
 # ---------------------------------------------------------------------------- best-of-N

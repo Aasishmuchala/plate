@@ -43,7 +43,6 @@ from __future__ import annotations
 import logging
 import math
 import os
-import struct
 import threading
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
@@ -52,9 +51,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import cv2
-import numpy as np
 from blake3 import blake3
+
+from plate_pixels.imghdr import header_size
 
 from . import canvas_rules
 from .custody import require_route, route_allowed
@@ -98,7 +97,6 @@ LAYER_ROLE = "ai_layer"
 JOURNAL_DIR = ("cache", "layer-upscale")
 # Weakest last: a sum of two prices is as firm as its least firm part.
 STATUS_ORDER = ("confirmed", "estimated", "unconfirmed", "fake")
-_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 class _Unavailable(RuntimeError):
@@ -148,12 +146,15 @@ def plan_factor(
 
 
 def _size_of(data: bytes) -> tuple[int, int] | None:
-    """(width, height) of encoded image bytes: a PNG's IHDR, else a decode; None when they are not an image."""
-    if len(data) >= 24 and data[:8] == _PNG_SIGNATURE and data[12:16] == b"IHDR":
-        w, h = struct.unpack(">II", data[16:24])
-        return int(w), int(h)
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
-    return None if img is None else (int(img.shape[1]), int(img.shape[0]))
+    """(width, height) of encoded image bytes from the header alone (`plate_pixels.imghdr.header_size`: PNG,
+    JPEG, WebP, BMP, TIFF), never a decode, so a decompression bomb costs nothing here; None when the bytes are
+    empty or not a readable image header. Never raises: ingress names the bad result."""
+    if not data:
+        return None
+    try:
+        return header_size(data)
+    except Exception:  # header_size does not raise; this keeps the hook's promise if that ever changes
+        return None
 
 
 def _scale_range(manifest: Any) -> tuple[int, int]:

@@ -17,7 +17,8 @@ that fits, `long_side` can only shrink it (INTER_AREA), and a request above the 
 - Both embed the source run's lineage (decision 26, with the IPTC AI marker when the engine was generative) and,
   when a lineage is given, write `<name>.cutdown.json = {source_run, box, preset, format|codec,
   gate_report_ref}` beside the file. The file is staged under a hidden sibling name and moved into place, and
-  an existing file is never overwritten (FileExistsError).
+  an existing file is never overwritten (FileExistsError). The name is claimed, not checked (`export.claim`,
+  `O_CREAT | O_EXCL`): of any number of cutdowns racing to one name exactly one is written.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from . import lineage as lineage_mod
 from .delivery.guard import DeliveryError, stage_path
 from .delivery.tools import probe_video, run_ffmpeg
 from .delivery.video import BT709
+from .export import claim
 from .fsutil import replace_with_retry, write_json_atomic
 from .lineage import Lineage
 
@@ -209,11 +211,18 @@ def _report_ref(lineage: Lineage) -> str | None:
 
 
 def _place(staged: Path, final: Path, lineage: Lineage | None) -> None:
+    """Embed the lineage, claim `final` (`O_CREAT | O_EXCL`: of any number of cutdowns racing to one name
+    exactly one wins, the others raise FileExistsError) and move the staged file over the empty claim; a
+    failure after the claim gives the name back."""
     if lineage is not None:
         lineage_mod.embed(staged, lineage)
-    if final.exists():
+    if not claim(final):
         raise FileExistsError(f"{final} already exists; cutdowns never overwrite")
-    replace_with_retry(staged, final)
+    try:
+        replace_with_retry(staged, final)
+    except BaseException:
+        final.unlink(missing_ok=True)
+        raise
 
 
 def _check_destination(out: Path, suffixes: Sequence[str], what: str) -> None:

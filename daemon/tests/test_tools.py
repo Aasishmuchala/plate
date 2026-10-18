@@ -476,7 +476,7 @@ def test_protect_and_index_references_are_honoured(proj, tmp_path):
     assert names(proj, rep.candidates) == {"orphan2"}
 
     idx = Index(tmp_path / "home")
-    with idx.project("tula-a") as conn:
+    with idx.project("tula-a", create=True) as conn:  # opening an index never creates one unless asked (T144)
         with tx(conn):
             apply_packet_entry(
                 conn,

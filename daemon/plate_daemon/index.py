@@ -8,11 +8,25 @@ work (`journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, see `db.con
 file once per process. Fresh connections keep the thread-pool routes, the background ingest and the
 worker from ever sharing one `sqlite3.Connection` concurrently.
 
+Opening an index never creates one by accident (Wave 12, T144): `connect` / `project` raise `UnknownProject`
+when `index/<id>.sqlite` does not exist, and `api.create_app` answers that 404 `not_found`. Only the calls that
+make a project real pass `create=True`: `set_project_root` (`POST /projects`, the CLI, `Pipeline.ensure_project`),
+`rebuild_from_project`, and the packet-first registration in `POST /packets`. So a request naming a project
+that does not exist leaves no `index/<id>.sqlite` behind, and `project_ids()` (every `index/*.sqlite` whose stem
+is a whole project id) only counts real projects. A new index file gets `project_meta.index_epoch`, a ULID that
+`rebuild_from_project` replaces: the SSE ids are `<epoch>.<seq>`, so a cursor from before a rebuild (whose seq
+restarts at 1) is recognised as stale and replayed from 0 (`sse.Bus`, `routes/events.cursor`). An index made
+before the epoch existed gets one on first read (`index_epoch`).
+
 Rebuild drops every table in one transaction, re-applies the migrations and replays, in order:
 `project.json` (root and custody into `project_meta`), `packets.json` (packets by reference), `assets/`
-(one `assets` row per CAS object) and `runs.jsonl`. Ledger records fold per `run_id` in file order: a
-record's `state` (a RunState value) wins, else its `kind` maps through `KIND_STATES`; run fields are read
-from the record or its `data`. A run whose packet is not registered, or that claims a provider state with
+(one `assets` row per CAS object) and `runs.jsonl`. Ledger records fold per `run_id`: a record's `state`
+(a RunState value) wins, else its `kind` maps through `KIND_STATES`; the run's state is the one of the record
+with the highest `data.event_seq` (the index `run_events` seq of the transition, Decision 73), so two appends
+that raced into the file out of order still fold to the state the live index had. Records without a seq, and
+ties, go in file order, and a terminal state is never overwritten by a non-terminal one (terminal states have
+no exits). A record repeating an earlier `(run_id, kind, state)` is folded once. Run fields are read from the
+record or its `data`, in file order. A run whose packet is not registered, or that claims a provider state with
 no `provider_job_id`, is skipped and reported. What the folder does not hold (quotes, envelopes, run and
 packet event logs, packet blob hashes, the SSE event log) is not recovered: write it to the folder first.
 
@@ -39,9 +53,10 @@ from typing import Any
 from .cas import CAS, hash_file
 from .config import PROJECT_ID_RE, check_project_id, index_db_path, index_dir
 from .db import connect, dumps, loads, migrate, tx
+from .idempotency import ulid
 from .machine import RunNotFound, append_note
 from .projects import Project
-from .states import PROVIDER_STATES, RunState
+from .states import PROVIDER_STATES, TERMINAL, RunState
 from .timeutil import iso, utcnow
 
 PACKET_COLUMNS = (
@@ -107,10 +122,22 @@ PRIORITY_NAMES = ("client_deadline", "interactive", "agent_batch", "calibration"
 COUNTED_TABLES = ("assets", "packets", "runs", "events", "project_meta")
 OVERRIDE_PREFIX = "override: "  # the reason prefix routes/runs.py puts on an override note
 PHASH_EXTS = frozenset({"png", "jpg", "jpeg", "tif", "tiff"})
+EPOCH_KEY = "index_epoch"  # project_meta key: this index file's generation, a ULID
 
 
 class RebuildError(RuntimeError):
     pass
+
+
+class UnknownProject(LookupError):
+    """No index for this project (and the caller did not ask for one to be made); the API answers 404.
+
+    `project_id` is None when the project could not even be named (an event for a run no index holds, a
+    subscription with several projects indexed and none chosen); the message then says why."""
+
+    def __init__(self, project_id: str | None = None, detail: str | None = None):
+        self.project_id = project_id
+        super().__init__(detail or f"project {project_id} is not indexed")
 
 
 # ---------------------------------------------------------------------------- packets
@@ -158,24 +185,56 @@ def _state_of(rec: dict[str, Any], data: dict[str, Any]) -> RunState | None:
     return KIND_STATES.get(str(rec.get("kind", "")).lower())
 
 
+def _event_seq(rec: dict[str, Any], data: dict[str, Any]) -> int | None:
+    """The `run_events` seq the record was written at (`data.event_seq`), None when it carries none."""
+    raw = data.get("event_seq", rec.get("event_seq"))
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+
+
+def _supersedes(state: RunState, seq: int | None, held: RunState | None, held_seq: int | None) -> bool:
+    """Whether a record's state replaces the one folded so far. A terminal state is never undone by a
+    non-terminal one; between two seqs the higher wins; ties and records without a seq go in file order."""
+    if held is None:
+        return True
+    if held in TERMINAL and state not in TERMINAL:
+        return False
+    if seq is not None and held_seq is not None:
+        return seq >= held_seq
+    return True
+
+
 def fold_run_records(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Ledger records -> one dict per run_id with its latest state and fields (file order)."""
+    """Ledger records -> one dict per run_id with its state and latest fields.
+
+    The state is the one of the record with the highest `data.event_seq` (ties and records without a seq: file
+    order; a terminal state is never overwritten by a non-terminal one). Fields follow file order. A record
+    that repeats an earlier `(run_id, kind, state)` is folded once (the race that appended `cancelled` twice)."""
     runs: dict[str, dict[str, Any]] = {}
+    seqs: dict[str, int | None] = {}
+    seen: set[tuple[str, str, str | None]] = set()
     for rec in records:
         rid = rec.get("run_id")
         if not isinstance(rid, str) or not rid:
             continue
         data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        state = _state_of(rec, data)
+        kind = str(rec.get("kind", "")).lower()
+        key = (rid, kind, state.value if state is not None else None)
+        if key in seen:
+            continue
+        seen.add(key)
         at = rec.get("at") if isinstance(rec.get("at"), str) else iso(utcnow())
         run = runs.setdefault(rid, {"run_id": rid, "created_utc": at})
         for f in RUN_FIELDS:
             v = rec.get(f, data.get(f))
             if v is not None:
                 run[f] = v
-        state = _state_of(rec, data)
         if state is not None:
-            run["state"] = state
-        if str(rec.get("kind", "")).lower() == "quoted":
+            seq = _event_seq(rec, data)
+            if _supersedes(state, seq, run.get("state"), seqs.get(rid)):
+                run["state"] = state
+                seqs[rid] = seq if seq is not None else seqs.get(rid)
+        if kind == "quoted":
             quote = data.get("quote") if isinstance(data.get("quote"), dict) else None
             run["quote_json"] = quote or {k: rec[k] for k in QUOTE_KEYS if k in rec}
         run["updated_utc"] = at
@@ -295,18 +354,34 @@ class Index:
     def db_path(self, project_id: str) -> Path:
         return index_db_path(project_id, self.home)
 
-    def connect(self, project_id: str) -> sqlite3.Connection:
+    def exists(self, project_id: str) -> bool:
+        return self.db_path(check_project_id(project_id)).is_file()
+
+    def connect(self, project_id: str, *, create: bool = False) -> sqlite3.Connection:
+        """A fresh connection to the project's index, migrated. Raises `UnknownProject` when the file does
+        not exist and `create` is false: only the calls that make a project real create its index."""
         check_project_id(project_id)
-        conn = connect(self.db_path(project_id))
-        if project_id not in self._migrated:
-            migrate(conn)
-            with self._lock:
-                self._migrated.add(project_id)
+        path = self.db_path(project_id)
+        fresh = not path.is_file()
+        if fresh and not create:
+            raise UnknownProject(project_id)
+        conn = connect(path)
+        try:
+            # A file deleted under a running daemon is new again: migrate it even if this process did before.
+            if fresh or project_id not in self._migrated:
+                migrate(conn)
+                with self._lock:
+                    self._migrated.add(project_id)
+            if fresh:
+                index_epoch(conn)
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
     @contextmanager
-    def project(self, project_id: str) -> Iterator[sqlite3.Connection]:
-        conn = self.connect(project_id)
+    def project(self, project_id: str, *, create: bool = False) -> Iterator[sqlite3.Connection]:
+        conn = self.connect(project_id, create=create)
         try:
             yield conn
         finally:
@@ -316,7 +391,12 @@ class Index:
         d = index_dir(self.home)
         if not d.is_dir():
             return []
-        return sorted(p.stem for p in d.glob("*.sqlite") if PROJECT_ID_RE.match(p.stem))
+        return sorted(p.stem for p in d.glob("*.sqlite") if PROJECT_ID_RE.fullmatch(p.stem))
+
+    def epoch(self, project_id: str) -> str:
+        """This index file's generation (`project_meta.index_epoch`); a rebuild gives it a new one."""
+        with self.project(project_id) as conn:
+            return index_epoch(conn)
 
     def remember(self, obj_id: str, project_id: str) -> None:
         with self._lock:
@@ -360,14 +440,16 @@ class Index:
 
     def project_root(self, project_id: str) -> Path | None:
         """The folder registered for this project (by rebuild or `set_project_root`), or None."""
-        if not self.db_path(project_id).is_file():
+        try:
+            with self.project(project_id) as conn:
+                row = conn.execute("SELECT value FROM project_meta WHERE key = 'root'").fetchone()
+        except UnknownProject:  # no index: the caller falls back to projects_dir/<id>
             return None
-        with self.project(project_id) as conn:
-            row = conn.execute("SELECT value FROM project_meta WHERE key = 'root'").fetchone()
         return Path(loads(row["value"])) if row else None
 
     def set_project_root(self, project_id: str, root: Path, custody: dict[str, Any] | None = None) -> None:
-        with self.project(project_id) as conn, tx(conn):
+        """Register the project's folder (and custody): this is what makes a project's index exist."""
+        with self.project(project_id, create=True) as conn, tx(conn):
             _set_meta(conn, "root", str(Path(root).absolute()))
             if custody is not None:
                 _set_meta(conn, "custody", custody)
@@ -377,15 +459,20 @@ class Index:
             return {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in COUNTED_TABLES}
 
     def rebuild_from_project(self, project_dir: Path | str, *, verify: bool = False) -> dict[str, Any]:
-        """Drop this project's index and replay the folder. Returns counts and the problems met.
-        `verify=True` re-hashes every asset and skips (and reports) objects whose bytes do not match.
-        Take `projects.Lock(project_dir)` first when a daemon may be writing the folder."""
+        """Drop this project's index and replay the folder (creating the index when there is none). Returns
+        counts and the problems met. `verify=True` re-hashes every asset and skips (and reports) objects whose
+        bytes do not match. The index gets a new `index_epoch`: its event seqs restart, and SSE cursors from
+        before are recognised as stale. Take `projects.Lock(project_dir)` first when a daemon may be writing
+        the folder."""
         project = Project.load(project_dir)
         pid = project.project_id
         problems: list[str] = []
         stored_images: list[tuple[str, Path]] = []
         notes = 0
-        conn = connect(self.db_path(pid))
+        path = self.db_path(pid)
+        existed = path.is_file()
+        committed = False
+        conn = connect(path)
         try:
             # Foreign keys off for the drop (no table order to get right); the replay checks references
             # itself and foreign_key_check below must come back empty before anything commits.
@@ -403,6 +490,7 @@ class Index:
                 _set_meta(conn, "root", str(project.root.absolute()))
                 _set_meta(conn, "custody", project.custody)
                 _set_meta(conn, "created_utc", project.doc.get("created_utc"))
+                _set_meta(conn, EPOCH_KEY, ulid())
                 for packet_id, entry in sorted(project.packets().items()):
                     try:
                         apply_packet_entry(conn, pid, packet_id, entry)
@@ -430,11 +518,14 @@ class Index:
                     raise RebuildError(
                         f"rebuild left dangling references: {[tuple(r) for r in dangling][:5]}"
                     )
+            committed = True
             conn.execute("PRAGMA foreign_keys=ON")
             # After the commit: decoding images is slow and must not hold the write lock.
             phashed, phash_skipped = _phash_assets(conn, pid, stored_images)
         finally:
             conn.close()
+            if not committed and not existed:  # a rebuild that failed must not leave an empty index behind
+                _discard_index(path)
         with self._lock:
             self._migrated.add(pid)
             self._owner = {k: v for k, v in self._owner.items() if v != pid}
@@ -486,6 +577,28 @@ def _insert_asset(
         "INSERT OR IGNORE INTO assets (hash, ext, bytes, phash, added_utc) VALUES (?, ?, ?, ?, ?)",
         (key, ext, int(nbytes), phash, added_utc),
     )
+
+
+def _discard_index(path: Path) -> None:
+    for p in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:  # Windows may hold the file a moment longer; an empty index is still only a cache
+            pass
+
+
+def index_epoch(conn: sqlite3.Connection) -> str:
+    """The index's `project_meta.index_epoch`, set now (a ULID) when the file has none yet: an index made
+    before epochs existed gets one on first read, and two connections racing to set it agree on one."""
+    row = conn.execute("SELECT value FROM project_meta WHERE key = ?", (EPOCH_KEY,)).fetchone()
+    if row is None:
+        with tx(conn):
+            conn.execute(
+                "INSERT OR IGNORE INTO project_meta (key, value) VALUES (?, ?)",
+                (EPOCH_KEY, json.dumps(ulid())),
+            )
+        row = conn.execute("SELECT value FROM project_meta WHERE key = ?", (EPOCH_KEY,)).fetchone()
+    return str(loads(row["value"]))
 
 
 def _set_meta(conn: sqlite3.Connection, key: str, value: Any) -> None:

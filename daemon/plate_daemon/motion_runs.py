@@ -22,8 +22,11 @@ RUNNING, FETCHING, NORMALIZING, GATING, DONE or GATE_FAIL, every move published 
              HIGH_RISK_MOVE) and `quote_motion` (custody before price: every video route is grade D, so an NDA
              project gets `CustodyViolation`, 403; then the preference rule, Wave 11 decision 63: the body's
              `route_id`, else the project's `video_route_pins[engine]`, pins a route, and the project's
-             `preferred_video_provider`, default `runway`, goes first where the frame fits; the reasons are kept
-             as `motion_run.route_reasons`). The worker submits the plan's payload (start under `image`,
+             `preferred_video_provider`, default `runway`, goes first where the frame fits; then each candidate's
+             adapter checks the plan's params as submit would, Wave 12 T138: a route that refuses them, such as
+             a Kling seed on Runway, is skipped for the next with `prefer: runway skipped: <why>`, and none
+             taking them is 422 `params` with no run; the reasons are kept as `motion_run.route_reasons`).
+             The worker submits the plan's payload (start under `image`,
              end under `image_tail`, opaque names), polls and fetches; the fetched clip goes into the CAS as
              `.mp4` at once and NORMALIZING hands it to `run_motion`, which stores the stills, reads the clip's
              real frame rate and runs the video gates. Outputs `[clip, start, end]` (`[clip, start]` for a

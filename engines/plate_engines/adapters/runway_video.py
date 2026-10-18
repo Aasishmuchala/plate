@@ -20,11 +20,17 @@ dropped (decision 69): a negative prompt with no `negativePrompt` field becomes 
 Runway centre-crops an off-ratio frame, which would move a crop pair's landing, so such a frame is refused and the
 message points at the Atlas route, which follows the source aspect.
 
+`validate_params` takes a `negative_prompt` on every model, also where the manifest declares none (Seedance 2.5,
+Gen-4.5), so the fold is reachable; `check_expressible(params, inputs)` runs the same refusals submit runs on the
+params and on which inputs are present, without reading a file, so the daemon can skip a route at the quote that
+would refuse at submit (Wave 12, T138).
+
 Money rules (decision 65): exactly one create POST per submit and no retry on a timeout, 429 or 5xx (Runway has no
 idempotency key and no list-tasks endpoint), so `idempotent_submit` and `supports_lookup` are False and the worker
 ends a lost submit as `submit_state_unknown` for a human. An upload that fails is not retried either (the docs say
 start over). Failures map by `failureCode` prefix (decision 66) onto refused / `bad_output:` / `input:` /
-`transient:` messages; JobState is unchanged.
+`transient:` messages; JobState is unchanged. A task that reads SUCCEEDED with no output URL yet is `running`
+(transient) for its first `EMPTY_SUCCESS_LOOKS` looks, then `failed`: the output list can lag the status.
 
 Key hygiene: the key is read from RUNWAYML_API_SECRET at call time and appears in the Authorization header of
 api.dev.runwayml.com requests only: never on the upload hop, never on a result download, never in a message.
@@ -125,6 +131,7 @@ class RunwayVideo(VideoAdapter):
     MIN_POLL_GAP_S = 5.0
     ETA_BASE_S = 90.0
     ETA_PER_VIDEO_S = 8.0
+    EMPTY_SUCCESS_LOOKS = 3  # SUCCEEDED without an output reads as running this many looks, then failed
 
     idempotent_submit = False  # no idempotency key at the vendor: a lost submit is a human's call
     supports_lookup = False  # no list-tasks endpoint: a lost task id cannot be found again
@@ -144,9 +151,9 @@ class RunwayVideo(VideoAdapter):
                 f"{manifest.id} via {self.route.route_id}: the runway route must name its Runway model (model_slug)"
             )
         self.model_id = self.route.model_slug
-        endpoint = "text_to_video" if manifest.kind == "video_r2v" else "image_to_video"
+        self._endpoint = "text_to_video" if manifest.kind == "video_r2v" else "image_to_video"
         try:
-            runway_schema.spec_for(self.model_id, endpoint)
+            runway_schema.spec_for(self.model_id, self._endpoint)
         except KeyError as exc:
             raise ValueError(f"{manifest.id} via runway: {exc.args[0]}") from None
         self._key_env = key_env
@@ -155,6 +162,7 @@ class RunwayVideo(VideoAdapter):
         self._tiers: dict[str, str | None] = {}  # task id -> resolution tier asked for (output_bits)
         self._notes: dict[str, list[str]] = {}  # task id -> what the route did that the plan did not say
         self._looks: dict[str, tuple[float, JobStatus]] = {}  # task id -> (when, the answer) for the 5 s rule
+        self._empty: dict[str, int] = {}  # task id -> looks that read SUCCEEDED without an output
         self._last_notes: list[str] = []  # the notes and tier of the last build_body, filed by submit
         self._last_tier: str | None = None
 
@@ -188,7 +196,10 @@ class RunwayVideo(VideoAdapter):
     # ---- params -----------------------------------------------------------------------------------------
 
     def validate_params(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        """The manifest schema, after mapping a resolution spelling onto the manifest's own (1080p / 1080 / 1080P)."""
+        """The manifest schema, after mapping a resolution spelling onto the manifest's own (1080p / 1080 / 1080P).
+        A `negative_prompt` is taken on every model, also where the manifest declares none (Seedance 2.5, Gen-4.5):
+        a model with no `negativePrompt` field gets it folded into `promptText` as the final `Avoid:` line (decision
+        69), so it is neither refused for want of a field nor dropped."""
         params = dict(params)
         res = params.get("resolution")
         if res is not None and not isinstance(res, bool):
@@ -198,7 +209,27 @@ class RunwayVideo(VideoAdapter):
             match = next((e for e in enum if e.upper() == want), None)
             if match is not None:
                 params["resolution"] = match
-        return super().validate_params(params)
+        negative = self._folded_negative(params)
+        out = super().validate_params(params)
+        if negative:
+            out["negative_prompt"] = negative
+        return out
+
+    def _folded_negative(self, params: dict[str, Any]) -> str | None:
+        """Take a `negative_prompt` the manifest does not declare out of `params` when this model folds it (no
+        `negativePrompt` field); the manifest schema checks every other name as before."""
+        if "negative_prompt" not in params or any(p.name == "negative_prompt" for p in self.manifest.params):
+            return None
+        if runway_schema.spec_for(self.model_id, self._endpoint).has_negative_prompt:
+            return None  # a model with the field: the manifest has to declare it
+        value = params.pop("negative_prompt")
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ParamError(
+                f"{self.engine_id}: negative_prompt: expected a string, got {type(value).__name__}"
+            )
+        return value.strip() or None
 
     def clamp_duration(self, seconds: float) -> int:
         """Ceil into the manifest range, then up to a duration this Runway model accepts (Kling 1 s -> 3 s)."""
@@ -290,8 +321,33 @@ class RunwayVideo(VideoAdapter):
             )
         return None
 
+    def check_expressible(self, params: Mapping[str, Any], inputs: Mapping[str, Any] | None = None) -> None:
+        """The refusals submit runs for what this Runway model cannot express (decision 69), on the params (as
+        `validate_params` returns them) and on which inputs are present: a seed on Kling, `cfg_scale` off the
+        default on Kling O3, `camera_fixed` or `return_last_frame` on Seedance, an end frame on a start-only model,
+        elements where the model takes none or too many, and a prompt over the cap once a negative prompt is
+        folded in. No file is read and nothing leaves: the daemon calls it at the quote, so a route that would
+        refuse at submit is skipped before a run exists. Raises ParamError or InputError, as submit would."""
+        inputs = inputs or {}
+        p = dict(params)
+        spec = runway_schema.spec_for(self.model_id, self._endpoint)
+        if self._endpoint == "text_to_video":
+            tail, elements, keyframes = False, 0, 0
+        else:
+            tail = any(inputs.get(k) is not None for k in ("image_tail", "end_image"))
+            raw = inputs.get("elements")
+            elements = len(raw) if isinstance(raw, (list, tuple)) else int(raw is not None)
+            keyframes = 1 + tail
+        self._refuse_inexpressible(spec, p, tail=tail, elements=elements, keyframes=keyframes)
+        prompt = inputs.get("prompt")
+        if isinstance(prompt, str):
+            try:
+                runway_schema.prompt_text(self.model_id, prompt, p.get("negative_prompt"))
+            except ValueError as exc:
+                raise InputError(f"{self.engine_id} via runway: {exc}") from None
+
     def _refuse_inexpressible(
-        self, spec: ModelSpec, parsed: VideoInputs, p: Mapping[str, Any], keyframes: int
+        self, spec: ModelSpec, p: Mapping[str, Any], *, tail: bool, elements: int, keyframes: int
     ) -> None:
         eid, model = self.engine_id, self.model_id
         pin = "not expressible on the runway route; pin the atlas route"
@@ -306,15 +362,15 @@ class RunwayVideo(VideoAdapter):
         for flag in ("camera_fixed", "return_last_frame"):
             if p.get(flag) is True:
                 raise ParamError(f"{eid}: {flag} true is {pin}")
-        if parsed.image_tail is not None and spec.keyframes != "first_last":
+        if tail and spec.keyframes != "first_last":
             raise InputError(f"{eid} via runway: {model} takes a start frame only, no end frame")
-        if parsed.elements:
+        if elements:
             if spec.references != "references_field":
                 raise InputError(f"{eid}: elements are {pin} ({model} takes no reference images)")
             room = (spec.references_max or 0) - keyframes
-            if len(parsed.elements) > room:
+            if elements > room:
                 raise InputError(
-                    f"{eid} via runway: {len(parsed.elements)} elements and {keyframes} keyframe(s); {model} takes "
+                    f"{eid} via runway: {elements} elements and {keyframes} keyframe(s); {model} takes "
                     f"at most {spec.references_max} images in all, so at most {room} elements"
                 )
         negative = p.get("negative_prompt")
@@ -334,7 +390,9 @@ class RunwayVideo(VideoAdapter):
                 raise InputError(f"{eid} via runway: a start frame is required")
             keyframes = 1 + (parsed.image_tail is not None)
         spec = runway_schema.spec_for(model, endpoint)
-        self._refuse_inexpressible(spec, parsed, p, keyframes)
+        self._refuse_inexpressible(
+            spec, p, tail=parsed.image_tail is not None, elements=len(parsed.elements), keyframes=keyframes
+        )
         notes: list[str] = []
         tier = self._tier(spec, p)
         ratio = self._ratio(spec, p, dims, tier, notes, need=need_ratio)
@@ -590,8 +648,12 @@ class RunwayVideo(VideoAdapter):
         if state == "SUCCEEDED":
             outputs = [str(u) for u in d.get("output") or [] if isinstance(u, str) and u]
             if not outputs:
+                # The output list can lag the status: the first looks wait for it, then the task is failed.
+                looks = self._empty[job] = self._empty.get(job, 0) + 1
                 return JobStatus(
-                    state="failed", message="transient: runway SUCCEEDED without an output", usage=usage
+                    state="running" if looks <= self.EMPTY_SUCCESS_LOOKS else "failed",
+                    message="transient: runway SUCCEEDED without an output",
+                    usage=usage,
                 )
             tier = resolution or self._tiers.get(job)
             bits = 10 if self.model_id == "seedance2_5" and tier and str(tier).upper() == "1080P" else None

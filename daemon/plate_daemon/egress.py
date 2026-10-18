@@ -24,7 +24,9 @@ The guard, before a byte leaves:
    folders and home path, else `LeakBlocked`. Slugs also match with `-`, `_`, a space or nothing between
    their words; plain single words (a layer called "SKY") are not identifiers and are not scanned for.
 5. log: one fsync'd line in `outbound.jsonl` with the BLAKE3 of the exact body, then the request is sent,
-   then its status and bytes in.
+   then its status and bytes in. Through `EgressTransport` the response body is not read here: it streams on
+   to the adapter (whose download enforces its own byte cap and deadline, router plan T130) and the status and
+   the bytes counted are logged when the body ends or is closed.
 
 `fetch(url, route)` applies the same destination rule to result downloads (no credentials are sent).
 """
@@ -39,7 +41,7 @@ import re
 import secrets
 import time
 import zlib
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -699,9 +701,59 @@ class EgressTransport(httpx.BaseTransport):
         sanitised, entry_id = self.egress.guard(self.run, self.route, request)
         try:
             response = self.egress.inner.handle_request(sanitised)
-            response.read()
         except Exception as e:
             self.egress.log.error(entry_id, error=f"{type(e).__name__}: {e}")
             raise
-        self.egress.log.response(entry_id, status=response.status_code, bytes_in=_bytes_in(response))
-        return response
+        # The body is not buffered here: a 300 MB result would sit in memory before any cap could see it. It
+        # streams through, counted, and the outbound log gets its status and bytes when it ends or is closed.
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=response.headers,
+            stream=_LoggedStream(response.stream, self.egress.log, entry_id, response.status_code),
+            extensions=response.extensions,
+        )
+
+
+class _LoggedStream(httpx.SyncByteStream):
+    """A vendor response body passed through unread. Counts the bytes as they go by and writes the outbound
+    log's `response` line once (end of body or close); a body that fails or is abandoned midway also gets an
+    `error` line saying how far it got."""
+
+    def __init__(self, inner: Any, log: OutboundLog, entry_id: str, status: int) -> None:
+        self._inner = inner
+        self._log = log
+        self._entry_id = entry_id
+        self._status = status
+        self.bytes_in = 0
+        self._ended = False
+        self._logged = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        try:
+            for chunk in self._inner:
+                self.bytes_in += len(chunk)
+                yield chunk
+        except Exception as e:
+            self._write(error=f"{type(e).__name__}: {e}")
+            raise
+        self._ended = True
+        self._write()
+
+    def close(self) -> None:
+        try:  # logged first: whoever sees the body closed sees its log lines too
+            if not self._ended:
+                self._write(error=f"the body was closed after {self.bytes_in} bytes, before it ended")
+            else:
+                self._write()
+        finally:
+            close = getattr(self._inner, "close", None)
+            if close is not None:
+                close()
+
+    def _write(self, *, error: str | None = None) -> None:
+        if self._logged:
+            return
+        self._logged = True
+        self._log.response(self._entry_id, status=self._status, bytes_in=self.bytes_in)
+        if error is not None:
+            self._log.error(self._entry_id, error=error)

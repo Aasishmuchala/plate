@@ -13,6 +13,7 @@ Stdlib only.
 
 from __future__ import annotations
 
+import errno
 import json
 import re
 from dataclasses import asdict, dataclass, field
@@ -25,12 +26,45 @@ from .fsutil import atomic_write_json
 
 FORMAT_VERSION = 1
 SIDECAR_SUFFIX = ".plate.json"
+PROJECT_KEY = "project_id"  # the key the scene's project binding is kept under (ui.controller)
 DEFAULT_ENGINE_ID = "nano-banana-2.1"
 ASPECT_RE = re.compile(r"^([1-9][0-9]{0,4}):([1-9][0-9]{0,4})$")
+NAME_SHOWN = 80  # a sidecar file name longer than this is elided in a message
 
 
 class RecipeError(ValueError):
     """A recipe that must not be used as written (the message says which field and why)."""
+
+
+def _shown(name: str) -> str:
+    return name if len(name) <= NAME_SHOWN else f"{name[:40]}...{name[-30:]}"
+
+
+class SidecarUnreadable(ValueError):
+    """<scene>.plate.json exists but cannot be trusted: it is not UTF-8 JSON holding an object, or its
+    project_id is not a string. Nothing may be written over it and the scene must not fall back to
+    another project silently; the message tells the artist to fix or delete the file."""
+
+    def __init__(self, path: Path | str, reason: str, message: str | None = None):
+        self.path = Path(path)
+        self.reason = str(reason)
+        super().__init__(
+            message
+            or f"{_shown(self.path.name)} is unreadable ({self.reason}): fix or delete it before sending"
+        )
+
+
+class SidecarUnwritable(SidecarUnreadable):
+    """The sidecar cannot be written (a file name past what the file system allows, a read-only
+    folder): the OSError as a message the artist can act on, never a bare OSError."""
+
+    def __init__(self, path: Path | str, reason: str):
+        name = _shown(Path(path).name)
+        super().__init__(
+            path,
+            reason,
+            f"{name} cannot be written ({reason}): shorten the scene's file name or save the scene elsewhere",
+        )
 
 
 def default_editable_classes() -> list[str]:
@@ -170,15 +204,64 @@ def _current_scene() -> str:
     return scene_path()
 
 
+def _why_not_json(text: str, exc: Exception) -> str:
+    """Why text that failed to parse is not a sidecar, in words an artist can act on."""
+    if not text.strip():
+        return "the file is empty"
+    if any(line.startswith(("<<<<<<<", ">>>>>>>")) for line in text.splitlines()):
+        return "unresolved merge conflict markers"
+    return f"not valid JSON: {exc}"
+
+
+def read_sidecar(path: Path, check_project: bool = True) -> dict[str, Any] | None:
+    """The sidecar's JSON object, None when there is no file (absent is not unreadable: a scene that
+    was never bound has none). Raises SidecarUnreadable for a file that exists but is not UTF-8 JSON
+    holding an object (an empty file, a trailing comma, UTF-16, conflict markers, a list), is a
+    directory or cannot be opened, or (check_project) whose project_id is present and not a string.
+    A file name past what the file system allows cannot exist, so it reads as absent."""
+    try:
+        raw = path.read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            return None
+        raise SidecarUnreadable(path, f"cannot be read: {exc.strerror or exc}") from exc
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        utf16 = raw.startswith((b"\xff\xfe", b"\xfe\xff"))
+        raise SidecarUnreadable(path, "UTF-16 text: save it as UTF-8" if utf16 else "not UTF-8 text") from exc
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError) as exc:
+        raise SidecarUnreadable(path, _why_not_json(text, exc)) from exc
+    if not isinstance(data, dict):
+        raise SidecarUnreadable(path, f"holds a JSON {type(data).__name__}, not an object")
+    if check_project and PROJECT_KEY in data and not isinstance(data[PROJECT_KEY], str):
+        raise SidecarUnreadable(path, f"{PROJECT_KEY} is not a string")
+    return data
+
+
+def write_sidecar(path: Path, data: dict[str, Any]) -> Path:
+    """atomic_write_json with the OSError (a file name too long for the file system, a read-only
+    folder) as SidecarUnwritable. Callers read_sidecar first, so an unreadable file is never replaced."""
+    try:
+        return atomic_write_json(path, data)
+    except OSError as exc:
+        raise SidecarUnwritable(path, exc.strerror or str(exc)) from exc
+
+
 def load_recipes(scene: str | Path | None = None) -> dict[str, CameraRecipe]:
     """{camera: CameraRecipe} from the scene's sidecar (scene default: the open .max). A missing
-    sidecar is no recipes; a malformed entry is skipped (the camera then gets the default recipe)."""
+    sidecar is no recipes; a malformed entry is skipped (the camera then gets the default recipe); an
+    unreadable sidecar is no recipes too (the dock refuses to send before it gets here)."""
     path = sidecar_path(_current_scene() if scene is None else scene)
-    if path is None or not path.is_file():
+    if path is None:
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
+        data = read_sidecar(path, check_project=False)
+    except SidecarUnreadable:
         return {}
     cameras = data.get("cameras") if isinstance(data, dict) else None
     out: dict[str, CameraRecipe] = {}
@@ -194,19 +277,14 @@ def load_recipes(scene: str | Path | None = None) -> dict[str, CameraRecipe]:
 
 def save_recipes(recipes: dict[str, Any], scene: str | Path | None = None) -> Path:
     """Write every recipe into the scene's sidecar (keys other than "cameras" are kept). Raises
-    RecipeError for an unsaved scene: there is nowhere next to it to write."""
+    RecipeError for an unsaved scene: there is nowhere next to it to write; SidecarUnreadable (nothing
+    written) when the sidecar exists but is unreadable, SidecarUnwritable when it cannot be written."""
     path = sidecar_path(_current_scene() if scene is None else scene)
     if path is None:
         raise RecipeError("the scene has never been saved: save the .max first, recipes live next to it")
-    existing: dict[str, Any] = {}
-    if path.is_file():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8-sig"))
-            existing = loaded if isinstance(loaded, dict) else {}
-        except (OSError, ValueError):
-            existing = {}
+    existing = read_sidecar(path) or {}
     cameras = {name: CameraRecipe.coerce(recipe, name).to_dict() for name, recipe in sorted(recipes.items())}
-    return atomic_write_json(path, {**existing, "format_version": FORMAT_VERSION, "cameras": cameras})
+    return write_sidecar(path, {**existing, "format_version": FORMAT_VERSION, "cameras": cameras})
 
 
 def get_recipe(camera: str, scene: str | Path | None = None) -> CameraRecipe:

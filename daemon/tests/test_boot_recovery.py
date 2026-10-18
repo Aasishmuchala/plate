@@ -3,8 +3,10 @@
 `worker.recover_on_boot(conn, engine, *, skip=is_pipeline_run)` reconciles seed runs against the one engine
 it is given and leaves pipeline runs alone: they are driven by `Pipeline.resume`, which resolves each run's
 real engine, so a pipeline run stuck in STAGING with a submit intent is never re-submitted to the FakeEngine.
-A poll that raises (an unknown job, a transport fault) ends the run FAILED as `provider_poll_error` and does
-not unwind the worker; the pipeline ledgers the move as `failed`.
+A poll that raises a non-transport error (an unknown job, a bug) ends the run FAILED as `provider_poll_error`
+and does not unwind the worker; the pipeline ledgers the move as `failed`. A transport fault (httpx timeout or
+network error, `ConnectionError`, `OSError`) is tolerated up to `POLL_FAULT_LIMIT - 1` times in a row (router
+plan T130; the sequences are in `test_stress_wave12_worker.py`), so the pins below raise non-transport errors.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ class UnknownJob(Exception):
 
 
 class PollRaises(FakeEngine):
-    """A FakeEngine whose poll raises: the provider forgot the job, or the transport failed."""
+    """A FakeEngine whose poll raises: by default the provider forgot the job (a non-transport error)."""
 
     def __init__(self, exc: Exception | None = None, **kwargs):
         super().__init__(**kwargs)
@@ -64,7 +66,8 @@ class Collector:
 
 def make_index(home: Path, pid: str = PID) -> Index:
     idx = Index(home)
-    with idx.project(pid) as conn, tx(conn):
+    # Opening an index never creates one unless asked (T144): this is the project's first open.
+    with idx.project(pid, create=True) as conn, tx(conn):
         apply_packet_entry(
             conn,
             pid,
@@ -262,6 +265,21 @@ def test_a_poll_that_raises_unknown_job_ends_failed(tmp_path, state_to_poll):
     assert run.error == "provider_poll_error: UnknownJob: no such job at the provider"
     assert run.provider_job_id  # a job may exist at the provider: kept for the console, and not refunded
     assert run.cost_usd_billed is not None and run.reserved_usd == 0  # settled at the quote, not refunded
+
+
+def test_one_transport_fault_on_a_poll_no_longer_fails_the_run(tmp_path):
+    """The old pin was 'one poll exception fails the run'; a transport fault now leaves the state alone."""
+    import httpx
+
+    from plate_daemon.machine import run_events
+
+    idx = make_index(tmp_path)
+    rid = submitted_run(idx, tmp_path, pipeline=False)
+    fault = PollRaises(httpx.ConnectError("vendor unreachable"))
+    with idx.project(PID) as conn:
+        assert step(conn, fault, rid, cas=cas_of(tmp_path)) is S.SUBMITTED
+        assert [e.kind for e in run_events(conn, rid)][-1] == "poll_fault"
+    assert snapshot(idx, rid)["reason_code"] is None
 
 
 def test_a_poll_fault_reason_is_capped_at_500_characters(tmp_path):

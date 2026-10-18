@@ -42,6 +42,15 @@ kept in <scene>.plate.json next to the .max file under "project_id"; without one
 project_id, then the .max file's stem as a slug. The project's custody (from the same answer) rides
 along with every send; a project the daemon does not know yet is created by the first packet with
 custody unset, which runs C0 (local) engines only until someone sets it.
+
+A binding is never guessed. A sidecar that exists but cannot be used (trailing comma, UTF-16, empty,
+merge-conflict markers, project_id not a string) raises recipes.SidecarUnreadable from project_id():
+nothing is written over it, set_project refuses, and the actions that send packets stay out of
+capabilities() with the message as their unavailable() reason (the dock's tooltip) and as the
+refusal send_packet returns. A stem that names no project (CJK, Devanagari, Arabic, blank, or a
+slug of under 3 characters out of a longer stem) with no sidecar and no config id raises
+ProjectUnresolved the same way: the artist picks a project in the Project combo. An unsaved scene
+keeps "untitled".
 """
 
 from __future__ import annotations
@@ -57,7 +66,7 @@ from typing import Any, Protocol
 from .. import config as config_mod
 from .. import packet, policy, recipes, transport
 from ..config import DEFAULT_DAEMON_URL, load_config, packets_dir
-from ..fsutil import atomic_write_json
+from ..recipes import SidecarUnreadable
 
 Progress = Callable[[int, int, str], None]
 
@@ -72,9 +81,14 @@ ALL_CAPABILITIES = (CAP_SEND_PACKET, CAP_BATCH, CAP_RECEIVE, CAP_MOTION, CAP_LIG
 RECEIVE_MODES = ("vfb_history", "viewport_background")
 MAXGAFFER_MISSING = "MAXGAFFER_MISSING"  # actions.light's code for a Max without MaxGaffer
 CUSTODY_UNSET = "custody unset (C0 only)"
-SCENE_PROJECT_KEY = "project_id"  # the key of <scene>.plate.json the project binding is kept under
+SCENE_PROJECT_KEY = recipes.PROJECT_KEY  # the key of <scene>.plate.json the binding is kept under
 PROJECTS_PATH = "/api/v0/projects"
 PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")  # the schema's slug ($defs/slug)
+UNSAVED_PROJECT_ID = "untitled"  # the project of a scene that was never saved
+STEM_SLUG_MIN = 3  # a stem slug shorter than this, out of a stem longer than this, names no project
+# The actions that put packets into the scene's project: they stay out of capabilities() while the
+# binding is unusable (Scout makes no packets; Receive reads a result).
+PROJECT_CAPABILITIES = (CAP_SEND_PACKET, CAP_BATCH, CAP_MOTION, CAP_LIGHT)
 HERO_SCAN_LIMIT = 20
 # Send + quote (decision 53): the graph template every ingested packet is laid out with, how long the
 # packet's event log is followed for the ingest, and the apply route (quoting every Edit takes a while).
@@ -321,51 +335,68 @@ def project_slug(text: Any) -> str:
     return slug
 
 
+class ProjectUnresolved(ValueError):
+    """The scene names no project: no sidecar binding, no config.json project_id, and a file name that
+    cannot be turned into one. The message tells the artist to pick one in the Project combo."""
+
+
 def scene_project_id(scene: str | Path | None) -> str | None:
-    """The project_id <scene>.plate.json binds the scene to, or None (no sidecar, unsaved scene)."""
+    """The project_id <scene>.plate.json binds the scene to, or None (an unsaved scene, no sidecar, or
+    a sidecar with no project_id or a blank one). A sidecar that exists but cannot be used raises
+    recipes.SidecarUnreadable(path, reason): not UTF-8 JSON holding an object, a project_id that is
+    not a string, or one that is no project id. It never reads as "unbound"."""
     path = recipes.sidecar_path(scene)
-    if path is None or not path.is_file():
+    if path is None:
         return None
+    return _read_binding(path)[1]
+
+
+def _read_binding(path: Path) -> tuple[dict[str, Any], str | None]:
+    """(the sidecar's keys, its project id): ({}, None) for no file; SidecarUnreadable for a file
+    that cannot be used, a project_id that is no project id included."""
+    data = recipes.read_sidecar(path) or {}
+    value = data.get(SCENE_PROJECT_KEY)
+    if not isinstance(value, str) or not value.strip():
+        return data, None
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return None
-    value = data.get(SCENE_PROJECT_KEY) if isinstance(data, dict) else None
-    try:
-        return project_slug(value) if isinstance(value, str) and value.strip() else None
-    except ValueError:
-        return None
+        return data, project_slug(value)
+    except ValueError as exc:
+        raise SidecarUnreadable(path, f"{SCENE_PROJECT_KEY} {value.strip()!r} is not a project id") from exc
 
 
 def save_scene_project_id(project_id: str, scene: str | Path | None) -> Path | None:
     """Write project_id into <scene>.plate.json, keeping every other key (the recipes). None for an
-    unsaved scene: there is nowhere next to it to write."""
+    unsaved scene: there is nowhere next to it to write. Raises recipes.SidecarUnreadable, writing
+    nothing, when the sidecar exists but is unreadable, and SidecarUnwritable when it cannot be written
+    (a file name past what the file system allows)."""
     path = recipes.sidecar_path(scene)
     if path is None:
         return None
-    existing: dict[str, Any] = {}
-    if path.is_file():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8-sig"))
-            existing = loaded if isinstance(loaded, dict) else {}
-        except (OSError, ValueError):
-            existing = {}
-    return atomic_write_json(path, {**existing, SCENE_PROJECT_KEY: project_slug(project_id)})
+    pid = project_slug(project_id)
+    existing, _bound = _read_binding(path)
+    return recipes.write_sidecar(path, {**existing, SCENE_PROJECT_KEY: pid})
 
 
-def stem_project_id(scene: str | Path | None) -> str:
-    """The .max file's stem as a slug (send_packet's own default), "untitled" for an unsaved scene."""
+def stem_project_id(scene: str | Path | None) -> str | None:
+    """The .max file's stem as a slug (send_packet's own default), "untitled" for an unsaved scene, and
+    None when the stem cannot name a project: it slugifies to nothing (CJK, Devanagari, Arabic,
+    blank) or to under 3 characters out of a stem of more than 3 (`客户A_别墅` -> "a")."""
     name = Path(str(scene)).stem if scene else ""
     if not name:
-        return "untitled"
+        return UNSAVED_PROJECT_ID
     try:
-        return packet.slugify(name)
+        slug = packet.slugify(name)
     except packet.ManifestError:
-        return "untitled"
+        return None
+    if len(slug) < STEM_SLUG_MIN and len(name.strip()) > STEM_SLUG_MIN:
+        return None
+    return slug
 
 
 def resolve_project_id(scene: str | Path | None, cfg: Mapping[str, Any] | None = None) -> str:
-    """The scene's project: <scene>.plate.json, else config.json's project_id, else the stem slug."""
+    """The scene's project: <scene>.plate.json, else config.json's project_id, else the stem slug.
+    Raises SidecarUnreadable for a sidecar that exists but cannot be used (it is never skipped for the
+    next source) and ProjectUnresolved when none of the three names a project."""
     bound = scene_project_id(scene)
     if bound:
         return bound
@@ -375,7 +406,12 @@ def resolve_project_id(scene: str | Path | None, cfg: Mapping[str, Any] | None =
             return project_slug(configured)
         except ValueError:
             pass
-    return stem_project_id(scene)
+    stem = stem_project_id(scene)
+    if stem is None:
+        raise ProjectUnresolved(
+            f"pick a project in the Project combo: '{Path(str(scene)).stem}' cannot name one"
+        )
+    return stem
 
 
 class Controller(Protocol):
@@ -395,6 +431,8 @@ class Controller(Protocol):
     def set_recipe(self, camera: str, recipe: dict[str, Any]) -> None: ...
     def daemon_status(self) -> dict[str, Any]: ...  # {"reachable", "ok", "daemon_version", "reason", "url"}
     def projects(self) -> list[dict[str, Any]]: ...  # GET /api/v0/projects heads
+    # project_id() raises SidecarUnreadable / ProjectUnresolved when the scene's binding is unusable;
+    # set_project() raises ValueError (not a project id) or SidecarUnreadable (it never writes over one)
     def project_id(self) -> str: ...
     def set_project(self, project_id: str) -> Path | None: ...  # where it was saved (None: unsaved scene)
     def project_custody(self, project_id: str | None = None) -> dict[str, Any] | None: ...
@@ -492,10 +530,21 @@ class LiveController:
             return False, f"{MAXGAFFER_MISSING}: {type(exc).__name__}: {exc}"
         return bool(ok), str(why or "")
 
+    def binding_problem(self) -> str | None:
+        """Why the open scene has no usable project binding ("<scene>.plate.json is unreadable (...):
+        fix or delete it before sending", or "pick a project in the Project combo: ..."), else None."""
+        try:
+            self.project_id()
+        except (SidecarUnreadable, ProjectUnresolved) as exc:
+            return str(exc)
+        return None
+
     def capabilities(self) -> set[str]:
         caps = {cap for cap, mod in self._ACTION_MODULES.items() if self._module_exists(mod)}
         if CAP_LIGHT in caps and not self._light_ready()[0]:
             caps.discard(CAP_LIGHT)
+        if self.binding_problem():  # no packet goes to a project nobody chose
+            caps -= set(PROJECT_CAPABILITIES)
         return caps
 
     def unavailable(self) -> dict[str, str]:
@@ -508,6 +557,10 @@ class LiveController:
             ok, why = self._light_ready()
             if not ok:
                 out[CAP_LIGHT] = why or MAXGAFFER_MISSING
+        problem = self.binding_problem()
+        if problem:
+            for cap in PROJECT_CAPABILITIES:
+                out.setdefault(cap, problem)
         return out
 
     def _action(self, cap: str) -> Any:
@@ -623,7 +676,9 @@ class LiveController:
 
     def project_id(self) -> str:
         """The open scene's project: the dock's choice, else <scene>.plate.json's, else config.json's
-        project_id, else the .max file's stem (re-read whenever another scene is open)."""
+        project_id, else the .max file's stem (re-read whenever another scene is open). Raises
+        SidecarUnreadable for a sidecar that cannot be used and ProjectUnresolved for a stem that names
+        no project; neither is cached, so fixing the file or picking a project resolves at once."""
         scene = self.scene_path()
         if self._project is None or self._project_scene != scene:
             self._project = resolve_project_id(scene, load_config())
@@ -633,16 +688,24 @@ class LiveController:
     def set_project(self, project_id: str) -> Path | None:
         """Bind the open scene to project_id and keep it in <scene>.plate.json. Returns that file, or
         None for an unsaved scene (the binding then lasts until another scene opens). Raises
-        ValueError for text that is not a project id."""
+        ValueError for text that is not a project id, SidecarUnreadable (the file is left as it is,
+        the old binding stays) for a sidecar that cannot be used, and SidecarUnwritable when the
+        sidecar cannot be written."""
         pid = project_slug(project_id)
         scene = self.scene_path()
+        saved = save_scene_project_id(pid, scene)
         self._project, self._project_scene = pid, scene
-        return save_scene_project_id(pid, scene)
+        return saved
 
     def project_custody(self, project_id: str | None = None) -> dict[str, Any] | None:
         """The project's custody from the last projects() answer; None while the daemon does not know
         the project (its first packet creates it with custody unset)."""
-        head = self._projects.get(project_id or self.project_id())
+        if not project_id:
+            try:
+                project_id = self.project_id()
+            except (SidecarUnreadable, ProjectUnresolved):
+                return None  # no usable binding: no project, so no custody to show
+        head = self._projects.get(project_id)
         custody = head.get("custody") if head else None
         return dict(custody) if isinstance(custody, dict) else None
 
@@ -658,7 +721,11 @@ class LiveController:
         """Still packets of camera in the packets folder that belong to the scene's project, newest
         first: the hero still Send Motion offers when this dock has sent none of the camera yet."""
         root = packets_dir(load_config())
-        project = self.project_id()
+        last = self._last.get(camera)
+        try:
+            project = self.project_id()
+        except (SidecarUnreadable, ProjectUnresolved):
+            return [last] if last else []  # no usable binding: only what this dock sent itself
         found: list[str] = []
         for manifest_path in root.glob("*/manifest.json") if root.is_dir() else []:
             try:
@@ -675,7 +742,6 @@ class LiveController:
             if isinstance(pid, str) and pid:
                 found.append(pid)
         found.sort(reverse=True)  # packet ids are time-sortable ULIDs
-        last = self._last.get(camera)
         ordered = ([last] if last else []) + [p for p in found if p != last]
         return ordered[:HERO_SCAN_LIMIT]
 
@@ -725,13 +791,17 @@ class LiveController:
         when "supersedes last" is ticked and the camera's last packet is known ({camera: id} for a
         still, the one id for Send Motion, whose last packet is the camera's last motion packet)."""
         names = list(cameras)
+        try:
+            project: str | None = self.project_id()
+        except (SidecarUnreadable, ProjectUnresolved):
+            project = None  # every action that sends packets has refused (_refused_unbound) before this
         opts = ActionOptions(
             recipes={c: self._recipe_object(c) for c in names},
             progress=progress,
             backup=False,
-            project_id=self.project_id(),
+            project_id=project,
         )
-        custody = packet_custody(self.project_custody())
+        custody = packet_custody(self.project_custody(project)) if project else None
         if custody:
             opts["custody"] = custody
         if self.supersede_last:
@@ -754,7 +824,18 @@ class LiveController:
         cfg = load_config()
         return cfg, packets_dir(cfg), str(cfg.get("daemon_url") or DEFAULT_DAEMON_URL)
 
+    def _refused_unbound(self, cameras: Iterable[str]) -> list[dict[str, Any]] | None:
+        """One failed result per camera, carrying the binding problem's message, while the scene's
+        project binding is unusable (None when it is fine): nothing is sent into a project nobody chose."""
+        problem = self.binding_problem()
+        if problem is None:
+            return None
+        return [_failed(str(c), problem) for c in cameras] or [_failed("", problem)]
+
     def _run(self, cap: str, cameras: list[str], progress: Progress) -> list[dict[str, Any]]:
+        refused = self._refused_unbound(cameras) if cap in PROJECT_CAPABILITIES else None
+        if refused is not None:
+            return refused
         if cap not in self.capabilities():
             return [result_dict({"ok": False, "errors": [f"{cap} is not available in this build"]})]
         _cfg, out_root, daemon_base = self._base()
@@ -775,6 +856,11 @@ class LiveController:
         result gains quote_line ("quoted 0.04 USD · waiting for approval", "approved · running" or
         "not quoted: ..."), quote_error and quote (quote_summary). The daemon calls go through io."""
         results = self.send_packet(cameras, progress)
+        problem = self.binding_problem()
+        if problem is not None:  # the send was refused: there is no project to quote in
+            for result in results:
+                result.update(quote_line=f"not quoted: {problem}", quote_error=True, quote=None)
+            return results
         cfg = load_config()
         project = self.project_id()
         for result in results:
@@ -841,6 +927,9 @@ class LiveController:
     ) -> list[dict[str, Any]]:
         """Send camera's move over the scene's animation range (or frames) as a motion packet of the
         hero still hero_packet_id (default: the dock's last packet of the camera)."""
+        refused = self._refused_unbound([camera])
+        if refused is not None:
+            return refused
         if CAP_MOTION not in self.capabilities():
             return [_failed(camera, "Send Motion is not available in this build")]
         hero = hero_packet_id or self._last.get(camera)
@@ -875,6 +964,9 @@ class LiveController:
         """MaxGaffer's match of camera to reference_path, the best state applied, and a re-rendered
         packet that supersedes the camera's last one (actions.light.run: light.match + apply +
         rerender_packet). MAXGAFFER_MISSING without MaxGaffer."""
+        refused = self._refused_unbound([camera])
+        if refused is not None:
+            return refused
         if CAP_LIGHT not in self.capabilities():
             why = self.unavailable().get(CAP_LIGHT) or "Light is not available in this build"
             return [_failed(camera, why, MAXGAFFER_MISSING if MAXGAFFER_MISSING in why else None)]

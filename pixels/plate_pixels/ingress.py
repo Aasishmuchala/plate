@@ -11,6 +11,11 @@ before resampling, so the frame is never squashed; the crop is reported. Resampl
 ``cv2.INTER_LANCZOS4``, except a strong reduction (the vendor answered at a tier more than 1.25x larger than
 what was sent) which uses ``cv2.INTER_AREA``: unfiltered Lanczos aliases a generator's fine foliage there. Only
 AI pixels are ever resampled here: the plate is read, never resized.
+
+``decode_result`` reads the declared size from the header first (``plate_pixels.imghdr``) and refuses a result over
+``max_pixels`` (``PLATE_RESULT_MAX_PIXELS``, default 64 000 000) before anything is allocated: a small PNG can
+declare a decode of many gigabytes. An empty or undecodable result is an ``IngressError`` that names its byte
+length and magic.
 """
 
 from __future__ import annotations
@@ -22,6 +27,8 @@ import cv2
 import numpy as np
 
 from .egress import SizeMap
+from .imghdr import header_size, magic
+from .imghdr import max_pixels as default_max_pixels
 from .register import estimate, to_gray, warp_to_plate
 
 __all__ = ["IngressError", "decode_result", "restore"]
@@ -35,12 +42,32 @@ class IngressError(ValueError):
     """The engine result or the size map cannot be mapped back onto the plate."""
 
 
-def decode_result(result: bytes | bytearray | memoryview | np.ndarray) -> np.ndarray:
-    """float32 (H, W, 3) RGB in [0, 1] from encoded image bytes (PNG/JPEG/WebP via cv2) or an RGB array."""
+def decode_result(
+    result: bytes | bytearray | memoryview | np.ndarray, *, max_pixels: int | None = None
+) -> np.ndarray:
+    """float32 (H, W, 3) RGB in [0, 1] from encoded image bytes (PNG/JPEG/WebP via cv2) or an RGB array.
+
+    Encoded bytes are checked before the decode: empty is refused, and so is a header that declares more than
+    ``max_pixels`` (default ``imghdr.max_pixels()``, i.e. ``PLATE_RESULT_MAX_PIXELS``)."""
     if isinstance(result, (bytes, bytearray, memoryview)):
-        img = cv2.imdecode(np.frombuffer(bytes(result), np.uint8), cv2.IMREAD_UNCHANGED)
+        data = bytes(result)
+        if not data:
+            raise IngressError("engine result is empty (0 bytes)")
+        cap = default_max_pixels() if max_pixels is None else int(max_pixels)
+        size = header_size(data)
+        if size is not None and size[0] * size[1] > cap:
+            w, h = size
+            raise IngressError(
+                f"engine result declares {w}x{h} = {w * h} px; the cap is {cap} (PLATE_RESULT_MAX_PIXELS)"
+            )
+        try:
+            img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
+        except cv2.error:
+            img = None
         if img is None:
-            raise IngressError("cannot decode the engine result")
+            raise IngressError(
+                f"cannot decode the engine result ({len(data)} bytes, magic {magic(data) or 'unknown'})"
+            )
         if img.ndim == 2:
             img = np.repeat(img[..., None], 3, axis=2)
         elif img.shape[2] == 4:

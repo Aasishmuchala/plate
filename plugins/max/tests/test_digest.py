@@ -109,6 +109,71 @@ def test_a_scaled_camera_is_reported(scene):
     assert any("not orthonormal" in w for w in out["warnings"])
 
 
+@pytest.mark.parametrize("where", [(0, 0), (1, 2), (0, 3), (2, 3), (3, 0)])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_entry_anywhere_in_the_pose_is_refused(where, value):
+    m = [[1.0, 0.0, 0.0, 5.0], [0.0, 1.0, 0.0, 6.0], [0.0, 0.0, 1.0, 7.0], [0, 0, 0, 1]]
+    assert digest.rotation_error(m) is None
+    m[where[0]][where[1]] = value
+    assert digest.rotation_error(m) == digest.NON_FINITE_POSE
+    assert digest.non_finite_entries(m) == [where]
+
+
+def test_a_nan_rotation_is_not_mistaken_for_an_orthonormal_one():
+    """max(0.0, nan) is 0.0 and nan > tol is False: the old check passed a NaN axis."""
+    m = [[float("nan"), 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0, 0, 0, 1]]
+    assert digest.rotation_error(m) is not None
+    with pytest.raises(packet.ManifestError, match="non-finite"):
+        packet.build_camera_block({**_example_camera_digest(), "world_from_camera": m})
+
+
+def _example_camera_digest():
+    return {
+        "name": "C",
+        "world_from_camera": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0, 0, 0, 1]],
+        "focal_mm": 24.0,
+        "film_gate_mm": 36.0,
+        "zoom_factor": 1.0,
+        "f_number": 8.0,
+        "focus_distance": 1.0,
+        "resolution": [160, 90],
+        "frame_range": [0, 0],
+        "hero_frame": 0,
+        "fps": 25.0,
+    }
+
+
+@pytest.mark.parametrize("film", [-36.0, 0.0, float("nan")])
+def test_a_film_gate_that_reads_but_is_not_positive_is_kept_as_read(scene, film):
+    scene.cameras["CAM_main"].film_width = film
+    out = digest.camera_digest("CAM_main")
+    assert out["film_gate_mm"] == film or (math.isnan(film) and math.isnan(out["film_gate_mm"]))
+    assert out["read_from"]["film_gate_mm"] == "film_width"
+    assert out["intrinsics_px"] is None and out["fov_deg"] is None
+    assert not any("assumed" in w for w in out["warnings"])
+
+
+def test_only_an_unreadable_film_gate_is_assumed(scene):
+    del scene.cameras["CAM_main"].film_width
+    out = digest.camera_digest("CAM_main")
+    assert out["film_gate_mm"] == digest.DEFAULT_FILM_MM
+    assert any("assumed 36.0 mm" in w for w in out["warnings"])
+
+
+@pytest.mark.parametrize(("attr", "value"), [("focal_length", 0.0), ("zoom_factor", 0.0)])
+def test_a_zero_focal_or_zoom_is_read_not_divided_by(scene, attr, value):
+    setattr(scene.cameras["CAM_main"], attr, value)  # the fake keeps its fov: the disagreement branch
+    out = digest.camera_digest("CAM_main")
+    assert out[{"focal_length": "focal_mm", "zoom_factor": "zoom_factor"}[attr]] == 0.0
+    assert out["intrinsics_px"] is None
+
+
+@pytest.mark.parametrize(("speed", "seconds"), [(0, math.inf), (-50, -0.02), (math.inf, 0.0)])
+def test_a_shutter_speed_that_is_not_positive_gives_a_shutter_that_is_not_either(scene, speed, seconds):
+    scene.cameras["CAM_main"].shutter_speed = speed
+    assert digest.camera_digest("CAM_main")["exposure"]["shutter_s"] == pytest.approx(seconds)
+
+
 def test_unknown_camera_raises(scene):
     with pytest.raises(digest.CameraNotFound):
         digest.camera_digest("nope")

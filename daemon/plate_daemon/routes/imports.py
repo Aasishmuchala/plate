@@ -7,11 +7,15 @@
   the declared `cost_usd`, approved by the human who imported it and gated like an Edit take, and its ledger
   records carry `data.imported: true`. Nothing leaves the box.
 - Refusals, all before a run row exists: 404 unknown project, packet or node; 422 `unknown_source`, a `path`
-  that is not absolute, `unreadable_image` (or scene-linear), `size_mismatch` (`{plate: [w, h], file: [w, h]}`:
-  an import is never resized onto the plate); 403 `custody` when the source's grade is not one the project and
-  the packet allow: a Higgsfield or Runway file is grade D (its plate already went to that vendor), so an NDA
-  project refuses it. 409 `approval_refused` (the run is CANCELLED) when an approver other than a human is
-  turned down by the budget rules.
+  that is not absolute, `not_a_file` (a FIFO, device, socket or directory: `os.stat` says so and nothing is
+  opened, so a hung mount or a FIFO with no writer cannot hold a worker thread), `unreadable_image` (a missing
+  file, or scene-linear), `unreadable_video` (a clip of fewer than 2 frames, or a still with a clip suffix),
+  `bad_cost` (`cost_usd` must be finite and at most 1000), `too_many_pixels` (a header over 100 000 000 px),
+  `size_mismatch` (`{plate: [w, h], file: [w, h]}`: an import is never resized onto the plate, and the header
+  is compared before the file is decoded); 413 `too_large` (over 1 GiB); 403 `custody` when the source's grade
+  is not one the project and the packet allow: a Higgsfield or Runway file is grade D (its plate already went
+  to that vendor), so an NDA project refuses it. 409 `approval_refused` (the run is CANCELLED) when an approver
+  other than a human is turned down by the budget rules.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..config import check_project_id
 from ..custody import CustodyViolation
-from ..imports import MAX_NOTE_CHARS, import_file
+from ..imports import MAX_NOTE_CHARS, check_import_file, import_file
 from ..machine import IllegalTransition
 from ..pipeline import PipelineError
 from . import API, ApiError, ctx, custody_error, illegal, pipeline_error, require_token
@@ -54,6 +58,7 @@ def import_route(request: Request, project_id: str, body: ImportBody) -> JSONRes
     if not path.is_absolute():
         raise ApiError(422, {"errors": [f"path must be an absolute file path, got {body.path!r}"]})
     try:
+        check_import_file(path)  # stat only: 422 not_a_file / unreadable_*, 413 too_large; never opens a FIFO
         run = import_file(
             c.pipeline,
             project_id,

@@ -1,4 +1,7 @@
-"""sse.py and GET /api/v0/events: durable events, Last-Event-ID replay, live follow, heartbeat."""
+"""sse.py and GET /api/v0/events: durable events, Last-Event-ID replay, live follow, heartbeat.
+
+The bus never creates an index (T144), so each test makes its projects' indexes first (`indexed`); SSE ids are
+`<epoch>.<seq>` (the epoch tests are in `test_stress_wave12_index.py`)."""
 
 from __future__ import annotations
 
@@ -11,6 +14,15 @@ import pytest
 
 from plate_daemon.index import Index
 from plate_daemon.sse import HEARTBEAT_S, Bus, EventFilter, UnknownProject
+
+
+def indexed(home, *project_ids: str) -> Index:
+    """An Index whose projects exist (what POST /projects or a packet-first ingest would have made)."""
+    idx = Index(home)
+    for pid in project_ids:
+        with idx.project(pid, create=True):
+            pass
+    return idx
 
 
 class SseReader:
@@ -34,14 +46,16 @@ class SseReader:
         raise AssertionError("stream ended")
 
     def event(self) -> dict:
+        """The next event: `id` is its seq, `epoch` the index epoch the SSE id carried (`<epoch>.<seq>`)."""
         while True:
             f = self.frame()
             if "data" in f:
-                return {"id": int(f["id"]), "rec": json.loads(f["data"])}
+                epoch, _, seq = f["id"].rpartition(".")
+                return {"id": int(seq), "epoch": epoch, "rec": json.loads(f["data"])}
 
 
 def test_publish_stores_events_with_increasing_seq(settings):
-    bus = Bus(Index(settings.home))
+    bus = Bus(indexed(settings.home, "proj"))
     a = bus.publish(None, {"kind": "graph.saved"}, project_id="proj")
     b = bus.publish("run_a", {"kind": "run.state", "to": "QUEUED"}, project_id="proj")
     assert b > a >= 1
@@ -51,13 +65,17 @@ def test_publish_stores_events_with_increasing_seq(settings):
         (b, "run_a", "run.state"),
     ]
     assert recs[1]["data"] == {"kind": "run.state", "to": "QUEUED"} and recs[1]["at"].endswith("Z")
+    assert {r["epoch"] for r in recs} == {bus.epoch("proj")}
+    assert bus.head("proj") == b
     assert bus.heartbeat_s == HEARTBEAT_S == 15.0
 
 
 def test_project_must_be_known_when_ambiguous(settings):
-    bus = Bus(Index(settings.home))
+    idx = indexed(settings.home, "one")
+    bus = Bus(idx)
     bus.publish(None, {"kind": "x"}, project_id="one")
     assert bus.resolve_project() == "one"
+    indexed(settings.home, "two")
     bus.publish(None, {"kind": "x"}, project_id="two")
     with pytest.raises(UnknownProject):
         bus.publish(None, {"kind": "x"})
@@ -65,9 +83,18 @@ def test_project_must_be_known_when_ambiguous(settings):
         bus.resolve_project(run_id="run_nowhere")
 
 
+def test_publishing_to_a_project_with_no_index_creates_none(settings):
+    bus = Bus(Index(settings.home))
+    with pytest.raises(UnknownProject) as err:
+        bus.publish(None, {"kind": "graph.saved"}, project_id="ghost")
+    assert err.value.project_id == "ghost"
+    assert not (settings.home / "index" / "ghost.sqlite").exists()
+    assert bus.index.project_ids() == []
+
+
 def test_subscribe_replays_then_wakes_on_publish_from_another_thread(settings):
     # poll_s is far longer than the wait below, so the follow-up event can only arrive by the wake-up.
-    bus = Bus(Index(settings.home), poll_s=30.0)
+    bus = Bus(indexed(settings.home, "proj"), poll_s=30.0)
     first = bus.publish("run_a", {"kind": "one"}, project_id="proj")
     second = bus.publish("run_a", {"kind": "two"}, project_id="proj")
     bus.publish("run_b", {"kind": "other run"}, project_id="proj")
@@ -89,17 +116,20 @@ def test_subscribe_replays_then_wakes_on_publish_from_another_thread(settings):
 
 
 def test_http_replay_by_last_event_id_then_live(settings, live_server):
-    bus = Bus(Index(settings.home), poll_s=0.05)
+    bus = Bus(indexed(settings.home, "proj"), poll_s=0.05)
     seqs = [bus.publish("run_a", {"kind": "run.state", "n": n}, project_id="proj") for n in range(3)]
     bus.publish("run_b", {"kind": "run.state", "n": 99}, project_id="proj")
     with live_server(bus=bus) as (s, url):
         q = f"{url}/api/v0/events?project_id=proj&run_id=run_a&token={s.token}"
-        with httpx.Client(timeout=10) as c, c.stream("GET", q, headers={"Last-Event-ID": str(seqs[0])}) as r:
+        epoch = bus.epoch("proj")
+        last = f"{epoch}.{seqs[0]}"
+        with httpx.Client(timeout=10) as c, c.stream("GET", q, headers={"Last-Event-ID": last}) as r:
             assert r.status_code == 200
             assert r.headers["content-type"].startswith("text/event-stream")
             reader = SseReader(r)
             replayed = [reader.event(), reader.event()]
             assert [e["id"] for e in replayed] == seqs[1:]
+            assert {e["epoch"] for e in replayed} == {epoch}
             assert [e["rec"]["data"]["n"] for e in replayed] == [1, 2]
             assert all(e["rec"]["run_id"] == "run_a" and e["rec"]["project_id"] == "proj" for e in replayed)
             live_seq = bus.publish("run_a", {"kind": "run.state", "n": 3}, project_id="proj")
@@ -108,7 +138,7 @@ def test_http_replay_by_last_event_id_then_live(settings, live_server):
 
 
 def test_http_events_bearer_header_and_query_after(settings, live_server):
-    bus = Bus(Index(settings.home), poll_s=0.05)
+    bus = Bus(indexed(settings.home, "proj"), poll_s=0.05)
     seqs = [bus.publish(None, {"kind": "k", "n": n}, project_id="proj") for n in range(3)]
     with live_server(bus=bus) as (s, url):
         hdr = {"Authorization": f"Bearer {s.token}"}
@@ -121,7 +151,7 @@ def test_http_events_bearer_header_and_query_after(settings, live_server):
 
 
 def test_http_heartbeat_comment(settings, live_server):
-    bus = Bus(Index(settings.home), heartbeat_s=0.2, poll_s=0.05)
+    bus = Bus(indexed(settings.home, "proj"), heartbeat_s=0.2, poll_s=0.05)
     bus.publish(None, {"kind": "k"}, project_id="proj")
     with live_server(bus=bus) as (s, url):
         q = f"{url}/api/v0/events?project_id=proj&token={s.token}"

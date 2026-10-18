@@ -27,6 +27,18 @@ def test_root_says_the_ui_is_not_built(client):
     assert r.headers["content-type"].startswith("text/plain")
 
 
+def test_unknown_api_paths_are_the_json_404_for_every_method(client, auth):
+    """HEAD, OPTIONS and TRACE too (they used to get the framework's 405 or its bare `{"detail": "Not Found"}`)."""
+    for path in ("/api", "/api/", "/api/v0/nope"):
+        for method in ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"):
+            r = client.request(method, path, headers=auth)
+            assert r.status_code == 404, (method, path)
+            assert r.headers["content-type"].startswith("application/json"), (method, path)
+            if method != "HEAD":
+                assert r.json()["error"] == "not_found", (method, path, r.text)
+    assert client.head("/api/v0/health").status_code == 200
+
+
 def test_root_serves_ui_dist_when_present(tmp_path, monkeypatch, auth):
     dist = tmp_path / "ui-dist"
     (dist / "assets").mkdir(parents=True)

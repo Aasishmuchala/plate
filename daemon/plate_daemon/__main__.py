@@ -12,6 +12,13 @@ scripted SimulatedCrash exits the process hard, which is what the cross-process 
 Before serving, every project index gets `recover_on_boot` (re-poll, adopt or fail; never resubmit) for the
 seed runs the fake engine owns. Pipeline runs are skipped there: `Pipeline.resume` in the app lifespan drives
 them with their real engine (`StagedEngine` / `AdapterBridge`), so none is re-submitted to the FakeEngine.
+
+The index is a cache of the project folder (Decision 6), so a lost one is rebuilt before that pass
+(`rebuild_missing_indexes`, Wave 12, T144): every folder under `settings.projects_dir` whose `runs.jsonl`
+exists and whose `index/<id>.sqlite` does not is replayed with `Index.rebuild_from_project` under the
+project lock, with a WARNING `index for <id> was missing: rebuilt from the project folder`, and
+`recover_on_boot` and `Pipeline.resume` then see its runs. A folder that cannot be read or rebuilt is
+logged and skipped; it never keeps the daemon from serving.
 """
 
 from __future__ import annotations
@@ -24,16 +31,19 @@ import sys
 import time
 from contextlib import ExitStack
 from pathlib import Path
+from typing import Any
 
 from . import __version__
 from .config import ConfigError, Settings, host_port
 from .engine_fake import FakeEngine
 from .index import Index
 from .lock import ProjectLocked, project_lock
+from .projects import Project
 from .worker import recover_on_boot
 
 log = logging.getLogger("plate_daemon")
 HOME_LOCK_WAIT_S = 10.0
+REBUILD_LOCK_WAIT_S = 5.0
 
 
 def bind_sockets(hosts: list[str], port: int) -> list[socket.socket]:
@@ -76,6 +86,53 @@ def _hold_home_lock(stack: ExitStack, home: Path, wait_s: float = HOME_LOCK_WAIT
             time.sleep(0.2)
 
 
+def _rebuild_locked(
+    index: Index, project: Project, wait_s: float = REBUILD_LOCK_WAIT_S
+) -> dict[str, Any] | None:
+    """`rebuild_from_project` under the project lock (retried for `wait_s`: the lock fails at once when held);
+    None when the index appeared meanwhile."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            with project.lock():
+                if index.exists(project.project_id):  # another process rebuilt it while we waited
+                    return None
+                return index.rebuild_from_project(project.root)
+        except ProjectLocked:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.2)
+
+
+def rebuild_missing_indexes(settings: Settings, index: Index) -> list[str]:
+    """Rebuild the index of every project folder that has a ledger and no index. Returns the ids rebuilt."""
+    pdir = settings.projects_dir
+    if pdir is None or not pdir.is_dir():
+        return []
+    rebuilt: list[str] = []
+    for folder in sorted(pdir.iterdir()):
+        if not (folder / "runs.jsonl").is_file() or not (folder / "project.json").is_file():
+            continue
+        try:
+            project = Project.load(folder)
+            pid = project.project_id
+            if index.exists(pid):
+                continue
+            res = _rebuild_locked(index, project)
+            if res is None:
+                continue
+        except Exception as e:  # unreadable folder, held lock, a replay that cannot commit: serve anyway
+            log.warning(
+                "index for %s is missing and was not rebuilt: %s: %s", folder.name, type(e).__name__, e
+            )
+            continue
+        log.warning("index for %s was missing: rebuilt from the project folder", pid)
+        if res["problems"]:
+            log.warning("rebuild of %s: %d problem(s): %s", pid, len(res["problems"]), res["problems"][:5])
+        rebuilt.append(pid)
+    return rebuilt
+
+
 def main() -> int:
     logging.basicConfig(
         level=os.environ.get("PLATE_LOG_LEVEL", "INFO").upper(), format="%(levelname)s %(name)s %(message)s"
@@ -99,6 +156,7 @@ def main() -> int:
             print(f"plate_daemon: another daemon already runs on {settings.home}", file=sys.stderr)
             return 3
         index = Index(settings.home)
+        rebuild_missing_indexes(settings, index)
         for project_id in index.project_ids():
             with index.project(project_id) as conn:
                 for action in recover_on_boot(conn, engine, skip=is_pipeline_run):

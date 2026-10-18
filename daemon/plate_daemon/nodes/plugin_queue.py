@@ -13,7 +13,10 @@ costs a re-queue and never a result (the run it belongs to keeps its own state i
     last_poll_utc() / counts()                                  -> when a dock last claimed, jobs waiting
 
 States: `queued -> claimed -> done | failed`, or `-> cancelled`. `seq` is the cursor a dock keeps: it only
-grows. A job that carries a `run_id` belongs to a node run, whose engine polls the job (nodes/runner.py); a
+grows. A claim is a lease, not a gift: a job still `claimed` `CLAIM_LEASE_S` seconds after it was taken (the dock
+died, or its answer was lost) goes back to `queued` with `claim_count + 1` at the next claiming listing, and
+after `CLAIM_LIMIT_PER_JOB` such expiries it becomes `failed`, which the run that waits for it sees. An
+answer that arrives late still closes a job that is `queued` or `claimed`. A job that carries a `run_id` belongs to a node run, whose engine polls the job (nodes/runner.py); a
 `receive` job (push a take into Max) also carries the run it shows, but no engine waits for it.
 
 Every `claim=True` listing stamps `last_poll_utc`, even when it finds nothing: that is how the UI knows a dock is
@@ -26,7 +29,7 @@ import json
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +40,8 @@ from ..timeutil import iso, utcnow
 __all__ = [
     "ACTIONS",
     "ACTIVE_STATES",
+    "CLAIM_LEASE_S",
+    "CLAIM_LIMIT_PER_JOB",
     "FILE_NAME",
     "Job",
     "MAX_PAYLOAD_BYTES",
@@ -57,6 +62,9 @@ STATES = ("queued", "claimed", "done", "failed", "cancelled")
 MAX_LIST = 200
 MAX_PAYLOAD_BYTES = 64 * 1024  # a job's arguments: ids, hashes, a few numbers
 MAX_RESULT_BYTES = 1024 * 1024  # a dock's answer: poses and packet ids, never pixels
+CLAIM_LEASE_S = 120  # a claimed job nobody answered within this long goes back to the queue
+CLAIM_LIMIT_PER_JOB = 3  # claims that may lapse before the job is failed
+LEASE_FAILURE = f"no Max dock finished this job after {CLAIM_LIMIT_PER_JOB} claims"
 
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS plugin_queue (
@@ -73,12 +81,15 @@ SCHEMA = (
         result TEXT,
         created_utc TEXT NOT NULL,
         claimed_utc TEXT,
-        finished_utc TEXT
+        finished_utc TEXT,
+        claim_count INTEGER NOT NULL DEFAULT 0
     )""",
     "CREATE INDEX IF NOT EXISTS plugin_queue_state ON plugin_queue(state, seq)",
     "CREATE INDEX IF NOT EXISTS plugin_queue_run ON plugin_queue(run_id)",
     "CREATE TABLE IF NOT EXISTS plugin_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 )
+# Columns added after the first release: a queue file made earlier gets them on first use.
+MIGRATIONS = (("claim_count", "ALTER TABLE plugin_queue ADD COLUMN claim_count INTEGER NOT NULL DEFAULT 0"),)
 
 
 class UnknownAction(ValueError):
@@ -112,6 +123,7 @@ class Job:
     result: dict[str, Any] | None = None
     claimed_utc: str | None = None
     finished_utc: str | None = None
+    claim_count: int = 0  # claims that lapsed without an answer
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Job:
@@ -135,6 +147,7 @@ class Job:
             "created_utc": self.created_utc,
             "claimed_utc": self.claimed_utc,
             "finished_utc": self.finished_utc,
+            "claim_count": self.claim_count,
             "result": self.result,
         }
 
@@ -156,11 +169,34 @@ class PluginQueue:
                     with tx(conn):
                         for stmt in SCHEMA:
                             conn.execute(stmt)
+                        have = {r["name"] for r in conn.execute("PRAGMA table_info(plugin_queue)")}
+                        for column, stmt in MIGRATIONS:
+                            if column not in have:
+                                conn.execute(stmt)
                     self._ready = True
         return conn
 
     def _now(self, now: datetime | None) -> str:
         return iso(now or self.clock())
+
+    def _cutoff(self, now: datetime | None) -> str:
+        """A claim stamped before this has outlived its lease (ISO stamps are fixed-width, so they compare as text)."""
+        return iso((now or self.clock()) - timedelta(seconds=CLAIM_LEASE_S))
+
+    def _expire_claims(self, conn: sqlite3.Connection, now: datetime | None) -> None:
+        """Take back every claim past its lease: failed once it has lapsed `CLAIM_LIMIT_PER_JOB` times, queued
+        again otherwise. Runs inside the claiming listing's transaction, before it selects."""
+        cutoff, stamp = self._cutoff(now), self._now(now)
+        lapsed = "state = 'claimed' AND COALESCE(claimed_utc, created_utc) < ?"
+        conn.execute(
+            f"""UPDATE plugin_queue SET state = 'failed', claim_count = claim_count + 1, result = ?, finished_utc = ?
+                WHERE {lapsed} AND claim_count + 1 >= ?""",
+            (dumps({"detail": LEASE_FAILURE}), stamp, cutoff, CLAIM_LIMIT_PER_JOB),
+        )
+        conn.execute(
+            f"UPDATE plugin_queue SET state = 'queued', claim_count = claim_count + 1, claimed_utc = NULL WHERE {lapsed}",
+            (cutoff,),
+        )
 
     # ------------------------------------------------------------------ writing
 
@@ -274,17 +310,22 @@ class PluginQueue:
         limit: int = 50,
         now: datetime | None = None,
     ) -> list[Job]:
-        """Jobs after cursor `since` (their `seq`), oldest first. With `claim`, the queued ones returned are
-        marked claimed in the same transaction, so a second dock never picks the same job."""
+        """Jobs after cursor `since` (their `seq`), oldest first. With `claim`, claims past their lease are taken
+        back first, then the queued jobs returned are marked claimed in the same transaction, so a second dock
+        never picks the same job. A claiming listing also offers a job whose claim lapsed whatever the cursor:
+        a dock that is alive but lost the answer is already past that job's `seq`."""
         bad = [s for s in states if s not in STATES]
         if bad:
             raise ValueError(f"unknown job states {bad}")
         marks = ",".join("?" * len(states))
+        after = "(seq > ? OR (state = 'queued' AND claim_count > 0))" if claim else "seq > ?"
         conn = self._conn()
         try:
             with tx(conn):
+                if claim:
+                    self._expire_claims(conn, now)
                 rows = conn.execute(
-                    f"SELECT * FROM plugin_queue WHERE seq > ? AND state IN ({marks}) ORDER BY seq LIMIT ?",
+                    f"SELECT * FROM plugin_queue WHERE {after} AND state IN ({marks}) ORDER BY seq LIMIT ?",
                     (max(int(since), 0), *states, max(1, min(int(limit), MAX_LIST))),
                 ).fetchall()
                 if claim:
@@ -317,14 +358,24 @@ class PluginQueue:
             conn.close()
         return str(row["value"]) if row else None
 
-    def counts(self) -> dict[str, int]:
-        """`{queued, claimed}`: the jobs waiting for a dock and the ones a dock has taken and not answered."""
+    def counts(self, *, now: datetime | None = None) -> dict[str, int]:
+        """`{queued, claimed, expired_claims}`: the jobs waiting for a dock, the ones a dock has taken and not
+        answered, and how many of those are past their lease (the next claiming listing takes them back; a
+        number that stays above 0 means no dock is polling)."""
         conn = self._conn()
         try:
             rows = conn.execute(
                 "SELECT state, COUNT(*) AS n FROM plugin_queue WHERE state IN ('queued', 'claimed') GROUP BY state"
             ).fetchall()
+            expired = conn.execute(
+                "SELECT COUNT(*) AS n FROM plugin_queue WHERE state = 'claimed' AND COALESCE(claimed_utc, created_utc) < ?",
+                (self._cutoff(now),),
+            ).fetchone()
         finally:
             conn.close()
         found = {r["state"]: int(r["n"]) for r in rows}
-        return {"queued": found.get("queued", 0), "claimed": found.get("claimed", 0)}
+        return {
+            "queued": found.get("queued", 0),
+            "claimed": found.get("claimed", 0),
+            "expired_claims": int(expired["n"]),
+        }

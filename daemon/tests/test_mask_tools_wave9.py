@@ -232,7 +232,7 @@ def test_mask_upload_packet_refusals(client, auth, tmp_path):
         f"/api/v0/assets?kind=mask&packet_id={client.packet_id}", content=png, headers=auth
     ).json() == {"error": "project_required"}
     r = client.post(f"{url}&packet_id={client.packet_id}", content=b"not an image", headers=auth)
-    assert r.status_code == 422 and r.json()["error"] == "bad_mask"
+    assert r.status_code == 422 and r.json()["error"] == "bad_image"  # no image header (T136)
 
 
 def test_fit_mask_unit():

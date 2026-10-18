@@ -19,10 +19,18 @@ envelope) and raise `EnvelopeRequired`, `EnvelopeExceeded` or `AutoApprovalDenie
 machine reserves the spend in the same transaction (and debits the envelope). `approve_group` approves a
 best-of-N group against the sum of its siblings' prices in one transaction. Envelopes are stored in the
 project's index, so an envelope budgets one owner on one project.
+
+Wave 12 (router plan T129, decision 80). The daily and unattended caps read `spent` when the caller passes one
+(`Pipeline.approve` passes `budgets.spend_snapshot_all`, every project index in this home); without it they read
+this connection's project, as before. A quote created more than 60 s after `now` (the clock moved back) is
+refused like a lapsed one: both are EXPIRED and the `QuoteExpired` carries their `run_ids`, so the caller can
+ledger the moves. An envelope's limits are finite, at most 1 000 000 USD, and live at most 366 days; a price's
+count (`candidate_count`, `num_images` or `n`) is a whole number of at least 1 and every quantity is finite.
 """
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
@@ -73,6 +81,10 @@ DEFAULT_ETA_S = {
 SIZE_LABEL_PARAMS = ("image_size", "resolution", "size")
 DURATION_PARAMS = ("duration_s", "duration", "seconds")
 COUNT_PARAMS = ("candidate_count", "num_images", "n")
+# Decision 80: what an envelope may hold, and how far ahead of the approver's clock a quote may have been made.
+ENVELOPE_MAX_USD = 1_000_000.0
+ENVELOPE_MAX_TTL_S = 31_622_400  # 366 days
+QUOTE_CLOCK_SKEW = timedelta(seconds=60)
 
 
 class EnvelopeRequired(Exception):
@@ -146,9 +158,25 @@ def _pick_size(manifest: Any, params: Mapping[str, Any]) -> dict[str, Any] | Non
 def _number(params: Mapping[str, Any], names: tuple[str, ...]) -> float | None:
     for name in names:
         v = params.get(name)
-        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
-            return float(v)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            if not math.isfinite(v):
+                raise ValueError(f"{name} is {v!r}; a price is computed from finite numbers only")
+            if v > 0:
+                return float(v)
     return None
+
+
+def _count(params: Mapping[str, Any]) -> int:
+    """How many images the request asks for: the first of `COUNT_PARAMS` that is set, else 1. A whole number of
+    at least 1 (a bool is not a number here)."""
+    for name in COUNT_PARAMS:
+        v = params.get(name)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise ValueError("candidate_count/num_images/n must be a whole number of at least 1")
+        return v
+    return 1
 
 
 def _norm(value: Any) -> str:
@@ -226,7 +254,7 @@ def build_quote(
         qty = secs
     else:
         qty = 1.0
-    count = int(_number(params, COUNT_PARAMS) or 1)
+    count = _count(params)
     return Quote(
         run_id=run_id,
         provider=r.provider,
@@ -356,8 +384,14 @@ def create_envelope(
     ttl_s: float,
     now: datetime | None = None,
 ) -> BudgetEnvelope:
+    if not all(math.isfinite(v) for v in (max_total_usd, max_per_run_usd, ttl_s)):
+        raise ValueError("envelope limits and ttl_s must be finite numbers")
     if max_total_usd < 0 or max_per_run_usd < 0 or ttl_s <= 0:
         raise ValueError("envelope limits must be >= 0 and ttl_s > 0")
+    if max_total_usd > ENVELOPE_MAX_USD or max_per_run_usd > ENVELOPE_MAX_USD:
+        raise ValueError(f"envelope limits are at most {ENVELOPE_MAX_USD:,.0f} USD")
+    if ttl_s > ENVELOPE_MAX_TTL_S:
+        raise ValueError(f"an envelope lives at most {ENVELOPE_MAX_TTL_S} s (366 days)")
     budgets.check_owner(owner)
     now = now or utcnow()
     env = BudgetEnvelope(
@@ -413,6 +447,13 @@ def _refusal(decision: budgets.Decision) -> EnvelopeRequired:
     return AutoApprovalDenied(decision.reason)
 
 
+def _expired(message: str, run_ids: list[str]) -> QuoteExpired:
+    """`QuoteExpired` naming the runs it moved to EXPIRED (`run_ids`), so the caller can ledger each move."""
+    exc = QuoteExpired(message)
+    exc.run_ids = list(run_ids)  # type: ignore[attr-defined]
+    return exc
+
+
 def _approve_runs(
     conn: sqlite3.Connection,
     run_ids: list[str],
@@ -422,6 +463,7 @@ def _approve_runs(
     policy: budgets.Policy | None,
     last_human_interaction_utc: datetime | None,
     on_alert: Callable[[budgets.Decision], None] | None,
+    spent: budgets.Spend | None = None,
 ) -> list[Run]:
     actor, envelope_id = _parse_actor(actor, envelope_id)
     now = now or utcnow()
@@ -435,8 +477,9 @@ def _approve_runs(
                 raise IllegalTransition(run.state, RunState.APPROVED)
             if run.quote is None:
                 raise QuoteNotFound(f"run {run.id} is QUOTED without a stored quote")
-        lapsed = [r for r in runs if r.quote.expired(now)]
-        if lapsed:
+        future = [r for r in runs if r.quote.created_utc > now + QUOTE_CLOCK_SKEW]
+        lapsed = [r for r in runs if r not in future and r.quote.expired(now)]
+        if future or lapsed:
             for r in lapsed:
                 transition(
                     conn,
@@ -446,9 +489,26 @@ def _approve_runs(
                     now=now,
                     reason=f"quote {r.quote.id} expired at {iso(r.quote.expires_utc)}",
                 )
-            outcome["raise"] = QuoteExpired(
-                f"quote for run {', '.join(r.id for r in lapsed)} expired; re-quote before approving"
-            )
+            for r in future:
+                transition(
+                    conn,
+                    r.id,
+                    RunState.EXPIRED,
+                    actor="system",
+                    now=now,
+                    reason=f"quote {r.quote.id} was created at {iso(r.quote.created_utc)}, after {iso(now)}: "
+                    "the clock moved",
+                )
+            if future:
+                message = (
+                    f"quote for run {', '.join(r.id for r in future)} was created in the future; the clock "
+                    "moved, re-quote before approving"
+                )
+            else:
+                message = (
+                    f"quote for run {', '.join(r.id for r in lapsed)} expired; re-quote before approving"
+                )
+            outcome["raise"] = _expired(message, [r.id for r in (*lapsed, *future)])
             return []
         row = get_envelope(conn, envelope_id) if envelope_id else None
         if envelope_id and row is None:
@@ -467,7 +527,9 @@ def _approve_runs(
                 env,
                 last_human_interaction_utc,
                 now=now,
-                spent=budgets.spend_snapshot(conn, now, last_human_interaction_utc),
+                spent=spent
+                if spent is not None
+                else budgets.spend_snapshot(conn, now, last_human_interaction_utc),
                 requester=actor,
                 price_usd=total,
             )
@@ -518,10 +580,12 @@ def approve(
     policy: budgets.Policy | None = None,
     last_human_interaction_utc: datetime | None = None,
     on_alert: Callable[[budgets.Decision], None] | None = None,
+    spent: budgets.Spend | None = None,
 ) -> Run:
-    """QUOTED -> APPROVED as `human`, `auto` or `agent` (`agent:<envelope_id>` also accepted)."""
+    """QUOTED -> APPROVED as `human`, `auto` or `agent` (`agent:<envelope_id>` also accepted). `spent` is what
+    the caps count as already committed (None: this connection's project)."""
     return _approve_runs(
-        conn, [run_id], actor, envelope_id, now, policy, last_human_interaction_utc, on_alert
+        conn, [run_id], actor, envelope_id, now, policy, last_human_interaction_utc, on_alert, spent
     )[0]
 
 
@@ -535,6 +599,7 @@ def approve_group(
     policy: budgets.Policy | None = None,
     last_human_interaction_utc: datetime | None = None,
     on_alert: Callable[[budgets.Decision], None] | None = None,
+    spent: budgets.Spend | None = None,
 ) -> list[Run]:
     """Approve every QUOTED sibling of a best-of-N group at once, against the group's total price."""
     ids = [
@@ -547,7 +612,9 @@ def approve_group(
     ]
     if not ids:
         raise QuoteNotFound(f"no QUOTED siblings in group {sibling_group}")
-    return _approve_runs(conn, ids, actor, envelope_id, now, policy, last_human_interaction_utc, on_alert)
+    return _approve_runs(
+        conn, ids, actor, envelope_id, now, policy, last_human_interaction_utc, on_alert, spent
+    )
 
 
 def expire_if_due(conn: sqlite3.Connection, run_id: str, now: datetime, actor: str = "recovery") -> bool:

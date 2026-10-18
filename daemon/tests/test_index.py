@@ -8,7 +8,7 @@ import sqlite3
 from plate_daemon.db import connect, tx
 from plate_daemon.index import COUNTED_TABLES, Index, apply_packet_entry, packet_entry
 from plate_daemon.machine import create_run, transition
-from plate_daemon.migrations import M001
+from plate_daemon.migrations import M001, MIGRATIONS
 from plate_daemon.models import Route, RunCreate
 from plate_daemon.projects import Project
 from plate_daemon.sse import Bus
@@ -78,7 +78,7 @@ def _live_project(tmp_path, home) -> tuple[Project, Index, dict[str, str]]:
 
 
 def test_connections_are_wal_with_the_plan_pragmas(settings):
-    with Index(settings.home).project("tula-wot") as conn:
+    with Index(settings.home).project("tula-wot", create=True) as conn:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
         assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
@@ -86,7 +86,7 @@ def test_connections_are_wal_with_the_plan_pragmas(settings):
 
 
 def test_schema_has_the_plan_columns(settings):
-    with Index(settings.home).project("tula-wot") as conn:
+    with Index(settings.home).project("tula-wot", create=True) as conn:
         assert _columns(conn, "assets") == {"hash", "ext", "bytes", "phash", "added_utc"}
         run_cols = {
             "run_id",
@@ -101,7 +101,16 @@ def test_schema_has_the_plan_columns(settings):
         assert {"packet_id", "path", "view_hash", "scene_hash", "manifest_hash"} <= _columns(conn, "packets")
         assert _columns(conn, "events") == {"seq", "run_id", "at", "kind", "json"}
         versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
-        assert versions == [1, 2]
+        assert versions == [v for v, _ in MIGRATIONS]
+        assert _columns(conn, "ledger_outbox") == {
+            "id",
+            "run_id",
+            "kind",
+            "record",
+            "created_utc",
+            "attempts",
+            "last_error",
+        }
 
 
 def test_a_seed_m001_index_migrates_forward_without_loss(settings):

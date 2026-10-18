@@ -16,13 +16,15 @@ transaction as the state change: reserved at APPROVED (the envelope is debited t
 state refunded when the provider never had the job (no provider id: FAILED before SUBMITTED, a cancel
 while queued) or settled at the quoted price otherwise (DONE, GATE_FAIL, FAILED after submit, REFUSED,
 CANCELLED at the provider); the ledger's reconciliation (T13) owns the billed truth after that. The index
-is per project, so the daily total here is this project's; a caller that budgets across projects passes
-its own `Spend`.
+is per project, so `spend_snapshot(conn, ...)` is one project's total; `spend_snapshot_all(index, ...)` sums
+every project index in this home (decision 80), which is what `Pipeline.approve` passes as `spent`, so the
+daily and unattended caps bound the user, not each project, and a refusal says how many projects it summed.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from collections.abc import Callable
@@ -35,6 +37,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .models import SPEND_REFUND, SPEND_RESERVE, SPEND_SETTLE, BudgetEnvelope, Run, spend_body
 from .states import Priority
 from .timeutil import iso, utcnow
+
+log = logging.getLogger(__name__)
 
 OWNER_RE = re.compile(r"^(agent(:[A-Za-z0-9_.@-]+)?|user:[A-Za-z0-9_.@-]+)$")
 EPS = 1e-9
@@ -111,10 +115,19 @@ class Decision(BaseModel):
 
 @dataclass(frozen=True)
 class Spend:
-    """What the user has already committed: today (UTC day) and, for auto/agent, since the last human."""
+    """What the user has already committed: today (UTC day) and, for auto/agent, since the last human.
+    `projects` is how many project indexes were summed (None: one connection's project)."""
 
     today_usd: float = 0.0
     since_human_usd: float = 0.0
+    projects: int | None = None
+
+    @property
+    def scope(self) -> str:
+        """` across N projects` when the totals were summed over the home, else nothing."""
+        if self.projects is None:
+            return ""
+        return f" across {self.projects} project{'' if self.projects == 1 else 's'}"
 
 
 def check_owner(owner: str) -> str:
@@ -209,13 +222,14 @@ def authorize(
         return deny(
             "daily_cap",
             f"{spent.today_usd:.2f} + {price:.2f} USD would pass the daily cap "
-            f"{policy.per_user_daily_cap_usd:.2f} USD",
+            f"{policy.per_user_daily_cap_usd:.2f} USD (spend{spent.scope or ' in this project'})",
         )
     if unattended and spent.since_human_usd + price > policy.unattended_cap_usd + EPS:
         return deny(
             "unattended_cap",
             f"unattended: {spent.since_human_usd:.2f} + {price:.2f} USD would pass the unattended cap "
-            f"{policy.unattended_cap_usd:.2f} USD; a human must look first",
+            f"{policy.unattended_cap_usd:.2f} USD (spend{spent.scope or ' in this project'}); a human must "
+            "look first",
         )
     return Decision(
         approve=True,
@@ -315,6 +329,25 @@ def spend_snapshot(
         today_usd=committed_since(conn, start),
         since_human_usd=committed_since(conn, since, unattended_only=True),
     )
+
+
+def spend_snapshot_all(index: Any, now: datetime, last_human_interaction_utc: datetime | None) -> Spend:
+    """`spend_snapshot` summed over every project index of `index` (`plate_daemon.index.Index`): the caps are
+    the user's, whichever project spends (decision 80). A project whose index cannot be opened is skipped with
+    a warning (its spend is then not counted; the warning says so)."""
+    today = since = 0.0
+    counted = 0
+    for pid in index.project_ids():
+        try:
+            with index.project(pid) as conn:
+                snap = spend_snapshot(conn, now, last_human_interaction_utc)
+        except Exception as e:  # one unreadable index must not stop every approval in the home
+            log.warning("spend of project %s not counted against the caps: %s", pid, e)
+            continue
+        today += snap.today_usd
+        since += snap.since_human_usd
+        counted += 1
+    return Spend(today_usd=round(today, 10), since_human_usd=round(since, 10), projects=counted)
 
 
 def publish_alert(bus: Any, project_id: str, run_id: str | None, decision: Decision) -> int | None:

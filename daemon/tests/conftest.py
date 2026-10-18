@@ -5,6 +5,12 @@ pointed at a folder that does not exist unless a test builds one. `client` is a 
 carries an allowlisted Host; `auth` is the matching bearer header. `live_server` runs the real app under
 uvicorn on an ephemeral loopback port for the tests that need true streaming (SSE); `child_env` and
 `free_port` help the tests that start a second Python process.
+
+`PLATE_RUN_WORKERS=0` is set for every test (router plan T145): approved runs execute inline through a
+BackgroundTask, so a TestClient call returns with the run at its end, as the suite expects. A test that wants
+the run executor sets the variable itself before it builds the app (`live_server` with `PLATE_RUN_WORKERS=4`).
+`live_server(on_app=fn, **create_app_kwargs)` calls `fn(app)` before serving, and the pipeline's executor is
+closed when the server stops.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ from pathlib import Path
 
 import pytest
 import uvicorn
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from plate_daemon.api import create_app
@@ -36,6 +43,7 @@ ENV_VARS = (
     "PLATE_FAKE_ENGINE",
     "PLATE_SYNC_INGEST",
     "PLATE_CAS_COPY",
+    "PLATE_RUN_WORKERS",
 )
 BASE_URL = "http://127.0.0.1:4610"
 DAEMON_DIR = Path(__file__).resolve().parents[1]
@@ -48,6 +56,7 @@ def plate_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("PLATE_HOME", str(tmp_path))
     monkeypatch.setenv("PLATE_UI_DIST", str(tmp_path / "ui-dist-absent"))
+    monkeypatch.setenv("PLATE_RUN_WORKERS", "0")  # runs inline, as the suite expects (T145)
     return tmp_path
 
 
@@ -94,12 +103,16 @@ def free_port() -> Callable[[], int]:
 
 
 @contextmanager
-def _serve(make_settings: Callable[[int], Settings], **app_kwargs) -> Iterator[tuple[Settings, str]]:
+def _serve(
+    make_settings: Callable[[int], Settings], on_app: Callable[[FastAPI], None] | None = None, **app_kwargs
+) -> Iterator[tuple[Settings, str]]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
     settings = make_settings(port)
     app = create_app(settings, **app_kwargs)
+    if on_app is not None:
+        on_app(app)
     server = uvicorn.Server(
         uvicorn.Config(app, log_level="warning", lifespan="on", timeout_graceful_shutdown=2)
     )
@@ -116,13 +129,16 @@ def _serve(make_settings: Callable[[int], Settings], **app_kwargs) -> Iterator[t
         server.should_exit = True
         thread.join(10)
         sock.close()
+        pipeline = getattr(app.state, "pipeline", None)
+        if pipeline is not None and hasattr(pipeline, "close"):
+            pipeline.close(2.0)  # the run executor's threads stop with the server
 
 
 @pytest.fixture
 def live_server(settings: Settings):
     """`with live_server(**create_app_kwargs) as (settings, url):` the real app on a real socket."""
 
-    def start(**app_kwargs):
-        return _serve(lambda port: settings.model_copy(update={"port": port}), **app_kwargs)
+    def start(on_app: Callable[[FastAPI], None] | None = None, **app_kwargs):
+        return _serve(lambda port: settings.model_copy(update={"port": port}), on_app, **app_kwargs)
 
     return start

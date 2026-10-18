@@ -124,6 +124,8 @@ Reference: `plate_spec.project_point(camera, p)`. This is the formula the P0 exi
 | `client_plate`, `depth_estimated`, `segments` | C | the client's plate, the estimated depth and a 16-bit segment label map |
 | `x_<name>` | any | extension roles, e.g. an opt-in pass written to its own file |
 
+`display_tiff16` may use any compression tifffile+imagecodecs decode (none, Deflate, LZW, PackBits); JPEG-compressed TIFF is refused.
+
 `beauty_exr.parts` is `single` (the default when absent: one EXR part holds every layer, which is what V-Ray writes) or `multi` (one part per layer, Blender's layout). Readers find each element by its `layer` and `channels` across all parts either way.
 
 Any other role is rejected. `beauty_exr`, `display_tiff16`, `client_plate`, `depth_estimated` and `segments` MUST have the rendered resolution exactly. EXR compression MUST be lossless (`none`, `rle`, `zip`, `zips`, `piz`): DWA and PXR24 quantise float channels and corrupt Cryptomatte hashes and world positions.

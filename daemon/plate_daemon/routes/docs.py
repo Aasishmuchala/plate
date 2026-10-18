@@ -4,8 +4,8 @@
   with forward slashes (`artist-manual.md`, `runbooks/nightly.md`), `title` the file's first `# ` heading.
 - `GET /docs/{name}.md` answers that file as `text/markdown; charset=utf-8`. The path is confined to the
   docs folder: only `.md` files, no `..`, no absolute or drive-letter names, no hidden names, and a link that
-  resolves outside the folder is refused; every refusal is the same 404, so a client learns nothing about
-  what else is on disk. There is no renderer (P5); a client shows the raw file.
+  resolves outside the folder is refused, and so is a name the filesystem cannot take (255+ characters); every
+  refusal is the same 404, so a client learns nothing about what else is on disk. There is no renderer (P5); a client shows the raw file.
 
 Both sit under the API prefix like every route (`/api/v0/docs/...`) and need the bearer token. They are not
 served at a bare `/docs`: only `/api/` is token-gated (`auth.AuthMiddleware`), and a tokenless `/docs` is what
@@ -44,9 +44,9 @@ def resolve_doc(name: str, root: Path | None = None) -> Path | None:
         return None
     try:
         path = (root / Path(*parts)).resolve()
-    except (OSError, ValueError):
-        return None
-    if not path.is_relative_to(root) or not path.is_file():
+        if not path.is_relative_to(root) or not path.is_file():
+            return None
+    except (OSError, ValueError):  # a 255+ character name: ENAMETOOLONG is the same 404 as a missing file
         return None
     return path
 

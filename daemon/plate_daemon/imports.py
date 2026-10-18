@@ -9,15 +9,21 @@ ledgered, reviewed and exported like any other take:
 
 What it checks before anything is stored, in this order (a refusal leaves no run row and no CAS object):
 
-- `source` is `higgsfield`, `runway` or `manual` (422 `unknown_source`), `cost_usd` a finite number >= 0 and
-  `by` an approver (`human`, `auto`, `agent:<envelope_id>`), else 422;
+- `source` is `higgsfield`, `runway` or `manual` (422 `unknown_source`), `cost_usd` a finite number from 0 to
+  `MAX_COST_USD` (1000; 422 `bad_cost`) and `by` an approver (`human`, `auto`, `agent:<envelope_id>`), else 422;
+- the path is a regular file (`check_import_file`: a FIFO, a device, a socket or a directory is 422 `not_a_file`
+  and is never opened, a missing one 422 `unreadable_image` / `unreadable_video`) of at most `IMPORT_MAX_BYTES`
+  (1 GiB; 413 `too_large`);
 - the project and the packet exist (404 `not_found`), and so does `node_id` when one is named (404);
 - custody: the import's route must be a grade the project and the packet allow (`custody.require_route`). A
   Higgsfield or Runway file is grade D (its plate already went to that vendor), so on an NDA project it is
   `CustodyViolation` (403); a manual file is C0;
 - the file decodes as a display-referred image (422 `unreadable_image`; a scene-linear file is refused too: the
   gates score display masters) at exactly the plate's size (422 `size_mismatch`: nothing is resized or
-  registered onto the plate here; the gates measure the file as it is).
+  registered onto the plate here; the gates measure the file as it is). The size is read from the header first
+  (`plate_pixels.imghdr`): a mismatch is refused before a pixel is decoded, so a 117 KiB 6000 x 6000 PNG costs the
+  daemon no memory, and a header over `IMPORT_MAX_PIXELS` (100 000 000) is 422 `too_many_pixels`. A JPEG's EXIF
+  Orientation is applied by the decoder, so a portrait JPEG whose header says landscape is judged upright.
 
 The run. Route `{engine_id: "import:<source>", provider: "external", custody_grade: D | C0, custody_status:
 "confirmed", upload_visibility: "unknown" | "local"}`; inputs `{plate, mask, imported: {path_name, source, note,
@@ -52,6 +58,9 @@ custody, quote, approval, moves, ledger), with these differences:
   nothing is resized. `approved_still_hash`, `end_still_hash` and `motion_packet_id` apply to a clip only (422
   `not_a_clip` on a still); a still hash names an image in the project's CAS (404 `not_found`, 422
   `unreadable_image`).
+- A clip has at least 2 frames (422 `unreadable_video`: a single frame cannot be scored for camera lock or
+  flicker), and the container comes from ffprobe's `format_name`, not the extension: a PNG renamed `.mp4` is "a
+  still with a clip suffix" (422 `unreadable_video`).
 - The raw file goes into the CAS with its extension (`result_key` = `normalized.raw_key`); `outputs[0]` is a copy
   with the run's lineage in the container (`.mp4` and `.mov`; `.webm` has no carrier, so the copy is the raw file
   and `normalized.lineage` is false). A clip has no editable mask and no ingress report: `inputs` carries no
@@ -67,9 +76,14 @@ custody, quote, approval, moves, ledger), with these differences:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
+import re
 import shutil
+import stat
+import subprocess
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -83,6 +97,7 @@ import numpy as np
 from plate_gates import io as pio
 from plate_gates import video_gates
 from plate_gates.timemap import TimeMap, fps_text
+from plate_pixels import imghdr
 
 from . import budgets, canvas_rules, gating
 from . import lineage as lineage_mod
@@ -91,7 +106,7 @@ from .config import check_project_id
 from .custody import require_route
 from .db import loads, tx
 from .delivery.guard import DeliveryError, ToolMissing
-from .delivery.tools import probe_video
+from .delivery.tools import PROBE_TIMEOUT_S, ffprobe_path, probe_video
 from .gate_reports import Service as ReportService
 from .machine import DuplicateRequest, IllegalTransition, annotate, create_run, get_run, transition
 from .models import APPROVED_BY_RE, QUOTE_TTL, Quote, Run, RunCreate
@@ -112,8 +127,12 @@ from .states import Priority, RunState
 
 __all__ = [
     "ENGINE_PREFIX",
+    "IMPORT_MAX_BYTES",
+    "IMPORT_MAX_PIXELS",
+    "MAX_COST_USD",
     "SOURCES",
     "VIDEO_EXTS",
+    "check_import_file",
     "import_file",
     "import_route",
     "is_import_run",
@@ -131,6 +150,13 @@ ACTOR = "import"
 MAX_NOTE_CHARS = 500
 JOB_ID_HEX = 24
 RAW_FALLBACK_EXT = "bin"
+IMPORT_MAX_BYTES = 1 << 30  # a file larger than this is 413 `too_large`
+# the declared width x height a still may ask a decoder for (as assets.UPLOAD_MAX_PIXELS)
+IMPORT_MAX_PIXELS = 100_000_000
+MAX_COST_USD = 1000.0  # a declared cost above this is a typo or a probe, not an import
+HEADER_PROBE_BYTES = 1 << 20  # the first MiB of a still holds its header (a JPEG's EXIF and ICC come first)
+TEMP_SUFFIX_CHARS = 16
+MIN_CLIP_FRAMES = 2  # one frame cannot be scored for camera lock or flicker
 # The moves an import ledgers (decision 42): the quote, the approval and the end, whatever it is.
 LEDGERED = frozenset({S.QUOTED, S.APPROVED, S.DONE, S.GATE_FAIL, S.FAILED, S.CANCELLED})
 
@@ -187,14 +213,44 @@ def _check_args(source: Any, cost_usd: Any, by: Any, note: Any) -> tuple[dict[st
     if isinstance(cost_usd, bool) or not isinstance(cost_usd, (int, float)):
         raise PipelineError(f"cost_usd must be a number of USD, got {cost_usd!r}", code="bad_cost")
     price = float(cost_usd)
-    if not math.isfinite(price) or price < 0:
-        raise PipelineError(f"cost_usd must be a finite amount >= 0, got {cost_usd!r}", code="bad_cost")
+    if not math.isfinite(price) or price < 0 or price > MAX_COST_USD:
+        raise PipelineError(
+            f"cost_usd must be a finite amount from 0 to {MAX_COST_USD:g} USD, got {cost_usd!r}",
+            code="bad_cost",
+        )
     if not isinstance(by, str) or not APPROVED_BY_RE.match(by):
         raise PipelineError(f"by must be human, auto or agent:<envelope_id>, got {by!r}", code="bad_approver")
     if note is not None and not isinstance(note, str):
         raise PipelineError("note must be text", code="bad_note")
     text = (note or "").strip()[:MAX_NOTE_CHARS] or None
     return route, price, text
+
+
+def check_import_file(path: str | Path) -> int:
+    """The size of `path`, which must be a regular file of at most `IMPORT_MAX_BYTES`. A FIFO, a device, a socket
+    or a directory is 422 `not_a_file` (opening a FIFO with no writer blocks a worker thread for good; `stat`
+    never opens it); a missing or unstat-able file is 422 `unreadable_image` (`unreadable_video` for a clip
+    suffix); a larger one is 413 `too_large`."""
+    file = Path(path)
+    code = "unreadable_video" if file.suffix.lower() in VIDEO_EXTS else "unreadable_image"
+    try:
+        st = os.stat(file)
+    except (OSError, ValueError) as e:  # missing, no permission, a name too long, an embedded NUL
+        raise PipelineError(f"cannot read {file.name}: {e}"[:500], code=code) from e
+    if not stat.S_ISREG(st.st_mode):
+        raise PipelineError(
+            f"{file.name} is not a regular file (a directory, FIFO, device or socket cannot be imported)",
+            code="not_a_file",
+        )
+    if st.st_size > IMPORT_MAX_BYTES:
+        raise PipelineError(
+            f"{file.name} is {st.st_size} bytes; the largest import is {IMPORT_MAX_BYTES} bytes",
+            code="too_large",
+            status=413,
+            size=st.st_size,
+            limit=IMPORT_MAX_BYTES,
+        )
+    return st.st_size
 
 
 def _packet(pl: Pipeline, project_id: str, packet_id: str) -> PacketView:
@@ -206,19 +262,62 @@ def _packet(pl: Pipeline, project_id: str, packet_id: str) -> PacketView:
         raise
 
 
+def _size_mismatch(name: str, plate: tuple[int, int], got: tuple[int, int]) -> PipelineError:
+    return PipelineError(
+        f"{name} is {got[0]} x {got[1]}; the plate is {plate[0]} x {plate[1]} (an import is never resized onto it)",
+        code="size_mismatch",
+        plate=list(plate),
+        file=list(got),
+    )
+
+
+def _read_still(file: Path, plate: tuple[int, int]) -> bytes:
+    """The bytes of a still, after its header was compared with the plate: a size that is not the plate's is
+    `size_mismatch` and one over `IMPORT_MAX_PIXELS` is `too_many_pixels`, both before a pixel is decoded (a
+    117 KiB PNG can declare 6000 x 6000). A JPEG may be the plate's size turned by its EXIF Orientation, so its
+    swapped size passes here and the decoder's upright shape is judged afterwards. A file with no readable
+    header passes to the decoder."""
+    try:
+        with file.open("rb") as fh:
+            head = fh.read(HEADER_PROBE_BYTES)
+        raw: bytes | None = None
+        size = imghdr.header_size(head)
+        if size is None and len(head) == HEADER_PROBE_BYTES:  # e.g. a TIFF whose first IFD is at the end
+            raw = file.read_bytes()
+            size = imghdr.header_size(raw)
+        if size is not None:
+            width, height = size
+            if width * height > IMPORT_MAX_PIXELS:
+                raise PipelineError(
+                    f"{file.name} declares {width} x {height} = {width * height} px; the cap is {IMPORT_MAX_PIXELS}",
+                    code="too_many_pixels",
+                    declared=[width, height],
+                    limit=IMPORT_MAX_PIXELS,
+                )
+            turned = imghdr.magic(head) == "jpeg" and (height, width) == plate
+            if size != plate and not turned:
+                raise _size_mismatch(file.name, plate, size)
+        return file.read_bytes() if raw is None else raw
+    except OSError as e:
+        raise PipelineError(f"cannot read {file.name}: {e}"[:500], code="unreadable_image") from e
+
+
 def _decode(raw: bytes, suffix: str, cache: Path) -> np.ndarray:
     """uint16 RGB (H, W, 3) of a display-referred image file's bytes (8-bit files are promoted by x257, as
     `PacketView.plate16` does). Raises PipelineError 422 `unreadable_image`."""
     from plate_pixels import imageio
 
     cache.mkdir(parents=True, exist_ok=True)
+    # The suffix only picks the decoder (.tif/.tiff or not): keep letters, digits and dots, at most 16 characters,
+    # so a 250-character extension is no "File name too long" and a ':' is no Windows alternate stream.
+    suffix = re.sub(r"[^A-Za-z0-9.]", "", suffix)[:TEMP_SUFFIX_CHARS]
     # decoded from these bytes, the ones that go into the CAS (never a second read of a file that may change)
     with tempfile.TemporaryDirectory(dir=cache) as tmp:
         p = Path(tmp) / f"import{suffix or '.bin'}"
-        p.write_bytes(raw)
         try:
+            p.write_bytes(raw)
             img = imageio.read(p)
-        except Exception as e:  # any decoder failure is the same answer: not an image this daemon reads
+        except Exception as e:  # any decoder or temp-file failure is the same answer: not an image we read
             raise PipelineError(
                 f"not a readable image ({type(e).__name__}: {e})"[:500], code="unreadable_image"
             ) from e
@@ -275,6 +374,57 @@ def _frame_rate(stream: Mapping[str, Any]) -> Fraction:
     return avg if avg > 0 else Fraction(stream.get("fps") or 0)
 
 
+def _is_still_container(format_name: str) -> bool:
+    """ffprobe's `format_name` of a still image: `png_pipe`, `jpeg_pipe`, `tiff_pipe`, `webp_pipe`, `bmp_pipe`
+    and the `image2` demuxer. A clip's is `mov,mp4,m4a,3gp,3g2,mj2` or `matroska,webm`."""
+    return any(t == "image2" or t == "image2pipe" or t.endswith("_pipe") for t in format_name.split(","))
+
+
+def _check_container(path: Path) -> None:
+    """The container is ffprobe's `format_name`, not the file's extension: a still with a clip suffix (a PNG
+    renamed `.mp4`) is 422 `unreadable_video`. 503 `tool_missing` without ffprobe."""
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe_path(),
+                "-v",
+                "error",
+                "-show_entries",
+                "format=format_name",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            timeout=PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except ToolMissing as e:
+        raise PipelineError(str(e), code="tool_missing", status=503) from e
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise PipelineError(
+            f"not a readable video ({type(e).__name__}: {e})"[:500], code="unreadable_video"
+        ) from e
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()[-2:]
+        raise PipelineError(
+            f"not a readable video: ffprobe could not read {path.name}: {' | '.join(tail)}"[:500],
+            code="unreadable_video",
+        )
+    try:
+        format_name = str(
+            (json.loads(proc.stdout.decode("utf-8")).get("format") or {}).get("format_name") or ""
+        )
+    except (ValueError, AttributeError):
+        format_name = ""
+    if _is_still_container(format_name):
+        raise PipelineError(
+            f"{path.name} is a still image ({format_name}) with a clip suffix: import it as a still, or give it "
+            "a video container",
+            code="unreadable_video",
+        )
+
+
 def _probe_clip(path: Path) -> dict[str, Any]:
     """width, height, fps, frames, duration and the codec tags of a clip, as plain JSON data."""
     if not path.is_file():
@@ -302,8 +452,10 @@ def _probe_clip(path: Path) -> dict[str, Any]:
             raise PipelineError(
                 f"cannot count the frames of {path.name}: {e}"[:500], code="unreadable_video"
             ) from e
-    if frames < 1:
-        raise PipelineError(f"{path.name} has no frames", code="unreadable_video")
+    if frames < MIN_CLIP_FRAMES:
+        raise PipelineError(
+            f"a clip has at least {MIN_CLIP_FRAMES} frames; this file has {frames}", code="unreadable_video"
+        )
     try:
         duration = float(stream["duration"])
     except (KeyError, TypeError, ValueError):
@@ -376,6 +528,9 @@ def _check_clip(
     motion_packet_id: str | None,
 ) -> _Clip:
     """Everything a clip must satisfy before a run row or a CAS object exists (see the module docstring)."""
+    if not file.is_file():
+        raise PipelineError(f"cannot read {file.name}: no such file", code="unreadable_video")
+    _check_container(file)
     probe = _probe_clip(file)
     motion, expected = None, None
     if motion_packet_id is not None:
@@ -719,6 +874,7 @@ def import_file(
         route, pl.allowed_grades(project_id, pv.manifest), what=f"a file imported from {source}"
     )
     file = Path(path)
+    check_import_file(file)  # a FIFO would block the read for good; the route has made this check too
     cas = pl.cas_for(project_id)
     is_clip = file.suffix.lower() in VIDEO_EXTS
     if not is_clip and (approved_still_hash or end_still_hash or motion_packet_id):
@@ -748,20 +904,12 @@ def import_file(
         inputs: dict[str, Any] = {"plate": pv.plate_hash, "imported": imported, STAGING_KEY: staging}
         data: dict[str, Any] = {"imported": True, "source": source, "media": "video"}
     else:
-        try:
-            raw = file.read_bytes()
-        except OSError as e:
-            raise PipelineError(f"cannot read {file.name}: {e}"[:500], code="unreadable_image") from e
-        image16 = _decode(raw, file.suffix.lower(), pl.settings.home / "cache")
         plate16 = pv.plate16()
+        plate_wh = (plate16.shape[1], plate16.shape[0])
+        raw = _read_still(file, plate_wh)  # the header is checked before the rest of the file is read
+        image16 = _decode(raw, file.suffix.lower(), pl.settings.home / "cache")
         if image16.shape != plate16.shape:
-            (ph, pw), (fh, fw) = plate16.shape[:2], image16.shape[:2]
-            raise PipelineError(
-                f"{file.name} is {fw} x {fh}; the plate is {pw} x {ph} (an import is never resized onto it)",
-                code="size_mismatch",
-                plate=[pw, ph],
-                file=[fw, fh],
-            )
+            raise _size_mismatch(file.name, plate_wh, (image16.shape[1], image16.shape[0]))
         mask = pl.mask_spec(graph, node_id or "", pv)
         pl.check_mask_keys(project_id, mask, pv)
         raw_key = cas.put_bytes(raw, _raw_ext(file))

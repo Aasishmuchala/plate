@@ -82,15 +82,21 @@ const SAVE_COLOR: Record<string, string> = {
   unsaved: "var(--text, #f2f2f7)",
   saving: "var(--text, #f2f2f7)",
   failed: "var(--red, #ff453a)",
+  conflict: "var(--amber, #ff9f0a)",
 };
 
-/** The open project's save state: `saved HH:MM:SS`, `unsaved`, `saving…` or `save failed: <message>` (red). */
+/**
+ * The open project's save state: `saved HH:MM:SS`, `unsaved`, `saving…`, `save failed: <message>` (red, with the
+ * wait before its retry) or `conflict: reload` (amber; App puts the Reload button beside it).
+ */
 function SaveChip() {
   const projectId = useGraphStore((s) => s.projectId);
   const saveState = useGraphStore((s) => s.saveState);
   const savedAt = useGraphStore((s) => s.savedAt);
   const error = useGraphStore((s) => s.saveError);
+  const retryInMs = useGraphStore((s) => s.retryInMs);
   if (projectId === null) return null;
+  const retry = retryInMs === null ? "" : ` · retry in ${Math.round(retryInMs / 1000)} s`;
   const text =
     saveState === "saved"
       ? savedAt === null
@@ -100,14 +106,22 @@ function SaveChip() {
         ? "unsaved"
         : saveState === "saving"
           ? "saving…"
-          : `save failed: ${error?.message || "the daemon did not store the graph"}`;
+          : saveState === "conflict"
+            ? "conflict: reload"
+            : `save failed: ${error?.message || "the daemon did not store the graph"}${retry}`;
   return (
     <span
       className="status-save"
       data-testid="save-state"
       data-state={saveState}
       aria-live="polite"
-      title={saveState === "failed" && error?.code ? error.code : `project ${projectId}`}
+      title={
+        saveState === "conflict" && error
+          ? error.message
+          : saveState === "failed" && error?.code
+            ? error.code
+            : `project ${projectId}`
+      }
       style={{ color: SAVE_COLOR[saveState] }}
     >
       {text}
@@ -124,9 +138,10 @@ function useDocumentTitle(): void {
   }, [projectId, saveState]);
 }
 
-/** Daemon health from `GET /api/v0/health`, whether this tab holds a bearer token, and the save state. */
+/** Daemon health from `GET /api/v0/health`, the bearer token's state (`present`, `rejected` after a 401, `missing`),
+ * and the save state. */
 export function StatusBar() {
-  const { state, health, tokenPresent } = useDaemonStatus();
+  const { state, health, tokenPresent, tokenState } = useDaemonStatus();
   useStubEngineFallback(state === "up" && health?.stub_engine === true);
   const daemon =
     state === "checking"
@@ -140,8 +155,8 @@ export function StatusBar() {
       <span data-testid="status-daemon" data-state={state}>
         daemon: {daemon}
       </span>
-      <span data-testid="status-token" data-present={tokenPresent}>
-        token: {tokenPresent ? "present" : "missing"}
+      <span data-testid="status-token" data-present={tokenPresent} data-state={tokenState}>
+        token: {tokenState === "none" ? "missing" : tokenState}
       </span>
       <SaveChip />
     </div>
@@ -186,8 +201,9 @@ export const PALETTE_KINDS: readonly NodeKind[] = NODE_KINDS.filter((k) => !PALE
 /** The artist-path editor (Plate, Edit, Export, Review) of the selected node; nothing for any other kind. */
 function SelectedPathEditor() {
   const selected = useGraphStore((s) => s.nodes.find((n) => n.selected));
+  const epoch = useGraphStore((s) => s.graphEpoch); // a reloaded graph remounts the editor (T147)
   const Editor = selected ? pathEditorFor(selected.data.kind) : null;
-  return Editor && selected ? <Editor nodeId={selected.id} /> : null;
+  return Editor && selected ? <Editor key={`${selected.id}:${epoch}`} nodeId={selected.id} /> : null;
 }
 
 /** Add a node near the middle of the visible canvas, nudged so repeated adds do not stack exactly. */

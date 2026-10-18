@@ -968,3 +968,109 @@ def test_resolution_spellings_map_onto_the_manifests_own(manifests):
     assert seedance.validate_params({"resolution": 1080})["resolution"] == "1080P"
     with pytest.raises(ParamError):
         seedance.validate_params({"resolution": "4K"})
+
+
+# ---- Wave 12 (T138): the params agree with the route --------------------------------------------------------
+
+NEGATIVE = "morphing, warping, new objects"
+FOLDING = ("seedance-2.5-i2v", "seedance-2.5-r2v", "gen-4.5")  # manifests that declare no negative_prompt
+
+
+@pytest.mark.parametrize("engine", FOLDING)
+def test_validate_params_takes_a_negative_prompt_the_manifest_does_not_declare(manifests, engine):
+    ad, _ = make(manifests, engine)
+    assert "negative_prompt" not in {p.name for p in ad.manifest.params}
+    assert ad.validate_params({"negative_prompt": f"  {NEGATIVE} "})["negative_prompt"] == NEGATIVE
+    assert "negative_prompt" not in ad.validate_params({"negative_prompt": "  "})
+    assert "negative_prompt" not in ad.validate_params({"negative_prompt": None})
+    with pytest.raises(ParamError, match="expected a string"):
+        ad.validate_params({"negative_prompt": 3})
+    with pytest.raises(
+        ParamError, match="unknown parameter"
+    ):  # every other name stays the manifest's to check
+        ad.validate_params({"negative_prompt": NEGATIVE, "negativePrompt": NEGATIVE})
+
+
+def body_inputs(tmp_path: Path, engine: str) -> dict:
+    if engine == "seedance-2.5-r2v":
+        return {"reference_images": [frame(tmp_path, "hero.png", STILL_A)], "prompt": R2V_PROMPT}
+    name = "start_image" if engine == "veo-3.1" else "image"
+    return {name: frame(tmp_path, "start_a.png", STILL_A), "prompt": SEEDANCE_PROMPT}
+
+
+@pytest.mark.parametrize("engine", sorted(SLUGS))
+def test_the_body_never_carries_a_negative_prompt_key(manifests, tmp_path, engine):
+    ad, ft = make(manifests, engine)
+    parsed = ad.parse_inputs(body_inputs(tmp_path, engine))
+    endpoint, body = ad.build_body(parsed, ad.validate_params({"negative_prompt": NEGATIVE}), (1920, 1080))
+    assert "negative_prompt" not in body
+    if engine == "veo-3.1":  # the one model with the field sends it as the field
+        assert body["negativePrompt"] == NEGATIVE and "Avoid:" not in body["promptText"]
+    else:  # every other model folds it as the final line
+        assert "negativePrompt" not in body and body["promptText"].endswith(f"\nAvoid: {NEGATIVE}")
+    runway_schema.check_body(SLUGS[engine], endpoint, body)
+    assert ft.served == []  # small frames go inline: building the body sends nothing
+
+
+def test_check_expressible_raises_what_submit_raises_without_reading_a_file(manifests):
+    start = {"image": "a" * 64, "prompt": O3_PROMPT}  # hashes, not files: only presence is read
+    pair = {**start, "image_tail": "b" * 64}
+    o3, ft = make(manifests, "kling-o3-4k")
+    o3.check_expressible(o3.validate_params({"negative_prompt": NEGATIVE}), pair)
+    o3.check_expressible(o3.validate_params({}), {**pair, "elements": ["e"] * 5})
+    with pytest.raises(ParamError, match="seed is not expressible on the runway route; pin the atlas route"):
+        o3.check_expressible(o3.validate_params({"seed": -1}), start)
+    with pytest.raises(ParamError, match="cfg_scale 0.7"):
+        o3.check_expressible(o3.validate_params({"cfg_scale": 0.7}), start)
+    with pytest.raises(InputError, match="at most 5 elements"):
+        o3.check_expressible(o3.validate_params({}), {**pair, "elements": ["e"] * 6})
+    v3, _ = make(manifests, "kling-v3-pro")
+    with pytest.raises(InputError, match="elements"):
+        v3.check_expressible(v3.validate_params({}), {**start, "elements": ["e"]})
+    seedance, _ = make(manifests, "seedance-2.5-i2v")
+    seedance.check_expressible(seedance.validate_params({"negative_prompt": NEGATIVE}), start)
+    with pytest.raises(ParamError, match="camera_fixed true"):
+        seedance.check_expressible(seedance.validate_params({"camera_fixed": True}), start)
+    gen, _ = make(manifests, "gen-4.5")
+    with pytest.raises(InputError, match="start frame only"):
+        gen.check_expressible(gen.validate_params({}), pair)
+    cap = runway_schema.spec_for("gen4.5").prompt_max
+    with pytest.raises(InputError, match="the limit is"):  # the folded line counts against the prompt cap
+        gen.check_expressible(gen.validate_params({"negative_prompt": "x" * cap}), start)
+    assert ft.served == []
+
+
+def succeeded_transport(looks: list[list[str]]) -> httpx.MockTransport:
+    """GET /v1/tasks/{id}: SUCCEEDED, with looks[n] as the output list of look n (the last one repeated)."""
+    seen: list[int] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        assert (request.method, request.url.path) == ("GET", f"/v1/tasks/{TASK}")
+        out = looks[min(len(seen), len(looks) - 1)]
+        seen.append(1)
+        return httpx.Response(200, json={"id": TASK, "status": "SUCCEEDED", "output": out})
+
+    return httpx.MockTransport(answer)
+
+
+@pytest.mark.parametrize(
+    ("looks", "states"),
+    [
+        ([[], [], [], [OUTPUT_URL]], ["running", "running", "running", "done"]),
+        ([[], [], [], []], ["running", "running", "running", "failed"]),
+    ],
+)
+def test_succeeded_without_an_output_is_transient_for_three_looks(manifests, looks, states):
+    clock = Clock()
+    ad = RunwayVideo(with_runway(manifests, "kling-v3-pro"), transport=succeeded_transport(looks), now=clock)
+    seen = []
+    for _ in looks:
+        clock.sleep(6.0)
+        seen.append(ad.poll(TASK))
+    assert [s.state for s in seen] == states
+    assert all(
+        s.message == "transient: runway SUCCEEDED without an output" for s in seen if s.state != "done"
+    )
+    if states[-1] == "done":
+        assert seen[-1].outputs == [OUTPUT_URL] and seen[-1].output_fps == 24.0
+    assert RunwayVideo.EMPTY_SUCCESS_LOOKS == 3

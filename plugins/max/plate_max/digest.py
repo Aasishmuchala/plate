@@ -56,6 +56,8 @@ _METERS_PER_TYPE = {
 
 ORTHO_TOL = 1e-4
 DEFAULT_FILM_MM = 36.0
+# rotation_error's answer for a pose holding NaN or infinity (policy.BAD_POSE, not SCALED_CAMERA).
+NON_FINITE_POSE = "camera pose has a non-finite value"
 
 # V-Ray Physical Camera property candidates, all TODO-verify on the box (ONBOX.md step 1). MAXScript
 # is case-insensitive, so "iso" and "ISO" are one property there; both are listed because the fake
@@ -327,15 +329,30 @@ def world_from_camera_from_max_rows(rows: Any) -> list[list[float]]:
     return m
 
 
+def non_finite_entries(m: Any) -> list[tuple[int, int]]:
+    """(row, column) of every entry of the matrix (all 16 of a 4x4) that is NaN, infinite or not a
+    number at all."""
+    bad = []
+    for i, row in enumerate(m):
+        for j, value in enumerate(row):
+            number = _as_float(value)
+            if number is None or not math.isfinite(number):
+                bad.append((i, j))
+    return bad
+
+
 def rotation_error(m: Any) -> str | None:
-    """None when the upper 3x3 is a proper rotation (orthonormal, det +1) within 1e-4."""
+    """None when the upper 3x3 is a proper rotation (orthonormal, det +1) within 1e-4 and every entry
+    of the matrix is finite (NON_FINITE_POSE otherwise: max() and < are blind to NaN)."""
+    if non_finite_entries(m):
+        return NON_FINITE_POSE
     r = [[float(m[i][j]) for j in range(3)] for i in range(3)]
     worst = 0.0
     for i in range(3):
         for j in range(3):
             dot = sum(r[k][i] * r[k][j] for k in range(3))
             worst = max(worst, abs(dot - (1.0 if i == j else 0.0)))
-    if worst > ORTHO_TOL:
+    if not (worst <= ORTHO_TOL):
         return f"rotation is not orthonormal (max |R^T R - I| = {worst:.2e}); scaled or sheared camera node?"
     det = (
         r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
@@ -435,7 +452,7 @@ def camera_digest(camera_name: str, frame: int | None = None, recipe: Any = None
 
     focal, film, zoom = lens["focal_mm"], lens["film_gate_mm"], lens["zoom_factor"]
     fov_deg = intrinsics_px = None
-    if resolution and focal and film and zoom and min(focal, film, zoom) > 0:
+    if resolution and all(_positive(v) for v in (focal, film, zoom)):
         derived = intrinsics(focal, film, zoom, resolution[0], resolution[1], pixel_aspect)
         fov_deg, intrinsics_px = derived["fov_deg"], derived["intrinsics_px"]
 
@@ -468,14 +485,22 @@ def camera_digest(camera_name: str, frame: int | None = None, recipe: Any = None
     return out
 
 
+def _positive(value: Any) -> bool:
+    """value is a finite number above zero (None, NaN, infinity, 0 and negatives are not)."""
+    return isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+
+
 def _read_lens(rd: _Reader, node: Any, read_from: dict[str, Any]) -> dict[str, Any]:
-    """The lens, exposure and white balance fields of camera_digest (called inside at_time)."""
+    """The lens, exposure and white balance fields of camera_digest (called inside at_time). A value
+    that reads but is not a positive finite number (a film gate of -36, a focal length of NaN) is kept
+    as read, so policy.lens_value_problems refuses it as BAD_LENS by name; only an unreadable film
+    gate is assumed (36 mm, with a warning)."""
     warnings = rd.warnings
 
     film_name, film_value = _probe(node, FILM_NAMES)
     film = _as_float(film_value)
     read_from["film_gate_mm"] = film_name
-    if film is None or film <= 0:
+    if film is None:
         film = DEFAULT_FILM_MM
         warnings.append(f"film_width: assumed {DEFAULT_FILM_MM} mm ({'/'.join(FILM_NAMES)} unreadable)")
     zoom_name, zoom_value = _probe(node, ZOOM_NAMES)
@@ -503,7 +528,11 @@ def _read_lens(rd: _Reader, node: Any, read_from: dict[str, Any]) -> dict[str, A
             warnings.append("focal_length: derived from fov and the film gate")
         else:
             warnings.append(f"{'/'.join(FOCAL_NAMES + FOV_NAMES)}: no readable focal length or fov")
-    elif fov is not None and abs(_hfov_deg(focal, film, zoom) - fov) > 0.05:
+    elif (
+        fov is not None
+        and all(_positive(v) for v in (focal, film, zoom))
+        and (abs(_hfov_deg(focal, film, zoom) - fov) > 0.05)
+    ):
         warnings.append(
             f"fov: {fov:.4f} deg disagrees with focal/film/zoom ({_hfov_deg(focal, film, zoom):.4f})"
         )
@@ -560,7 +589,10 @@ def _read_lens(rd: _Reader, node: Any, read_from: dict[str, Any]) -> dict[str, A
 def _read_exposure(rd: _Reader, node: Any, read_from: dict[str, Any]) -> dict[str, Any]:
     """{iso, shutter_s, enabled, ev}. shutter_speed is V-Ray's 1/seconds; a movie camera (type 1)
     exposes by shutter angle at the scene frame rate. enabled is None when the exposure switch is
-    unreadable (then the camera block treats iso + shutter as physical exposure, as before)."""
+    unreadable (then the camera block treats iso + shutter as physical exposure, as before). A
+    shutter_speed that is not a positive finite number gives a shutter_s that is not one either
+    (0 -> inf, negative -> negative, NaN -> NaN), so lint refuses it as BAD_LENS instead of the camera
+    being sent with no exposure."""
     iso = _candidate_number(rd, node, ISO_NAMES, read_from, "exposure.iso")
     shutter_s = None
     name, value = _probe(node, SHUTTER_SPEED_NAMES)
@@ -568,8 +600,8 @@ def _read_exposure(rd: _Reader, node: Any, read_from: dict[str, Any]) -> dict[st
         speed = _as_float(value)
         if speed is None:
             rd.warnings.append(f"{name}: not a number ({value!r})")
-        elif speed > 0:
-            shutter_s = 1.0 / speed
+        else:
+            shutter_s = 1.0 / speed if speed != 0 else math.inf
     else:
         name, value = _probe(node, SHUTTER_SECONDS_NAMES)
         shutter_s = _as_float(value)

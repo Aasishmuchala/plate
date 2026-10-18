@@ -12,7 +12,7 @@
 | the page says `UI not built: cd ui && npm run build` | the daemon is fine, the UI bundle is not built | F |
 | Max's dock says `Token rejected` (401) | the plugin and daemon disagree on the token | G |
 | 403 on every request from a browser | Host or Origin not on the allowlist | H |
-| a project says it is locked by another host | another machine has the project open | I |
+| a save says `project_locked` or `graph_busy`, or a tool says a project is locked by another PLATE process | a write was in flight in another process or save: the project lock is taken per write, not held while a project is open | I |
 
 ## A. Another daemon is running
 
@@ -50,7 +50,14 @@ The daemon always accepts `127.0.0.1:<port>` and `localhost:<port>` (the port it
 
 ## I. Project locked
 
-A project has one writer at a time (`project.lock`). The error names the holding host, process id and time. Close the project on that machine, or if that machine has crashed, restart the daemon there once: it recovers cleanly. Do not delete `project.lock` from a share while the holder might still be running.
+The project lock (`project.lock`) is taken for each write (a graph save, a ledger line, a packet registered, a reindex or a purge) and let go as soon as that write is done. It is **not** held while a project is open, so it does not mean "another machine has the project open", and it does not stop a second daemon from opening the same folder.
+
+What the messages mean now:
+
+- `409 project_locked`, `409 graph_busy` or `429 too_many_saves` from the canvas: another save of this project is in progress (in this daemon, or in a tool or another daemon). Wait a second. The canvas retries by itself and shows `save failed: ...` until it lands.
+- `locked by another PLATE process (host pid N since T)` from `plate-tools reindex` or `purge`, or from the daemon: that process was writing at that instant. Wait a few seconds and run it again. The holder's host, process id and time are in the message. The OS frees the lock when the holder dies, so a crashed process never leaves it stuck.
+
+**Two daemons on one project folder are unsupported** until a project lease (a host, pid and heartbeat) lands: each would write the folder, and the one that restarts would adopt the other's in-flight runs. This matters when a project sits on the NAS. Run one daemon per project folder; if you moved a project to another machine, stop the old daemon first. Do not delete `project.lock` from a share while a holder might still be running.
 
 ## After a restart
 

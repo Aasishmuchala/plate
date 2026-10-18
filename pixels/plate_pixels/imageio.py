@@ -4,10 +4,18 @@ Every write goes to ``<name>.<ext>.part`` and is moved into place with ``os.repl
 because Windows holds a lock for a moment after a viewer, an indexer or an AV scan touches the file). PNG is
 read and written through cv2 on bytes (``cv2.imread``/``imwrite`` fail on non-ASCII Windows paths); TIFF goes
 through tifffile. EXR lives in ``plate_pixels.exr``.
+
+A client file is checked before it is decoded. ``declared_size(path)`` reads the width and height from the
+header alone (``imghdr``; a TIFF whose first IFD sits past the first MiB goes through tifffile's page header),
+and ``read(path, max_pixels=N)`` refuses a file whose header declares more than ``N`` pixels with
+``TooManyPixels`` before a pixel is allocated: a 52 KB PNG can declare 4000 x 4000 and a 775 KB one 16000 x
+16000. ``read`` applies the EXIF Orientation tag of a JPEG (cv2's ``IMREAD_UNCHANGED`` ignores it, so a phone
+photo would come out sideways); PNG, TIFF and the rest are read as stored.
 """
 
 from __future__ import annotations
 
+import io
 import os
 import time
 from collections.abc import Iterator
@@ -20,12 +28,19 @@ import numpy as np
 import tifffile
 
 from . import icc as _icc
+from . import imghdr
 from .icc import SRGB_ICC
 
 __all__ = [
+    "HEADER_PROBE_BYTES",
     "Image",
     "SRGB_ICC",
+    "TooManyPixels",
+    "apply_orientation",
     "atomic_target",
+    "check_pixel_budget",
+    "declared_size",
+    "exif_orientation",
     "part_path",
     "read",
     "replace_with_retry",
@@ -37,6 +52,10 @@ __all__ = [
 TIFF_ICC_TAG = 34675
 REPLACE_RETRIES = 5
 REPLACE_DELAY_S = 0.05
+# a PNG, JPEG, WebP or BMP header is in the first MiB (a JPEG's EXIF and ICC segments come first)
+HEADER_PROBE_BYTES = 1 << 20
+EXIF_ORIENTATION_TAG = 0x0112
+TOO_MANY_PIXELS = "too_many_pixels"
 
 
 @dataclass
@@ -49,6 +68,84 @@ class Image:
     bit_depth: int
     encoding: str  # 'srgb' | 'linear'
     icc: bytes | None
+
+
+class TooManyPixels(ValueError):
+    """A file whose header declares more pixels than the caller allows; nothing was decoded. The message starts
+    with ``too_many_pixels:`` so the pixels worker's 400 body still names the cause to the daemon."""
+
+    def __init__(self, width: int, height: int, limit: int):
+        super().__init__(
+            f"{TOO_MANY_PIXELS}: the file declares {width} x {height} = {width * height} px; the cap is {limit}"
+        )
+        self.width, self.height, self.limit = width, height, limit
+
+
+# --------------------------------------------------------------------------- header-first checks
+
+
+def declared_size(path: str | Path) -> tuple[int, int] | None:
+    """``(width, height)`` the file's header declares, without decoding a pixel; None when it cannot be read
+    from the header (an unknown format, a truncated header)."""
+    p = Path(path)
+    with p.open("rb") as fh:
+        head = fh.read(HEADER_PROBE_BYTES)
+    size = imghdr.header_size(head)
+    if size is None and imghdr.magic(head) == "tiff":  # the first IFD can sit at the end of the file
+        try:
+            with tifffile.TiffFile(p) as tf:
+                page = tf.pages[0]
+                size = (int(page.imagewidth), int(page.imagelength))
+        except Exception:  # a damaged TIFF is the decoder's to name
+            size = None
+    return size
+
+
+def check_pixel_budget(path: str | Path, max_pixels: int) -> tuple[int, int] | None:
+    """Raise ``TooManyPixels`` when the header of ``path`` declares more than ``max_pixels``; else the size."""
+    size = declared_size(path)
+    if size is not None and size[0] * size[1] > max_pixels:
+        raise TooManyPixels(size[0], size[1], max_pixels)
+    return size
+
+
+# --------------------------------------------------------------------------- EXIF orientation
+
+
+def exif_orientation(raw: bytes) -> int:
+    """The EXIF Orientation (1 to 8) of a JPEG's bytes; 1 for any other format, no tag or an unreadable one."""
+    if raw[:3] != b"\xff\xd8\xff":
+        return 1
+    try:
+        from PIL import Image as PILImage  # lazy: only a JPEG pays for it; open() reads the header only
+
+        with PILImage.open(io.BytesIO(raw)) as im:
+            value = int(im.getexif().get(EXIF_ORIENTATION_TAG, 1))
+    except Exception:  # a bomb warning, a corrupt EXIF block: the decoder will name a real problem
+        return 1
+    return value if 1 <= value <= 8 else 1
+
+
+def apply_orientation(a: np.ndarray, orientation: int) -> np.ndarray:
+    """``a`` (H, W[, C]) turned the way EXIF ``orientation`` says to show it (PIL's ``exif_transpose``:
+    2 mirror, 3 rotate 180, 4 flip, 5 transpose, 6 rotate 90 clockwise, 7 transverse, 8 rotate 90 anticlockwise)."""
+    if orientation == 2:
+        out = a[:, ::-1]
+    elif orientation == 3:
+        out = a[::-1, ::-1]
+    elif orientation == 4:
+        out = a[::-1, :]
+    elif orientation == 5:
+        out = np.swapaxes(a, 0, 1)
+    elif orientation == 6:
+        out = np.swapaxes(a, 0, 1)[:, ::-1]
+    elif orientation == 7:
+        out = np.swapaxes(a, 0, 1)[::-1, ::-1]
+    elif orientation == 8:
+        out = np.swapaxes(a, 0, 1)[::-1, :]
+    else:
+        return a
+    return np.ascontiguousarray(out)
 
 
 # --------------------------------------------------------------------------- atomic writes
@@ -227,14 +324,23 @@ def _read_tiff(path: Path) -> Image:
     return Image(rgb=rgb, alpha=alpha, bit_depth=depth, encoding=enc, icc=icc)
 
 
-def read(path: str | Path) -> Image:
-    """Read a PNG, TIFF or other cv2-decodable image (JPEG client plates) into an :class:`Image`."""
+def read(path: str | Path, *, max_pixels: int | None = None) -> Image:
+    """Read a PNG, TIFF or other cv2-decodable image (JPEG client plates) into an :class:`Image`.
+
+    ``max_pixels`` refuses (``TooManyPixels``) a file whose header declares more before anything is decoded.
+    A JPEG's EXIF Orientation is applied, so the image comes out the way a viewer shows it."""
     p = Path(path)
+    if max_pixels is not None:
+        check_pixel_budget(p, max_pixels)
     if p.suffix.lower() in (".tif", ".tiff"):
         return _read_tiff(p)
     raw = p.read_bytes()
     icc = _icc.read_png_icc(raw) if raw[:8] == _icc.PNG_SIGNATURE else None
-    rgb_raw, alpha_raw = _split_channels(_decode_cv(raw, p))
+    decoded = _decode_cv(raw, p)
+    orientation = exif_orientation(raw)
+    if orientation != 1:
+        decoded = apply_orientation(decoded, orientation)
+    rgb_raw, alpha_raw = _split_channels(decoded)
     rgb, depth, enc = _normalise(rgb_raw)
     alpha = _normalise(alpha_raw)[0] if alpha_raw is not None else None
     return Image(rgb=np.ascontiguousarray(rgb), alpha=alpha, bit_depth=depth, encoding=enc, icc=icc)

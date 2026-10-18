@@ -100,3 +100,69 @@ def test_lint_blocks_overlap_between_locked_and_editable(scene):
 def test_each_never_editable_tag_locks_an_editable_layer(tag):
     cls, source = policy.classify_object("SKY", [tag.upper()])
     assert cls == tag and source in ("rule", "manual")
+
+
+# --------------------------------------------------------------------------- decision 81 checks
+
+
+def test_duplicate_node_names_list_every_layer(scene):
+    scene.objects.append(make_node("VEG_tree_01", "ARCH_walls", "MAT_brick"))
+    scene.objects.append(make_node("VEG_tree_01", None, "MAT_leaf"))
+    [problem] = policy.duplicate_node_problems(digest.scene_nodes())
+    assert problem["code"] == policy.DUPLICATE_NODE_NAME and problem["node"] == "VEG_tree_01"
+    assert problem["detail"].startswith(policy.duplicate_node_text("VEG_tree_01") + ": 3 geometry nodes")
+    assert "'VEG_tree_01', 'ARCH_walls', no layer" in problem["detail"]
+
+
+def test_unique_names_are_no_problem(scene):
+    assert policy.duplicate_node_problems(digest.scene_nodes()) == []
+    assert policy.duplicate_camera_problems(["CAM_a", "CAM_b"]) == []
+    assert [p["node"] for p in policy.duplicate_camera_problems(["CAM_a", "CAM_b", "CAM_a"])] == ["CAM_a"]
+
+
+@pytest.mark.parametrize(
+    ("name", "bad"),
+    [
+        ("CAM_front", False),
+        ("Cam 1", False),
+        ("CAM_\U0001f3e0", False),
+        ("CAM:1", False),  # BAD_NAME_CHARS' business, not the slug's
+        ("\u5ba2\u6237A", True),
+        ("CAM_caf\u00e9", True),
+        ("   ", True),
+        ("", True),
+        ("\U0001f3a5", True),
+    ],
+)
+def test_shot_slug_problems(name, bad):
+    problems = policy.shot_slug_problems(name)
+    assert bool(problems) is bad
+    assert all(p["code"] == policy.BAD_SHOT_SLUG and p["node"] == name for p in problems)
+
+
+def test_lens_value_problems_name_the_property_and_skip_unread_values():
+    cam = {
+        "name": "C",
+        "focal_mm": 24.0,
+        "film_gate_mm": None,
+        "zoom_factor": 1.0,
+        "f_number": float("inf"),
+        "exposure": {"iso": -100.0, "shutter_s": None},
+        "read_from": {"f_number": "fnumber", "exposure.iso": "ISO"},
+    }
+    problems = policy.lens_value_problems(cam)
+    assert [p["code"] for p in problems] == [policy.BAD_LENS, policy.BAD_LENS]
+    assert "f-number fnumber is inf, not a finite number" in problems[0]["detail"]
+    assert "ISO ISO is -100, not positive" in problems[1]["detail"]
+    assert policy.lens_value_problems({"name": "C"}) == []
+
+
+def test_a_non_finite_pose_is_bad_pose_and_only_that():
+    m = [[1.0, 0.0, 0.0, float("nan")], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0, 0, 0, 1]]
+    problems, _ = policy.camera_checks({"name": "C", "world_from_camera": m})
+    assert [p["code"] for p in problems] == [policy.BAD_POSE]
+    assert "position (row4) x" in problems[0]["detail"]
+    scaled = [[2.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0], [0.0, 0.0, 2.0, 0.0], [0, 0, 0, 1]]
+    assert [p["code"] for p in policy.camera_checks({"name": "C", "world_from_camera": scaled})[0]] == [
+        policy.SCALED_CAMERA
+    ]

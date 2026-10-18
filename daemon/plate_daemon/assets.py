@@ -20,6 +20,12 @@ Only images decode; asking for a pixel format of anything else (JSON, an EXR, a 
 
 `mask_png(data)` is the other direction: an uploaded mask (`POST /assets?kind=mask`) becomes an 8-bit
 single-channel PNG whatever it arrived as.
+
+Nothing decodes before its header has been read (`check_header`, router plan T136): a 410 KiB PNG can declare
+12000 x 12000 x 3 and ask for 432 MB. `plate_pixels.imghdr.header_size` names the declared size from the first
+bytes; no header it knows is `BadImage`, a size over `UPLOAD_MAX_PIXELS` is `TooManyPixels`, and `cv2.imdecode`
+runs only after both. Every upload and every stored-asset decode goes through `_imdecode`, which is where the
+check lives.
 """
 
 from __future__ import annotations
@@ -33,6 +39,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from plate_pixels import imghdr
+
 from .cas import CAS
 from .config import check_project_id
 
@@ -40,11 +48,16 @@ __all__ = [
     "FORMATS",
     "MASK_MAX_BYTES",
     "MEDIA_TYPES",
+    "NOT_AN_IMAGE_HEADER",
     "THUMB_PX",
+    "UPLOAD_MAX_PIXELS",
     "Asset",
     "AssetFormatError",
     "AssetNotFound",
+    "BadImage",
     "BadMask",
+    "TooManyPixels",
+    "check_header",
     "decode_rgba",
     "locate",
     "mask_png",
@@ -55,6 +68,8 @@ __all__ = [
 
 THUMB_PX = 320
 MASK_MAX_BYTES = 32 * 1024 * 1024
+UPLOAD_MAX_PIXELS = 100_000_000  # declared width x height an upload or stored asset may ask a decoder for
+NOT_AN_IMAGE_HEADER = "not a PNG/JPEG/WebP/BMP/TIFF header"
 FORMATS = ("png", "rgba16f", "thumb")
 KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_EXTS = frozenset({"png", "tif", "tiff", "jpg", "jpeg"})
@@ -81,6 +96,18 @@ class AssetFormatError(ValueError):
 
 class BadMask(ValueError):
     """An uploaded mask that is not an 8-bit grey, RGB or RGBA image."""
+
+
+class BadImage(ValueError):
+    """Bytes whose first bytes are no image header PLATE reads, or a PNG or JPEG reference that does not decode."""
+
+
+class TooManyPixels(ValueError):
+    """An image whose header declares more than `UPLOAD_MAX_PIXELS`; nothing was decoded."""
+
+    def __init__(self, declared: tuple[int, int], limit: int):
+        self.declared, self.limit = declared, limit
+        super().__init__(f"the image declares {declared[0]} x {declared[1]} pixels; the limit is {limit}")
 
 
 @dataclass(frozen=True)
@@ -145,10 +172,23 @@ def locate(
     raise AssetNotFound(key)
 
 
+def check_header(data: bytes) -> tuple[int, int]:
+    """The `(width, height)` the header of `data` declares, read without decoding a pixel.
+
+    `BadImage` when the first bytes are no header `plate_pixels.imghdr` reads (an empty body, a GIF, a clip, a
+    truncated header); `TooManyPixels` when `width * height` passes `UPLOAD_MAX_PIXELS`."""
+    size = imghdr.header_size(data)
+    if size is None:
+        raise BadImage(NOT_AN_IMAGE_HEADER)
+    if size[0] * size[1] > UPLOAD_MAX_PIXELS:
+        raise TooManyPixels(size, UPLOAD_MAX_PIXELS)
+    return size
+
+
 def _imdecode(data: bytes) -> np.ndarray | None:
-    """cv2 `IMREAD_UNCHANGED` decode; None for bytes that are not an image (cv2 raises on an empty buffer)."""
-    if not data:
-        return None
+    """cv2 `IMREAD_UNCHANGED` decode, after `check_header` (so `BadImage` / `TooManyPixels` before any decode);
+    None for a header that is fine on bytes cv2 cannot read."""
+    check_header(data)
     try:
         return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
     except cv2.error:
@@ -157,7 +197,10 @@ def _imdecode(data: bytes) -> np.ndarray | None:
 
 def _decode(data: bytes) -> np.ndarray:
     """The image as stored (cv2 `IMREAD_UNCHANGED`: BGR(A) order, uint8 or uint16)."""
-    img = _imdecode(data)
+    try:
+        img = _imdecode(data)
+    except BadImage as e:
+        raise AssetFormatError("the asset is not a decodable image") from e
     if img is None:
         raise AssetFormatError("the asset is not a decodable image")
     if img.dtype not in (np.uint8, np.uint16):
@@ -213,8 +256,10 @@ def _png(asset: Asset, data: bytes) -> bytes:
 def mask_png(data: bytes) -> tuple[bytes, int, int]:
     """(8-bit single-channel PNG bytes, width, height) of an uploaded mask.
 
-    Accepts 8-bit grey, or 8-bit RGB / RGBA (the red channel is the mask). Anything else raises `BadMask`."""
-    img = _imdecode(data)
+    Accepts 8-bit grey, or 8-bit RGB / RGBA (the red channel is the mask). The header is read first
+    (`BadImage` for bytes with no image header, `TooManyPixels` over `UPLOAD_MAX_PIXELS`); a decodable image
+    that is not a mask raises `BadMask`."""
+    img = _imdecode(data)  # reads the header before decoding
     if img is None:
         raise BadMask("the body is not a decodable image")
     if img.dtype != np.uint8:

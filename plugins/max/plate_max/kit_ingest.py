@@ -84,6 +84,31 @@ EXR_COMPRESSION = {
 }
 LOSSLESS_EXR = ("none", "rle", "zip", "zips", "piz")
 MAX_EXR_ATTRIBUTE_BYTES = 64 << 20
+# The header comes from the client's machine: bound what reading it can allocate or loop over. A V-Ray
+# multilayer file has one part and a few hundred attributes; a Cryptomatte manifest is the only large string.
+MAX_EXR_PARTS = 64
+MAX_EXR_STRING_BYTES = 1 << 20  # one string attribute
+MAX_EXR_STRING_TOTAL = 16 << 20  # every string attribute of the file
+MAX_EXR_ATTRIBUTES = 100_000  # attributes of all parts together
+
+# TIFF Compression (tag 259) values of the JPEG family. A display master must be lossless, and the daemon
+# refuses these (spec/PACKET.md 4.1); plate_max has no pixel decoder, so the tag is what it can check.
+TIFF_COMPRESSION_TAG = 259
+LOSSY_TIFF_COMPRESSION = {
+    6: "old-style JPEG",
+    7: "JPEG",
+    99: "JPEG",
+    22610: "JPEG XR",
+    33003: "JPEG 2000",
+    33004: "JPEG 2000",
+    33005: "JPEG 2000",
+    33007: "JPEG",
+    34712: "JPEG 2000",
+    34892: "lossy JPEG",
+    34934: "JPEG XR",
+    50002: "JPEG XL",
+    52546: "JPEG XL",
+}
 
 # Metres per Max SystemType unit; the packet schema takes the first five only.
 METERS_PER_TYPE = {
@@ -122,6 +147,7 @@ __all__ = [
     "ExrHeader",
     "convert_kit",
     "inspect_plate",
+    "refuse_lossy_tiff",
     "kit_files",
     "kit_stem",
     "kit_to_packet",
@@ -241,14 +267,34 @@ def _read_channels(value: bytes) -> dict[str, str]:
     return out
 
 
-def _read_part_header(fh: Any) -> tuple[dict[str, tuple[str, bytes]], bool]:
+_KEPT_ATTRIBUTES = ("channels", "dataWindow", "compression", "name")  # the rest are read past, not held
+
+
+@dataclass
+class _HeaderBudget:
+    """What reading one file's header has used so far against the MAX_EXR_* caps."""
+
+    attributes: int = 0
+    string_bytes: int = 0
+
+
+def _read_part_header(
+    fh: Any, budget: _HeaderBudget | None = None
+) -> tuple[dict[str, tuple[str, bytes]], bool]:
     """Attributes of one header as {name: (type, raw value)}; the flag is False when the header was empty,
-    which in a multipart file is the marker that ends the header list."""
+    which in a multipart file is the marker that ends the header list. Only the channel list, data window,
+    compression, part name and the string attributes are kept. KitError past the attribute and string caps."""
+    budget = budget if budget is not None else _HeaderBudget()
     attrs: dict[str, tuple[str, bytes]] = {}
+    seen = 0
     while True:
         name = _cstr(fh)
         if name == "":
-            return attrs, bool(attrs)
+            return attrs, seen > 0
+        seen += 1
+        budget.attributes += 1
+        if budget.attributes > MAX_EXR_ATTRIBUTES:
+            raise KitError(f"the EXR header has more than {MAX_EXR_ATTRIBUTES} attributes: not a V-Ray file?")
         kind = _cstr(fh)
         raw_size = fh.read(4)
         if len(raw_size) < 4:
@@ -256,10 +302,19 @@ def _read_part_header(fh: Any) -> tuple[dict[str, tuple[str, bytes]], bool]:
         size = struct.unpack("<i", raw_size)[0]
         if not 0 <= size <= MAX_EXR_ATTRIBUTE_BYTES:
             raise KitError(f"the EXR attribute {name!r} has an impossible size: not an OpenEXR file?")
+        if kind == "string":
+            if size > MAX_EXR_STRING_BYTES:
+                raise KitError(
+                    f"the EXR string attribute {name!r} is {size} bytes, over the {MAX_EXR_STRING_BYTES} byte limit"
+                )
+            budget.string_bytes += size
+            if budget.string_bytes > MAX_EXR_STRING_TOTAL:
+                raise KitError(f"the EXR string attributes add up to over {MAX_EXR_STRING_TOTAL} bytes")
         value = fh.read(size)
         if len(value) != size:
             raise KitError("the EXR header is truncated")
-        attrs[name] = (kind, value)
+        if kind == "string" or name in _KEPT_ATTRIBUTES:
+            attrs[name] = (kind, value)
 
 
 def read_exr_header(path: Path | str) -> ExrHeader:
@@ -274,35 +329,43 @@ def read_exr_header(path: Path | str) -> ExrHeader:
             raise KitError("deep OpenEXR files are not supported")
         multipart = bool(flags & 0x1000)
         raw_parts: list[dict[str, tuple[str, bytes]]] = []
+        budget = _HeaderBudget()
         while True:
-            attrs, nonempty = _read_part_header(fh)
+            attrs, nonempty = _read_part_header(fh, budget)
             if not nonempty:
                 break
             raw_parts.append(attrs)
+            if len(raw_parts) > MAX_EXR_PARTS:  # checked as each part arrives, so a long list is never walked
+                raise KitError(f"the EXR has more than {MAX_EXR_PARTS} parts: not a V-Ray file?")
             if not multipart:
                 break
     if not raw_parts:
         raise KitError("the EXR has no header")
     parts: list[ExrPart] = []
     strings: dict[str, str] = {}
-    for attrs in raw_parts:
-        if "channels" not in attrs or "dataWindow" not in attrs:
-            raise KitError("the EXR header has no channel list or data window")
-        x0, y0, x1, y1 = struct.unpack("<4i", attrs["dataWindow"][1])
-        comp = attrs.get("compression", ("compression", b"\xff"))[1][0]
-        part_name = attrs["name"][1].decode("utf-8", "replace") if "name" in attrs else None
-        parts.append(
-            ExrPart(
-                name=part_name,
-                compression=EXR_COMPRESSION.get(comp, "unknown"),
-                width=x1 - x0 + 1,
-                height=y1 - y0 + 1,
-                channels=_read_channels(attrs["channels"][1]),
+    try:
+        for attrs in raw_parts:
+            if "channels" not in attrs or "dataWindow" not in attrs:
+                raise KitError("the EXR header has no channel list or data window")
+            x0, y0, x1, y1 = struct.unpack("<4i", attrs["dataWindow"][1])
+            comp = attrs.get("compression", ("compression", b"\xff"))[1][0]
+            part_name = attrs["name"][1].decode("utf-8", "replace") if "name" in attrs else None
+            parts.append(
+                ExrPart(
+                    name=part_name,
+                    compression=EXR_COMPRESSION.get(comp, "unknown"),
+                    width=x1 - x0 + 1,
+                    height=y1 - y0 + 1,
+                    channels=_read_channels(attrs["channels"][1]),
+                )
             )
-        )
-        for key, (kind, value) in attrs.items():
-            if kind == "string":
-                strings[key] = value.decode("utf-8", "replace")
+            for key, (kind, value) in attrs.items():
+                if kind == "string":
+                    strings[key] = value.decode("utf-8", "replace")
+    except KitError:
+        raise
+    except (struct.error, IndexError, ValueError) as exc:  # an attribute whose bytes are not its type's
+        raise KitError(f"the EXR header is malformed: {exc}") from exc
     return ExrHeader(parts, strings)
 
 
@@ -432,6 +495,7 @@ class PlateInfo:
     channels: str  # "RGB" | "RGBA" | "L" | "LA" | "P" | "CMYK"
     icc: bool = False
     srgb: bool = False
+    compression: int | None = None  # TIFF tag 259 of the first page; None for PNG/JPEG or an absent tag
 
     @property
     def is_tiff16_rgb(self) -> bool:
@@ -495,7 +559,7 @@ def _inspect_tiff(fh: Any) -> PlateInfo:
     for i in range(n):
         tag, typ, count, field_bytes = struct.unpack(f"{bo}HHI4s", raw[i * 12 : (i + 1) * 12])
         size = _TIFF_TYPE_SIZE.get(typ)
-        if size is None or tag not in (256, 257, 258, 262, 277, 338, 339, 34675):
+        if size is None or tag not in (256, 257, 258, TIFF_COMPRESSION_TAG, 262, 277, 338, 339, 34675):
             continue
         if tag == 34675:
             tags[tag] = [1]
@@ -520,7 +584,10 @@ def _inspect_tiff(fh: Any) -> PlateInfo:
         channels = {(2, 3): "RGB", (2, 4): "RGBA", (1, 1): "L", (3, 1): "P", (5, 4): "CMYK"}.get(
             (photometric, samples), "?"
         )
-    return PlateInfo("tiff", tags[256][0], tags[257][0], depth, channels, icc=34675 in tags)
+    compression = (tags.get(TIFF_COMPRESSION_TAG) or [None])[0]
+    return PlateInfo(
+        "tiff", tags[256][0], tags[257][0], depth, channels, icc=34675 in tags, compression=compression
+    )
 
 
 def _inspect_jpeg(fh: Any) -> PlateInfo:
@@ -548,6 +615,17 @@ def _inspect_jpeg(fh: Any) -> PlateInfo:
             return PlateInfo("jpeg", width, height, precision, {1: "L", 3: "RGB", 4: "CMYK"}.get(comps, "?"))
         fh.seek(length - 2, 1)
     raise KitError("the JPEG plate has no frame header")
+
+
+def refuse_lossy_tiff(info: PlateInfo, what: str) -> None:
+    """KitError naming the compression when a TIFF display master is JPEG-family. plate_max has no pixel
+    decoder, so this is the part of the daemon's ingest decode check (spec/PACKET.md 4.1: JPEG-compressed TIFF
+    is refused) that the tag can answer; the daemon decodes the first page for real when it ingests."""
+    if info.format == "tiff" and info.compression in LOSSY_TIFF_COMPRESSION:
+        raise KitError(
+            f"{what} is a {LOSSY_TIFF_COMPRESSION[info.compression]}-compressed TIFF (compression {info.compression}): "
+            "a display master must be uncompressed or use Deflate, LZW or PackBits; JPEG-compressed TIFF is refused"
+        )
 
 
 def inspect_plate(path: Path | str) -> PlateInfo:
@@ -937,6 +1015,8 @@ def convert_kit(
             "size (a plate is never resampled)"
         )
     direct = plate.is_tiff16_rgb
+    if direct:  # copied as the master as it is, so it must be one the daemon can ingest
+        refuse_lossy_tiff(plate, f"the plate {plate_src.name}")
     if not direct and plate_to_tiff16 is None:
         raise KitError(
             f"the plate is a {plate.bit_depth}-bit {plate.format.upper()} ({plate.channels}): pass plate_to_tiff16 to make the 16-bit TIFF master"
@@ -969,6 +1049,7 @@ def convert_kit(
             master = inspect_plate(tif_dst)
             if not master.is_tiff16_rgb or (master.width, master.height) != (width, height):
                 raise KitError("plate_to_tiff16 must write a 16-bit RGB(A) TIFF of the plate's size")
+            refuse_lossy_tiff(master, "the TIFF plate_to_tiff16 wrote")
         tif_hash = _hex_of(hasher(tif_dst))
 
         shares = pixel_shares(exr_dst, elements) if callable(pixel_shares) else pixel_shares

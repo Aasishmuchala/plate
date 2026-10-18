@@ -12,10 +12,20 @@ best-of-N, export, envelopes.
   and run in the background by the pipeline (`start`, default true). The seed's `{actor}` body approves
   only (`start` defaults to false), which keeps `POST /queue` and `POST /step` the dev driver they were.
   Refusals: 403 custody, 409 `quote_expired` (the run is then EXPIRED) / illegal transition / `auto_cap`,
-  `daily_cap`, `unattended_cap`, 422 `envelope_required` / `envelope_exceeded`.
-- `POST /runs/{id}/cancel`, `POST /runs/{id}/fanout {n}` (a QUOTED run becomes sibling 0 of n under one
-  quote; the list is returned), `GET /runs/{id}/gate[?n=]` (the stored report, `gates/<run>.<n>.json`,
-  with `n`, `versions`, `shipped` and `overlays`; 404 before gating).
+  `daily_cap`, `unattended_cap`, 422 `envelope_required` / `envelope_exceeded`. A cancel that lands between
+  the approval and the queue is the typed 409 `illegal_transition` (`from: CANCELLED, to: QUEUED`), never a
+  500; the approval already committed stays committed.
+- The unattended clock (decision 71): `override`, `accept` and the misc routes' scrub, verdict and timer reset
+  it (`Pipeline.touch_human`) only for a request carrying `X-Plate-Client: ui` (`routes.projects.from_ui`);
+  a human approval resets it in `Pipeline.approve`. curl, the CLI, MCP and the plugin never do.
+- Approved runs are driven by `Pipeline.start_runs` (decision 75): the run executor's bounded pool, at most the
+  route's `max_inflight` at a time, never a request thread; under `PLATE_RUN_WORKERS=0` a BackgroundTask as
+  before.
+- `POST /runs/{id}/cancel`: the run CANCELLED (its view), 409 `illegal_transition` from a state with no cancel;
+  while a vendor call holds the run (decision 76) it answers 202 `{"run_id", "state", "cancel": "requested"}`
+  at once and the step cancels it as soon as it lets go. `POST /runs/{id}/fanout {n}` (a QUOTED run becomes
+  sibling 0 of n under one quote; the list is returned), `GET /runs/{id}/gate[?n=]` (the stored report,
+  `gates/<run>.<n>.json`, with `n`, `versions`, `shipped` and `overlays`; 404 before gating).
 - `overlays` (T109, verification gap G1) is the report's `metrics.overlays` block lifted to the top: the hashes,
   formats and sizes of what the viewer's `e` and `h` modes draw, stored in the project CAS at gate time and
   served by `GET /assets/{hash}`: `edges_plate` and `edges_candidate` (8-bit grey PNGs, 255 = edge, the G-buffer
@@ -30,7 +40,9 @@ best-of-N, export, envelopes.
   what shipped, and with its own `overlays`. 409 `no_report` when the run was never gated, `not_rescorable`
   for a take `Pipeline.gate` did not score (numeric nodes, motion, carried-over layers).
 - `POST /runs/{id}/override {reason, by}`: a GATE_FAIL run becomes exportable; the reason (10 characters at
-  least) is in the run's event log and in a ledger `override` record with top-level `by` and `reason`.
+  least) is in a ledger `override` record with top-level `by` and `reason`, then in the run's event log. The
+  record goes first and fails closed: a ledger that cannot take it is 503 `ledger_unavailable` and the run gets
+  no note, so nothing unrecorded can let an export out.
   `POST /runs/{id}/accept {scrub_log_id, by?}`: a DONE (or overridden) take is accepted only against a
   logged FULL scrub of this run: a ledger record of kind `scrub` (written by `POST /runs/{id}/scrub`, T38)
   whose `opaque_id` or `data.scrub_log_id` is the id and whose `data.full_scrub` is true, or
@@ -38,11 +50,18 @@ best-of-N, export, envelopes.
 - `POST /runs/{id}/export {out_dir, format?, name?, override?, reason?, full_frame?}` (or the legacy `{dest}`: its folder,
   stem and suffix): through `export.export` (decision 39), the run's gated composite as tiff16 / png16 / exr
   with its lineage embedded and `<name>.gate.json` beside it; the report is marked shipped and a ledger
-  `export` record written. Export does not require accept. GATE_FAIL needs an override, recorded earlier or
-  typed here (`override: true` + `reason`); one typed here is a ledger `override` record too.
+  `export` record written (`data.repeat: true` for a byte-identical re-export, which answers `repeat: true`).
+  Export does not require accept. GATE_FAIL needs an override, recorded earlier or typed here (`override: true`
+  + `reason`). One typed here is on the record before a byte is written: the ledger `override` record first
+  (fail-closed: a ledger that cannot take it is 503 `ledger_unavailable` and nothing is written, no note and
+  no file), then the run's `override` note and the `run.override` event, then `export.export`.
 - The seed's dev routes `POST /runs` (a run outside the canvas), `/runs/{id}/quote`, `/queue` and `/step`
   answer 404 unless `PLATE_DEV=1` (decision 36); under dev `POST /runs` refuses `inputs.staging`, `mask` and
   `plate` (a pipeline run is quoted from the canvas, never made by hand). `POST|GET /envelopes` stay.
+- `POST /envelopes {project_id, owner, max_total_usd, max_per_run_usd, ttl_s}`: finite numbers only, the two
+  limits 0 to 1 000 000 USD and `ttl_s` above 0 up to 366 days (422 otherwise, before any write); the owner is
+  checked (422) and the project must exist (404 `not_found`) before its index is opened, so a refused request
+  leaves no `index/<id>.sqlite` behind.
 """
 
 from __future__ import annotations
@@ -60,10 +79,19 @@ from fastapi import APIRouter, BackgroundTasks, Body, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from .. import budgets
 from ..adapter import SimulatedCrash
 from ..config import check_project_id
 from ..custody import CustodyViolation
-from ..export import FORMATS, MIN_OVERRIDE_REASON, NAME_RE, NotExportable, export, recorded_override
+from ..export import (
+    FORMATS,
+    MIN_OVERRIDE_REASON,
+    NAME_RE,
+    OVERRIDE_PREFIX,
+    NotExportable,
+    export,
+    recorded_override,
+)
 from ..gate_reports import NoReport
 from ..gate_reports import Service as ReportService
 from ..ledger import Ledger
@@ -81,7 +109,7 @@ from ..quotes import (
     quote_run,
 )
 from ..states import RunState
-from ..worker import FanOutError, fan_out
+from ..worker import CancelPending, FanOutError, fan_out
 from . import API, ApiError, Ctx, ctx, custody_error, illegal, pipeline_error, require_token, run_project
 
 
@@ -105,6 +133,8 @@ SUFFIX_FORMATS = {".tif": "tiff16", ".tiff": "tiff16", ".png": "png16", ".exr": 
 DEFAULT_EXPORT_FORMAT = "tiff16"
 LIST_LIMIT_DEFAULT = 200
 LIST_LIMIT_MAX = 1000
+ENVELOPE_MAX_USD = 1_000_000
+ENVELOPE_MAX_TTL_S = 31_622_400  # 366 days
 
 
 class ApproveBody(BaseModel):
@@ -160,9 +190,9 @@ class EnvelopeBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     project_id: str
     owner: str = Field(min_length=1)
-    max_total_usd: float = Field(ge=0)
-    max_per_run_usd: float = Field(ge=0)
-    ttl_s: float = Field(gt=0)
+    max_total_usd: float = Field(ge=0, le=ENVELOPE_MAX_USD, allow_inf_nan=False)
+    max_per_run_usd: float = Field(ge=0, le=ENVELOPE_MAX_USD, allow_inf_nan=False)
+    ttl_s: float = Field(gt=0, le=ENVELOPE_MAX_TTL_S, allow_inf_nan=False)
 
 
 # ---------------------------------------------------------------------------- the run as the UI reads it
@@ -217,6 +247,14 @@ def _refusal_code(e: AutoApprovalDenied) -> str:
         if needle in text:
             return code
     return "approval_refused"
+
+
+def from_ui(request: Request) -> bool:
+    """`routes.projects.from_ui` (decision 71: only the UI resets the unattended clock), imported when called
+    because `routes.projects` imports this module."""
+    from .projects import from_ui as _from_ui
+
+    return _from_ui(request)
 
 
 # ---------------------------------------------------------------------------- the seed's dev routes
@@ -495,6 +533,10 @@ def approve_route(request: Request, run_id: str, body: ApproveBody, background: 
             runs = c.pipeline.approve(
                 conn, pid, run_id, by, body.envelope_id, reason=body.reason, now=c.now()
             )
+            ids = [r.id for r in runs]
+            if start:  # a cancel between the approval and here is the typed 409 below
+                for rid in ids:
+                    c.pipeline.queue(conn, pid, rid)
         except CustodyViolation as e:
             raise custody_error(e) from e
         except PipelineError as e:
@@ -513,11 +555,8 @@ def approve_route(request: Request, run_id: str, body: ApproveBody, background: 
             raise ApiError(409, {"error": "quote_missing", "detail": str(e)}) from e
         except ValueError as e:
             raise ApiError(422, {"errors": [str(e)]}) from e
-        ids = [r.id for r in runs]
-        if start:
-            for rid in ids:
-                c.pipeline.queue(conn, pid, rid)
-            background.add_task(c.pipeline.execute_all, pid, ids)
+        if start:  # off the request pool: the run executor, or a BackgroundTask under PLATE_RUN_WORKERS=0
+            c.pipeline.start_runs(pid, ids, background=background)
         views = [run_view(conn, rid) for rid in ids]
     if len(views) == 1 and views[0].get("sibling_group") is None:
         return views[0]
@@ -525,9 +564,7 @@ def approve_route(request: Request, run_id: str, body: ApproveBody, background: 
 
 
 @router.post("/runs/{run_id}/cancel")
-def cancel_route(
-    request: Request, run_id: str, body: Annotated[CancelBody | None, Body()] = None
-) -> dict[str, Any]:
+def cancel_route(request: Request, run_id: str, body: Annotated[CancelBody | None, Body()] = None) -> Any:
     c = ctx(request)
     body = body or CancelBody()
     pid = run_project(c, run_id)
@@ -536,6 +573,9 @@ def cancel_route(
             c.pipeline.cancel(conn, pid, run_id, actor=body.actor, reason=body.reason)
         except IllegalTransition as e:
             raise illegal(e) from e
+        except CancelPending:  # a vendor call holds the run: the step cancels it when it lets go
+            state = get_run(conn, run_id).state.value
+            return JSONResponse({"run_id": run_id, "state": state, "cancel": "requested"}, status_code=202)
         return run_view(conn, run_id)
 
 
@@ -579,9 +619,13 @@ def override_route(request: Request, run_id: str, body: OverrideBody) -> dict[st
                     "detail": "only a GATE_FAIL run is overridden",
                 },
             )
+        try:  # ledgered first and fail-closed (decision 73): no record, no note, no override
+            c.pipeline.ledger(pid, "override", run, by=body.by, note=reason, conn=conn)
+        except PipelineError as e:
+            raise pipeline_error(e) from e
         append_note(conn, run_id, kind="override", actor=body.by, reason=f"override: {reason}")
-        c.pipeline.ledger(pid, "override", run, by=body.by, note=reason)
-        c.pipeline.touch_human()
+        if from_ui(request):
+            c.pipeline.touch_human()
         c.pipeline.publish(
             pid, run_id, {"kind": "run.override", "run_id": run_id, "by": body.by, "reason": reason}
         )
@@ -635,7 +679,8 @@ def accept_route(request: Request, run_id: str, body: AcceptBody) -> dict[str, A
         append_note(conn, run_id, kind="accept", actor=body.by, reason=json.dumps(note, sort_keys=True))
         run = get_run(conn, run_id)
         c.pipeline.ledger(pid, "done", run, by=body.by, data=note)
-        c.pipeline.touch_human()
+        if from_ui(request):
+            c.pipeline.touch_human()
         c.pipeline.publish(pid, run_id, {"kind": "run.accepted", "run_id": run_id, "by": body.by})
         return run_view(conn, run_id)
 
@@ -671,7 +716,7 @@ def _export_target(body: ExportBody) -> tuple[Path, str, str | None]:
                 422, {"error": "bad_format", "detail": f"format {fmt!r}: use one of {', '.join(FORMATS)}"}
             )
         name = body.name
-    if name is not None and not NAME_RE.match(name):
+    if name is not None and not NAME_RE.fullmatch(name):
         raise ApiError(
             422,
             {
@@ -689,6 +734,31 @@ def _report_n(ref: str | None, run_id: str) -> int | None:
     return int(n) if head == run_id and n.isdigit() else None
 
 
+def _record_typed_override(c: Ctx, conn: sqlite3.Connection, pid: str, run: Run, typed: str) -> None:
+    """An override typed into an export body goes on the record before `export.export` writes a byte: the
+    ledger `override` record first (fail-closed: a `PipelineError` there is the answer and nothing is written,
+    not even the run's note, so no unledgered override can let a later export out), then the run's `override`
+    note when it does not say this already, then the `run.override` event. A reason too short to override
+    with is refused here, before anything is recorded."""
+    if len(typed) < MIN_OVERRIDE_REASON:
+        raise ApiError(
+            409,
+            {
+                "error": "not_exportable",
+                "detail": f"a GATE_FAIL override needs a reason of at least {MIN_OVERRIDE_REASON} characters",
+            },
+        )
+    try:
+        c.pipeline.ledger(pid, "override", run, by="human", note=typed, conn=conn)
+    except PipelineError as e:
+        raise pipeline_error(e) from e
+    if recorded_override(conn, run.id) != typed:
+        append_note(conn, run.id, kind="override", actor="human", reason=f"{OVERRIDE_PREFIX}{typed}")
+    c.pipeline.publish(
+        pid, run.id, {"kind": "run.override", "run_id": run.id, "by": "human", "reason": typed}
+    )
+
+
 @router.post("/runs/{run_id}/export")
 def export_route(request: Request, run_id: str, body: ExportBody) -> dict[str, Any]:
     c = ctx(request)
@@ -700,8 +770,8 @@ def export_route(request: Request, run_id: str, body: ExportBody) -> dict[str, A
         run = get_run(conn, run_id)
         earlier = recorded_override(conn, run_id)
         # an override typed here, on a run that needs one, that says something the record does not yet
-        inline = run.state is S.GATE_FAIL and typed is not None and typed != earlier
-        done = None
+        if run.state is S.GATE_FAIL and typed is not None and typed != earlier:
+            _record_typed_override(c, conn, pid, run, typed)
         try:
             done = export(
                 run,
@@ -715,19 +785,10 @@ def export_route(request: Request, run_id: str, body: ExportBody) -> dict[str, A
                 full_frame=body.full_frame,
             )
         except NotExportable as e:
-            raise ApiError(409, {"error": "not_exportable", "detail": str(e)}) from e
+            raise ApiError(getattr(e, "status", 409), {"error": "not_exportable", "detail": str(e)}) from e
         except ValueError as e:
             raise ApiError(422, {"errors": [str(e)]}) from e
-        finally:
-            noted = recorded_override(conn, run_id)
-            if inline and (done is not None or (earlier is None and noted is not None)):
-                if noted != typed:  # export.export notes an override only when none was recorded before
-                    append_note(conn, run_id, kind="override", actor="human", reason=f"override: {typed}")
-                c.pipeline.ledger(pid, "override", run, by="human", note=typed)
-                c.pipeline.publish(
-                    pid, run_id, {"kind": "run.override", "run_id": run_id, "by": "human", "reason": typed}
-                )
-        assert done is not None  # every failure above raised
+        repeat = getattr(done, "repeat", False) is True  # a byte-identical re-export (T127) still ships
         try:  # the version the sidecar copied; the report file itself is never touched
             shipped = ReportService(project_dir).shipped(run_id, _report_n(done.report_ref, run_id)).shipped
         except NoReport:  # a seed run's stub gate wrote no report file
@@ -743,6 +804,7 @@ def export_route(request: Request, run_id: str, body: ExportBody) -> dict[str, A
                 "override_reason": done.override_reason,
                 "by": "human",
                 **done.framing.record(),
+                **({"repeat": True} if repeat else {}),
             },
         )
         return {
@@ -752,6 +814,7 @@ def export_route(request: Request, run_id: str, body: ExportBody) -> dict[str, A
             "format": done.fmt,
             "shipped": shipped,
             **done.framing.record(),
+            **({"repeat": True} if repeat else {}),
         }
 
 
@@ -761,6 +824,13 @@ def export_route(request: Request, run_id: str, body: ExportBody) -> dict[str, A
 @router.post("/envelopes", status_code=201)
 def create_envelope_route(request: Request, body: EnvelopeBody) -> JSONResponse:
     c = ctx(request)
+    try:  # the owner and the project before the index is opened: a refused request leaves no sqlite file
+        budgets.check_owner(body.owner)
+        project = c.pipeline.load_project(check_project_id(body.project_id))
+    except ValueError as e:
+        raise ApiError(422, {"errors": [str(e)]}) from e
+    if project is None:
+        raise ApiError(404, {"error": "not_found", "project_id": body.project_id})
     try:
         with c.index.project(body.project_id) as conn:
             env = create_envelope(

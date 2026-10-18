@@ -1,6 +1,6 @@
 # UI: the PLATE canvas
 
-`ui/` is a Vite + React 19 + TypeScript app: `@xyflow/react` draws the graph, `zustand` holds it, `vitest` (jsdom) tests it. It is the artist's canvas: typed nodes with the doctrine rules enforced as you wire them, a Make bar that quotes before it spends, a best-of-N candidate strip, a WebGL2 compare viewer, a node editor per kind, and panels for projects, history, gates, custody, the human-minute timer and the verdict keys. Ports (docs/P0_AUDIT.md, Reconciliation): in development the Vite dev server runs on 5173 and proxies `/api` to the daemon on 4610 (`PLATE_DEV=1` adds the two 5173 origins to the daemon's Origin allowlist; `127.0.0.1:4610` and `localhost:4610` are always allowed, with or without it); the built UI (`ui/dist`) is served by the daemon itself at `http://127.0.0.1:4610/`. The token arrives once in the launch URL's `#token=` fragment, is moved to `sessionStorage` and sent as `Authorization: Bearer`. How to use it is the [artist manual](artist-manual.md).
+`ui/` is a Vite + React 19 + TypeScript app: `@xyflow/react` draws the graph, `zustand` holds it, `vitest` (jsdom) tests it. It is the artist's canvas: typed nodes with the doctrine rules enforced as you wire them, a Make bar that quotes before it spends, a best-of-N candidate strip, a WebGL2 compare viewer, a node editor per kind, and panels for projects, history, gates, custody, the human-minute timer and the verdict keys. Ports (docs/P0_AUDIT.md, Reconciliation): in development the Vite dev server runs on 5173 and proxies `/api` to the daemon on 4610 (`PLATE_DEV=1` adds the two 5173 origins to the daemon's Origin allowlist; `127.0.0.1:4610` and `localhost:4610` are always allowed, with or without it); the built UI (`ui/dist`) is served by the daemon itself at `http://127.0.0.1:4610/`. The token arrives once in the launch URL's `#token=` fragment, is moved to `sessionStorage` and sent as `Authorization: Bearer` (its three states, `present`, `rejected` and `none`, are under "Token states" below). How to use it is the [artist manual](artist-manual.md).
 
 ## Run it
 
@@ -55,7 +55,31 @@ Generating nodes (`Edit`, `People`, `Motion`, `CropPair`) each cost one generati
 
 ## The graph is saved for you, and the server owns status
 
-The store saves the graph by itself: 400 ms after any structural change (a node added or removed, a wire, a parameter), 1.5 s after a drag of nodes ends (a positions-only save), and always right before a quote. The status bar chip reads `saved HH:MM:SS`, `unsaved`, `saving…` or, in red, `save failed: <message>`; the tab title is `PLATE · <project>` with a trailing ` *` while there is something unsaved. A project with no open graph shows an empty-state card; no placeholder nodes are loaded. Every request carries `X-Plate-Client: ui`, which is how the daemon knows a person is at the keyboard. What the server stores for each node's `gateStatus`, `approved`, `approvedBy` and `scrubLogId` is computed from the run history and the ledger, not taken from the browser; the answer to the save is applied back onto the nodes. A save the daemon refuses (a wire that breaks a canvas rule) marks that wire as refused and shows the reason.
+The store saves the graph by itself: 400 ms after any structural change (a node added or removed, a wire, a parameter), 1.5 s after a drag of nodes ends (a positions-only save), and always right before a quote. The status bar chip reads `saved HH:MM:SS`, `unsaved`, `saving…`, in red `save failed: <message>`, or `conflict: reload`; the tab title is `PLATE · <project>` with a trailing ` *` while there is something unsaved. A project with no open graph shows an empty-state card; no placeholder nodes are loaded. Every request carries `X-Plate-Client: ui`, which is how the daemon knows a person is at the keyboard: only a request with that header (or an approval made as a person) resets the unattended-spend clock, so a terminal, curl or an agent never does. What the server stores for each node's `gateStatus`, `approved`, `approvedBy` and `scrubLogId` is computed from the run history and the ledger, not taken from the browser; the answer to the save is applied back onto the nodes. A save the daemon refuses (a wire that breaks a canvas rule) marks that wire as refused and shows the reason.
+
+### Save retry, revision and conflict
+
+The daemon stores a `graph_revision` in `project.json`; every `GET /projects/{id}/graph`, every save answer and the `graph` in other answers carry it as `revision`. The store keeps the one it last loaded or saved and sends it as `revision` in the body of the next `PUT`.
+
+| situation | what the store does |
+|---|---|
+| the save fails and might pass: a network error, a 5xx, 409 `graph_busy` (another save of the project was in progress for more than 5 s), 429 `too_many_saves` (more than four saves already waiting) | the chip stays red, `save failed: <message>`, and the save is retried after 1, 2, 4 and 8 seconds and then every 15, until it succeeds or you open another project. When the daemon heartbeat goes from down to up the store saves at once if `saveState` is not `saved` |
+| 422, a wire that breaks a canvas rule | not retried; the wire is marked refused with the reason (the daemon's answer is the truth) |
+| 409 `graph_conflict` (`current`, `sent`) | the daemon holds a newer revision than the one sent. `saveState` becomes `conflict`, the chip reads `conflict: reload`, and nothing is written. **Reload** fetches the stored graph and replaces the local one. The only local work kept is an Edit's prompt text, in `conflictLocal` and offered as **copy prompt**; every other local change is dropped |
+| the `PUT` carries no `revision` (an older client) | accepted without a check; the daemon only enforces the protocol on clients that send one |
+| the graph is over 4 MiB, or a node or edge has no string id | 422 `graph_too_large` or the shape errors (`UNKNOWN_NODE` for an id that is an object or array), never a 500; a request body over 8 MiB is refused 413 before it is read |
+
+**Debounce ceiling.** The 400 ms debounce is capped at `SAVE_MAX_WAIT_MS = 2000`: typing without a pause still saves at least every two seconds.
+
+**Pagehide.** `pagehide` and `visibilitychange` to hidden flush the pending `PUT` with `fetch(..., { keepalive: true })`, so closing a tab right after an edit does not lose it. While `saveState` is not `saved`, a `beforeunload` handler sets `event.returnValue`, so the browser asks before the tab closes or reloads.
+
+**Another writer.** A `graph.saved` event on the project stream is not trusted for its content. When one arrives and this tab has nothing in flight, the store fetches the head of the graph (`GET /projects/{id}/graph`) and compares revisions: a higher one than the store's reloads the graph (a node added by another tab or by an agent appears), or becomes `conflict` when this tab has unsaved changes. The stream cursor passed on reconnect is the last SSE id exactly as received (`<epoch>.<seq>`; the epoch changes when the daemon rebuilds its index, and then replay starts from the beginning of the new epoch), never parsed as a number.
+
+**Reopen after a reload.** The open project id is kept in `sessionStorage`; reloading the page opens the same project again instead of the empty-state card.
+
+### Token states
+
+The status bar chip has three token states. `token: present`: a token is in `sessionStorage`. `token: rejected`: the health check or any call answered 401, so the token this tab holds is not the daemon's (the chip no longer claims `present` just because something is stored). `token: missing`: the tab has no token, and a box appears to paste the `#token=` value into. An error from the daemon that is not JSON (a proxy's HTML page, a bare 502) is shown as `<status> <statusText> (non-JSON response)`, never as the body.
 
 ## Daemon routes the UI calls
 
@@ -72,6 +96,8 @@ Every route below is in the daemon (under `/api/v0`). Bearer token on all of the
 | `POST /pixels/idpick`, `/pixels/segment`, `/pixels/ocr` | Mask, People and Recolour editors | the daemon forwards to the pixels worker (or calls the backends in-process under `PLATE_PIXELS_INPROC=1`) |
 | `POST /assets?kind=mask&project_id=` | Mask editor, save a painted mask | stores an 8-bit grey PNG in the project's store and answers its hash |
 | `GET /assets/{hash}[?fmt=]` | viewer, thumbnails | a plate by reference from its packet folder, or a stored take; Range requests work on raw files |
+| `GET /projects/{id}/graph`, `PUT /projects/{id}/graph` | the store | the graph with its `revision`; the save answers the graph with server-derived node status and the new revision, 409 `graph_conflict` for a stale `revision`, 409 `graph_busy` and 429 `too_many_saves` under a save storm, 422 for a rule refusal or `graph_too_large` |
+| `POST /projects/{id}/nodes` | none yet (API; the MCP `add_node`) | appends one node (and the edges from `connect_from`) under the project lock and answers `{node_id, revision, graph}`; no stale-graph overwrite is possible |
 | `POST /runs/{id}/accept`, `/scrub` | verdict panel | the logged full scrub and the acceptance that needs it |
 | `POST /runs/{id}/export` | Export editor | the exported file, its sidecar and format; a GATE_FAIL take needs an override reason |
 | `POST /projects/{id}/review` | Review editor | the review zip: path, size, takes |

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +99,7 @@ def test_plugin_queue_lifecycle(tmp_path):
     claimed = q.list_jobs(0, claim=True, limit=1)
     assert [j.state for j in claimed] == ["claimed"] and claimed[0].claimed_utc
     assert [j.id for j in q.list_jobs(0)] == [b.id]  # a claimed job is not offered twice
+    assert claimed[0].claim_count == 0 and q.counts() == {"queued": 1, "claimed": 1, "expired_claims": 0}
     assert {j.id for j in q.list_jobs(0, states=("queued", "claimed"))} == {a.id, b.id}
 
     done = q.finish(a.id, ok=True, result={"metrics": {"de00": 1.5}})
@@ -853,6 +855,25 @@ def test_light_failures_are_the_docks_to_report(env):
     failed = env.advance(run.id)
     assert failed.state.value == "FAILED" and failed.reason_code == "provider_failed"
     assert "MAXGAFFER_MISSING" in failed.error
+
+
+def test_light_fails_when_no_dock_finishes_the_job(env):
+    """T139: a claim is a lease. Three docks that take the job and never answer fail the run, with the reason."""
+    _light_graph(env)
+    run = env.make()
+    queue = env.runner.queue
+    t0 = env.pipeline.clock() - timedelta(minutes=30)  # claims in the past: the live clock sees them lapsed
+    for k in range(3):
+        [job] = queue.list_jobs(0, claim=True, now=t0 + timedelta(minutes=3 * k))
+        assert job.id == run.provider_job_id and job.claim_count == k
+        assert env.advance(run.id).state.value == "RUNNING"
+    status = env.client.get("/api/v0/plugin/status", headers=env.auth).json()
+    assert status["claimed"] == 1 and status["expired_claims"] == 1  # the third dock has gone quiet too
+    assert queue.list_jobs(0, claim=True, now=t0 + timedelta(minutes=9)) == []
+    failed = env.advance(run.id)
+    assert failed.state.value == "FAILED" and failed.reason_code == "provider_failed"
+    assert "no Max dock finished this job after 3 claims" in failed.error
+    assert env.answer(run.provider_job_id, ok=True).status_code == 409  # nothing left to answer
 
 
 def test_light_named_packet_that_moved_the_camera_fails_the_gate(env):

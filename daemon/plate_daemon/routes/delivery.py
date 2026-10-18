@@ -18,7 +18,9 @@
   inside the file, a `.gate.json` sidecar beside it, an existing file never overwritten (409 `exists`). The
   stored report is marked shipped and a ledger `export` record is written with `data.delivery: true`.
   ffmpeg or ffprobe missing is 503 `tool_missing`; any other delivery error (an AV1 re-tag of a take that is
-  not AV1, a bad timeline) is 422 `delivery_error`.
+  not AV1, a bad timeline) is 422 `delivery_error`. A project folder whose `gates/` cannot take the shipped
+  mark is refused after the guard and before the take is read (503 `not_exportable`,
+  `export.check_project_writable`).
 - Framing (router plan T114). When the run's packet declares `camera.safe_frame`, the pixel formats
   (`prores4444`, `hevc`, `exr_sequence`) write the safe-frame region by default, placed on the take by
   `export.framing` (a pixel crop, nothing resampled; HEVC's 4:2:0 snaps it inward to even coordinates). A clip
@@ -31,8 +33,8 @@
 
 `deliver_run(pipeline, run_id, fmt, out_dir, ...)` is the same thing as a function (`plate deliver`, T78): it
 raises `PipelineError` (404 unknown run; 422 `bad_format`, `bad_name`, `bad_out_dir`, `not_a_clip`,
-`no_output`, `safe_frame_mismatch`, `packet_unreadable`), `DeliveryRefused`, `ToolMissing`, `DeliveryError` or
-`FileExistsError`.
+`no_output`, `safe_frame_mismatch`, `packet_unreadable`), `DeliveryRefused`, `ProjectUnwritable` (a
+`NotExportable`), `ToolMissing`, `DeliveryError` or `FileExistsError`.
 """
 
 from __future__ import annotations
@@ -55,7 +57,9 @@ from ..delivery.tools import probe_video, run_ffmpeg
 from ..export import (
     NAME_RE,
     Framing,
+    NotExportable,
     SafeFrameError,
+    check_project_writable,
     declared_safe_frame,
     framing,
     packet_manifest,
@@ -240,7 +244,7 @@ def deliver_run(
             f"out_dir must be an absolute folder path, got {str(out_dir)!r}", code="bad_out_dir"
         )
     stem = name or run_id
-    if not NAME_RE.match(stem):
+    if not NAME_RE.fullmatch(stem):
         raise PipelineError(
             f"delivery name {stem!r}: letters, digits, '.', '_' and '-' only (a Windows file name)",
             code="bad_name",
@@ -262,6 +266,7 @@ def deliver_run(
         )
         need_report = fmt not in NO_REPORT_NEEDED
         authorize(prov, require_report=need_report)  # refuse before anything is read or written (no hook yet)
+        check_project_writable(project_dir)  # the shipped mark goes there: refuse before a client file
         if typed is not None and typed != recorded:
             prov = dataclasses.replace(prov, on_override=_override_hook(pl, conn, project_id, run, by))
         src = _take(run, cas)
@@ -371,6 +376,8 @@ def deliver_route(request: Request, run_id: str, body: DeliverBody) -> dict[str,
         raise pipeline_error(e) from e
     except DeliveryRefused as e:
         raise ApiError(409, {"error": "delivery_refused", "code": e.code, "detail": str(e)}) from e
+    except NotExportable as e:
+        raise ApiError(getattr(e, "status", 409), {"error": "not_exportable", "detail": str(e)}) from e
     except ToolMissing as e:
         raise ApiError(503, {"error": "tool_missing", "detail": str(e)}) from e
     except FileExistsError as e:

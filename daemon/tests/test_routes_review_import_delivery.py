@@ -442,6 +442,12 @@ def test_import_refusals_leave_no_run(sync_settings, auth, tmp_path):
         assert r.status_code == 422 and r.json()["error"] == "unreadable_image"
         r = _import(c, auth, path="relative.png", packet_id=packet_id, source="manual")
         assert r.status_code == 422
+        # T137: a directory is not a file (stat says so, nothing is opened); a declared cost has a bound
+        r = _import(c, auth, path=str(tmp_path), packet_id=packet_id, source="manual")
+        assert r.status_code == 422 and r.json()["error"] == "not_a_file", r.text
+        for cost in (1e308, 1000.01):
+            r = _import(c, auth, path=plate, packet_id=packet_id, source="manual", cost_usd=cost)
+            assert r.status_code == 422 and r.json()["error"] == "bad_cost", r.text
 
         r = _import(c, auth, path=plate, packet_id="pkt_absent", source="manual")
         assert r.status_code == 404 and r.json()["error"] == "not_found"

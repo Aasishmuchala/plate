@@ -6,10 +6,22 @@ a FixtureTransport in tests, a LiveTransport only under PLATE_LIVE=1. Constructi
 goes through an AllowlistTransport built from the route's allowed_hosts. The adapter exposes the vendor's FULL
 parameter schema as declared in the manifest (advanced: true only hides a field in the UI) and rejects unknown
 fields with ParamError. Prices come from the manifest and stay as unconfirmed as the manifest says.
+
+Result downloads (`fetch`, router plan T130, decision 76) stream: a `Content-Length` over the cap is refused at
+once, the body is counted chunk by chunk into a SpooledTemporaryFile (8 MiB in memory, then disk) against
+`FETCH_MAX_BYTES` (256 MiB for image kinds, 2 GiB for video kinds, by the manifest kind) and against a wall-clock
+`FETCH_DEADLINE_S` (600 s) measured from the request start; over either is a `FetchError`. The body is read on a
+helper thread so the deadline holds even while one read blocks (a vendor dripping a byte every 59 s never trips
+httpx's per-read timeout); the caller stops waiting at the deadline and the helper closes the response at its
+next chunk or read timeout.
 """
 
 from __future__ import annotations
 
+import queue
+import tempfile
+import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -24,6 +36,8 @@ from ..router import effective_grade, estimate_price
 from .transport import AllowlistTransport, HttpxAtlasTransport, make_client
 
 __all__ = [
+    "FETCH_DEADLINE_S",
+    "FETCH_MAX_BYTES",
     "Adapter",
     "AtlasClient",
     "FetchError",
@@ -36,9 +50,19 @@ __all__ = [
     "Quote",
     "SilentlyIgnoredInput",
     "Staged",
+    "stream_download",
 ]
 
 JobState = Literal["queued", "running", "done", "failed", "refused"]
+
+MiB = 1024 * 1024
+# Result download caps (decision 76): by the manifest kind, video kinds get the larger one.
+FETCH_MAX_BYTES = {"image": 256 * MiB, "video": 2048 * MiB}
+VIDEO_MANIFEST_KINDS = frozenset({"video_i2v", "video_r2v", "video_startend", "local_video"})
+FETCH_DEADLINE_S = 600.0
+FETCH_SPOOL_BYTES = 8 * MiB  # held in memory below this; a larger body spills to a temp file
+_FETCH_QUEUE_DEPTH = 4  # chunks in flight between the reading thread and the caller
+_FETCH_PUT_POLL_S = 0.25
 
 
 class ParamError(ValueError):
@@ -58,7 +82,7 @@ class MissingTransport(TypeError):
 
 
 class FetchError(RuntimeError):
-    """A result download came back with a non-2xx status."""
+    """A result download came back with a non-2xx status, or exceeded its byte cap or wall-clock deadline."""
 
 
 class SilentlyIgnoredInput(RuntimeError):
@@ -276,11 +300,33 @@ class Adapter(ABC):
         """One look at the job (no sleeping, no looping): queued, running, done, failed or refused."""
 
     def fetch(self, url: str) -> bytes:
-        """Download a result. The host must be in the route's allowed_hosts; no credentials are sent."""
-        resp = self.http().get(url)
-        if resp.status_code // 100 != 2:
-            raise FetchError(f"download failed: {resp.status_code}")
-        return resp.content
+        """Download a result. The host must be in the route's allowed_hosts; no credentials are sent. Streamed
+        under `fetch_cap()` bytes and `fetch_deadline_s` seconds (`stream_download`)."""
+        return self.download(url)
+
+    # Instance or subclass overrides of the download limits (None: by the manifest kind).
+    fetch_max_bytes: int | None = None
+    fetch_deadline_s: float = FETCH_DEADLINE_S
+
+    def fetch_cap(self) -> int:
+        """The byte cap for one result download: `fetch_max_bytes`, else 2 GiB for video kinds, 256 MiB else."""
+        if self.fetch_max_bytes is not None:
+            return int(self.fetch_max_bytes)
+        kind = "video" if self.manifest.kind in VIDEO_MANIFEST_KINDS else "image"
+        return FETCH_MAX_BYTES[kind]
+
+    def download(
+        self, url: str, *, params: Mapping[str, Any] | None = None, headers: Mapping[str, str] | None = None
+    ) -> bytes:
+        """GET `url` on this adapter's allowlisted client, streamed under its byte cap and deadline."""
+        return stream_download(
+            self.http(),
+            url,
+            max_bytes=self.fetch_cap(),
+            deadline_s=self.fetch_deadline_s,
+            params=params,
+            headers=headers,
+        )
 
     # ---- HTTP plumbing ----------------------------------------------------------------------------------
 
@@ -303,3 +349,100 @@ class Adapter(ABC):
         if self._client is not None:
             self._client.close()
             self._client = None
+
+
+# ---- streamed downloads ---------------------------------------------------------------------------------
+
+
+def stream_download(
+    client: httpx.Client,
+    url: str,
+    *,
+    max_bytes: int,
+    deadline_s: float = FETCH_DEADLINE_S,
+    params: Mapping[str, Any] | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> bytes:
+    """GET `url` and return its body, or raise `FetchError` past `max_bytes` (a `Content-Length` over it is
+    refused before the body) or `deadline_s` seconds from the request start; a non-2xx status is
+    `FetchError("download failed: <status>")` and a transport error propagates as the client raised it.
+
+    The request and the body are read on a daemon thread that hands chunks over a short queue, so the caller
+    waits at most the time left on the deadline whatever one read does. The body is spooled (8 MiB in memory,
+    then a temp file) so memory never holds more than that plus a few chunks until the download is complete."""
+    started = time.monotonic()
+    chunks: queue.Queue[tuple[Any, ...]] = queue.Queue(maxsize=_FETCH_QUEUE_DEPTH)
+    stop = threading.Event()
+
+    def hand_over(item: tuple[Any, ...]) -> bool:
+        while not stop.is_set():
+            try:
+                chunks.put(item, timeout=_FETCH_PUT_POLL_S)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def read() -> None:
+        try:
+            request = client.build_request("GET", url, params=params, headers=headers)
+            response = client.send(request, stream=True)
+        except BaseException as e:  # handed to the caller, raised there
+            hand_over(("error", e))
+            return
+        try:
+            length = _declared_length(response.headers.get("content-length"))
+            if not hand_over(("head", response.status_code, length)):
+                return
+            if response.status_code // 100 != 2 or (length is not None and length > max_bytes):
+                return  # refused on the head: not one byte of the body is read
+            for chunk in response.iter_bytes():
+                if stop.is_set() or not hand_over(("data", chunk)):
+                    return
+            hand_over(("end",))
+        except BaseException as e:
+            hand_over(("error", e))
+        finally:
+            response.close()
+
+    worker = threading.Thread(target=read, name="plate-fetch", daemon=True)
+    worker.start()
+    spool = tempfile.SpooledTemporaryFile(max_size=FETCH_SPOOL_BYTES)
+    total = 0
+    try:
+        while True:
+            left = deadline_s - (time.monotonic() - started)
+            try:
+                if left <= 0:
+                    raise queue.Empty
+                item = chunks.get(timeout=left)
+            except queue.Empty:
+                raise FetchError(f"download exceeded {deadline_s:g} s ({total} bytes in)") from None
+            tag = item[0]
+            if tag == "error":
+                raise item[1]
+            if tag == "head":
+                status, length = item[1], item[2]
+                if status // 100 != 2:
+                    raise FetchError(f"download failed: {status}")
+                if length is not None and length > max_bytes:
+                    raise FetchError(f"download exceeded {max_bytes} bytes (Content-Length {length})")
+                continue
+            if tag == "end":
+                break
+            total += len(item[1])
+            if total > max_bytes:
+                raise FetchError(f"download exceeded {max_bytes} bytes")
+            spool.write(item[1])
+        spool.seek(0)
+        return spool.read()
+    finally:
+        stop.set()
+        spool.close()
+
+
+def _declared_length(value: str | None) -> int | None:
+    """A `Content-Length` header as an int, or None when absent or not a plain number."""
+    if value is None or not value.strip().isdigit():
+        return None
+    return int(value.strip())

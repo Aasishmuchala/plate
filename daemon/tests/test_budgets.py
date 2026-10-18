@@ -21,6 +21,7 @@ from plate_daemon.budgets import (
     is_unattended,
     publish_alert,
     spend_snapshot,
+    spend_snapshot_all,
 )
 from plate_daemon.db import tx
 from plate_daemon.engine_fake import FakeEngine
@@ -459,6 +460,62 @@ def test_a_best_of_n_group_is_approved_against_its_total(idx):
         assert [r.state for r in approved] == [S.APPROVED] * 3
         assert [r.reserved_usd for r in approved] == [pytest.approx(0.04)] * 3
         assert spend_snapshot(conn, now, None).today_usd == pytest.approx(0.12)
+
+
+def test_the_caps_count_every_project_index_in_the_home(idx, tmp_path, caplog):
+    """Decision 80 (Wave 12): `spend_snapshot_all` sums every project of the home, the refusal says how many it
+    summed, and an index that cannot be opened is skipped with a warning (never a crash)."""
+    now = datetime.now(UTC)
+    with idx.project(PID) as conn:
+        approve(conn, new_quoted(conn), "auto", last_human_interaction_utc=now)
+    other = "budget-two"
+    with idx.project(other) as conn:
+        with tx(conn):
+            apply_packet_entry(
+                conn,
+                other,
+                PACKET,
+                {
+                    "shot_id": "s01",
+                    "kind": "still",
+                    "tier": "A",
+                    "packet_version": "0.1.1",
+                    "path": str(tmp_path / "packets" / PACKET),
+                    "manifest_blake3": "a" * 64,
+                },
+            )
+        runs = []
+        for _ in range(2):
+            run = create_run(
+                conn,
+                RunCreate(
+                    project_id=other, packet_id=PACKET, inputs={"plate": uuid.uuid4().hex}, route=ROUTE
+                ),
+            )
+            quote_run(conn, run.id)
+            runs.append(run.id)
+        approve(conn, runs[0], "auto", last_human_interaction_utc=now)
+    (idx.home / "index" / "broken.sqlite").write_bytes(b"this is not a sqlite file at all, not even close")
+
+    spent = spend_snapshot_all(idx, now, now)
+    assert (spent.today_usd, spent.projects) == (pytest.approx(0.08), 2)
+    assert "broken" in caplog.text
+    with idx.project(other) as conn:
+        assert spend_snapshot(conn, now, now).projects is None  # one connection: this project only
+        with pytest.raises(AutoApprovalDenied, match="across 2 projects"):
+            approve(
+                conn,
+                runs[1],
+                "auto",
+                policy=Policy(per_user_daily_cap_usd=0.1),
+                last_human_interaction_utc=now,
+                spent=spent,
+            )
+        assert get_run(conn, runs[1]).state is S.QUOTED
+        # Without `spent` the cap reads this project alone (0.04 + 0.04 fits a 0.1 cap).
+        assert approve(conn, runs[1], "auto", policy=Policy(per_user_daily_cap_usd=0.1)).state is S.APPROVED
+    d = authorize(quoted(0.04), POLICY, None, None, now=T0, spent=Spend(0.0, 19.99, projects=1))
+    assert d.code == "unattended_cap" and "across 1 project)" in d.reason
 
 
 # ---------------------------------------------------------------------------- quotes from manifests

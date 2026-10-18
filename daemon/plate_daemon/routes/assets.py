@@ -7,12 +7,20 @@ shared cache) and `X-Plate-Source: cas | packet` (a packet file is served by ref
 one, the decoded image is rendered in memory. 404 for an unknown or malformed key, 415 for a pixel format of
 something that is not an image.
 
+Every upload is judged on its header before a pixel is decoded (router plan T136): `plate_pixels.imghdr`
+names the declared size from the first bytes, so a 410 KiB PNG that declares 12000 x 12000 x 3 costs a header
+read, not 432 MB. Bytes whose header it does not read (empty, a GIF, a clip, truncated) are 422 `bad_image`
+(`"not a PNG/JPEG/WebP/BMP/TIFF header"`); a declared `width * height` over `UPLOAD_MAX_PIXELS` (100 000 000,
+in `plate_daemon.assets`) is 422 `{"error": "too_many_pixels", "declared": [w, h], "limit": N}`. Both come
+before `cv2.imdecode`, for masks and references alike.
+
 `POST /assets?kind=mask&project_id=<id>[&packet_id=<id>]`: store an uploaded mask in the project's CAS as an
 8-bit grey PNG. The body is the raw image (`Content-Type: image/png`, at most 32 MiB). With `packet_id` (a packet
 of that project) a mask whose size is not the packet's plate size is resized to it nearest-neighbour and
 thresholded `> 127` to 0/255, so a mask painted at the editor's working size lands where the quote checks it
 (router plan T82). 201 `{hash, width, height, project_id, scaled_from: [w, h] | null}`; 422 `bad_kind` /
-`project_required` / `bad_mask`, 404 for an unknown project or packet, 413 over the limit.
+`project_required` / `bad_image` / `too_many_pixels` / `bad_mask` (an image that decodes but is not an 8-bit
+grey, RGB or RGBA mask), 404 for an unknown project or packet, 413 over the limit.
 
 `POST /assets?kind=reference&project_id=<id>[&note=<text>]`: store a reference image (decision 46: an engine
 input, never pixels of the output). The body is a PNG or JPEG (at most 32 MiB); it is decoded as 8-bit colour
@@ -20,7 +28,7 @@ input, never pixels of the output). The body is a PNG or JPEG (at most 32 MiB); 
 re-encoded as an 8-bit RGB PNG, so no metadata of the upload survives. The hash is appended to
 `<project>/references.json` (`{schema, references: [{hash, width, height, bytes, uploaded_utc, note?}]}`,
 idempotent on the hash). 201 `{hash, width, height, kind: "reference", project_id, scaled_from}`; refusals as
-for masks, with 422 `bad_image`. `GET /projects/{id}/references` lists the entries in upload order.
+for masks, with 422 `bad_image` / `too_many_pixels`. `GET /projects/{id}/references` lists the entries in upload order.
 """
 
 from __future__ import annotations
@@ -35,7 +43,18 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
-from ..assets import MASK_MAX_BYTES, AssetFormatError, AssetNotFound, BadMask, locate, mask_png, render
+from ..assets import (
+    MASK_MAX_BYTES,
+    AssetFormatError,
+    AssetNotFound,
+    BadImage,
+    BadMask,
+    TooManyPixels,
+    check_header,
+    locate,
+    mask_png,
+    render,
+)
 from ..fsutil import read_json, write_json_atomic
 from ..lock import ProjectLocked
 from ..pipeline import PipelineError
@@ -81,6 +100,8 @@ async def get_asset(
         raise ApiError(404, {"error": "not_found", "hash": key}) from e
     except AssetFormatError as e:
         raise ApiError(415, {"error": "unsupported_format", "detail": str(e)}) from e
+    except TooManyPixels as e:
+        raise too_many_pixels(e) from e
     except ValueError as e:  # an invalid project id
         raise ApiError(422, {"errors": [str(e)]}) from e
     return Response(content=body, media_type=media_type, headers={**headers, **source})
@@ -101,8 +122,13 @@ async def _read_capped(request: Request, limit: int) -> bytes | None:
     return b"".join(chunks)
 
 
-class BadImage(ValueError):
-    """An uploaded reference that is not a decodable PNG or JPEG."""
+def too_many_pixels(e: TooManyPixels) -> ApiError:
+    """422 `too_many_pixels`: the header declared more than the limit, and nothing was decoded."""
+    return ApiError(422, {"error": "too_many_pixels", "declared": list(e.declared), "limit": e.limit})
+
+
+def bad_image(e: BadImage) -> ApiError:
+    return ApiError(422, {"error": "bad_image", "detail": str(e)})
 
 
 def fit_mask(png: bytes, size: tuple[int, int]) -> tuple[bytes, int, int, list[int] | None]:
@@ -110,8 +136,14 @@ def fit_mask(png: bytes, size: tuple[int, int]) -> tuple[bytes, int, int, list[i
 
     A mask already at that size is kept byte for byte; another is resized nearest-neighbour (no new grey
     levels at the edges) and thresholded `> 127` to 0/255, so the quote's `mask_size` check and the
-    staging's `> 127` read agree with what the artist painted."""
+    staging's `> 127` read agree with what the artist painted.
+
+    The header is read first (`BadImage` / `TooManyPixels`, nothing decoded); a PNG that then does not decode is
+    a `BadMask`."""
+    check_header(png)
     grey = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_UNCHANGED)
+    if grey is None:
+        raise BadMask("the mask is not a decodable image")
     h, w = grey.shape[:2]
     if (w, h) == size:
         return png, w, h, None
@@ -128,9 +160,13 @@ def reference_png(data: bytes) -> tuple[bytes, int, int, list[int] | None]:
 
     Decoded as 8-bit colour (alpha and 16-bit depth dropped, a JPEG's EXIF orientation applied by the decoder),
     shrunk with INTER_AREA when a side passes `REFERENCE_MAX_SIDE`, then re-encoded: the PNG carries pixels
-    only, so nothing of the upload's metadata (EXIF, GPS, ICC, XMP) reaches the CAS."""
+    only, so nothing of the upload's metadata (EXIF, GPS, ICC, XMP) reaches the CAS.
+
+    The header is read before the decode: `BadImage` when it is none PLATE reads, `TooManyPixels` over
+    `UPLOAD_MAX_PIXELS` (a 16000 x 16000 reference is refused, not shrunk to 4096)."""
     if not (data.startswith(PNG_MAGIC) or data.startswith(JPEG_MAGIC)):
         raise BadImage("a reference is a PNG or JPEG image")
+    check_header(data)
     try:
         img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     except cv2.error as e:
@@ -266,6 +302,10 @@ async def post_asset(
         out = await run_in_threadpool(work)
     except BadMask as e:
         raise ApiError(422, {"error": "bad_mask", "detail": str(e)}) from e
+    except BadImage as e:
+        raise bad_image(e) from e
+    except TooManyPixels as e:
+        raise too_many_pixels(e) from e
     return JSONResponse(out, status_code=201)
 
 
@@ -300,7 +340,9 @@ async def _post_reference(request: Request, c: Ctx, project: Project, note: str 
     try:
         out = await run_in_threadpool(work)
     except BadImage as e:
-        raise ApiError(422, {"error": "bad_image", "detail": str(e)}) from e
+        raise bad_image(e) from e
+    except TooManyPixels as e:
+        raise too_many_pixels(e) from e
     except ProjectLocked as e:
         raise ApiError(409, {"error": "project_locked", "project_id": project_id, "detail": str(e)}) from e
     except ValueError as e:  # references.json was edited into something else

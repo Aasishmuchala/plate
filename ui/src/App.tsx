@@ -8,6 +8,12 @@
 // docked below; Esc returns, and the sidebar keeps the editors. `f` outside the viewer goes fullscreen. The
 // Recomposite bar (T99) sits under the viewer when the compared take has a stored raw layer, and a status-bar chip
 // says when the Max dock last polled for jobs (`GET /plugin/status`, every 30 s).
+// T147: the open project id is kept in sessionStorage and reopened after a reload; the page lifecycle flushes a
+// pending save on pagehide and warns before unloading unsaved work (store.installPageLifecycle); another writer's
+// `graph.saved` reloads the graph or flags a conflict (runEvents.followGraphSaves). The status bar gets the
+// conflict's Reload button (then `copy prompt` for the Edit prompts the reload dropped) and, while the tab has no
+// token or the daemon refused it, a field to paste the `#token=` value; a pasted token remounts the canvas so every
+// panel reads again with it.
 // The canvas theme is imported here (vitest runs with css: false, so tests never load it).
 
 import "./canvas/canvas.css";
@@ -16,24 +22,25 @@ import {
   Component,
   type ComponentType,
   type CSSProperties,
+  type FormEvent,
   type ReactNode,
   useEffect,
   useLayoutEffect,
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { fetchJson } from "./api/client";
-import { useLastAlert } from "./api/useDaemonStatus";
+import { ApiError, fetchJson, getGraph, setToken, tokenFromPaste } from "./api/client";
+import { useLastAlert, useTokenGeneration, useTokenState } from "./api/useDaemonStatus";
 import { CandidateStrip } from "./canvas/CandidateStrip";
 import { CompareViewer, useBindCompareToPanels } from "./canvas/CompareViewer";
-import { hub } from "./canvas/runEvents";
+import { followGraphSaves } from "./canvas/runEvents";
 import { useRunStore } from "./canvas/runStore";
 import PlateCanvas from "./PlateCanvas";
 import { editorFor } from "./editors";
 import { Panels } from "./panels";
 import { usePanelsStore } from "./panels/store";
 import { isTextEntry } from "./panels/VerdictPanel";
-import { useGraphStore } from "./store";
+import { installPageLifecycle, type LocalPrompt, saveIfPending, useGraphStore } from "./store";
 import { toggleFullscreen } from "./viewer/Viewer";
 
 const ALERT_COLOR: Record<string, string> = {
@@ -83,6 +90,179 @@ function StatusAlert() {
     </span>
   );
   return bar ? createPortal(node, bar) : node;
+}
+
+// ------------------------------------------------------------------------------------------------ save conflict
+
+const BAR_GROUP: CSSProperties = { display: "inline-flex", alignItems: "center", gap: 6 };
+
+/** The theme's field look (canvas.css styles text inputs; this one is a password field, so it says it here). */
+const TOKEN_FIELD: CSSProperties = {
+  width: 240,
+  padding: "2px 8px",
+  border: "1px solid var(--hair)",
+  borderRadius: 8,
+  background: "var(--inset)",
+  color: "var(--text)",
+  font: "inherit",
+};
+
+/**
+ * Beside the `conflict: reload` chip: the Reload button. After the reload, one `copy prompt` button per Edit prompt
+ * the artist had typed that the daemon's graph does not have (the clipboard, else a field to copy from by hand).
+ */
+function ConflictBar() {
+  const bar = useStatusBar();
+  const saveState = useGraphStore((s) => s.saveState);
+  const local = useGraphStore((s) => s.conflictLocal);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState<Record<string, "copied" | "by-hand">>({});
+  const conflict = saveState === "conflict";
+  const prompts = conflict ? [] : (local?.prompts ?? []);
+  if (!conflict && prompts.length === 0) return null;
+  const reload = async () => {
+    setBusy(true);
+    try {
+      await useGraphStore.getState().reloadGraph();
+    } finally {
+      setBusy(false);
+    }
+  };
+  const copy = async (p: LocalPrompt) => {
+    try {
+      await navigator.clipboard.writeText(p.prompt);
+      setCopied((c) => ({ ...c, [p.nodeId]: "copied" }));
+    } catch {
+      setCopied((c) => ({ ...c, [p.nodeId]: "by-hand" }));
+    }
+  };
+  const node = (
+    <span className="status-conflict" data-testid="conflict-bar" style={BAR_GROUP}>
+      {conflict ? (
+        <button
+          type="button"
+          className="btn btn-ghost"
+          data-testid="save-reload"
+          disabled={busy}
+          onClick={() => void reload()}
+          title="Take the daemon's graph. Your unsaved Edit prompts stay here to copy."
+        >
+          {busy ? "Reloading" : "Reload"}
+        </button>
+      ) : null}
+      {prompts.map((p) => (
+        <span key={p.nodeId} style={BAR_GROUP} data-testid={`conflict-prompt-${p.nodeId}`}>
+          <button
+            type="button"
+            className="btn btn-ghost"
+            data-testid={`copy-prompt-${p.nodeId}`}
+            title={p.prompt}
+            onClick={() => void copy(p)}
+          >
+            {copied[p.nodeId] === "copied" ? `copied: ${p.label}` : `copy prompt: ${p.label}`}
+          </button>
+          {copied[p.nodeId] === "by-hand" ? (
+            <input
+              readOnly
+              value={p.prompt}
+              aria-label={`your prompt for ${p.label}`}
+              data-testid={`conflict-prompt-text-${p.nodeId}`}
+              onFocus={(e) => e.currentTarget.select()}
+            />
+          ) : null}
+        </span>
+      ))}
+      {prompts.length > 0 ? (
+        <button
+          type="button"
+          className="btn btn-ghost"
+          data-testid="conflict-dismiss"
+          onClick={() => useGraphStore.getState().dismissConflictLocal()}
+        >
+          Dismiss
+        </button>
+      ) : null}
+    </span>
+  );
+  return bar ? createPortal(node, bar) : node;
+}
+
+// ------------------------------------------------------------------------------------------------ token entry
+
+/** While the tab has no token, or the daemon refused it: a field for the `#token=` value the daemon printed. */
+function TokenEntry() {
+  const bar = useStatusBar();
+  const state = useTokenState();
+  const [text, setText] = useState("");
+  const [problem, setProblem] = useState<string | null>(null);
+  if (state === "present") return null;
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    const token = tokenFromPaste(text);
+    if (!token) {
+      setProblem("no token in that text");
+      return;
+    }
+    setText("");
+    setProblem(null);
+    setToken(token);
+    saveIfPending();
+  };
+  const node = (
+    <form className="token-entry" data-testid="token-entry" onSubmit={submit} style={BAR_GROUP}>
+      <input
+        type="password"
+        autoComplete="off"
+        aria-label="Daemon token"
+        data-testid="token-input"
+        placeholder="paste the #token= the daemon printed"
+        style={TOKEN_FIELD}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+      />
+      <button type="submit" className="btn btn-ghost" data-testid="token-submit">
+        Use token
+      </button>
+      {problem ? (
+        <span role="alert" data-testid="token-problem">
+          {problem}
+        </span>
+      ) : null}
+    </form>
+  );
+  return bar ? createPortal(node, bar) : node;
+}
+
+// ------------------------------------------------------------------------------------------------ reopen
+
+/** Where the tab remembers its open project across a reload. */
+export const OPEN_PROJECT_KEY = "plate.project";
+
+/**
+ * Remember the open project, and reopen it after a reload. `generation` (bumped by a pasted token) tries again when
+ * the first read was refused; a project the daemon no longer has is forgotten.
+ */
+function useReopenProject(generation: number): void {
+  const projectId = useGraphStore((s) => s.projectId);
+  useEffect(() => {
+    if (projectId !== null) window.sessionStorage.setItem(OPEN_PROJECT_KEY, projectId);
+  }, [projectId]);
+  useEffect(() => {
+    const id = window.sessionStorage.getItem(OPEN_PROJECT_KEY);
+    if (!id || useGraphStore.getState().projectId !== null) return;
+    let alive = true;
+    getGraph(id).then(
+      (graph) => {
+        if (alive && useGraphStore.getState().projectId === null) useGraphStore.getState().loadProject(graph, id);
+      },
+      (err: unknown) => {
+        if (err instanceof ApiError && err.status === 404) window.sessionStorage.removeItem(OPEN_PROJECT_KEY);
+      },
+    );
+    return () => {
+      alive = false;
+    };
+  }, [generation]);
 }
 
 // ------------------------------------------------------------------------------------------------ Max dock chip
@@ -285,18 +465,19 @@ function useEnlargeKeys(): void {
  * stage takes the canvas area's place beside the sidebar (enlarge.css orders it first). Not inside `.plate-canvas`:
  * the canvas's own keys (T98: z, Cmd/Ctrl+D) must not fire from the viewer. Found on mount and on every toggle.
  */
-function useCanvasArea(enlarged: boolean): Element | null {
+function useCanvasArea(enlarged: boolean, generation: number): Element | null {
   const [area, setArea] = useState<Element | null>(null);
   useLayoutEffect(() => {
     const el = document.querySelector(".plate-canvas")?.parentElement ?? null;
     setArea((cur) => (cur === el ? cur : el));
-  }, [enlarged]);
+  }, [enlarged, generation]);
   return enlarged && area?.isConnected ? area : null;
 }
 
 export default function App() {
   const selected = useGraphStore((s) => s.nodes.find((n) => n.selected));
   const projectId = useGraphStore((s) => s.projectId);
+  const graphEpoch = useGraphStore((s) => s.graphEpoch);
   const enlarged = useRunStore((s) => s.enlarged);
   // The strip docked under the enlarged viewer: the selected node's, unless it made nothing and a pair is open.
   const stripNode = useRunStore((s) => {
@@ -304,10 +485,14 @@ export default function App() {
     return own ?? s.compare?.b?.nodeId ?? s.compare?.a.nodeId ?? selected?.id ?? null;
   });
   const Editor = selected ? editorFor(selected.data.kind) : null;
-  const area = useCanvasArea(enlarged);
+  const generation = useTokenGeneration();
+  const area = useCanvasArea(enlarged, generation);
 
-  // Hold the open project's event stream so alerts and packet/plugin records arrive even when no run is live.
-  useEffect(() => (projectId ? hub.follow(projectId) : undefined), [projectId]);
+  // Hold the open project's event stream so alerts and packet/plugin records arrive even when no run is live, and
+  // so another writer's graph.saved reaches the store.
+  useEffect(() => (projectId ? followGraphSaves(projectId) : undefined), [projectId]);
+  useEffect(() => installPageLifecycle(), []);
+  useReopenProject(generation);
   useBindCompareToPanels();
   useEnlargeKeys();
   // Leaving the enlarged view also leaves the page's fullscreen.
@@ -333,8 +518,8 @@ export default function App() {
 
   return (
     <div className={enlarged ? "plate-shell is-enlarged" : "plate-shell"} data-testid="plate-shell">
-      <PlateCanvas>
-        {Editor && selected ? <Editor nodeId={selected.id} /> : null}
+      <PlateCanvas key={generation}>
+        {Editor && selected ? <Editor key={`${selected.id}:${graphEpoch}`} nodeId={selected.id} /> : null}
         {!enlarged ? (
           <>
             <CompareViewer />
@@ -344,6 +529,8 @@ export default function App() {
           stage
         )}
         <Panels />
+        <ConflictBar />
+        <TokenEntry />
         <StatusAlert />
         <HostChip />
       </PlateCanvas>

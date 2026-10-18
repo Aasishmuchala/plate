@@ -4,9 +4,23 @@
   packet folders the daemon reads (`packets_dirs`; the Max plugin's preflight checks its own folder is one of
   them), `projects_dir`, `dev` and `cas_copy`.
 - `GET /projects` lists the head of every project.json (`{project_id, custody, created_utc, engine_pins,
-  root, nodes}`); `POST /projects {project_id, custody: {nda, allowed_grades?}, engine_pins?, root?}` makes
-  the folder (default `<home>/projects/<id>`) and registers it with the index: 201, or 200 when it fills in
-  the custody of a project a packet created first (`custody.unset`), else 409.
+  root, nodes, graph_revision}`); `POST /projects {project_id, custody: {nda, allowed_grades?}, engine_pins?,
+  root?}` makes the folder (default `<home>/projects/<id>`) and registers it with the index: 201, or 200 when
+  it fills in the custody of a project a packet created first, else 409. `custody.unset` is the server's mark
+  (decision 79): a client's is dropped, and the fill-in happens only on a stored `unset: true` and is ledgered
+  first as a custody `override` (no ledger, no fill-in: 503 `ledger_unavailable`).
+- The graph has a revision (decision 77): `GET /projects/{id}/graph` and the `graph` of every answer that
+  stores one carry `revision` next to `nodes`/`edges`. A `PUT` that sends a `revision` other than the stored one
+  is 409 `{"error": "graph_conflict", "current", "sent"}` (one that sends none is an old client: accepted).
+  Before any rule runs a graph is held to `projects.check_graph` (string node ids and kinds, string edge ends:
+  else 422, UNKNOWN_NODE for a node; over 4 MiB: 422 `graph_too_large`).
+- `POST /projects/{id}/nodes {kind, params?, label?, connect_from?, position?}` (201) appends one node, id
+  `<kind>-<n>` for the smallest free n, with an edge from each `connect_from` node, through the same status
+  derivation and rules as `PUT`: `{node_id, revision, graph, violations}`. It is how an agent adds a node
+  without a read-modify-write of the whole graph (two of those lose one another's nodes).
+- Saves of one project queue on a per-project lock (`GRAPH_SAVE_WAIT_S`): a wait that runs out is 409
+  `graph_busy`; a `PUT` that finds `GRAPH_MAX_WAITERS` saves already waiting is 429 `too_many_saves` at once
+  (`retry_after_ms`), so a storm of big graphs cannot take every request thread.
 - `PUT /projects/{id}/graph` is where the canvas rules are ENFORCED (`canvas_rules`, the mirror of
   `ui/src/canvasRules.ts`; the UI's checks are UX). The server owns node status (decision 31): before any
   rule runs, every node's `gateStatus`, `approved`, `approvedBy` and `scrubLogId` are rewritten from the
@@ -43,14 +57,18 @@ saving graphs or quoting all night cannot keep its own spend "attended".
 from __future__ import annotations
 
 import copy
+import os
 import sqlite3
-from collections.abc import Callable, Mapping
+import threading
+import time
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from .. import __version__, canvas_rules
 from ..config import check_project_id
@@ -58,8 +76,17 @@ from ..custody import CustodyViolation
 from ..ledger import Ledger, LedgerError
 from ..lock import ProjectLocked
 from ..pipeline import PipelineError, project_head
-from ..projects import Project, ProjectError, check_custody, check_graph
-from ..states import RunState
+from ..projects import (
+    GRAPH_MAX_BYTES,
+    GraphShapeError,
+    GraphTooLarge,
+    Lock,
+    Project,
+    ProjectError,
+    check_custody,
+    check_graph,
+)
+from ..states import Priority, RunState
 from . import API, ApiError, ctx, custody_error, pipeline_error, require_token
 from .runs import find_scrub, run_view
 
@@ -82,6 +109,19 @@ STATUS_DEFAULTS: dict[str, Any] = {"gateStatus": "none", "approved": False}  # c
 # The server's flag on a stored edge whose still locked after the artist picked another take (T111).
 EDGE_LOCKED = "locked"
 HELD_CODES = frozenset({"VIDEO_LOCKED"})
+# Save backpressure (decision 77): one save of a project at a time; the rest wait this long, and a PUT that
+# finds this many already waiting is told to come back instead of taking another request thread.
+GRAPH_SAVE_WAIT_S = 5.0
+GRAPH_MAX_WAITERS = 4
+# An append is one small node: agents adding a dozen at once all get theirs (MCP add_node), still bounded.
+NODE_MAX_WAITERS = 16
+RETRY_AFTER_MS = 500
+APPEND_TRIES = 3  # a writer outside the save lock (previs, revisions, the CLI) moved the graph: rebuild on it
+NODE_DX, NODE_DY = 300, 140  # where an appended node goes when the body names no position (mcp_server's)
+CUSTODY_FILL_REASON = "custody set for a packet-first project"
+_SAVE_LOCKS: dict[str, threading.Lock] = {}
+_SAVE_WAITERS: dict[str, int] = {}
+_SAVE_GUARD = threading.Lock()
 
 
 class ProjectBody(BaseModel):
@@ -109,11 +149,34 @@ class NodeQuoteBody(BaseModel):
     packet_id: str | None = None
     prompt: str | None = None
     priority: str | int | None = None
-    attempt: int | None = Field(default=None, ge=1)  # absent: the pipeline numbers repeats (decision 40)
+    # absent: the pipeline numbers repeats (decision 40); at most 1000 (decision 80)
+    attempt: int | None = Field(default=None, ge=1, le=1000)
     feather_px: float | None = Field(default=None, ge=4, le=12)  # inside the mask, 4-12 px (decision 4)
     task: str | None = None  # relight, people, vegetation, sky, rephotograph_close (the router's task names)
     shot_class: str | None = None  # wide, medium, close
     recipe: str | None = None  # a runnable recipe id or path (decision 33)
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def _priority(cls, value: Any) -> str | None:
+        """`Priority.parse` at the door (decision 80): a word or number it cannot read is the 422 here, and
+        `0` (the client-deadline class) is a priority like any other. Passed on as the class's label."""
+        return None if value is None else Priority.parse(value).label
+
+
+class Position(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    x: float = Field(allow_inf_nan=False)
+    y: float = Field(allow_inf_nan=False)
+
+
+class NodeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: str
+    params: dict[str, Any] | None = None
+    label: str | None = Field(default=None, max_length=500)
+    connect_from: list[str] = Field(default_factory=list, max_length=64)
+    position: Position | None = None
 
 
 def from_ui(request: Request) -> bool:
@@ -138,7 +201,71 @@ def _project(request: Request, project_id: str) -> Project:
 
 
 def _locked(project_id: str, e: ProjectLocked) -> ApiError:
-    return ApiError(409, {"error": "project_locked", "project_id": project_id, "detail": str(e)})
+    detail = "another save of this project is in progress; retry" if e.holder_pid == os.getpid() else str(e)
+    return ApiError(409, {"error": "project_locked", "project_id": project_id, "detail": detail})
+
+
+@contextmanager
+def _lock(project: Project) -> Iterator[Lock]:
+    """The project lock. A holder in this process (a ledger append, a packet registration, another handle)
+    lets go in milliseconds, so wait for it up to LOCK_TIMEOUT_S, as for a holder not yet named in the lock
+    file; another process's lock fails at once, as before."""
+    deadline = time.monotonic() + LOCK_TIMEOUT_S
+    delay = 0.005
+    while True:
+        lock = project.lock(timeout_s=LOCK_TIMEOUT_S)
+        try:
+            lock.acquire()
+            break
+        except ProjectLocked as e:
+            if e.holder_pid not in (None, os.getpid()) or time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.1)
+    try:
+        yield lock
+    finally:
+        lock.release()
+
+
+@contextmanager
+def _save_slot(project: Project, max_waiters: int) -> Iterator[None]:
+    """One save of a project at a time, in this process (decision 77). A save that finds `max_waiters`
+    already waiting is 429 `too_many_saves` at once; one that waits GRAPH_SAVE_WAIT_S in vain is 409
+    `graph_busy`."""
+    key = str(project.root)
+    with _SAVE_GUARD:
+        slot = _SAVE_LOCKS.setdefault(key, threading.Lock())
+        if _SAVE_WAITERS.get(key, 0) >= max_waiters:
+            raise ApiError(429, {"error": "too_many_saves", "retry_after_ms": RETRY_AFTER_MS})
+        _SAVE_WAITERS[key] = _SAVE_WAITERS.get(key, 0) + 1
+    try:
+        got = slot.acquire(timeout=GRAPH_SAVE_WAIT_S)
+    finally:
+        with _SAVE_GUARD:
+            _SAVE_WAITERS[key] -= 1
+    if not got:
+        raise ApiError(
+            409,
+            {
+                "error": "graph_busy",
+                "project_id": project.project_id,
+                "detail": f"another save of this project held it for {GRAPH_SAVE_WAIT_S:g} s; retry",
+            },
+        )
+    try:
+        yield
+    finally:
+        slot.release()
+
+
+def _head(project: Project) -> dict[str, Any]:
+    return {**project_head(project), "graph_revision": project.graph_revision}
+
+
+def _graph_view(project: Project) -> dict[str, Any]:
+    """The stored graph as the routes answer it: `revision` next to `nodes` and `edges`."""
+    return {**project.graph, "revision": project.graph_revision}
 
 
 @router.get("/session")
@@ -157,7 +284,17 @@ def session(request: Request) -> dict[str, Any]:
 
 @router.get("/projects")
 def list_projects(request: Request) -> list[dict[str, Any]]:
-    return ctx(request).pipeline.project_list()
+    return [_with_revision(h) for h in ctx(request).pipeline.project_list()]
+
+
+def _with_revision(head: dict[str, Any]) -> dict[str, Any]:
+    """A listed head with its `graph_revision` (a folder that no longer reads is listed as it came)."""
+    if "graph_revision" in head or head.get("broken") or not head.get("root"):
+        return head
+    try:
+        return {**head, "graph_revision": Project.load(Path(head["root"])).graph_revision}
+    except (OSError, ValueError):  # ProjectError is a ValueError
+        return head
 
 
 @router.post("/projects", status_code=201)
@@ -172,15 +309,36 @@ def create_project(request: Request, body: ProjectBody) -> JSONResponse:
         raise ApiError(422, {"errors": [f"root must be an absolute folder, got {body.root!r}"]})
     existing = c.pipeline.load_project(pid)
     if existing is not None:
-        if not existing.custody.get("unset"):
-            raise ApiError(409, {"error": "exists", "project_id": pid, "root": str(existing.root)})
-        with existing.lock(timeout_s=LOCK_TIMEOUT_S):
-            existing.doc["custody"] = custody
-            existing.doc["engine_pins"] = dict(body.engine_pins)
-            existing.save()
+        exists = ApiError(409, {"error": "exists", "project_id": pid, "root": str(existing.root)})
+        if existing.custody.get("unset") is not True:  # only the server's own mark (decision 79)
+            raise exists
+        try:
+            with _lock(existing) as lock:
+                existing = Project.load(existing.root)  # under the lock: one fill-in wins
+                if existing.custody.get("unset") is not True:
+                    raise exists
+                old = dict(existing.custody)
+                try:  # ledgered first: a custody the ledger cannot hold is not set
+                    Ledger(existing.root, lock=lock, clock=c.now).append(
+                        {
+                            "kind": "override",
+                            "by": "human",
+                            "reason": CUSTODY_FILL_REASON,
+                            "data": {"what": "custody", "from": old, "to": custody},
+                        }
+                    )
+                except LEDGER_ERRORS as e:
+                    raise ApiError(
+                        503, {"error": "ledger_unavailable", "detail": f"custody unchanged: {e}"}
+                    ) from e
+                existing.doc["custody"] = custody
+                existing.doc["engine_pins"] = dict(body.engine_pins)
+                existing.save()
+        except ProjectLocked as e:
+            raise _locked(pid, e) from e
         c.index.set_project_root(pid, existing.root, custody)
         _touch_if_human(request)
-        return JSONResponse(project_head(existing), status_code=200)
+        return JSONResponse(_head(existing), status_code=200)
     root = Path(body.root) if body.root else c.settings.projects_dir / pid
     try:
         project = Project.create(root, pid, custody, now=c.now())
@@ -194,12 +352,12 @@ def create_project(request: Request, body: ProjectBody) -> JSONResponse:
             project.save()
     c.index.set_project_root(pid, project.root, project.custody)
     _touch_if_human(request)
-    return JSONResponse(project_head(project), status_code=201)
+    return JSONResponse(_head(project), status_code=201)
 
 
 @router.get("/projects/{project_id}/graph")
 def get_graph(request: Request, project_id: str) -> dict[str, Any]:
-    return _project(request, project_id).graph
+    return _graph_view(_project(request, project_id))
 
 
 # ---------------------------------------------------------------------------- server-derived node status
@@ -386,17 +544,33 @@ def _refused(problems: list[dict[str, Any]]) -> ApiError:
     )
 
 
-@router.put("/projects/{project_id}/graph")
-def put_graph(request: Request, project_id: str, graph: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
-    c = ctx(request)
-    project = _project(request, project_id)
-    held: list[dict[str, Any]] = []
+def _shape_checked(graph: dict[str, Any]) -> None:
+    """`projects.check_graph` as the routes answer it: 422 `graph_too_large`, a node's problem as an
+    UNKNOWN_NODE refusal (never a 500 from an id that is an object), anything else as `errors`."""
     try:
         check_graph(graph)
+    except GraphTooLarge as e:
+        raise ApiError(
+            422,
+            {"error": "graph_too_large", "errors": [str(e)], "bytes": e.size, "limit_bytes": GRAPH_MAX_BYTES},
+        ) from e
+    except GraphShapeError as e:
+        if e.code is not None:
+            raise _refused([{"node": e.node, "code": e.code, "message": str(e)}]) from e
+        raise ApiError(422, {"errors": [str(e)]}) from e
+    except ProjectError as e:
+        raise ApiError(422, {"errors": [str(e)]}) from e
+
+
+def _checked(c: Any, project: Project, graph: dict[str, Any]) -> list[dict[str, Any]]:
+    """Derive the status and run the rules on `graph` against what `project` stores (decision 31, T111):
+    the held violations, flagged on `graph`'s edges; a refusal raises the 422."""
+    held: list[dict[str, Any]] = []
+    try:
         claimed = copy.deepcopy(graph)
         for edge in graph["edges"]:
             edge.pop(EDGE_LOCKED, None)  # server-owned, like the node status
-        with c.index.project(project_id) as conn:
+        with c.index.project(project.project_id) as conn:
             _apply_status(graph, derive_status(conn, project.root, graph))
         problems = canvas_rules.check_nodes(graph)
         if not problems:
@@ -411,27 +585,180 @@ def put_graph(request: Request, project_id: str, graph: Annotated[dict[str, Any]
     if problems:
         raise _refused(problems + held)
     _flag_edges(graph, held)
+    return held
+
+
+class _Moved(Exception):
+    """The stored graph is not at the revision the save was built on."""
+
+    def __init__(self, current: int):
+        self.current = current
+        super().__init__(f"the graph is at revision {current}")
+
+
+def _write(
+    project: Project, graph: dict[str, Any], held: list[dict[str, Any]], expect: int | None
+) -> Project:
+    """Store a checked graph under the project lock, re-read there: `_Moved` when the stored revision is not
+    `expect` (None: any), a held edge another writer removed meanwhile is a new edge again and refused."""
     try:
-        with project.lock(timeout_s=LOCK_TIMEOUT_S):
+        with _lock(project):
             project = Project.load(project.root)  # under the lock: never write back a stale custody
+            if expect is not None and project.graph_revision != expect:
+                raise _Moved(project.graph_revision)
             stored = _edge_keys(project.graph)
             gone = [v for v in held if _edge_key(v["edge"]) not in stored]
             if gone:  # removed by another writer since the check: a new edge again, so refused
                 raise _refused(gone + [v for v in held if v not in gone])
             project.save_graph(graph)
     except ProjectLocked as e:
-        raise _locked(project_id, e) from e
+        raise _locked(project.project_id, e) from e
+    return project
+
+
+def _conflict(current: int, sent: int) -> ApiError:
+    return ApiError(409, {"error": "graph_conflict", "current": current, "sent": sent})
+
+
+def _saved(request: Request, project: Project) -> None:
     _touch_if_human(request)
-    c.pipeline.publish(
-        project_id,
+    graph = project.graph
+    ctx(request).pipeline.publish(
+        project.project_id,
         None,
         {
             "kind": "graph.saved",
             "nodes": len(graph.get("nodes") or []),
             "edges": len(graph.get("edges") or []),
+            "revision": project.graph_revision,
         },
     )
-    return {"ok": True, "project_id": project_id, "graph": project.graph, "violations": held}
+
+
+@router.put("/projects/{project_id}/graph")
+def put_graph(request: Request, project_id: str, graph: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+    c = ctx(request)
+    project = _project(request, project_id)
+    sent = graph.pop("revision", None)  # the revision the client read; never stored inside the graph
+    if sent is not None and (not isinstance(sent, int) or isinstance(sent, bool) or sent < 0):
+        raise ApiError(
+            422, {"error": "bad_revision", "errors": [f"revision must be a whole number, got {sent!r}"]}
+        )
+    _shape_checked(graph)
+    with _save_slot(project, GRAPH_MAX_WAITERS):
+        project = _project(request, project_id)  # what the save before this one left
+        if sent is not None and sent != project.graph_revision:
+            raise _conflict(project.graph_revision, sent)
+        held = _checked(c, project, graph)
+        try:
+            project = _write(project, graph, held, sent)
+        except _Moved as e:  # a writer outside the save lock moved it after the check
+            raise _conflict(e.current, sent) from e
+    _saved(request, project)
+    return {"ok": True, "project_id": project_id, "graph": _graph_view(project), "violations": held}
+
+
+def _free_id(kind: str, taken: set[Any]) -> str:
+    n = 1
+    while f"{kind.lower()}-{n}" in taken:
+        n += 1
+    return f"{kind.lower()}-{n}"
+
+
+def _position(nodes: list[dict[str, Any]], sources: list[dict[str, Any]]) -> dict[str, float]:
+    """Right of the rightmost source, below what that column holds; with no placed source, under the rest."""
+
+    def at(n: Mapping[str, Any]) -> tuple[float, float] | None:
+        pos = n.get("position")
+        if isinstance(pos, Mapping) and all(
+            isinstance(pos.get(k), (int, float)) and not isinstance(pos.get(k), bool) for k in ("x", "y")
+        ):
+            return float(pos["x"]), float(pos["y"])
+        return None
+
+    placed = [p for p in (at(s) for s in sources) if p is not None]
+    if not placed:
+        return {"x": 0, "y": NODE_DY * len(nodes)}
+    x = max(p[0] for p in placed) + NODE_DX
+    column = [p for p in (at(n) for n in nodes) if p is not None and p[0] == x]
+    return {"x": x, "y": max(p[1] for p in placed) + NODE_DY * len(column)}
+
+
+def _appended(stored: Mapping[str, Any], body: NodeBody) -> tuple[dict[str, Any], str]:
+    """The stored graph plus the body's node (and an edge from each `connect_from` node), and the new id."""
+    graph = copy.deepcopy(dict(stored))
+    nodes, edges = graph["nodes"], graph["edges"]
+    by_id = {n.get("id"): n for n in nodes if isinstance(n.get("id"), str)}
+    sources = list(dict.fromkeys(body.connect_from))
+    missing = [s for s in sources if s not in by_id]
+    if missing:
+        raise ApiError(
+            422,
+            {
+                "error": "unknown_node",
+                "errors": [f"connect_from names nodes the graph does not hold: {missing}"],
+                "missing": missing,
+            },
+        )
+    nid = _free_id(body.kind, set(by_id))
+    params = dict(body.params or {})
+    node: dict[str, Any] = {"id": nid, "kind": body.kind, "label": body.label or body.kind}
+    if body.kind == "Plate":  # a Plate's packet link and tier live on the node, as the canvas writes them
+        for src, dst in (("packetId", "packetId"), ("packet_id", "packetId"), ("tier", "tier")):
+            if src in params:
+                node[dst] = params.pop(src)
+    node["params"] = params
+    if body.position is not None:
+        node["position"] = {"x": body.position.x, "y": body.position.y}
+    else:
+        node["position"] = _position(nodes, [by_id[s] for s in sources])
+    nodes.append(node)
+    edges.extend({"id": f"{s}->{nid}", "source": s, "target": nid} for s in sources)
+    return graph, nid
+
+
+@router.post("/projects/{project_id}/nodes", status_code=201)
+def add_node(request: Request, project_id: str, body: NodeBody) -> dict[str, Any]:
+    """Append one node under the save lock (decision 77): concurrent appends each get their own id."""
+    c = ctx(request)
+    project = _project(request, project_id)
+    if body.kind not in canvas_rules.NODE_KINDS:
+        raise ApiError(
+            422,
+            {
+                "error": "unknown_kind",
+                "errors": [
+                    f"unknown node kind {body.kind!r}; kinds are {', '.join(canvas_rules.NODE_KINDS)}"
+                ],
+            },
+        )
+    with _save_slot(project, NODE_MAX_WAITERS):
+        for _try in range(APPEND_TRIES):
+            project = _project(request, project_id)
+            graph, nid = _appended(project.graph, body)
+            _shape_checked(graph)
+            held = _checked(c, project, graph)
+            try:
+                project = _write(project, graph, held, project.graph_revision)
+                break
+            except _Moved:
+                continue
+        else:
+            raise ApiError(
+                409,
+                {
+                    "error": "graph_busy",
+                    "project_id": project_id,
+                    "detail": f"the graph moved under {APPEND_TRIES} appends in a row; retry",
+                },
+            )
+    _saved(request, project)
+    return {
+        "node_id": nid,
+        "revision": project.graph_revision,
+        "graph": _graph_view(project),
+        "violations": held,
+    }
 
 
 # ---------------------------------------------------------------------------- custody
@@ -442,7 +769,7 @@ def put_custody(request: Request, project_id: str, body: CustodyBody) -> dict[st
     c = ctx(request)
     project = _project(request, project_id)
     try:
-        with project.lock(timeout_s=LOCK_TIMEOUT_S) as lock:
+        with _lock(project) as lock:
             project = Project.load(project.root)
             old = dict(project.custody)
             keep = {k: v for k, v in old.items() if k not in ("nda", "allowed_grades", "unset")}
@@ -485,7 +812,7 @@ def put_custody(request: Request, project_id: str, body: CustodyBody) -> dict[st
         raise _locked(project_id, e) from e
     c.index.set_project_root(project_id, project.root, project.custody)
     _touch_if_human(request)
-    return project_head(project)
+    return _head(project)
 
 
 # ---------------------------------------------------------------------------- quoting a node

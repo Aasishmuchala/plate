@@ -86,7 +86,7 @@ The SQLite index is rebuilt from the folder: `project.json`, `packets.json`, `as
 plate-tools reindex D:\Projects\clubhouse          (add --verify to re-hash every blob; slow on a big project)
 ```
 
-It takes the project lock first. If the daemon has the project open you get `refused: ... locked by another PLATE process (host pid N since T)`; stop the daemon or close the project. The report compares the ids the folder holds with the ids in the new index (assets, packets, runs). `INCONSISTENT` means something the folder holds is not in the index, usually a run whose packet is not in `packets.json` or a blob that fails `--verify`; the problems are listed by id.
+It takes the project lock first. The lock is held only while something writes (a graph save, a ledger line), not while the daemon has the project open, so it is usually free: if a write is in flight you get `refused: ... locked by another PLATE process (host pid N since T)`, and a few seconds later the same command works. Because the lock is per write, it does not stop the daemon from starting a run right after the tool lets go: stop the daemon before a reindex that must see a still project. The report compares the ids the folder holds with the ids in the new index (assets, packets, runs). `INCONSISTENT` means something the folder holds is not in the index, usually a run whose packet is not in `packets.json` or a blob that fails `--verify`; the problems are listed by id.
 
 ## End-of-project purge
 
@@ -103,7 +103,7 @@ plate-tools purge D:\Projects\clubhouse --older-than-days 30
 It prints how many blobs it would delete and how many vendor-side deletions are still owed. `--json` lists every candidate with its hash, extension, size and age.
 
 4. Decide what to keep. By default a blob is kept when the graph, `packets.json`, a gate report or **any** ledger record names it, so only true orphans go. For the end of a project add `--no-keep-ledger`: then the candidates nobody chose (re-rolled takes) also go, while the graph's picks, accepted and exported runs (with their inputs) and the gate reports stay. `--no-keep-masters` and `--no-keep-gate-reports` drop those protections too; use them only when the deliverables are archived elsewhere.
-5. Apply it: `plate-tools purge D:\Projects\clubhouse --older-than-days 30 --no-keep-ledger --apply`. It needs the project lock, so the daemon must not have the project open. It writes `purge_<time>.json` in the project folder: every deleted hash, its size and age, what was kept and why, and the vendor-side deletions still owed. `runs.jsonl` is never touched. A ledger whose hash chain does not verify refuses the purge, because references in damaged records cannot be seen.
+5. Apply it: `plate-tools purge D:\Projects\clubhouse --older-than-days 30 --no-keep-ledger --apply`. It takes the project lock for the whole apply, so the daemon's writes wait (a save is refused `project_locked`, and the canvas retries) until it finishes; the lock cannot stop a run that is already in flight from adding a blob the purge has not seen, so stop the daemon first anyway. It writes `purge_<time>.json` in the project folder: every deleted hash, its size and age, what was kept and why, and the vendor-side deletions still owed. `runs.jsonl` is never touched. A ledger whose hash chain does not verify refuses the purge, because references in damaged records cannot be seen.
 6. Back up again (the backup removes the purged files from the offsite copy at the next `sync`).
 
 A blob must be older than `--older-than-days` (by file time, which a backup and restore keep), so a take generated this morning is never a candidate.
@@ -138,7 +138,7 @@ On a critical alert: find the runs (`runs.jsonl`, kind `approved`, `by` of `auto
 
 | you see | cause | do |
 |---|---|---|
-| `refused: ... locked by another PLATE process` | the daemon (or another tool) holds `project.lock` | stop the daemon or close the project; `backup` and dry-run `purge` do not need the lock |
+| `refused: ... locked by another PLATE process` | the daemon or another tool was writing at that instant: `project.lock` is taken per write, not held while a project is open | wait a few seconds and run it again; for `purge --apply` and a `reindex` that must see a still project, stop the daemon first. `backup` and dry-run `purge` do not need the lock |
 | `backup copied but the command failed` | the offsite command exited non-zero or was not found (exit 127) | the local copy is fine; fix the command or the remote, run `backup` again; read `stderr_tail` in the report |
 | `the backup folder and the project folder must not contain each other` | the destination is inside the project (or the reverse) | choose a destination on another disk |
 | `restore drill FAILED` | see the drill section | do not delete the backup; re-run the backup and re-drill |

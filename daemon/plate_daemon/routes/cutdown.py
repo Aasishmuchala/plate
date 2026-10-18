@@ -13,12 +13,14 @@
   report and GATE_FAIL without a recorded override are 409 `delivery_refused` with the guard's `code`. Then
   the lineage goes inside the file (with the IPTC AI marker on a generative take), `<name>.cutdown.json` beside
   it, a ledger `export` record (`data.cutdown: true`) is written and the stored gate report is marked shipped.
-  An existing file is 409 `exists`; ffmpeg or ffprobe missing is 503 `tool_missing`; a crop that cannot be made
-  (unknown preset, an upscale) is 422 `cutdown_error`.
+  An existing file is 409 `exists` (the name is claimed, so of concurrent cutdowns to one name exactly one is
+  written); ffmpeg or ffprobe missing is 503 `tool_missing`; a crop that cannot be made (unknown preset, an
+  upscale) is 422 `cutdown_error`. A project folder whose `gates/` cannot take the shipped mark is refused after
+  the guard and before the take is read (503 `not_exportable`, `export.check_project_writable`).
 
 `cutdown_run(pipeline, run_id, preset, out_dir, ...)` is the same thing as a function; it raises `PipelineError`
 (404 unknown run; 422 `bad_name`, `bad_out_dir`, `no_output`, `unreadable_take`), `DeliveryRefused`,
-`ToolMissing`, `DeliveryError`, `CutdownError` or `FileExistsError`.
+`ProjectUnwritable` (a `NotExportable`), `ToolMissing`, `DeliveryError`, `CutdownError` or `FileExistsError`.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ from .. import cutdown
 from ..delivery.frames import is_video_file
 from ..delivery.guard import DeliveryError, DeliveryRefused, Provenance, ToolMissing, authorize
 from ..delivery.tools import probe_video
-from ..export import NAME_RE, recorded_override
+from ..export import NAME_RE, NotExportable, check_project_writable, recorded_override
 from ..gate_reports import NoReport
 from ..gate_reports import Service as ReportService
 from ..lineage import LineageError
@@ -109,7 +111,7 @@ def cutdown_run(
             f"out_dir must be an absolute folder path, got {str(out_dir)!r}", code="bad_out_dir"
         )
     stem = name or f"{run_id}_{preset.replace(':', 'x')}"
-    if not NAME_RE.match(stem):
+    if not NAME_RE.fullmatch(stem):
         raise PipelineError(
             f"cutdown name {stem!r}: letters, digits, '.', '_' and '-' only (a Windows file name)",
             code="bad_name",
@@ -128,6 +130,7 @@ def cutdown_run(
             engine_version=str(run.route_dict.get("model_version") or "") or None,
         )
         authorize(prov)  # refuse before anything is read or written
+        check_project_writable(project_dir)  # the shipped mark goes there: refuse before a client file
         key = run.outputs[0] if run.outputs else None
         src = cas.find(key) if key else None
         if src is None:
@@ -225,6 +228,8 @@ def cutdown_route(request: Request, run_id: str, body: CutdownBody) -> dict[str,
         raise pipeline_error(e) from e
     except DeliveryRefused as e:
         raise ApiError(409, {"error": "delivery_refused", "code": e.code, "detail": str(e)}) from e
+    except NotExportable as e:
+        raise ApiError(getattr(e, "status", 409), {"error": "not_exportable", "detail": str(e)}) from e
     except ToolMissing as e:
         raise ApiError(503, {"error": "tool_missing", "detail": str(e)}) from e
     except FileExistsError as e:

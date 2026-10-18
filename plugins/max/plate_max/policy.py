@@ -6,13 +6,21 @@ signage; everything else, and everything unlabelled, stays locked. The class rul
 same list written into the manifest's policy.class_rules, so plate_spec.validate_legend can re-check
 every class_source=rule entry against them. lint() is the Send gate: the policy checks (unlabelled
 share, locked/editable overlap) plus the scene checks that must pass before a render is worth
-starting (scaled, shifted or hidden camera, no V-Ray, node names that break file names). With
-level_and_crop (decision 58) a two-point camera that bridge.camera_level can send as a level pinhole
-is a SHIFTED_CAMERA warning instead of a blocking problem. Stdlib only.
+starting (scaled, shifted or hidden camera, a non-finite camera pose, no V-Ray, node names that
+break file names). With level_and_crop (decision 58) a two-point camera that bridge.camera_level can
+send as a level pinhole is a SHIFTED_CAMERA warning instead of a blocking problem.
+
+lint_scene() adds what only the open scene can tell (decision 81), all before any render: two
+geometry nodes sharing a name (DUPLICATE_NODE_NAME: Cryptomatte hashes the name, so they would share
+one id and one class, and whichever node came last would decide whether locked architecture is
+editable), two cameras sharing a name (DUPLICATE_CAMERA_NAME: the Send would render the first one
+under both), a camera name that cannot become a shot id (BAD_SHOT_SLUG) and lens or exposure values
+that are not positive finite numbers (BAD_LENS). Stdlib only.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from . import digest
@@ -129,6 +137,11 @@ SHIFTED_CAMERA = "SHIFTED_CAMERA"
 NO_VRAY = "NO_VRAY"
 HIDDEN_CAMERA = "HIDDEN_CAMERA"
 BAD_NAME_CHARS = "BAD_NAME_CHARS"
+DUPLICATE_NODE_NAME = "DUPLICATE_NODE_NAME"
+DUPLICATE_CAMERA_NAME = "DUPLICATE_CAMERA_NAME"
+BAD_SHOT_SLUG = "BAD_SHOT_SLUG"
+BAD_LENS = "BAD_LENS"
+BAD_POSE = "BAD_POSE"
 
 # Characters that would break a file name or a path made from a node name (":" is the Windows
 # drive/stream separator and the one the generated file names must never contain).
@@ -208,16 +221,46 @@ def level_plan(cam: dict[str, Any]) -> tuple[camera_level.LevelPlan | None, str]
     return camera_level.assess(cam, int(resolution[0]), int(resolution[1]))
 
 
+# Max Matrix3 rows as the artist knows them; world_from_camera[i][j] is row j + 1, axis i.
+_MAX_ROWS = ("X axis (row1)", "Y axis (row2)", "Z axis (row3)", "position (row4)")
+
+
+def pose_problems(cam: dict[str, Any]) -> list[dict[str, Any]]:
+    """BAD_POSE when the camera_digest()'s world_from_camera holds NaN or infinity (a broken scripted
+    controller, say): the detail names the transform rows. None (unreadable) is not judged here."""
+    m = cam.get("world_from_camera")
+    if m is None:
+        return []
+    bad = digest.non_finite_entries(m)
+    if not bad:
+        return []
+    name = str(cam.get("name"))
+    where = sorted(
+        {_MAX_ROWS[j] + " " + "xyz"[i] for i, j in bad if i < 3 and j < 4}
+        | {f"entry [{i}][{j}]" for i, j in bad if i >= 3 or j >= 4}
+    )
+    return [
+        _problem(
+            BAD_POSE,
+            name,
+            f"camera {name}: {digest.NON_FINITE_POSE} (NaN or infinity in the objecttransform "
+            f"{', '.join(where)}): fix the camera's transform or its animation controller before sending",
+        )
+    ]
+
+
 def camera_checks(
     cam: dict[str, Any], hidden: bool = False, level_and_crop: bool = False
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """(problems, warnings) for one camera_digest(): SCALED_CAMERA, SHIFTED_CAMERA, HIDDEN_CAMERA.
-    With level_and_crop, a shifted or tilted camera that camera_level can plan is a SHIFTED_CAMERA
-    warning (Send renders the level pinhole and crops it); one it cannot stays a problem, saying why."""
+    """(problems, warnings) for one camera_digest(): BAD_POSE, SCALED_CAMERA, SHIFTED_CAMERA,
+    HIDDEN_CAMERA. A pose with a non-finite value is BAD_POSE (never also SCALED_CAMERA); a finite
+    pose that is not a proper rotation is SCALED_CAMERA. With level_and_crop, a shifted or tilted
+    camera that camera_level can plan is a SHIFTED_CAMERA warning (Send renders the level pinhole and
+    crops it); one it cannot stays a problem, saying why."""
     name = str(cam.get("name"))
-    out: list[dict[str, Any]] = []
+    out: list[dict[str, Any]] = pose_problems(cam)
     warnings: list[dict[str, Any]] = []
-    if cam.get("world_from_camera") is not None:
+    if cam.get("world_from_camera") is not None and not out:
         problem = digest.rotation_error(cam["world_from_camera"])
         if problem:
             out.append(_problem(SCALED_CAMERA, name, f"camera {name}: {problem}"))
@@ -286,6 +329,166 @@ def name_problems(names: list[str] | tuple[str, ...]) -> list[dict[str, Any]]:
     return out
 
 
+def _layer_text(layer: Any) -> str:
+    return repr(str(layer)) if layer is not None else "no layer"
+
+
+def duplicate_node_text(name: str) -> str:
+    """The words legend.build_id_legend raises for two visible nodes named name, and the start of
+    DUPLICATE_NODE_NAME's detail: one text for the same refusal."""
+    return f"duplicate visible node name {name!r}"
+
+
+def duplicate_node_problems(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """DUPLICATE_NODE_NAME for every name two or more geometry nodes share (digest.scene_nodes()
+    records, hidden ones included: V-Ray can render hidden geometry). The detail starts with the text
+    legend.build_id_legend raises for it and lists the nodes' layers."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for node in nodes:
+        groups.setdefault(str(node["name"]), []).append(node)
+    out = []
+    for name, group in groups.items():
+        if len(group) < 2:
+            continue
+        layers = ", ".join(_layer_text(n.get("layer")) for n in group)
+        out.append(
+            _problem(
+                DUPLICATE_NODE_NAME,
+                name,
+                f"{duplicate_node_text(name)}: {len(group)} geometry nodes share it (layers "
+                f"{layers}); Cryptomatte gives them one id and one class, so rename them apart before "
+                "sending",
+            )
+        )
+    return out
+
+
+def duplicate_camera_problems(names: list[str] | tuple[str, ...]) -> list[dict[str, Any]]:
+    """DUPLICATE_CAMERA_NAME for every name two or more camera nodes share: the Send finds a camera by
+    name, so it would render the first one under both."""
+    counts: dict[str, int] = {}
+    for name in names:
+        counts[str(name)] = counts.get(str(name), 0) + 1
+    return [
+        _problem(
+            DUPLICATE_CAMERA_NAME,
+            name,
+            f"{count} cameras are named {name!r}: Send finds a camera by its name and would render the "
+            "first one for both; rename them apart",
+        )
+        for name, count in counts.items()
+        if count > 1
+    ]
+
+
+def shot_slug_problems(camera_name: str) -> list[dict[str, Any]]:
+    """BAD_SHOT_SLUG when packet.slugify(camera_name) raises (no ASCII letter or digit at all) or
+    yields a slug that is not the whole name's: a letter or digit outside a-z, A-Z, 0-9 would be
+    dropped ('客户A' would be shot 'a'). Symbols, spaces and emoji are separators and do not count."""
+    from . import packet  # packet imports this module
+
+    name = str(camera_name)
+    try:
+        slug = packet.slugify(name)
+    except packet.ManifestError:
+        return [
+            _problem(
+                BAD_SHOT_SLUG,
+                name,
+                f"camera name {name!r} has no ASCII letter or digit, so it cannot become a shot id: "
+                "rename the camera (for example CAM_front)",
+            )
+        ]
+    dropped = sorted({c for c in name if c.isalnum() and not c.isascii()})
+    if dropped:
+        return [
+            _problem(
+                BAD_SHOT_SLUG,
+                name,
+                f"camera name {name!r} has letters or digits outside a-z and 0-9 ({' '.join(dropped)}): "
+                f"its shot id would be {slug!r}, not the camera's name; rename it with ASCII letters "
+                "and digits",
+            )
+        ]
+    return []
+
+
+# (camera_digest field, what the artist calls it, read_from key naming the Max property).
+LENS_FIELDS = (
+    ("focal_mm", "focal length", "focal_mm"),
+    ("film_gate_mm", "film gate", "film_gate_mm"),
+    ("zoom_factor", "zoom factor", "zoom_factor"),
+    ("f_number", "f-number", "f_number"),
+    ("exposure.iso", "ISO", "exposure.iso"),
+    ("exposure.shutter_s", "shutter", "exposure.shutter_s"),
+)
+
+
+def _lens_value(cam: dict[str, Any], field: str) -> Any:
+    value: Any = cam
+    for key in field.split("."):
+        value = value.get(key) if isinstance(value, dict) else None
+    return value
+
+
+def _number_text(value: Any) -> str:
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def lens_value_problems(cam: dict[str, Any]) -> list[dict[str, Any]]:
+    """BAD_LENS for every lens or exposure value of a camera_digest() that was read but is not a
+    positive finite number (focal length, film gate, zoom, f-number, ISO, shutter): the detail names
+    the camera property it came from. An unreadable value (None) is the digest's warning, not this."""
+    name = str(cam.get("name"))
+    read_from = cam.get("read_from") or {}
+    out = []
+    for field, label, source in LENS_FIELDS:
+        value = _lens_value(cam, field)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = math.nan
+        if math.isfinite(number) and number > 0:
+            continue
+        prop = read_from.get(source) or field
+        typed = number
+        if field == "exposure.shutter_s" and prop in digest.SHUTTER_SPEED_NAMES and not math.isnan(number):
+            typed = 1.0 / number if number else math.inf  # V-Ray stores 1/seconds: the number typed
+        why = "not a finite number" if not math.isfinite(typed) else "not positive"
+        shown = _number_text(typed) if not math.isnan(number) else _number_text(value)
+        out.append(
+            _problem(
+                BAD_LENS,
+                name,
+                f"camera {name}: {label} {prop} is {shown}, {why}: set the camera's {prop} to a "
+                "positive number before sending",
+            )
+        )
+    return out
+
+
+def camera_names(rt: Any) -> list[str]:
+    """The names of the scene's camera nodes (rt.cameras), camera targets left out."""
+    try:
+        nodes = list(getattr(rt, "cameras", None) or [])
+    except Exception:
+        return []
+    out = []
+    for node in nodes:
+        try:
+            if str(rt.classOf(node)).lower() == "targetobject":
+                continue
+        except Exception:
+            pass
+        out.append(str(getattr(node, "name", "")))
+    return out
+
+
 def lint(
     policy: dict[str, Any] | None,
     coverage: dict[str, float] | None,
@@ -351,9 +554,12 @@ def lint_scene(
 ) -> LintReport:
     """lint() over the open scene: reads the camera, its hidden state, the renderer and the node
     names through pymxs. Without policy and coverage (before any render exists) it runs the scene
-    checks only; the unlabelled share needs the render's Cryptomatte coverage. level_and_crop: see
-    lint() (off by default: a camera is refused unless the caller levels it). Raises
-    digest.CameraNotFound for an unknown camera."""
+    checks only; the unlabelled share needs the render's Cryptomatte coverage. Before lint() it runs
+    the checks only the scene can answer: DUPLICATE_NODE_NAME over digest.scene_nodes(),
+    DUPLICATE_CAMERA_NAME over rt.cameras, and BAD_SHOT_SLUG and BAD_LENS on the camera_digest()
+    (BAD_POSE comes from lint()'s camera checks); their problems come first in the report.
+    level_and_crop: see lint() (off by default: a camera is refused unless the caller levels it).
+    Raises digest.CameraNotFound for an unknown camera."""
     rt = runtime()
     cam = digest.camera_digest(camera_name)
     node = rt.getNodeByName(camera_name, exact=True)
@@ -363,8 +569,15 @@ def lint_scene(
         renderer = str(rt.classOf(rt.renderers.current))
     except Exception:
         renderer = ""
-    names = [camera_name] + [str(n["name"]) for n in digest.scene_nodes()]
-    return lint(
+    nodes = digest.scene_nodes()
+    first = (
+        duplicate_node_problems(nodes)
+        + duplicate_camera_problems(camera_names(rt))
+        + shot_slug_problems(camera_name)
+        + lens_value_problems(cam)
+    )
+    names = [camera_name] + [str(n["name"]) for n in nodes]
+    report = lint(
         policy,
         coverage,
         max_unlabelled_share,
@@ -374,3 +587,6 @@ def lint_scene(
         renderer=renderer,
         level_and_crop=level_and_crop,
     )
+    if not first:
+        return report
+    return LintReport(first + report.problems, report.unlabelled_share, report.warnings)

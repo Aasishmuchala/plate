@@ -47,7 +47,13 @@ SECRET_MODE = 0o600  # config.json holds the token: owner-only from the moment i
 REPO_UI_DIST = Path(__file__).resolve().parents[2] / "ui" / "dist"
 
 # Same shape as the packet schema's slug ($defs/slug): lower-case, no path or Windows-forbidden characters.
+# Match with `fullmatch`: `$` also accepts a trailing newline ("nl1\n"), `fullmatch` does not.
 PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+# The largest JSON body an API route reads (api.BodyCap answers 413 above it without reading the body). The assets
+# and hash routes carry their own caps. `PLATE_JSON_MAX_MB` moves it (a positive number of MiB).
+JSON_MAX_MB_ENV = "PLATE_JSON_MAX_MB"
+JSON_MAX_BYTES = 8 * 1024 * 1024
 
 
 class ConfigError(RuntimeError):
@@ -69,7 +75,7 @@ def app_home(env: Mapping[str, str] | None = None) -> Path:
 
 
 def check_project_id(project_id: str) -> str:
-    if not isinstance(project_id, str) or not PROJECT_ID_RE.match(project_id):
+    if not isinstance(project_id, str) or not PROJECT_ID_RE.fullmatch(project_id):
         raise ValueError(f"invalid project_id {project_id!r}: expected a lower-case slug [a-z0-9_-]")
     return project_id
 
@@ -249,6 +255,20 @@ def _check_tailscale_ip(raw: str) -> str:
     return str(ip)
 
 
+def json_max_bytes(env: Mapping[str, str] | None = None) -> int:
+    """The JSON body cap in bytes: `PLATE_JSON_MAX_MB` MiB when set, else `JSON_MAX_BYTES` (8 MiB)."""
+    raw = (os.environ if env is None else env).get(JSON_MAX_MB_ENV)
+    if raw is None or raw.strip() == "":
+        return JSON_MAX_BYTES
+    try:
+        mib = float(raw)
+    except ValueError as e:
+        raise ConfigError(f"{JSON_MAX_MB_ENV}={raw!r} is not a number of MiB") from e
+    if not 0 < mib < 2**20:  # also rejects nan and inf
+        raise ConfigError(f"{JSON_MAX_MB_ENV}={raw!r} must be a positive number of MiB")
+    return max(1, int(mib * 1024 * 1024))
+
+
 def host_port(host: str, port: int) -> str:
     """`host:port` as it appears in a Host header (IPv6 literals bracketed)."""
     h = host.strip("[]")
@@ -270,6 +290,7 @@ class Settings(BaseModel):
     packet_versions: list[str] = Field(default_factory=lambda: list(PACKET_VERSIONS))
     sync_ingest: bool = False
     cas_copy: bool = False
+    json_max_bytes: int = Field(default=JSON_MAX_BYTES, gt=0)
 
     @model_validator(mode="after")
     def _defaults(self) -> Settings:
@@ -344,6 +365,7 @@ class Settings(BaseModel):
                 ui_dist=Path(env["PLATE_UI_DIST"]) if env.get("PLATE_UI_DIST") else REPO_UI_DIST,
                 sync_ingest=_env_bool(env, "PLATE_SYNC_INGEST"),
                 cas_copy=_env_bool(env, "PLATE_CAS_COPY"),
+                json_max_bytes=json_max_bytes(env),
             )
         except ValueError as e:  # pydantic ValidationError is a ValueError
             raise ConfigError(str(e)) from e

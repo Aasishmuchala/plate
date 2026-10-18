@@ -132,6 +132,14 @@ def _export(c: TestClient, auth: dict, run_id: str, **body):
     return c.post(f"/api/v0/runs/{run_id}/export", json=body, headers=auth)
 
 
+def _never_overwrote(r) -> None:
+    """An export onto a file that exists: 409 `not_exportable`, or (T127, decision 74) the byte-identical
+    repeat of the same take, 200 with `repeat: true` and nothing rewritten."""
+    refused = r.status_code == 409 and r.json().get("error") == "not_exportable"
+    repeat = r.status_code == 200 and r.json().get("repeat") is True
+    assert refused or repeat, r.text
+
+
 # ---------------------------------------------------------------------------- run history
 
 
@@ -281,9 +289,12 @@ def test_export_png16_writes_the_composite_and_its_sidecar_and_ships_the_report(
         assert data["override_reason"] is None
         assert _records(sync_settings, "override", run_id) == []
 
-        # never overwrites; a second format of the same take shares the sidecar
+        # never overwrites (refused, or since T127 a byte-identical repeat that writes nothing); a second format
+        # of the same take shares the sidecar
+        before = (out / "take_01.png").read_bytes()
         r = _export(c, auth, run_id, out_dir=str(out), format="png16", name="take_01")
-        assert r.status_code == 409 and r.json()["error"] == "not_exportable"
+        _never_overwrote(r)
+        assert (out / "take_01.png").read_bytes() == before
         r = _export(c, auth, run_id, out_dir=str(out), format="exr", name="take_01")
         assert r.status_code == 200, r.text
         sidecar = json.loads((out / "take_01.gate.json").read_text(encoding="utf-8"))
@@ -334,7 +345,9 @@ def test_the_legacy_dest_body_writes_a_real_tiff_and_bad_bodies_are_refused(sync
         refused(422)
         refused(422, dest=str(tmp_path / "a.tif"), out_dir=str(tmp_path))
         refused(422, out_dir=str(tmp_path), colour="srgb")
-        refused(409, "not_exportable", dest=str(dest))  # exists: exports never overwrite
+        before = dest.read_bytes()
+        _never_overwrote(_export(c, auth, run_id, dest=str(dest)))  # exists: exports never overwrite
+        assert dest.read_bytes() == before
         assert _export(c, auth, "nope", dest=str(tmp_path / "x.tif")).status_code == 404
 
 

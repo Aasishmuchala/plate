@@ -1,4 +1,4 @@
-"""The client review route (router plan T74; BUILD_PLAN decisions 21 and 39).
+"""The client review routes (router plan T74, T146; BUILD_PLAN decisions 21 and 39).
 
 - `POST /projects/{id}/review {run_ids: [...], watermark?: "REVIEW", max_width?: 2048, title?, subtitle?, author?,
   reply_to?}` ->
@@ -15,6 +15,10 @@
   stored gate report is allowed and shows "not scored". 422 `review_error` for a take the exporter cannot
   build (no output in the CAS, a video take, a packet with no display master) and `{"errors"}` for a bad
   watermark, width or reply-to address.
+- `GET /runs/{id}/reviewable` -> 200 `{"ok": true}` when `check_reviewable` lets the take into a review, else
+  its 409 `not_reviewable` body (`code`, `run_id`, `detail`); 404 for an unknown run. Nothing is written. It is
+  how the MCP server's `export_review`, which builds its bundle in its own process, meets the same guard
+  (decision 78) before anything is written.
 """
 
 from __future__ import annotations
@@ -40,7 +44,7 @@ from ..review_bundle import (
     TakeSource,
     export_review,
 )
-from . import API, ApiError, Ctx, ctx, pipeline_error, require_token
+from . import API, ApiError, Ctx, ctx, pipeline_error, require_token, run_project
 from .runs import run_view
 
 router = APIRouter(prefix=API, dependencies=[Depends(require_token)])
@@ -126,3 +130,23 @@ def review_route(request: Request, project_id: str, body: ReviewBody) -> dict[st
     except ValueError as e:  # watermark, max_width, title, reply_to
         raise ApiError(422, {"errors": [str(e)]}) from e
     return {"zip_path": str(zip_path), "bytes": zip_path.stat().st_size, "takes": len(run_ids)}
+
+
+@router.get("/runs/{run_id}/reviewable")
+def reviewable_route(request: Request, run_id: str) -> dict[str, Any]:
+    """The review guard for one run, with nothing written: 200 `{"ok": true}` or the 409 `not_reviewable`."""
+    c = ctx(request)
+    project_id = run_project(c, run_id)
+    try:
+        project = c.pipeline.load_project(project_id)
+        if project is None:
+            raise ApiError(404, {"error": "not_found", "project_id": project_id})
+        with c.index.project(project_id) as conn:
+            try:
+                run = get_run(conn, run_id)
+            except RunNotFound as e:
+                raise ApiError(404, {"error": "not_found", "run_id": run_id}) from e
+            check_reviewable(conn, run, project.root)
+    except PipelineError as e:
+        raise pipeline_error(e) from e
+    return {"ok": True}

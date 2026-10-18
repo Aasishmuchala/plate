@@ -35,6 +35,10 @@ The job is a small pipeline of plain functions over a frozen `MotionPlan`:
    resolution, else manifest order, with the reason on the route record), and prices the clip per second from the
    route's own price or the manifest's. A pinned route (`route_id`) is the only candidate; a Runway route that cannot
    take the frame is 422 `route_ratio` (Runway centre-crops an off-ratio frame, which would move the landing).
+   The params must agree with the route (Wave 12, T138): each candidate's adapter is built as submit builds it and
+   runs `validate_params(plan.params())` plus, on Runway, `check_expressible` (a seed on Kling, `camera_fixed` on
+   Seedance...); a route that refuses is skipped for the next in preference order, the reason on the record
+   (`prefer: runway skipped: <why>`), and when none takes them the quote is 422 `params` with no run.
    `to_run_create` shapes the same plan as a `RunCreate` for the run table (no STAGING_KEY: not an image run).
 4. `run_motion(plan, engine, cas)` drives any engine that speaks the worker's protocol (submit / poll / fetch),
    stores the start and end stills and the clip in the project CAS, reads the clip's real fps (a clip that is not at
@@ -59,13 +63,14 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import httpx
 import numpy as np
 from blake3 import blake3
 
 from plate_engines import prefer
 from plate_engines.adapters import runway_schema
 from plate_engines.adapters.atlas_video import frame_size
-from plate_engines.adapters.base import ParamError
+from plate_engines.adapters.base import InputError, ParamError
 from plate_engines.adapters.base import _check_param as check_param
 from plate_engines.atlas import (
     VIDEO_POLL_INTERVAL_S,
@@ -82,7 +87,7 @@ from plate_pixels.egress import encode_png8
 from .. import canvas_rules, custody, idempotency
 from ..adapter import PollResult
 from ..models import Quote, RunCreate
-from ..pipeline import PipelineError
+from ..pipeline import PipelineError, adapter_class
 from ..quotes import build_quote
 from ..recipes import ProjectSheet, RunnableRecipe, assemble_runnable, load_runnable, unfilled_count
 from . import croppair, move_policy
@@ -111,11 +116,13 @@ __all__ = [
     "element_png",
     "engine_frame",
     "motion_engines",
+    "params_check",
     "pick_route",
     "plan_from_still",
     "plan_motion",
     "plan_two_stills",
     "quote_motion",
+    "route_adapter",
     "run_motion",
     "runway_ratio",
     "takes_end",
@@ -338,14 +345,27 @@ class MotionPlan:
         return _png_size(self.start_png)
 
     def params(self) -> dict[str, Any]:
-        """The engine's own parameters (the manifest's full schema names): the drawer's extras, then the plan's."""
+        """The engine's own parameters (the manifest's full schema names): the drawer's extras, then the plan's. An
+        empty negative prompt is left out: an engine that declares none (Seedance 2.5, Gen-4.5) would refuse it."""
         p: dict[str, Any] = dict(self.extra_params)
-        p.update(duration=self.duration_s, negative_prompt=self.negative_prompt)
+        p["duration"] = self.duration_s
+        if self.negative_prompt:
+            p["negative_prompt"] = self.negative_prompt
         if self.resolution:
             p["resolution"] = self.resolution
         if self.seed is not None:
             p["seed"] = self.seed
         return p
+
+    def present_inputs(self) -> dict[str, Any]:
+        """Which inputs the job sends, by hash (and the prompt): what a route's `check_expressible` reads at the
+        quote, before any frame is staged."""
+        inputs: dict[str, Any] = {"image": self.start_hash, "prompt": self.prompt}
+        if self.end_png is not None:
+            inputs["image_tail"] = self.end_hash
+        if self.elements:
+            inputs["elements"] = list(self.element_hashes)
+        return inputs
 
     def input_hashes(self) -> dict[str, str]:
         """Inputs by hash only (the idempotency key and the run row never carry prompt text)."""
@@ -885,6 +905,72 @@ def _check_fits(manifest: Any, r: Any, frame: tuple[int, int] | None, tier: str 
     )
 
 
+class _QuoteTransport(httpx.BaseTransport):
+    """The network of an adapter built at the quote: it only checks params, so any request is a bug."""
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        raise RuntimeError(f"a quote sends nothing; refused {request.method} {request.url.host}")
+
+
+def route_adapter(manifest: Any, route: Any) -> Any:
+    """The `plate_engines` adapter for `manifest` on `route`, built as submit builds it (`pipeline.adapter_class`)
+    but on a transport that sends nothing; None when no adapter speaks the route (the run would fail `no_adapter`
+    at execution, as before). An adapter that cannot be built refuses the route (InputError)."""
+    cls = adapter_class(manifest, route)
+    if cls is None:
+        return None
+    try:
+        return cls(manifest, route, transport=_QuoteTransport())
+    except ValueError as e:
+        raise InputError(f"{manifest.id} via {route.route_id}: the adapter cannot be built ({e})") from e
+
+
+def params_check(plan: MotionPlan, manifest: Any) -> Callable[[Any], None]:
+    """`accept` for `pick_route`: the route's adapter validates `plan.params()` exactly as submit does and, where
+    it has one (Runway), runs `check_expressible` on them and on which inputs the plan sends. Raises ParamError or
+    InputError for a route that would refuse the job at submit."""
+
+    def accept(route: Any) -> None:
+        adapter = route_adapter(manifest, route)
+        if adapter is None:
+            return
+        params = adapter.validate_params(plan.params())
+        check = getattr(adapter, "check_expressible", None)
+        if callable(check):
+            check(params, plan.present_inputs())
+
+    return accept
+
+
+def _accepted(
+    manifest: Any,
+    routes: list[Any],
+    accept: Callable[[Any], None],
+    frame: tuple[int, int] | None,
+    tier: str | None,
+) -> tuple[Any, list[str]]:
+    """The first of `routes` (preference order; the first already fits the frame) that the frame fits and `accept`
+    takes, with a `prefer: <provider> skipped: <why>` reason per route `accept` refused. None taking the job is a
+    MotionError 422 `params` naming the first refusal (the preferred route's), every route's under `routes`."""
+    skipped: list[str] = []
+    refusals: list[dict[str, str]] = []
+    for i, r in enumerate(routes):
+        if i:
+            try:  # a later Runway route the frame does not fit: prefer_route said so already
+                _check_fits(manifest, r, frame, tier)
+            except MotionError as e:
+                refusals.append({"route_id": r.route_id, "detail": str(e)})
+                continue
+        try:
+            accept(r)
+        except (ParamError, InputError) as e:
+            refusals.append({"route_id": r.route_id, "detail": str(e)})
+            skipped.append(f"prefer: {r.provider} skipped: {e}")
+            continue
+        return r, skipped
+    raise MotionError(refusals[0]["detail"], code="params", engine=manifest.id, routes=refusals)
+
+
 def pick_route(
     manifest: Any,
     allowed_grades: Iterable[Any],
@@ -893,13 +979,15 @@ def pick_route(
     prefer_provider: str | None = prefer.PREFERRED_VIDEO_PROVIDER,
     frame: tuple[int, int] | None = None,
     tier: str | None = None,
+    accept: Callable[[Any], None] | None = None,
 ) -> dict[str, Any]:
     """The run's route record: the active routes (only `route_id` when one is pinned) whose effective custody grade
     the run allows, ordered by the preference rule (`prefer.prefer_route`: `prefer_provider`'s routes first for a
     video engine when `frame` fits one of their legal ratios at `tier`; None or "none" keeps manifest order), the
     first one taken. `reasons` on the record says why. Raises `CustodyViolation` (403) when no route is allowed:
     every route of these engines is grade D, so an NDA project never gets here; MotionError 422 `route_ratio` when
-    the route taken is a Runway route the frame does not fit."""
+    the route taken is a Runway route the frame does not fit. With `accept` (`params_check`), a route it refuses
+    (ParamError / InputError) is skipped for the next in order, and none taking the job is 422 `params`."""
     candidates = [r for r in manifest.routes if r.status == "active"]
     if route_id is not None:
         candidates = [r for r in candidates if r.route_id == route_id]
@@ -914,6 +1002,9 @@ def pick_route(
     )
     r = ok[0]
     _check_fits(manifest, r, frame, tier)
+    if accept is not None:
+        r, skipped = _accepted(manifest, ok, accept, frame, tier)
+        reasons = [*reasons, *skipped]
     return {
         "engine_id": manifest.id,
         "provider": r.provider,
@@ -939,7 +1030,8 @@ def quote_motion(
 ) -> tuple[dict[str, Any], Quote]:
     """(route, Quote) for the job. The lock comes first: a locked video node raises MotionLocked (409) before a
     route is picked or a price is built. Then custody (CustodyViolation), then the preference rule on the plan's
-    frame and resolution, then the route's price per second (its own price, else the manifest's)."""
+    frame and resolution, skipping a route whose adapter refuses the plan's params (`params_check`; none left is
+    MotionError 422 `params`), then the route's price per second (its own price, else the manifest's)."""
     check_unlocked(graph, plan.node_id)
     manifest = _manifest(plan.engine_id, manifests)
     route = pick_route(
@@ -949,6 +1041,7 @@ def quote_motion(
         prefer_provider=prefer_provider,
         frame=plan.size,
         tier=plan.resolution,
+        accept=params_check(plan, manifest),
     )
     quote = build_quote(manifest, route, plan.input_hashes(), plan.params(), now=now)
     return route, quote

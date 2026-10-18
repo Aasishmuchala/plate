@@ -23,8 +23,11 @@ dedupes on the idempotency key (`idempotent_submit`), as the plan requires of re
 score real pixels instead of noise; `shift_px` then moves it that many pixels to the right with edge
 replication (a negative value moves it left), which is how a test or a demo makes a camera-drift GATE_FAIL.
 A payload that carried no image has nothing to echo and gets the deterministic noise. The echoed bytes are
-held in memory only (the newest `ECHO_KEEP` jobs), never in the journal: a restarted daemon echoes again once
-the pipeline re-submits, and a fetch for a job whose image was lost raises `ResultExpired`.
+held for the newest `ECHO_KEEP` jobs, never in the journal itself: with a journal they are also persisted
+beside it (`<journal>.echo/<job_id>.png`, atomic writes, the same newest `ECHO_KEEP` kept) and reloaded on
+construction, so a restarted fake echoes the same bytes as a real provider would serve the same result again
+(router plan T130: a daemon killed in FETCHING resumes to NORMALIZING). A fetch for a job whose image is gone
+(evicted, or never persisted because there was no journal) raises `ResultExpired`.
 
 Jobs, the call counters and the call log (`calls`: one `{op, job, key}` per submit, poll, fetch, cancel and
 lookup) persist to a JSON `journal` with atomic replaces, so a daemon killed mid-run restarts against the
@@ -52,7 +55,7 @@ from typing import Any, Literal
 from blake3 import blake3
 
 from .adapter import PollResult, ResultExpired, SimulatedCrash
-from .fsutil import read_json, write_json_atomic
+from .fsutil import read_json, write_bytes_atomic, write_json_atomic
 from .idempotency import canonical_json
 from .states import RunState
 
@@ -238,6 +241,7 @@ class FakeEngine:
         self._state = _empty_state()
         if self.journal is not None and self.journal.exists():
             self._state.update(read_json(self.journal))
+        self._load_echo_sources()
 
     # ------------------------------------------------------------------ construction helpers
 
@@ -274,11 +278,17 @@ class FakeEngine:
         if self.journal is None:
             with self._lock:
                 new._state = copy.deepcopy(self._state)
+                new._echo_src = OrderedDict(self._echo_src)  # the provider's copy of the inputs survives too
         return new
 
     @property
     def hang_marker(self) -> Path | None:
         return None if self.journal is None else self.journal.with_name(self.journal.name + ".hang")
+
+    @property
+    def echo_dir(self) -> Path | None:
+        """Where the echo sources persist (`<journal>.echo/`), or None without a journal."""
+        return None if self.journal is None else self.journal.with_name(self.journal.name + ".echo")
 
     # ------------------------------------------------------------------ persistence
 
@@ -382,15 +392,46 @@ class FakeEngine:
         return job_id
 
     def _keep_echo_source(self, job_id: str, payload: dict[str, Any]) -> None:
-        """Hold the PNG a submit carried so `fetch` can hand it back. Every submit does this, deduped ones
-        included: a restarted daemon that re-submits the same key refills what it lost."""
+        """Hold the PNG a submit carried so `fetch` can hand it back, and persist it beside the journal. Every
+        submit does this, deduped ones included: a re-submit of the same key refills what was evicted."""
         data = payload_image(payload) if self.echo else None
         if data is None:
             return
         self._echo_src[job_id] = data
         self._echo_src.move_to_end(job_id)
+        evicted: list[str] = []
         while len(self._echo_src) > ECHO_KEEP:
-            self._echo_src.popitem(last=False)
+            evicted.append(self._echo_src.popitem(last=False)[0])
+        folder = self.echo_dir
+        if folder is None:
+            return
+        path = folder / f"{job_id}.png"
+        if not path.is_file():
+            write_bytes_atomic(path, data)
+        for old in evicted:
+            (folder / f"{old}.png").unlink(missing_ok=True)
+
+    def _read_echo_source(self, job_id: str) -> bytes | None:
+        """A persisted echo source this instance does not hold (another instance over the same journal wrote it)."""
+        folder = self.echo_dir
+        if folder is None:
+            return None
+        try:
+            return (folder / f"{job_id}.png").read_bytes()
+        except OSError:
+            return None
+
+    def _load_echo_sources(self) -> None:
+        """Reload the newest `ECHO_KEEP` persisted echo sources (job ids sort by age: `fake-000123`)."""
+        folder = self.echo_dir
+        if not self.echo or folder is None or not folder.is_dir():
+            return
+        names = sorted(p.stem for p in folder.glob("fake-*.png") if p.is_file())
+        for job_id in names[-ECHO_KEEP:]:
+            try:
+                self._echo_src[job_id] = (folder / f"{job_id}.png").read_bytes()
+            except OSError:  # a file being replaced or removed right now: that job simply cannot echo
+                continue
 
     def poll(self, provider_job_id: str) -> PollResult:
         with self._lock:
@@ -427,7 +468,7 @@ class FakeEngine:
             if self.output == "text":
                 return f"PLATE-FAKE-RESULT {job_id} {job['idempotency_key']}\n".encode()
             if self.echo and job.get("has_image"):
-                sent = self._echo_src.get(job_id)
+                sent = self._echo_src.get(job_id) or self._read_echo_source(job_id)
                 if sent is None:
                     raise ResultExpired(f"{result_url}: the image to echo is gone (resubmit the job)")
                 return shift_right(sent, self.shift_px)

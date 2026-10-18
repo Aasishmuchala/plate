@@ -15,6 +15,12 @@ Both write the new packet folder under `<packets dir>/<project_id>/` (so `POST /
 it with `prepare_ingest` and answer 202 like `POST /packets`: `{packet_id, status, events_url, packet_dir,
 tier}`; `status` is `ingested` when the daemon ingests synchronously (`PLATE_SYNC_INGEST=1`), else `ingesting`
 and the packet's event stream says when it is done. Nothing here leaves the machine.
+
+Refusals made before a pixel is decoded (router plan T137): a `shot_id` is a slug by `fullmatch` (a trailing
+newline is not one); a plate whose header declares more than `TIERC_MAX_PIXELS` (100 000 000) is 422
+`{"error": "too_many_pixels", "declared": [w, h], "limit": N}` (a 52 KB PNG can declare 4000 x 4000, and a 775 KB
+one 16000 x 16000); a kit `camera` that is not 1 to 64 of `[A-Za-z0-9 ._-]`, or whose `<camera>_camera.json`
+resolves outside the kit folder, is 422 `bad_camera`.
 """
 
 from __future__ import annotations
@@ -45,7 +51,9 @@ PIXELS_PORT = 4611  # plate_pixels.server.PORT; not imported so the daemon does 
 PIXELS_PORT_ENV = "PLATE_PIXELS_PORT"
 INPROC_ENV = "PLATE_PIXELS_INPROC"
 PIXELS_TIMEOUT = httpx.Timeout(900.0, connect=5.0)
-SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+SLUG = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")  # always `fullmatch`: `$` would let a trailing "\n" in
+CAMERA_NAME = re.compile(r"[A-Za-z0-9 ._-]{1,64}")
+TOO_MANY_PIXELS = "too_many_pixels"
 TIERC_KINDS = ("depth", "intrinsics", "segment")
 MAX_CONSENT_CHARS = 2000
 
@@ -81,7 +89,7 @@ def project_or_404(c: Ctx, project_id: str) -> Project:
 
 
 def check_slug(what: str, value: str) -> str:
-    if not SLUG.match(value):
+    if not SLUG.fullmatch(value):
         raise ApiError(422, {"errors": [f"invalid {what} {value!r}: expected a lower-case slug [a-z0-9_-]"]})
     return value
 
@@ -93,6 +101,63 @@ def existing_file(what: str, raw: str) -> Path:
     if not p.is_file():
         raise ApiError(422, {"errors": [f"{what}: no such file {raw!r}"]})
     return p
+
+
+def too_many_pixels(e: Any) -> ApiError:
+    """The 422 for a `plate_pixels.imageio.TooManyPixels` (nothing was decoded)."""
+    return ApiError(
+        422,
+        {
+            "error": TOO_MANY_PIXELS,
+            "detail": str(e),
+            "declared": [e.width, e.height],
+            "limit": e.limit,
+        },
+    )
+
+
+def check_pixel_budget(plate: Path) -> None:
+    """422 `too_many_pixels` when the plate's header declares more than `TIERC_MAX_PIXELS`. The header alone is
+    read; a file whose header cannot be read passes here and is named by the decoder."""
+    from plate_pixels import imageio
+    from plate_pixels.tierc import TIERC_MAX_PIXELS
+
+    try:
+        imageio.check_pixel_budget(plate, TIERC_MAX_PIXELS)
+    except imageio.TooManyPixels as e:
+        raise too_many_pixels(e) from e
+    except OSError:
+        pass  # unreadable: the build says so
+
+
+def check_camera(folder: Path, camera: str) -> str:
+    """A kit camera name is a plain name, and the camera JSON the kit looks for (`<stem>_camera.json`, then
+    `<camera>_camera.json`) stays inside the kit folder. 422 `bad_camera` otherwise."""
+    from plate_max import kit_ingest
+
+    if not CAMERA_NAME.fullmatch(camera):
+        raise ApiError(
+            422,
+            {
+                "error": "bad_camera",
+                "detail": f"camera {camera!r} must be 1 to 64 of letters, digits, space, '.', '_' or '-'",
+            },
+        )
+    root = folder.resolve()
+    for name in dict.fromkeys((kit_ingest.kit_stem(camera), camera)):
+        try:
+            inside = (folder / f"{name}_camera.json").resolve().is_relative_to(root)
+        except (OSError, ValueError):
+            inside = False
+        if not inside:
+            raise ApiError(
+                422,
+                {
+                    "error": "bad_camera",
+                    "detail": f"the camera file for {camera!r} is outside the kit folder",
+                },
+            )
+    return camera
 
 
 def new_packet_folder(c: Ctx, project_id: str, prefix: str, shot_id: str) -> Path:
@@ -157,6 +222,9 @@ def _pixels_failure(status: int, body: Any) -> ApiError:
     if status == 428:
         return ApiError(428, {"error": "consent record required"})
     if status == 400:
+        # plate_pixels.imageio.TooManyPixels, across the process line
+        if detail.startswith(f"{TOO_MANY_PIXELS}:"):
+            return ApiError(422, {"error": TOO_MANY_PIXELS, "detail": detail})
         return ApiError(422, {"errors": [detail]})
     if status == 409:
         return ApiError(409, {"error": "exists", "detail": detail})
@@ -211,6 +279,7 @@ def _tierc_http(c: Ctx, args: dict[str, Any]) -> dict[str, Any]:
 
 def _tierc_inproc(request: Request, args: dict[str, Any]) -> dict[str, Any]:
     from plate_pixels.backends import Backends, InputError, ModelUnavailable
+    from plate_pixels.imageio import TooManyPixels
     from plate_pixels.tierc import ConsentRequired, TierCError, build_tier_c_packet
 
     backends = getattr(request.app.state, "pixels_backends", None)
@@ -229,6 +298,8 @@ def _tierc_inproc(request: Request, args: dict[str, Any]) -> dict[str, Any]:
         )
     except ConsentRequired as e:
         raise ApiError(428, {"error": "consent record required"}) from e
+    except TooManyPixels as e:
+        raise too_many_pixels(e) from e
     except FileExistsError as e:
         raise ApiError(409, {"error": "exists", "detail": str(e)}) from e
     except ModelUnavailable as e:
@@ -259,6 +330,7 @@ def post_tierc(
     project = project_or_404(c, project_id)
     shot_id = check_slug("shot_id", body.shot_id)
     plate = existing_file("plate_path", body.plate_path)
+    check_pixel_budget(plate)
     out_dir = new_packet_folder(c, project_id, "tierc", shot_id)
     args = {
         "plate_path": str(plate),
@@ -315,11 +387,16 @@ def object_pixel_shares(exr_path: Path | str, elements: list[dict[str, Any]]) ->
 
 
 def plate_to_tiff16(src: Path | str, dst: Path | str) -> None:
-    """Any 8- or 16-bit RGB(A) image to a 16-bit TIFF of the same size (8-bit values are promoted by x257)."""
+    """Any 8- or 16-bit RGB(A) image to a 16-bit TIFF of the same size (8-bit values are promoted by x257).
+    A plate whose header declares more than `TIERC_MAX_PIXELS` is refused (`TooManyPixels`) before it is decoded."""
     import cv2
     import numpy as np
     import tifffile
 
+    from plate_pixels import imageio
+    from plate_pixels.tierc import TIERC_MAX_PIXELS
+
+    imageio.check_pixel_budget(src, TIERC_MAX_PIXELS)
     img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError(f"cannot read the plate {str(src)!r}")
@@ -346,15 +423,18 @@ def post_kit(request: Request, project_id: str, body: KitBody, background: Backg
         )
     plate = existing_file("plate_path", body.plate_path)
     shot_id = check_slug("shot_id", body.shot_id) if body.shot_id else None
+    camera = check_camera(folder, body.camera)
+    check_pixel_budget(plate)
 
     from plate_max import kit_ingest  # stdlib-only plugin module: imported when a kit arrives
+    from plate_pixels import imageio
 
     out_dir = new_packet_folder(c, project_id, "kit", shot_id or "shot")
     custody = {"nda": True, "allowed_grades": project.allowed_grades} if project.nda else None
     try:
         result = kit_ingest.convert_kit(
             folder,
-            body.camera,
+            camera,
             plate,
             hasher=kit_hasher,
             pixel_shares=object_pixel_shares,
@@ -366,6 +446,8 @@ def post_kit(request: Request, project_id: str, body: KitBody, background: Backg
         )
     except kit_ingest.KitError as e:
         raise ApiError(422, {"error": "kit_invalid", "errors": [str(e)]}) from e
+    except imageio.TooManyPixels as e:
+        raise too_many_pixels(e) from e
     except (OSError, ValueError) as e:
         raise ApiError(422, {"error": "kit_invalid", "errors": [f"{type(e).__name__}: {e}"]}) from e
     try:

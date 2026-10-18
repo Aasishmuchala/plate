@@ -15,6 +15,8 @@ import json
 import re
 import shutil
 import string
+import struct
+import time
 from pathlib import Path
 
 import pytest
@@ -1013,3 +1015,188 @@ def test_a_legend_text_with_a_bom_and_crlf_is_read(kit_dir, tmp_path):
     (kit_dir / "CAM_a_legend.txt").write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
     result = convert(kit_dir, _tiff16(tmp_path / "plate.tif"))
     assert plate_spec.validate_packet_dir(result.packet_dir) == []
+
+
+# --------------------------------------------------------------------------- kit_ingest: caps on the client's EXR header (T135)
+
+EXR_MAGIC, EXR_MULTIPART = 20000630, 0x1000
+
+
+def _exr_attr(name: str, kind: str, value: bytes) -> bytes:
+    return name.encode() + b"\0" + kind.encode() + b"\0" + struct.pack("<i", len(value)) + value
+
+
+def _exr_part(extra: bytes = b"") -> bytes:
+    """One valid part header: a single half channel, ZIP, a 16x16 data window, plus `extra` attributes."""
+    channel = b"R\0" + struct.pack("<i4Bii", 1, 0, 0, 0, 0, 1, 1) + b"\0"
+    return (
+        _exr_attr("channels", "chlist", channel)
+        + _exr_attr("compression", "compression", b"\x03")
+        + _exr_attr("dataWindow", "box2i", struct.pack("<4i", 0, 0, 15, 15))
+        + extra
+        + b"\0"
+    )
+
+
+def _exr_file(path: Path, parts: list[bytes]) -> Path:
+    """A header-only multipart EXR (no pixel data: the reader never asks for any)."""
+    path.write_bytes(struct.pack("<II", EXR_MAGIC, 2 | EXR_MULTIPART) + b"".join(parts) + b"\0")
+    return path
+
+
+def test_100_000_twelve_byte_parts_are_refused_quickly(tmp_path):
+    part = b"a\0int\0" + struct.pack("<i", 1) + b"x" + b"\0"  # the stress test's part: 12 bytes
+    assert len(part) == 12
+    exr = _exr_file(tmp_path / "bomb.exr", [part] * 100_000)
+    t0 = time.perf_counter()
+    with pytest.raises(KitError, match=rf"more than {kit_ingest.MAX_EXR_PARTS} parts"):
+        kit_ingest.read_exr_header(exr)
+    assert time.perf_counter() - t0 < 1.0
+
+
+def test_64_parts_read_and_65_do_not(tmp_path):
+    ok = kit_ingest.read_exr_header(_exr_file(tmp_path / "p64.exr", [_exr_part()] * 64))
+    assert len(ok.parts) == 64 and ok.parts[0].compression == "zip" and ok.parts[0].width == 16
+    with pytest.raises(KitError, match="more than 64 parts"):
+        kit_ingest.read_exr_header(_exr_file(tmp_path / "p65.exr", [_exr_part()] * 65))
+
+
+def test_a_string_attribute_over_1_mib_is_refused_before_it_is_read(tmp_path):
+    limit = kit_ingest.MAX_EXR_STRING_BYTES
+    assert limit == 1 << 20
+    fits = _exr_part(_exr_attr("cryptomatte/abc1234/manifest", "string", b"x" * limit))
+    header = kit_ingest.read_exr_header(_exr_file(tmp_path / "fits.exr", [fits]))
+    assert len(header.strings["cryptomatte/abc1234/manifest"]) == limit
+    # the size field alone is enough: 32 MiB is declared, nothing is allocated or read
+    declared = b"big\0string\0" + struct.pack("<i", 32 << 20)
+    (tmp_path / "over.exr").write_bytes(struct.pack("<II", EXR_MAGIC, 2) + declared)
+    with pytest.raises(KitError, match=rf"'big' is {32 << 20} bytes, over the {limit} byte limit"):
+        kit_ingest.read_exr_header(tmp_path / "over.exr")
+    just_over = _exr_part(_exr_attr("big", "string", b"x" * (limit + 1)))
+    with pytest.raises(KitError, match="over the 1048576 byte limit"):
+        kit_ingest.read_exr_header(_exr_file(tmp_path / "just_over.exr", [just_over]))
+
+
+def test_string_attributes_are_capped_at_16_mib_in_total(tmp_path):
+    chunk = b"x" * kit_ingest.MAX_EXR_STRING_BYTES
+
+    def strings(n: int) -> bytes:
+        return b"".join(_exr_attr(f"s{i}", "string", chunk) for i in range(n))
+
+    assert kit_ingest.MAX_EXR_STRING_TOTAL == 16 << 20
+    ok = kit_ingest.read_exr_header(_exr_file(tmp_path / "s16.exr", [_exr_part(strings(16))]))
+    assert len(ok.strings) == 16
+    with pytest.raises(KitError, match=r"string attributes add up to over 16777216 bytes"):
+        kit_ingest.read_exr_header(_exr_file(tmp_path / "s17.exr", [_exr_part(strings(17))]))
+    # the total runs across parts, not per part
+    with pytest.raises(KitError, match="add up to over"):
+        kit_ingest.read_exr_header(_exr_file(tmp_path / "split.exr", [_exr_part(strings(9))] * 2))
+
+
+def test_the_attribute_count_is_capped_across_parts(tmp_path, monkeypatch):
+    monkeypatch.setattr(kit_ingest, "MAX_EXR_ATTRIBUTES", 40)
+    filler = b"".join(_exr_attr(f"n{i}", "int", struct.pack("<i", i)) for i in range(20))
+    fits = _exr_file(tmp_path / "fits.exr", [_exr_part(filler)])  # 23 attributes
+    assert len(kit_ingest.read_exr_header(fits).parts) == 1
+    with pytest.raises(KitError, match="more than 40 attributes"):
+        kit_ingest.read_exr_header(_exr_file(tmp_path / "many.exr", [_exr_part(filler)] * 2))
+
+
+def test_attributes_the_converter_never_reads_are_not_kept(tmp_path):
+    extra = _exr_attr("owner", "string", b"studio") + _exr_attr("chunkCount", "int", struct.pack("<i", 7))
+    header = kit_ingest.read_exr_header(_exr_file(tmp_path / "x.exr", [_exr_part(extra)]))
+    assert header.strings == {"owner": "studio"} and header.channels == {"R": "half"}
+
+
+def test_bytes_that_are_not_their_attribute_type_are_a_kit_error_not_a_crash(tmp_path):
+    short = (
+        _exr_attr("channels", "chlist", b"R\0" + struct.pack("<i4Bii", 1, 0, 0, 0, 0, 1, 1) + b"\0")
+        + _exr_attr("dataWindow", "box2i", b"\0\0\0\0")  # 4 bytes, not 16
+        + b"\0"
+    )
+    with pytest.raises(KitError, match="malformed"):
+        kit_ingest.read_exr_header(_exr_file(tmp_path / "short.exr", [short]))
+    no_compression_byte = _exr_part().replace(
+        _exr_attr("compression", "compression", b"\x03"), _exr_attr("compression", "compression", b"")
+    )
+    with pytest.raises(KitError, match="malformed"):
+        kit_ingest.read_exr_header(_exr_file(tmp_path / "empty.exr", [no_compression_byte]))
+
+
+# --------------------------------------------------------------------------- kit_ingest: the display TIFF's compression (T135)
+
+
+def _set_tiff_compression(path: Path, value: int) -> Path:
+    """Rewrite the Compression tag (259) of a classic TIFF's first IFD in place."""
+    raw = bytearray(path.read_bytes())
+    bo = "<" if raw[:2] == b"II" else ">"
+    ifd = struct.unpack_from(f"{bo}I", raw, 4)[0]
+    (count,) = struct.unpack_from(f"{bo}H", raw, ifd)
+    for i in range(count):
+        at = ifd + 2 + 12 * i
+        if struct.unpack_from(f"{bo}H", raw, at)[0] == 259:
+            struct.pack_into(f"{bo}H", raw, at + 8, value)
+            path.write_bytes(bytes(raw))
+            return path
+    raise AssertionError("the TIFF has no Compression tag")
+
+
+def test_inspect_plate_reports_the_tiff_compression(tmp_path):
+    import tifffile
+
+    none = tmp_path / "none.tif"
+    tifffile.imwrite(str(none), _plate_array(12, 8), photometric="rgb")
+    deflate = tmp_path / "deflate.tif"
+    tifffile.imwrite(str(deflate), _plate_array(12, 8), photometric="rgb", compression="zlib")
+    assert kit_ingest.inspect_plate(none).compression == 1
+    assert kit_ingest.inspect_plate(deflate).compression == 8
+    png = _png8(tmp_path / "a.png", 12, 8)
+    assert kit_ingest.inspect_plate(png).compression is None
+
+
+@pytest.mark.parametrize(
+    "code, name", [(7, "JPEG"), (6, "old-style JPEG"), (34712, "JPEG 2000"), (50002, "JPEG XL")]
+)
+def test_a_jpeg_family_tiff_master_is_refused_naming_the_compression(kit_dir, tmp_path, code, name):
+    plate = _set_tiff_compression(_tiff16(tmp_path / "plate.tif"), code)
+    assert kit_ingest.inspect_plate(plate).is_tiff16_rgb  # the 16-bit RGB header check alone passes it
+    with pytest.raises(
+        KitError, match=rf"{name}-compressed TIFF \(compression {code}\).*JPEG-compressed TIFF is refused"
+    ):
+        convert(kit_dir, plate)
+    assert [p.name for p in kit_dir.iterdir() if p.is_dir()] == []  # nothing half-written
+
+
+def test_an_lzw_or_packbits_16_bit_tiff_is_copied_as_the_master(kit_dir, tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    img = _plate_array()[..., ::-1].copy()  # cv2 writes BGR
+    for code in (5, 32773):
+        plate = tmp_path / f"plate_{code}.tif"
+        assert cv2.imwrite(str(plate), img, [cv2.IMWRITE_TIFF_COMPRESSION, code])
+        assert kit_ingest.inspect_plate(plate).compression == code
+        result = convert(kit_dir, plate)
+        assert plate_spec.validate_packet_dir(result.packet_dir, check_files=True) == []
+        assert (result.packet_dir / "display.tif").read_bytes() == plate.read_bytes()
+
+
+def test_a_converter_that_writes_a_jpeg_tiff_is_refused(kit_dir, tmp_path):
+    def jpeg_writer(src, dst):
+        _promote(src, dst)
+        _set_tiff_compression(Path(dst), 7)
+
+    with pytest.raises(KitError, match=r"plate_to_tiff16 wrote is a JPEG-compressed TIFF \(compression 7\)"):
+        convert(kit_dir, _png8(tmp_path / "plate.png"), plate_to_tiff16=jpeg_writer)
+    assert [p.name for p in kit_dir.iterdir() if p.is_dir()] == []
+
+
+def test_an_8_bit_jpeg_tiff_plate_still_goes_through_the_converter(kit_dir, tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    plate = tmp_path / "plate8.tif"
+    params = [cv2.IMWRITE_TIFF_COMPRESSION, 7, cv2.IMWRITE_TIFF_ROWSPERSTRIP, 8]
+    assert cv2.imwrite(str(plate), _plate_array(dtype="uint8")[..., ::-1].copy(), params)
+    info = kit_ingest.inspect_plate(plate)
+    assert info.compression == 7 and not info.is_tiff16_rgb
+    result = convert(kit_dir, plate)  # promoted by the caller's decoder, like a JPEG plate
+    assert "client_plate_8bit" in result.flags
+    master = kit_ingest.inspect_plate(result.packet_dir / "display.tif")
+    assert master.is_tiff16_rgb and master.compression not in kit_ingest.LOSSY_TIFF_COMPRESSION

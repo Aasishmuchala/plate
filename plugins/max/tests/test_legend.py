@@ -65,6 +65,31 @@ def test_duplicate_visible_node_names_block_send(scene):
         legend.build_id_legend(digest.scene_nodes(), digest_fn=sha)
 
 
+def test_the_legend_and_the_lint_use_one_text_for_a_duplicate_name(scene):
+    scene.objects.append(make_node("SKY", "ARCH_walls", "MAT_brick"))
+    with pytest.raises(legend.LegendError) as caught:
+        legend.build_id_legend(digest.scene_nodes(), digest_fn=sha)
+    assert str(caught.value) == policy.duplicate_node_text("SKY")
+    [problem] = policy.duplicate_node_problems(digest.scene_nodes())
+    assert problem["detail"].startswith(str(caught.value))
+
+
+def test_legend_nodes_refuses_a_duplicate_instead_of_letting_the_last_win(scene):
+    from plate_max.actions import send_packet
+    from plate_max.exr_header import Coverage
+
+    scene.objects.append(make_node("ARCH_walls", "VEG_tree_01", "MAT_leaf"))  # editable twin, last
+    shares = {legend.cryptomatte_hash(n): 0.1 for n in ("ARCH_walls", "SKY")}
+    coverage = Coverage(layer="CryptoObject", shares=shares, pixels=100, compression="zip")
+    manifest = {n: legend.cryptomatte_hash(n) for n in ("ARCH_walls", "SKY")}
+    with pytest.raises(send_packet.SendAbort) as caught:
+        send_packet.legend_nodes(manifest, coverage, digest.scene_nodes())
+    assert caught.value.stage == "lint" and caught.value.problems[0]["code"] == policy.DUPLICATE_NODE_NAME
+    scene.objects.pop()
+    nodes, _ = send_packet.legend_nodes(manifest, coverage, digest.scene_nodes())
+    assert {n["name"]: n["layer"] for n in nodes} == {"ARCH_walls": "ARCH_walls", "SKY": "SKY"}
+
+
 def test_two_materials_sharing_a_name_block_send(scene):
     clone = SimpleNamespace(name="MAT_leaf")  # a different material object with the same name
     scene.objects.append(make_node("VEG_tree_02", "VEG_tree_02", clone))

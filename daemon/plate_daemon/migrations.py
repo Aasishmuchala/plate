@@ -11,6 +11,9 @@ custody, so a project on the NAS is found by id), `runs.node_id` / `runs.quote_j
 `idempotency_key`, `packets.view_hash`, and read-only aliases `runs.run_id` (= `id`) and
 `packets.manifest_hash` (= `manifest_blake3`) under the names the plan uses. Applied migrations are never
 edited: a change is a new numbered entry.
+
+M003 (Wave 12, T134) adds `ledger_outbox`: records the project ledger could not take while its file was
+unwritable or its lock was held, parked in order until `ledger.drain_outbox` appends them (Decision 73).
 """
 
 from __future__ import annotations
@@ -162,4 +165,16 @@ M002 = [
     "ALTER TABLE packets ADD COLUMN manifest_hash TEXT GENERATED ALWAYS AS (manifest_blake3) VIRTUAL",
 ]
 
-MIGRATIONS: list[tuple[int, list[str]]] = [(1, M001), (2, M002)]
+M003 = [
+    """CREATE TABLE ledger_outbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT,
+        kind TEXT NOT NULL,
+        record TEXT NOT NULL,
+        created_utc TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT
+    )""",
+]
+
+MIGRATIONS: list[tuple[int, list[str]]] = [(1, M001), (2, M002), (3, M003)]

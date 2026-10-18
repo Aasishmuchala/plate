@@ -27,11 +27,18 @@ approved; a packet or reference edge is not a still), HIGH_RISK_MOVE (a high or 
 override) and INVENTED_ANGLE (a camera override on an Edit needs an override and the `unseen geometry guessed`
 label). `can_accept` refuses a take without a logged full scrub (SCRUB_REQUIRED). `check_nodes` adds what the
 TypeScript types make impossible but JSON allows: an unknown kind or a repeated id (UNKNOWN_NODE).
+
+Scale (T133): `validate_graph` builds one `RuleContext` (the node map, both adjacency maps, and, when the graph
+has no cycle, a topological pass that fills every node's generation depth, plate anchoring and concept/previs
+tier once) and hands it to `validate_edge`, so a graph costs O(nodes + edges) lookups per edge, not a graph
+walk per affected node. `validate_edge(graph, edge)` alone builds the context for that one call. A graph with
+a cycle that does not pass through the edge keeps the old per-edge reach walks, so its answers are unchanged.
 """
 
 from __future__ import annotations
 
 import re
+from collections import Counter, deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -48,11 +55,13 @@ __all__ = [
     "RULE_CODES",
     "UNSEEN_GEOMETRY_LABEL",
     "VIDEO_KINDS",
+    "RuleContext",
     "RuleResult",
     "ancestors",
     "anchored_to_plate",
     "as_edge",
     "as_graph",
+    "build_context",
     "can_accept",
     "check_nodes",
     "effective_labels",
@@ -316,34 +325,63 @@ def _reach(start: str, nxt: Mapping[str, list[str]]) -> set[str]:
     return seen
 
 
+def _depth_walk(node_map: Mapping[str, Mapping[str, Any]], up: Mapping[str, list[str]], root: str) -> int:
+    """The depth walk behind `generation_depth`, iterative so a long chain cannot exhaust the recursion limit:
+    the generating nodes on the longest upstream path from a Plate to `root` (counting `root` when it
+    generates), -1 when no Plate is upstream or `root` is not a node. A source already on the walk's stack
+    (a back edge) is skipped, and a finished node keeps the value it was given."""
+    if root not in node_map:
+        return -1
+    done: dict[str, int] = {}
+    active: set[str] = set()
+
+    def frame(nid: str) -> list[Any]:  # [node id, its sources, 1 if it generates, best depth so far]
+        kind = node_map[nid].get("kind")
+        active.add(nid)
+        return [
+            nid,
+            iter(up.get(nid, ())),
+            1 if kind in GENERATING_KINDS else 0,
+            0 if kind == "Plate" else -1,
+        ]
+
+    stack = [frame(root)]
+    result = -1
+    while stack:
+        top = stack[-1]
+        descended = False
+        for src in top[1]:
+            if src in active:
+                continue
+            if src in done:
+                d = done[src]
+            elif src not in node_map:
+                d = -1
+            else:
+                stack.append(frame(src))
+                descended = True
+                break
+            if d >= 0:
+                top[3] = max(top[3], d + top[2])
+        if descended:
+            continue
+        stack.pop()
+        active.discard(top[0])
+        done[top[0]] = best = top[3]
+        if stack:
+            if best >= 0:
+                stack[-1][3] = max(stack[-1][3], best + stack[-1][2])
+        else:
+            result = best
+    return result
+
+
 def generation_depth(nodes: Iterable[Mapping[str, Any]], edges: Iterable[Any], node_id: str) -> int:
     """Generating nodes on the longest upstream path from a Plate to `node_id`, counting `node_id` when it
     generates; 0 for a node with no Plate upstream. Back edges of a cycle are ignored."""
     node_map = _by_id(n if "id" in n and "kind" in n else node_data(n) for n in nodes)
     up = _upstream(as_edge(e) for e in edges)
-    done: dict[str, int] = {}
-    active: set[str] = set()
-
-    def walk(nid: str) -> int:
-        if nid in done:
-            return done[nid]
-        node = node_map.get(nid)
-        if node is None:
-            return -1
-        active.add(nid)
-        own = 1 if node.get("kind") in GENERATING_KINDS else 0
-        best = 0 if node.get("kind") == "Plate" else -1
-        for src in up.get(nid, ()):
-            if src in active:
-                continue
-            d = walk(src)
-            if d >= 0:
-                best = max(best, d + own)
-        active.discard(nid)
-        done[nid] = best
-        return best
-
-    return max(walk(node_id), 0)
+    return max(_depth_walk(node_map, up, node_id), 0)
 
 
 def ancestors(graph: Any, node_id: str) -> set[str]:
@@ -447,21 +485,167 @@ def _edge_ports(source_kind: Any, target_kind: Any, e: Mapping[str, Any]) -> tup
     return edge_type, _input_for(target_kind, e.get("targetHandle"), edge_type)
 
 
+# ---------------------------------------------------------------------------- the per-graph context
+
+
+class RuleContext:
+    """What `validate_edge` reads about a graph, computed once (T133): the node map, the upstream and downstream
+    adjacency, and, when the edges hold no cycle, one topological pass that fills for every node its generation
+    depth (and the largest depth at or below it), whether it is anchored to a Plate, and whether it is concept
+    or previs tier. `acyclic` is False when some cycle exists, and then only the maps are filled: the rules fall
+    back to the per-edge reach walks, which treat a cycle as they always did.
+
+    Build it with `build_context(graph)` and pass it to `validate_edge(graph, edge, ctx)` for each edge of that
+    same graph. The tables describe the graph WITH the edge in it, so they apply only to an edge the context was
+    built from (`covers`); any other edge is checked against a context built for it alone."""
+
+    def __init__(
+        self,
+        nodes: Iterable[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        node_map: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        self.node_map = node_map if node_map is not None else _by_id(nodes)
+        self.up = _upstream(edges)
+        self.down = _downstream(edges)
+        self._count = Counter(e["id"] for e in edges)
+        self._pair = {e["id"]: (e["source"], e["target"]) for e in edges}
+        self.anchored: dict[str, bool] = {}
+        self.concept: dict[str, bool] = {}
+        self.previs: dict[str, bool] = {}
+        self.max_depth_below: dict[str, int] = {}
+        order = self._topological_order()
+        self.acyclic = order is not None
+        if order is not None:
+            self._fill(order)
+
+    def covers(self, edge: Mapping[str, Any]) -> bool:
+        """Is `edge` one of the edges this context was built from (the only one of its id, same ends)?"""
+        eid = edge["id"]
+        return self._count.get(eid) == 1 and self._pair[eid] == (edge["source"], edge["target"])
+
+    def _topological_order(self) -> list[str] | None:
+        """Kahn's order over every id an edge or a node names, None when a cycle (a self loop included) exists."""
+        ids = set(self.node_map)
+        ids.update(self.up)
+        ids.update(self.down)
+        indegree = {nid: len(self.up.get(nid, ())) for nid in ids}
+        ready = deque(nid for nid, n in indegree.items() if n == 0)
+        order: list[str] = []
+        while ready:
+            nid = ready.popleft()
+            order.append(nid)
+            for child in self.down.get(nid, ()):
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    ready.append(child)
+        return order if len(order) == len(ids) else None
+
+    def _fill(self, order: list[str]) -> None:
+        node_map, up = self.node_map, self.up
+        raw: dict[str, int] = {}  # `_depth_walk`'s value: -1 when no Plate is upstream or the id is no node
+        for nid in order:
+            node = node_map.get(nid)
+            parents = up.get(nid, ())
+            kind = node.get("kind") if node is not None else None
+            self.anchored[nid] = kind == "Plate" or any(self.anchored[a] for a in parents)
+            self.concept[nid] = _is_concept(node) or any(self.concept[a] for a in parents)
+            self.previs[nid] = is_previs(node) or any(self.previs[a] for a in parents)
+            if node is None:
+                raw[nid] = -1
+                continue
+            own = 1 if kind in GENERATING_KINDS else 0
+            best = 0 if kind == "Plate" else -1
+            for a in parents:
+                if raw[a] >= 0:
+                    best = max(best, raw[a] + own)
+            raw[nid] = best
+        for nid in reversed(order):
+            below = max((self.max_depth_below[c] for c in self.down.get(nid, ())), default=0)
+            self.max_depth_below[nid] = max(raw[nid], 0, below)
+
+
+def build_context(graph: Any) -> RuleContext:
+    """The `RuleContext` for `graph`, to pass to `validate_edge` for each of its edges."""
+    g = as_graph(graph)
+    return RuleContext(g.nodes, g.edges)
+
+
+class _TableProbe:
+    """The queries `validate_edge` makes of the graph with the edge in it, answered from an acyclic context."""
+
+    def __init__(self, ctx: RuleContext) -> None:
+        self.ctx = ctx
+
+    def cycle(self) -> bool:
+        return False  # the graph with the edge in it has no cycle at all
+
+    def concept_tier(self, nid: str) -> bool:
+        return self.ctx.concept.get(nid, False)
+
+    def previs_tier(self, nid: str) -> bool:
+        return self.ctx.previs.get(nid, False)
+
+    def anchored(self, nid: str) -> bool:
+        return self.ctx.anchored.get(nid, False)
+
+    def depth_exceeded(self, target: str) -> bool:
+        return self.ctx.max_depth_below.get(target, 0) > MAX_GENERATION_DEPTH
+
+
+class _ReachProbe:
+    """The same queries answered by walking the graph per query: what `validate_edge` always did, kept for a
+    graph with a cycle (where a depth depends on the order a walk meets the back edge)."""
+
+    def __init__(
+        self, node_map: Mapping[str, Mapping[str, Any]], edges: Iterable[dict[str, Any]], e: dict[str, Any]
+    ) -> None:
+        self.node_map = node_map
+        self.e = e
+        self.others = [x for x in edges if x["id"] != e["id"]]
+        self.nxt = [*self.others, e]
+        self.up = _upstream(self.nxt)
+
+    def cycle(self) -> bool:
+        e = self.e
+        return e["source"] == e["target"] or e["source"] in _reach(e["target"], _downstream(self.others))
+
+    def concept_tier(self, nid: str) -> bool:
+        return _concept_tier(self.node_map, self.up, nid)
+
+    def previs_tier(self, nid: str) -> bool:
+        return _previs_tier(self.node_map, self.up, nid)
+
+    def anchored(self, nid: str) -> bool:
+        return anchored_to_plate(self.node_map, self.up, nid)
+
+    def depth_exceeded(self, target: str) -> bool:
+        affected = [target, *_reach(target, _downstream(self.nxt))]
+        return any(
+            max(_depth_walk(self.node_map, self.up, nid), 0) > MAX_GENERATION_DEPTH for nid in affected
+        )
+
+
 # ---------------------------------------------------------------------------- the rules
 
 
-def validate_edge(graph: Any, edge: Any) -> RuleResult:
-    """Would `edge` be allowed in `graph`? The edge may already be in `graph.edges` (it is ignored there)."""
+def validate_edge(graph: Any, edge: Any, ctx: RuleContext | None = None) -> RuleResult:
+    """Would `edge` be allowed in `graph`? The edge may already be in `graph.edges` (it is ignored there).
+    `ctx` is `build_context(graph)` when many edges of one graph are checked; left out, one is built here."""
     g = as_graph(graph)
     e = as_edge(edge)
-    node_map = _by_id(g.nodes)
+    covered = ctx is not None and ctx.covers(e)
+    node_map = ctx.node_map if ctx is not None and covered else _by_id(g.nodes)
     source = node_map.get(e["source"])
     target = node_map.get(e["target"])
     if source is None or target is None:
         return _refuse("UNKNOWN_NODE", "unknown node")
 
-    others = [x for x in g.edges if x["id"] != e["id"]]
-    if e["source"] == e["target"] or e["source"] in _reach(e["target"], _downstream(others)):
+    if not covered or ctx is None:
+        # The graph as it would be with the edge in it (an edge of the same id is replaced).
+        ctx = RuleContext(g.nodes, [*(x for x in g.edges if x["id"] != e["id"]), e], node_map)
+    probe = _TableProbe(ctx) if ctx.acyclic else _ReachProbe(node_map, g.edges, e)
+    if probe.cycle():
         return _refuse("CYCLE", "cycle")
 
     sk = source.get("kind")
@@ -475,24 +659,20 @@ def validate_edge(graph: Any, edge: Any) -> RuleResult:
         if port is None or port[0] not in REFERENCE_HANDLES or "reference" not in port[2]:
             return _refuse("REFERENCE_ONLY", _REFERENCE_ONLY)
 
-    nxt = [*others, e]
-    next_up = _upstream(nxt)
-
-    if tk in DELIVERY_KINDS and _concept_tier(node_map, next_up, e["target"]):
+    if tk in DELIVERY_KINDS and probe.concept_tier(e["target"]):
         return _refuse("CONCEPT_TO_DELIVERY", f"concept tier cannot reach {tk}")
 
-    if tk in EXPORT_KINDS and _previs_tier(node_map, next_up, e["target"]):
+    if tk in EXPORT_KINDS and probe.previs_tier(e["target"]):
         return _refuse(
             "PREVIS_NOT_DELIVERABLE", f"previs output cannot reach {tk}: PREVIS is not deliverable"
         )
 
     # A Reference anchors nothing: an edge from one needs the generator itself anchored through its other inputs.
     anchor = e["target"] if sk == "Reference" else e["source"]
-    if tk in GENERATING_KINDS and not anchored_to_plate(node_map, next_up, anchor):
+    if tk in GENERATING_KINDS and not probe.anchored(anchor):
         return _refuse("NO_PLATE_ANCHOR", "generation must be anchored to a plate camera (source-view-only)")
 
-    affected = [e["target"], *_reach(e["target"], _downstream(nxt))]
-    if any(generation_depth(g.nodes, nxt, nid) > MAX_GENERATION_DEPTH for nid in affected):
+    if probe.depth_exceeded(e["target"]):
         return _refuse("DEPTH_EXCEEDED", "generation depth > 2 from the plate")
 
     if tk in VIDEO_KINDS and not (source.get("gateStatus") == "pass" and source.get("approved") is True):
@@ -526,9 +706,10 @@ def validate_edge(graph: Any, edge: Any) -> RuleResult:
 def validate_graph(graph: Any) -> list[dict[str, Any]]:
     """Every edge re-checked: `[{edge, code, message}]`, empty when the graph obeys the canvas rules."""
     g = as_graph(graph)
+    ctx = RuleContext(g.nodes, g.edges)
     out: list[dict[str, Any]] = []
     for e in g.edges:
-        res = validate_edge(g, e)
+        res = validate_edge(g, e, ctx)
         if not res.ok:
             out.append({"edge": e, "code": res.code, "message": res.message})
     return out

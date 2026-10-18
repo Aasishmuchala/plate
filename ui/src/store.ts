@@ -14,8 +14,19 @@
 // positions save 1500 ms later, so a run of drags is one PUT (a structural save due sooner carries the positions with
 // it). Tidy, Clear and Duplicate are artist commands: Tidy and Clear save at once, Duplicate is a structural change.
 // `saveState` is what the status-bar chip shows: `unsaved` from the first change until its PUT leaves, `saving` while
-// it is out, `saved` (with `savedAt`) once the daemon stored the latest graph, `failed` after a refused or lost PUT.
-// The canvas starts empty: no placeholder nodes; the artist opens or creates a project.
+// it is out, `saved` (with `savedAt`) once the daemon stored the latest graph, `failed` after a refused or lost PUT,
+// `conflict` after another writer moved the graph under this tab. The canvas starts empty: no placeholder nodes; the
+// artist opens or creates a project.
+//
+// T147, decision 77. The graph has the daemon's `revision`: a load that carries one (the daemon's copy) adopts it,
+// every PUT sends it and the answer's replaces it. A 409 `graph_conflict` stops saving (`saveState: "conflict"`,
+// `conflict.current`) until the artist reloads; `reloadGraph` takes the daemon's graph and keeps the unsaved Edit
+// prompts that differ from it in `conflictLocal` (offered as `copy prompt`). Any other failed PUT that is not a 422
+// rule refusal is retried 1, 2, 4, 8, then every 15 s (`SAVE_RETRY_MS`) until it lands or the project changes, and
+// at once when the daemon comes back (`saveIfPending`). Continuous typing still saves every `SAVE_MAX_WAIT_MS`. A
+// `graph.saved` from another writer (`noteRemoteSave`) reads the head: a newer revision is reloaded, or is a
+// conflict when this tab has unsaved changes. `installPageLifecycle` flushes a pending save with a keepalive PUT on
+// pagehide or when the page is hidden, and asks before unloading while the daemon does not have the latest graph.
 
 import {
   addEdge,
@@ -28,7 +39,7 @@ import {
   type XYPosition,
 } from "@xyflow/react";
 import { create } from "zustand";
-import { ApiError, saveGraph } from "./api/client";
+import { ApiError, getGraph, revisionOf, type SaveOptions, type StoredGraph, saveGraph } from "./api/client";
 import { tidyPositions } from "./canvas/layout";
 import {
   applyOverride,
@@ -64,11 +75,39 @@ export type NodeStatusPatch = Partial<
 /** How long the store waits after the last structural change before it PUTs the graph. */
 export const SAVE_DEBOUNCE_MS = 400;
 
+/** The longest a run of changes waits for its PUT: continuous typing still saves this often. */
+export const SAVE_MAX_WAIT_MS = 2000;
+
 /** How long it waits after the last node drag before it PUTs the moved positions. */
 export const POSITION_SAVE_DEBOUNCE_MS = 1500;
 
+/** The waits before each retry of a failed save; the last one repeats until the save lands. */
+export const SAVE_RETRY_MS: readonly number[] = [1000, 2000, 4000, 8000, 15000];
+
+/** What the browser shows (or, today, ignores in favour of its own text) when the tab is left with unsaved work. */
+export const UNLOAD_WARNING = "The daemon does not have the latest graph yet; leaving now loses the last changes.";
+
 /** Where the open project's graph stands against the daemon's copy (the status-bar chip). */
-export type SaveState = "saved" | "unsaved" | "saving" | "failed";
+export type SaveState = "saved" | "unsaved" | "saving" | "failed" | "conflict";
+
+/** The daemon's answer to a stale save: the revision it holds and the one this tab sent (null: unknown). */
+export interface SaveConflict {
+  current: number | null;
+  sent: number | null;
+}
+
+/** An Edit node's prompt as this tab had it. */
+export interface LocalPrompt {
+  nodeId: string;
+  label: string;
+  prompt: string;
+}
+
+/** The artist's copy at a conflict: the whole graph, and the Edit prompts a Reload would lose. */
+export interface ConflictLocal {
+  graph: Graph;
+  prompts: LocalPrompt[];
+}
 
 /** A duplicate sits this far right of and below its original. */
 export const DUPLICATE_OFFSET_PX = 40;
@@ -103,6 +142,19 @@ export interface GraphState {
   saveState: SaveState;
   /** When the daemon last stored this project's graph from this tab (epoch ms); null since the project was opened. */
   savedAt: number | null;
+  /** The daemon's revision of the graph this tab holds (decision 77); null when unknown (an older daemon or reader). */
+  revision: number | null;
+  /** Set while `saveState` is `conflict`. */
+  conflict: SaveConflict | null;
+  /** Kept from the last conflict; after a Reload, only the Edit prompts that differ from the daemon's graph. */
+  conflictLocal: ConflictLocal | null;
+  /** The wait before the scheduled retry of a failed save (ms); null when none is scheduled. */
+  retryInMs: number | null;
+  /** Bumped whenever the graph is replaced from outside the canvas (a load, a Reload, another writer's save), so the
+   * editors that hold a draft of a node's params (the Edit prompt box) remount and read the new graph. */
+  graphEpoch: number;
+  /** Open a graph. One that carries the daemon's `revision` is the stored copy (never an edit); one without it is,
+   * for the open project, an edit to save (drop-to-restore). */
   loadProject: (graph: LoadableGraph, projectId?: string | null) => void;
   toGraph: () => Graph;
   /** Add a node; returns its id. */
@@ -130,8 +182,13 @@ export interface GraphState {
   overrideNode: (id: string, reason: string, by: string) => void;
   /** Link a Plate node to a packet (the Plate editor's picker). */
   setPlatePacket: (nodeId: string, link: PlatePacketLink) => void;
-  /** PUT the graph now (cancels a scheduled save). Resolves once the daemon answered; the outcome is `saveError`. */
-  saveNow: () => Promise<void>;
+  /** PUT the graph now (cancels a scheduled save). Resolves once the daemon answered; the outcome is `saveError`.
+   * Nothing is sent while `saveState` is `conflict`. */
+  saveNow: (opts?: SaveOptions) => Promise<void>;
+  /** The conflict chip's Reload: take the daemon's graph; the unsaved Edit prompts it lacks stay in `conflictLocal`. */
+  reloadGraph: () => Promise<void>;
+  /** Forget `conflictLocal` (the artist copied what they wanted). */
+  dismissConflictLocal: () => void;
 }
 
 /** A plain default xyflow box; the class lets the stylesheet mark each kind and the concept tier. */
@@ -148,7 +205,20 @@ function makeNode(id: string, kind: NodeKind, position: XYPosition, init: Partia
 /** No project, no nodes (T98: the canvas shows its empty state until a project is opened). */
 export function createInitialGraph(): Pick<
   GraphState,
-  "projectId" | "nodes" | "edges" | "lastRefusal" | "lastRefusalCode" | "violations" | "saveError" | "saveState" | "savedAt"
+  | "projectId"
+  | "nodes"
+  | "edges"
+  | "lastRefusal"
+  | "lastRefusalCode"
+  | "violations"
+  | "saveError"
+  | "saveState"
+  | "savedAt"
+  | "revision"
+  | "conflict"
+  | "conflictLocal"
+  | "retryInMs"
+  | "graphEpoch"
 > {
   return {
     projectId: null,
@@ -160,6 +230,11 @@ export function createInitialGraph(): Pick<
     saveError: null,
     saveState: "saved",
     savedAt: null,
+    revision: null,
+    conflict: null,
+    conflictLocal: null,
+    retryInMs: null,
+    graphEpoch: 0,
   };
 }
 
@@ -241,14 +316,24 @@ const noRefusal = { lastRefusal: null, lastRefusalCode: null } as const;
 // ---------------------------------------------------------------------------- autosave bookkeeping
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+/** The ceiling on a run of changes (`SAVE_MAX_WAIT_MS`): started by its first change, not restarted by the rest. */
+let maxWaitTimer: ReturnType<typeof setTimeout> | null = null;
 /** The slower positions save (a drag ended); a structural save that leaves first carries the positions. */
 let positionTimer: ReturnType<typeof setTimeout> | null = null;
+/** The next retry of a failed save, and how many retries this failure has had. */
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+let retryStep = 0;
 /** The PUT on the wire, and the save queued behind it. */
 let inflight: Promise<void> | null = null;
 let followUp: Promise<void> | null = null;
-/** Bumped on every structural change; `inflightRevision` is the revision the PUT on the wire carries. */
-let revision = 0;
-let inflightRevision = -1;
+/** Bumped on every change to save; `inflightSeq` is the one the PUT on the wire carries. (Not the daemon's
+ * `revision`, which counts the daemon's saves.) */
+let editSeq = 0;
+let inflightSeq = -1;
+/** The highest revision another writer's `graph.saved` named while it could not be checked (a PUT or a check was
+ * out); `Infinity` when it named none. */
+let remoteHint: number | null = null;
+let remoteCheck: Promise<void> | null = null;
 /** While above zero, store updates are the store's own bookkeeping (a load, the daemon's status), not edits. */
 let quiet = 0;
 
@@ -261,15 +346,17 @@ function quietly(fn: () => void): void {
   }
 }
 
+function clear(timer: ReturnType<typeof setTimeout> | null): null {
+  if (timer !== null) clearTimeout(timer);
+  return null;
+}
+
+/** Drop every scheduled save: the debounce, its ceiling, the positions save and a retry. */
 function cancelScheduledSave(): void {
-  if (saveTimer !== null) {
-    clearTimeout(saveTimer);
-    saveTimer = null;
-  }
-  if (positionTimer !== null) {
-    clearTimeout(positionTimer);
-    positionTimer = null;
-  }
+  saveTimer = clear(saveTimer);
+  maxWaitTimer = clear(maxWaitTimer);
+  positionTimer = clear(positionTimer);
+  retryTimer = clear(retryTimer);
 }
 
 /** The chip's state; the store's own bookkeeping, never an edit. */
@@ -279,27 +366,36 @@ function setSaveState(saveState: SaveState, savedAt?: number): void {
   quietly(() => useGraphStore.setState(savedAt === undefined ? { saveState } : { saveState, savedAt }));
 }
 
-/** A structural change: remember it and (re)start the debounce. */
+const inConflict = (): boolean => useGraphStore.getState().saveState === "conflict";
+
+/** A structural change: remember it and (re)start the debounce; the first change of a run starts its ceiling.
+ * Whichever fires first saves, and the save cancels the other. */
 function markChanged(): void {
-  revision += 1;
-  cancelScheduledSave();
+  editSeq += 1;
+  if (inConflict()) return; // nothing is saved over another writer's graph until the artist reloads
+  saveTimer = clear(saveTimer);
+  positionTimer = clear(positionTimer);
   saveTimer = setTimeout(() => {
     saveTimer = null;
     void useGraphStore.getState().saveNow();
   }, SAVE_DEBOUNCE_MS);
+  maxWaitTimer ??= setTimeout(() => {
+    maxWaitTimer = null;
+    void useGraphStore.getState().saveNow();
+  }, SAVE_MAX_WAIT_MS);
   setSaveState("unsaved");
 }
 
 /** Positions changed (nothing else): the PUT on the wire, if any, no longer carries the graph. */
 function markMoved(): void {
-  revision += 1;
-  setSaveState("unsaved");
+  editSeq += 1;
+  if (!inConflict()) setSaveState("unsaved");
 }
 
 /** A drag ended: save the positions 1500 ms after the last one, unless a structural save is due first anyway. */
 function schedulePositionSave(): void {
   markMoved();
-  if (saveTimer !== null) return;
+  if (inConflict() || saveTimer !== null) return;
   if (positionTimer !== null) clearTimeout(positionTimer);
   positionTimer = setTimeout(() => {
     positionTimer = null;
@@ -371,8 +467,8 @@ function serverStatus(cur: PlateNodeData, wire: Record<string, unknown>): Partia
   return Object.keys(out).length > 0 ? out : null;
 }
 
-/** A good save: take the daemon's node status, drop the refusals of an earlier failed save. */
-function applyStored(stored: LoadableGraph): void {
+/** A good save: take the daemon's node status and revision, drop the refusals of an earlier failed save. */
+function applyStored(stored: StoredGraph): void {
   const s = useGraphStore.getState();
   const wire = new Map<string, Record<string, unknown>>();
   for (const n of stored.nodes) if (n && typeof n.id === "string") wire.set(n.id, n as unknown as Record<string, unknown>);
@@ -381,7 +477,8 @@ function applyStored(stored: LoadableGraph): void {
     const patch = w ? serverStatus(n.data, w) : null;
     return patch ? { ...n, data: { ...n.data, ...patch } } : n;
   });
-  quietly(() => useGraphStore.setState({ ...settle(nodes, s.edges), saveError: null }));
+  const revision = revisionOf(stored) ?? s.revision;
+  quietly(() => useGraphStore.setState({ ...settle(nodes, s.edges), saveError: null, revision, retryInMs: null }));
 }
 
 function describeFailure(err: unknown): { code: string | null; message: string } {
@@ -422,22 +519,199 @@ function refuseSave(err: unknown): void {
   quietly(() => useGraphStore.setState({ saveError, violations }));
 }
 
-async function putGraph(projectId: string, graph: Graph, carried: number): Promise<void> {
-  let stored: LoadableGraph;
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
+const asRevision = (v: unknown): number | null => (typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : null);
+
+/** The daemon's 409 `graph_conflict` (the graph moved since this tab read it), or null for any other failure. */
+function conflictOf(err: unknown): SaveConflict | null {
+  if (!(err instanceof ApiError) || err.status !== 409 || !isRecord(err.body) || err.body.error !== "graph_conflict") {
+    return null;
+  }
+  return { current: asRevision(err.body.current), sent: asRevision(err.body.sent) };
+}
+
+/** Everything but a rule refusal (422) and a conflict heals by itself: the network, a 5xx, `graph_busy`, a 429. */
+const retryable = (err: unknown): boolean => !(err instanceof ApiError) || (err.status !== 422 && conflictOf(err) === null);
+
+/** Try a failed save again after the next wait of `SAVE_RETRY_MS`. */
+function scheduleRetry(): void {
+  retryTimer = clear(retryTimer);
+  const wait = SAVE_RETRY_MS[Math.min(retryStep, SAVE_RETRY_MS.length - 1)];
+  retryStep += 1;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    void useGraphStore.getState().saveNow();
+  }, wait);
+  quietly(() => useGraphStore.setState({ retryInMs: wait }));
+}
+
+/** The Edit prompts of a graph that are not blank. */
+function editPrompts(nodes: GraphNode[]): LocalPrompt[] {
+  const out: LocalPrompt[] = [];
+  for (const n of nodes) {
+    const prompt = n.data.kind === "Edit" ? n.data.params?.prompt : undefined;
+    if (typeof prompt === "string" && prompt.trim() !== "") out.push({ nodeId: n.id, label: n.data.label, prompt });
+  }
+  return out;
+}
+
+/** Another writer moved the graph: stop saving over it, keep the artist's copy, and say so on the chip. */
+function enterConflict(conflict: SaveConflict): void {
+  cancelScheduledSave();
+  const s = useGraphStore.getState();
+  const local = s.conflictLocal ?? { graph: s.toGraph(), prompts: editPrompts(s.nodes) };
+  const at = conflict.current === null ? "" : ` (now revision ${conflict.current})`;
+  const saveError: SaveError = {
+    code: "graph_conflict",
+    message: `the graph was changed elsewhere${at}; reload it to go on`,
+  };
+  quietly(() =>
+    useGraphStore.setState({ saveState: "conflict", conflict, conflictLocal: local, saveError, retryInMs: null }),
+  );
+}
+
+/** Replace the open graph with the daemon's copy (nothing unsaved is lost: the caller checked). */
+function applyRemote(head: StoredGraph): void {
+  const s = useGraphStore.getState();
+  const { nodes, edges } = graphFromWire(head);
+  const selected = new Set(s.nodes.filter((n) => n.selected).map((n) => n.id));
+  const kept = nodes.map((n) => (selected.has(n.id) ? { ...n, selected: true } : n));
+  cancelScheduledSave();
+  retryStep = 0;
+  editSeq += 1; // a PUT still out does not carry this graph
+  quietly(() =>
+    useGraphStore.setState({
+      edges,
+      ...settle(kept, edges),
+      ...noRefusal,
+      revision: revisionOf(head),
+      conflict: null,
+      saveError: null,
+      saveState: "saved",
+      retryInMs: null,
+      graphEpoch: s.graphEpoch + 1,
+    }),
+  );
+}
+
+/** Read the head after another writer's `graph.saved` and reload it, or flag a conflict over unsaved changes. */
+async function checkHead(projectId: string): Promise<void> {
+  let head: StoredGraph;
   try {
-    stored = await saveGraph(projectId, graph);
+    head = await getGraph(projectId);
+  } catch {
+    return; // the next graph.saved, or this tab's next save (a 409 when stale), tells again
+  }
+  const s = useGraphStore.getState();
+  if (s.projectId !== projectId || s.saveState === "conflict") return;
+  const theirs = revisionOf(head);
+  if (theirs === null || (s.revision !== null && theirs <= s.revision)) return; // nothing newer than ours
+  if (inflight) {
+    // a PUT left while the head was read: its answer (stored, or a 409) decides; look again after it
+    remoteHint = Math.max(remoteHint ?? theirs, theirs);
+    return;
+  }
+  try {
+    if (s.saveState === "saved") applyRemote(head);
+    // Unsaved here and a revision of ours to compare with: a conflict. With no revision of ours this tab cannot
+    // tell another writer from its own history; its next save (sent with none) is stored and adopts the revision.
+    else if (s.revision !== null) enterConflict({ current: theirs, sent: s.revision });
   } catch (err) {
-    if (useGraphStore.getState().projectId === projectId) {
-      refuseSave(err);
-      setSaveState("failed");
+    console.error("the daemon's graph could not be loaded", err);
+  }
+}
+
+/** Run the deferred head check once nothing is out; a hint this tab's own save has since caught up with is dropped. */
+function runRemoteCheck(projectId: string): void {
+  if (remoteHint === null || inflight || remoteCheck) return;
+  const hint = remoteHint;
+  remoteHint = null;
+  const ours = useGraphStore.getState().revision;
+  if (ours !== null && hint <= ours) return; // it was the echo of the PUT that just came back
+  remoteCheck = checkHead(projectId).finally(() => {
+    remoteCheck = null;
+    if (useGraphStore.getState().projectId === projectId) runRemoteCheck(projectId);
+  });
+}
+
+/**
+ * A `graph.saved` for `projectId` naming `revision` (null: it named none). This tab's own save, or anything not
+ * newer than the revision it holds, is ignored; otherwise the head is read once nothing is out (runEvents).
+ */
+export function noteRemoteSave(projectId: string, revision: number | null): void {
+  const s = useGraphStore.getState();
+  if (s.projectId !== projectId) return;
+  if (revision !== null && s.revision !== null && revision <= s.revision) return;
+  const hint = revision ?? Number.POSITIVE_INFINITY;
+  remoteHint = remoteHint === null ? hint : Math.max(remoteHint, hint);
+  runRemoteCheck(projectId);
+}
+
+/** Send the pending save now, if there is one (the daemon came back, a token was pasted). */
+export function saveIfPending(): void {
+  const s = useGraphStore.getState();
+  if (s.projectId !== null && s.saveState !== "saved" && s.saveState !== "conflict") void s.saveNow();
+}
+
+/** The page is going away (pagehide) or hidden (mobile browsers may never fire pagehide): send what is pending
+ * with a keepalive PUT. A PUT already out is left alone: the unload warning covered what came after it. */
+export function flushPendingSave(): void {
+  const s = useGraphStore.getState();
+  if (s.projectId === null || s.saveState === "saved" || s.saveState === "conflict" || inflight) return;
+  void s.saveNow({ keepalive: true });
+}
+
+/** `beforeunload`: ask before leaving while the daemon does not have the latest graph. */
+export function guardUnload(event: Event): void {
+  const s = useGraphStore.getState();
+  if (s.projectId === null || s.saveState === "saved") return;
+  event.preventDefault();
+  (event as BeforeUnloadEvent).returnValue = UNLOAD_WARNING;
+}
+
+/** Flush on pagehide and on hidden, warn on unload. Returns the uninstall function (App mounts it). */
+export function installPageLifecycle(win: Window = window): () => void {
+  const onHidden = () => {
+    if (win.document.visibilityState === "hidden") flushPendingSave();
+  };
+  win.addEventListener("pagehide", flushPendingSave);
+  win.document.addEventListener("visibilitychange", onHidden);
+  win.addEventListener("beforeunload", guardUnload);
+  return () => {
+    win.removeEventListener("pagehide", flushPendingSave);
+    win.document.removeEventListener("visibilitychange", onHidden);
+    win.removeEventListener("beforeunload", guardUnload);
+  };
+}
+
+async function putGraph(
+  projectId: string,
+  graph: Graph,
+  carried: number,
+  revision: number | null,
+  opts: SaveOptions,
+): Promise<void> {
+  let stored: StoredGraph;
+  try {
+    stored = await saveGraph(projectId, graph, revision, opts);
+  } catch (err) {
+    if (useGraphStore.getState().projectId !== projectId) return;
+    const conflict = conflictOf(err);
+    if (conflict) {
+      enterConflict(conflict);
+      return;
     }
+    refuseSave(err);
+    setSaveState("failed");
+    if (retryable(err)) scheduleRetry();
     return;
   }
   // another project was opened while the PUT was out: its answer is not about this graph
   if (useGraphStore.getState().projectId !== projectId) return;
+  retryStep = 0;
   applyStored(stored);
   // a change made while the PUT was out is still to be saved (its own timer or the queued follow-up sends it)
-  if (revision === carried) setSaveState("saved", Date.now());
+  if (editSeq === carried) setSaveState("saved", Date.now());
   else setSaveState("unsaved");
 }
 
@@ -450,15 +724,23 @@ export const useGraphStore = create<GraphState>()((set, get) => ({
     const { nodes, edges } = graphFromWire(graph);
     const settled = settle(nodes, edges);
     const sameProject = projectId !== null && projectId === prev.projectId;
+    // The daemon's copy (it carries a revision) replaces what this tab holds and is never an edit.
+    const stored = revisionOf(graph);
     // Opening a project is not an edit; re-loading the open one with a different graph is (drop-to-restore adds the
     // producing subgraph this way), and is saved like any other change.
-    const edited = sameProject && signature(prev.nodes, prev.edges) !== signature(settled.nodes, edges);
-    if (!sameProject) {
+    const edited = sameProject && stored === null && signature(prev.nodes, prev.edges) !== signature(settled.nodes, edges);
+    if (!sameProject || stored !== null) {
       cancelScheduledSave();
-      revision += 1; // a PUT still out for the old project does not carry this graph
+      retryStep = 0;
+      editSeq += 1; // a PUT still out (for the old project, or of the old graph) does not carry this graph
     }
-    const fresh = sameProject ? {} : { saveError: null, saveState: "saved" as const, savedAt: null };
-    quietly(() => set({ projectId, edges, ...settled, ...noRefusal, ...fresh }));
+    const status = { saveError: null, saveState: "saved" as const, conflict: null, retryInMs: null, revision: stored };
+    const fresh = !sameProject
+      ? { ...status, savedAt: null, conflictLocal: null }
+      : stored !== null
+        ? status
+        : {};
+    quietly(() => set({ projectId, edges, ...settled, ...noRefusal, ...fresh, graphEpoch: prev.graphEpoch + 1 }));
     if (edited) markChanged();
   },
   toGraph: () => graphToWire(get().nodes, get().edges),
@@ -630,26 +912,55 @@ export const useGraphStore = create<GraphState>()((set, get) => ({
     };
     set({ ...settle(nodes.map((n) => (n.id === nodeId ? { ...n, data } : n)), edges), ...noRefusal });
   },
-  saveNow: () => {
+  saveNow: (opts = {}) => {
     cancelScheduledSave();
     const projectId = get().projectId;
-    if (projectId === null) return Promise.resolve();
+    if (projectId === null || get().saveState === "conflict") return Promise.resolve();
     if (inflight) {
       // The PUT on the wire already carries this graph; otherwise send the current one as soon as it is back.
-      if (inflightRevision === revision) return inflight;
+      if (inflightSeq === editSeq) return inflight;
       followUp ??= inflight.then(() => {
         followUp = null;
-        return get().projectId === projectId ? get().saveNow() : undefined;
+        return get().projectId === projectId ? get().saveNow(opts) : undefined;
       });
       return followUp;
     }
-    inflightRevision = revision;
+    inflightSeq = editSeq;
     setSaveState("saving");
-    inflight = putGraph(projectId, get().toGraph(), revision).finally(() => {
+    if (get().retryInMs !== null) quietly(() => set({ retryInMs: null }));
+    inflight = putGraph(projectId, get().toGraph(), editSeq, get().revision, opts).finally(() => {
       inflight = null;
+      // a graph.saved that came while the PUT was out is checked now (after the follow-up, if one is queued)
+      if (followUp === null) runRemoteCheck(projectId);
     });
     return inflight;
   },
+  reloadGraph: async () => {
+    const projectId = get().projectId;
+    if (projectId === null) return;
+    const local = get().conflictLocal;
+    let head: StoredGraph;
+    try {
+      head = await getGraph(projectId);
+    } catch (err) {
+      if (get().projectId === projectId) {
+        quietly(() => set({ saveError: { code: "reload_failed", message: `the reload failed: ${describeFailure(err).message}` } }));
+      }
+      return;
+    }
+    if (get().projectId !== projectId) return;
+    try {
+      applyRemote(head);
+    } catch (err) {
+      quietly(() => set({ saveError: { code: "reload_failed", message: `the reload failed: ${describeFailure(err).message}` } }));
+      return;
+    }
+    // what a Reload would lose: the artist's Edit prompts the daemon's graph does not have
+    const theirs = new Map(head.nodes.map((n): [string, unknown] => [n.id, n.kind === "Edit" ? n.params?.prompt : undefined]));
+    const prompts = (local?.prompts ?? []).filter((p) => theirs.get(p.nodeId) !== p.prompt);
+    quietly(() => set({ conflictLocal: local && prompts.length > 0 ? { ...local, prompts } : null }));
+  },
+  dismissConflictLocal: () => quietly(() => set({ conflictLocal: null })),
 }));
 
 // Every store update is checked here, whichever path made it (the actions above, the editors' `setState` for
@@ -658,6 +969,8 @@ export const useGraphStore = create<GraphState>()((set, get) => ({
 useGraphStore.subscribe((state, prev) => {
   if (state.projectId !== prev.projectId) {
     cancelScheduledSave();
+    retryStep = 0;
+    remoteHint = null;
     return;
   }
   if (quiet > 0 || state.projectId === null) return;

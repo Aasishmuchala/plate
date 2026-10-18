@@ -1,14 +1,18 @@
 """Batch export (router plan T86): many takes through `export.export` in one request.
 
 - `POST /projects/{id}/export {run_ids?, accepted?, out_dir, format?, name_pattern?, full_frame?}` ->
-  `{exported: [{run_id, path, sidecar, crop | full_frame}], refused: [{run_id, error, ...}]}`. `format` is
+  `{exported: [{run_id, path, sidecar, crop | full_frame, repeat?}], refused: [{run_id, error, ...}]}`. `format` is
   `tiff16` (default), `png16` or `exr`; `out_dir` an absolute folder. Each run goes through `export.export`
   with the single route's guards (`POST /runs/{id}/export`), and one run that cannot leave never stops the
   others:
   - GATE_FAIL needs an override recorded earlier (`POST /runs/{id}/override`); there is no typed override here;
   - previs is refused (`PREVIS_NOT_DELIVERABLE`), and so is any state but DONE (or an overridden GATE_FAIL);
-  - an existing file is never overwritten, so two runs that format to one name leave the second refused.
-  Each exported run is marked shipped and gets a ledger `export` record (`data.batch: true`).
+  - an existing file is never overwritten, so two runs that format to one name leave the second refused
+    (`export.export` claims the name, so this holds for concurrent batches too). A run exported again to the
+    name it already has, byte for byte, is not refused: the entry and the ledger record say `repeat: true`.
+  Each exported run is marked shipped and gets a ledger `export` record (`data.batch: true`). A project folder
+  whose `gates/` cannot take the shipped mark refuses the whole batch before any file is written (503
+  `not_exportable`).
 - Framing (router plan T114): a run whose packet declares `camera.safe_frame` is written as its safe-frame
   region (`export.export`'s default, a pixel crop); `full_frame: true` keeps every take whole. The sidecar,
   the ledger record and the `exported` entry carry `crop: {x, y, width, height}` or `full_frame: true`; a
@@ -21,6 +25,8 @@
   `{run}` (its id), `{run8}` (the last 8 characters of the id; the leading ones are a timestamp, so siblings
   made together share them), `{packet}`, `{engine}` and `{n}` (the 1-based position in this batch, three
   digits). Characters outside letters, digits, `.`, `_` and `-` become `-` (a Windows file name; no `:`).
+  The pattern is parsed before anything is formatted: a field that is not one of those names exactly (no
+  `.attr`, no `[index]`), a format spec or a conversion (`{n:>9}`, `{n!r}`) is 422 `bad_name_pattern`.
 
 A refusal is `{run_id, error, detail}`: `error` is `not_found`, `not_accepted`, `not_exportable` (with `code`
 `PREVIS_NOT_DELIVERABLE`, `GATE_FAIL`, `RUN_NOT_DELIVERABLE`, `SAFE_FRAME_MISMATCH` or `PACKET_UNREADABLE`
@@ -28,12 +34,14 @@ when the guard says why), `bad_name` or `bad_format`.
 
 `export_many(pipeline, project_id, ...)` is the same thing as a function (`plate export --runs/--accepted`,
 T103). It raises `PipelineError` for a problem with the request itself (404 unknown project; 422 `bad_format`,
-`bad_out_dir`, `bad_name_pattern`, `no_runs`).
+`bad_out_dir`, `bad_name_pattern`, `no_runs`; 503 `not_exportable` for a project folder that cannot take the
+shipped mark).
 """
 
 from __future__ import annotations
 
 import re
+import string
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -43,7 +51,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..config import check_project_id
 from ..delivery.guard import PREVIS_NOT_DELIVERABLE, Provenance
-from ..export import FORMATS, NAME_RE, NotExportable, export, recorded_override
+from ..export import FORMATS, NAME_RE, NotExportable, check_project_writable, export, recorded_override
 from ..gate_reports import NoReport
 from ..gate_reports import Service as ReportService
 from ..machine import RunNotFound, get_run
@@ -95,11 +103,11 @@ def _values(run: Run, n: int) -> dict[str, str]:
 def _file_name(pattern: str, run: Run, n: int) -> str:
     try:
         stem = pattern.format_map(_values(run, n))
-    except (KeyError, IndexError, ValueError, AttributeError) as e:
+    except (KeyError, IndexError, ValueError, AttributeError, MemoryError) as e:
         raise _Refused(
             "bad_name", f"name_pattern {pattern!r}: use {', '.join('{' + p + '}' for p in PLACEHOLDERS)}"
         ) from e
-    if not NAME_RE.match(stem):
+    if not NAME_RE.fullmatch(stem):
         raise _Refused(
             "bad_name",
             f"export name {stem!r}: letters, digits, '.', '_' and '-' only, 120 characters at most",
@@ -108,16 +116,28 @@ def _file_name(pattern: str, run: Run, n: int) -> str:
 
 
 def _check_pattern(pattern: str) -> None:
-    """Refuse a pattern that cannot name any run before the batch starts."""
+    """Refuse a pattern that cannot name any run before the batch starts. It is parsed first, so a format spec
+    (`{n:>900000000}` would build a 900 MB string), a conversion or an attribute/index lookup never reaches
+    `format_map`."""
+    usage = f"name_pattern {pattern!r}: use {', '.join('{' + p + '}' for p in PLACEHOLDERS)}"
+    try:
+        fields = list(string.Formatter().parse(pattern))
+    except ValueError as e:  # an unmatched brace
+        raise PipelineError(usage, code="bad_name_pattern") from e
+    for _literal, field, spec, conversion in fields:
+        if field is None:
+            continue
+        if field not in PLACEHOLDERS or spec or conversion is not None:
+            raise PipelineError(
+                f"{usage}, each exactly as written: no format spec, conversion, attribute or index",
+                code="bad_name_pattern",
+            )
     probe = dict.fromkeys(PLACEHOLDERS, "x")
     try:
         stem = pattern.format_map(probe)
-    except (KeyError, IndexError, ValueError, AttributeError) as e:
-        raise PipelineError(
-            f"name_pattern {pattern!r}: use {', '.join('{' + p + '}' for p in PLACEHOLDERS)}",
-            code="bad_name_pattern",
-        ) from e
-    if not NAME_RE.match(stem):
+    except (KeyError, IndexError, ValueError, AttributeError, MemoryError) as e:
+        raise PipelineError(usage, code="bad_name_pattern") from e
+    if not NAME_RE.fullmatch(stem):
         raise PipelineError(
             f"name_pattern {pattern!r}: a name is letters, digits, '.', '_' and '-' only (a Windows file name)",
             code="bad_name_pattern",
@@ -171,6 +191,10 @@ def export_many(
     if pl.load_project(project_id) is None:
         raise PipelineError(f"no project {project_id}", code="not_found", status=404, project_id=project_id)
     project_dir = pl.project_dir(project_id)
+    try:  # every run's shipped mark goes there: refuse the batch before a client file is written
+        check_project_writable(project_dir)
+    except NotExportable as e:
+        raise PipelineError(str(e), code="not_exportable", status=getattr(e, "status", 409)) from e
     cas = pl.cas_for(project_id)
     exported: list[dict[str, Any]] = []
     refused: list[dict[str, Any]] = []
@@ -213,6 +237,9 @@ def export_many(
                         full_frame=full_frame,
                     )
                 except NotExportable as e:
+                    status = getattr(e, "status", 409)
+                    if status != 409:  # not this run: the project folder (503); the batch stops here
+                        raise PipelineError(str(e), code="not_exportable", status=status) from e
                     code = getattr(e, "code", None) or (
                         "RUN_NOT_DELIVERABLE"
                         if run.state not in (RunState.DONE, RunState.GATE_FAIL)
@@ -242,6 +269,7 @@ def export_many(
                         "shipped": shipped,
                         "by": by,
                         **done.framing.record(),
+                        **({"repeat": True} if done.repeat else {}),
                     },
                 )
                 exported.append(
@@ -250,6 +278,7 @@ def export_many(
                         "path": str(done.path),
                         "sidecar": str(done.report_path),
                         **done.framing.record(),
+                        **({"repeat": True} if done.repeat else {}),
                     }
                 )
             except _Refused as r:

@@ -14,13 +14,14 @@ Open the failing run's event log (History tab, or `GET /api/v0/runs/<id>`); the 
 | `runway 429: daily generation cap or rate limit; not retried` | the rolling 24 hour cap, on the create | 2.2 |
 | `runway upload init failed: 429` | the upload rate limit | 2.2 |
 | state `queued`, message `throttled: at the account's concurrency limit, queued at the vendor` | THROTTLED: waiting at the vendor | 2.3 |
-| FAILED, reason `submit_state_unknown` | the create's answer was lost | 2.4 |
+| FAILED, reason `submit_state_unknown` | the create's answer was lost: a timeout, a dropped connection or a 5xx on the create | 2.4 |
 | REFUSED, `refused: runway:SAFETY....` or `INPUT_PREPROCESSING.SAFETY....` | Runway's moderation | 2.5 |
 | FAILED, `bad_output: runway:INTERNAL.BAD_OUTPUT....` | a quality rejection | 2.6 |
 | FAILED, `transient: ...`, `runway 502/503/504: not retried ...` | the vendor, or a third-party model behind it | 2.7 |
 | FAILED, `input: ...`, `runway 400 ... at <path>`, `no legal ratio for ...` | the asset, the ratio or the account | 2.8 |
 | `HostNotAllowed`, `EgressBlocked`, or `runway upload failed: 403` | a host outside the route's `allowed_hosts` | 2.9 |
 | the task succeeded at the vendor but the run cannot fetch the clip | the signed output URL expired | 2.10 |
+| FAILED `result_url_expired`, `result_empty`, `result_not_image`, `result_too_large`, `fetch_error` or `resume_limit` | the download came back unusable, the URL stayed stale after one fresh poll, or the daemon stopped twice on the run | 2.10 |
 
 ## 2. What to do, by message
 
@@ -58,13 +59,13 @@ Not an error. Runway stored the task but has not started it because the account 
 
 ### 2.4 `submit_state_unknown`
 
-PLATE sent a create and never got the task id back (a timeout, a dropped connection, the daemon stopped in that instant). Runway cannot be asked "did you get this?", so the run ends FAILED for a human.
+PLATE sent a create and never got the task id back (a timeout, a dropped connection, a 5xx, the daemon stopped in that instant). Runway cannot be asked "did you get this?", and a create has no idempotency key, so the run ends FAILED `submit_state_unknown` for a human. A create that **timed out** is the common case: the request may have reached Runway and made a billed task, and PLATE cannot tell. The run's `failed` ledger record carries `billing_unknown: true` and is never marked `refunded`, so the ledger does not claim the money came back; if a task did bill, the daily reconciliation will show it as the gap, and step 5 is how you explain it. An error PLATE made while building the request is a different reason, `staging_error`: nothing was sent, nothing can be billed, and it does not count against the route's health.
 
 1. **Do not re-approve blind.** A second create is a second billed task.
 2. Open the Runway dev portal (dev.runway.com), **Manage, then Request History**, and look for the request by time and model.
 3. If there is a task and you want its clip: let it finish in the portal, download it, and file it with `plate import <file> --project <dir|id> --packet <id|dir> --source runway` (it is imported, gated and ledgered as a grade D take; see [manual-pipeline-fallback.md](manual-pipeline-fallback.md)). If you do not want it, cancel it in the portal (a pending, throttled or running task is cancelled; a finished one is deleted).
 4. If there is no task, re-quote the node and approve the new attempt.
-5. Write down which of the two it was (section 6): the daily reconciliation compares the ledger with the bill, and a task PLATE never recorded is the gap it will show.
+5. Write down which of the two it was (section 6): the daily reconciliation compares the ledger with the bill, and a task PLATE never recorded is the gap it will show. The `billing_unknown` record stays as it was written; do not edit `runs.jsonl` (the hash chain is the evidence).
 
 A 502, 503 or 504 on a create (`runway 503: not retried (no idempotency key; ...)`) needs the same step 2 first: Runway says it is shedding load, but the create may still have landed.
 
@@ -114,7 +115,7 @@ Every `runway` route allows `api.dev.runwayml.com`, `.cloudfront.net` and `.amaz
 
 Output URLs are signed and expire within 24 to 48 hours. PLATE downloads the clip the moment the task succeeds, so this only happens when a run sat between SUCCEEDED and FETCHING for a day or two (the daemon was off, or a host was blocked, 2.9).
 
-1. If the run is still open, restart the daemon: a run that holds a task id is re-polled, never resubmitted, and a fresh `GET /v1/tasks/<id>` returns freshly signed URLs for as long as the task is retrievable.
+1. If the run is still open, restart the daemon: a run that holds a task id is re-polled, never resubmitted, and a fresh `GET /v1/tasks/<id>` returns freshly signed URLs for as long as the task is retrievable. A run left in FETCHING is re-polled **once** for a fresh URL on restart: if the task answers SUCCEEDED with a different output URL, the new URL is stored on the run and the download is tried one more time. If the URL is still refused, the run is FAILED `result_url_expired` (step 2 or 3). A download is also checked before it is kept: 0 bytes is `result_empty`, a body that is neither an image nor a clip is `result_not_image`, a picture declaring more than `PLATE_RESULT_MAX_PIXELS` (64 000 000 by default) is `result_too_large`, and a download that passes its byte cap (256 MiB for stills, 2 GiB for clips) or its 600 s deadline is `fetch_error`. A run the daemon was stopped on twice while it was in FETCHING, NORMALIZING or GATING is FAILED `resume_limit` on the third start instead of a third attempt; the message names the result blob that is kept.
 2. If the run already failed, the portal's Request History still shows the task and its output while it is retained: download it there and import it (`--source runway`, 2.4 step 3).
 3. If the task is gone (deleted, or past the vendor's retention, which is unpublished), re-quote. The credits were spent either way.
 

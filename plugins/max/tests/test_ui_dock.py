@@ -1182,6 +1182,62 @@ def test_the_project_combo_persists_to_the_scene_sidecar(
         dock.deleteLater()
 
 
+def test_an_unreadable_sidecar_disables_send_with_the_reason_until_it_is_fixed(
+    qt, dockmod, stub_daemon, clubhouse, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ctl.LiveController, "make_poller", lambda self, **hooks: None)
+    max_file = _save_scene(clubhouse, tmp_path / "jobs", "clubhouse.max")
+    sidecar = max_file.with_name("clubhouse.plate.json")
+    sidecar.write_bytes(b'{"project_id": "tula-wot",}')  # a trailing comma: unreadable, not unbound
+    dock = dockmod.PlateDock(ctl.LiveController())
+    try:
+        select(dock, "CAM_front")
+        message = ctl.LiveController().binding_problem()
+        assert message.startswith("clubhouse.plate.json is unreadable (")
+        assert message.endswith("): fix or delete it before sending")
+        for button in (dock.btn_send, dock.btn_send_quote, dock.btn_batch, dock.btn_motion):
+            assert not button.isEnabled()
+        assert dock.btn_send.toolTip() == message and dock.btn_send_quote.toolTip() == message
+        assert dock.btn_scout.isEnabled()  # Scout puts no packet into a project
+        assert dock.cb_project.currentText() == ""  # no binding is shown, none is guessed
+        dock.choose_project("clubhouse")  # picking a project must not overwrite the file either
+        assert sidecar.read_bytes() == b'{"project_id": "tula-wot",}'
+        assert f"Project: {message}" in dock.log.toPlainText()  # the refusal is in the log, in red
+        sidecar.write_text(json.dumps({"project_id": "tula-wot"}), encoding="utf-8", newline="\n")
+        dock.refresh_cameras()
+        select(dock, "CAM_front")
+        assert dock.btn_send.isEnabled() and dock.btn_send.toolTip() == ""
+        assert dock.cb_project.currentText() == "tula-wot"
+    finally:
+        dock.close()
+        dock.deleteLater()
+
+
+def test_a_stem_that_names_no_project_disables_send_until_one_is_picked(
+    qt, dockmod, stub_daemon, clubhouse, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ctl.LiveController, "make_poller", lambda self, **hooks: None)
+    max_file = _save_scene(clubhouse, tmp_path / "jobs", "客户A_别墅.max")
+    dock = dockmod.PlateDock(ctl.LiveController())
+    try:
+        select(dock, "CAM_front")
+        assert not dock.btn_send.isEnabled() and not dock.btn_send_quote.isEnabled()
+        assert dock.btn_send.toolTip() == "pick a project in the Project combo: '客户A_别墅' cannot name one"
+        assert dock.cb_project.currentText() == ""
+        assert dock.choose_project("tula-wot") is True
+        assert json.loads(max_file.with_name("客户A_别墅.plate.json").read_text(encoding="utf-8")) == {
+            "project_id": "tula-wot"
+        }
+        dock.refresh_cameras()
+        select(dock, "CAM_front")
+        assert dock.btn_send.isEnabled() and dock.cb_project.currentText() == "tula-wot"
+        dock.refresh_projects()
+        assert dock.lbl_custody.text() == "NDA · C0, C1"
+    finally:
+        dock.close()
+        dock.deleteLater()
+
+
 def test_send_motion_from_the_dock_reaches_the_action_with_the_project_from_the_combo(
     qt, dockmod, stub_daemon, clubhouse, tmp_path, monkeypatch
 ):

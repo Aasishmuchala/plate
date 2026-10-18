@@ -499,29 +499,24 @@ def test_an_edit_on_a_take_with_no_output_is_refused_before_any_run_row(sync_set
         assert _run_count(c) == 0
 
 
-def test_a_take_made_outside_the_pipeline_is_gated_on_its_pixel_difference(sync_settings, auth):
-    """A base with no DONE run behind it (here a hand-made PNG): the union is where it differs from the plate."""
+def test_a_take_made_outside_the_pipeline_is_not_a_base(sync_settings, auth):
+    """Decision 72 (Wave 12): a hand-made PNG with no run of that node behind it is never a base. It used to be
+    gated on its pixel difference, which made "outside the union is the plate" true by definition."""
     with _client(sync_settings, Recorder(manifest=MASK_AND_REFS)) as c:
         packet_id = _setup(c, auth)
         pl = c.app.state.pipeline
-        plate = _plate16()
-        painted = plate.copy()
+        painted = _plate16().copy()
         painted[20:60, 30:90] = (60000, 1000, 1000)
         key = pl.cas_for(PROJECT).put_bytes(encode_png16(painted), "png")
         nodes = [_plate(packet_id), {**_edit("e1"), "outputHash": key}, _mask("m2", [SHRUB]), _edit("e2")]
         _put_graph(c, auth, nodes, [_edge("p", "e1"), _edge("p", "m2"), _edge("m2", "e2"), _edge("e1", "e2")])
-        run, _q = _quote(c, {}, "e2")
-        assert (run.inputs["base"], run.inputs["base_run"]) == (key, None)
-        done = _approve(c, auth, run.id)
-        assert done["state"] in ("DONE", "GATE_FAIL"), done.get("error")
-        cas = _cas(sync_settings)
-        union = _grey(cas, done["normalized"]["mask_union_key"])
-        mask2 = _grey(cas, done["normalized"]["mask_key"])
-        assert np.array_equal(union, mask2 | np.any(painted != plate, axis=2))
-        out = decode_png16(cas.read_bytes(done["outputs"][0]))
-        assert np.array_equal(
-            out[20:60, 30:90][~mask2[20:60, 30:90]], painted[20:60, 30:90][~mask2[20:60, 30:90]]
+        e = _refusal(c, {}, "e2")
+        assert (e.code, e.status, e.extra["node"]) == ("base_not_a_take", 422, "e1")
+        assert str(e) == (
+            f"e1 outputHash {key[:12]} is not a take of that node in this project; an upload or a foreign blob "
+            "is never a base (import it first)"
         )
+        assert _run_count(c) == 0
 
 
 # ---------------------------------------------------------------------------- recipe tokens (decision 50)

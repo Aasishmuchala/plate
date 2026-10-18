@@ -19,6 +19,7 @@ import time
 import types
 import urllib.parse
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -31,6 +32,11 @@ from plate_max.packet_id import new_packet_id
 TOKEN = "feedfacefeedfacefeedfacefeedface"
 REF_KEY = "ab" * 32
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+
+def utc_now() -> str:
+    """The daemon's stamp format (timeutil.iso): 2026-10-17T09:41:07.123456Z."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +54,7 @@ class QueueDaemon:
         self.seen: list[tuple[str, str, dict]] = []  # (method, path, query)
         self.result_status: int | None = None  # force an answer to the result POST
         self.result_script: list[int] = []  # statuses for the next result POSTs, in turn
+        self.claim_delays: list[float] = []  # seconds the next claiming polls wait before answering
         self.seq = 0
 
     def add(self, action, **args):
@@ -99,10 +106,14 @@ def serve(daemon: QueueDaemon):
                 return
             if url.path == "/api/v0/plugin/jobs":
                 since, limit = int(query.get("since", "0")), int(query.get("limit", "50"))
-                found = [j for j in daemon.jobs if j["state"] == "queued" and j["seq"] > since][:limit]
+                states = [s for s in query.get("state", "queued").split(",") if s]
+                found = [j for j in daemon.jobs if j["state"] in states and j["seq"] > since][:limit]
                 if query.get("claim") == "1":
                     for j in found:
-                        j["state"] = "claimed"
+                        if j["state"] == "queued":
+                            j["state"], j["claimed_utc"] = "claimed", utc_now()
+                    if daemon.claim_delays:  # the daemon claims, then answers too late: the answer is lost
+                        time.sleep(daemon.claim_delays.pop(0))
                 return self._json(200, {"jobs": found, "next": max([j["seq"] for j in found], default=since)})
             if url.path.startswith("/api/v0/assets/"):
                 key = url.path.rsplit("/", 1)[1]

@@ -5,10 +5,12 @@ daemon's own TestClient where an `httpx.Client` to 127.0.0.1:4610 would be. A Fa
 egress sent (EchoEngine) lets the gates score real pixels, so a run reaches DONE with a gate report.
 
 Covered: the tool list is exactly the eight names (and the CLI says so), an envelope is required and enforced,
-a run completes and its report comes back, the NDA rules (numbers, ids and paths only; the Judge is
-`unavailable: custody`; `export_review` still works), the bundle holds watermarked 8-bit proxies and no master,
-every call lands in `outbound.jsonl` with host `mcp:stdio` before the result is returned, and the envelope
-CLI.
+a run completes and its report comes back, the NDA rules (an allowlist: ids, kinds, hashes, numbers and enum
+params pass, every other string is withheld; the Judge is `unavailable: custody`; `export_review` still works),
+the bundle holds watermarked 8-bit proxies and no master, every call lands in `outbound.jsonl` with host
+`mcp:stdio` before the result is returned, and the envelope CLI. The Wave 12 stress repros (allowlist scrub on a
+graph full of free text, NDA error messages, the review guard, concurrent run_node / add_node, a log failure
+after the daemon acted) are in `test_stress_wave12_mcp.py`.
 """
 
 from __future__ import annotations
@@ -378,8 +380,9 @@ def test_add_node_refuses_delivery_nodes_and_human_only_fields(daemon):
         assert e.value.code == "not_allowed", key
     with pytest.raises(McpError, match="unknown node kind"):
         tools.add_node(PROJECT, "Teleporter")
-    with pytest.raises(McpError, match="do not exist"):
+    with pytest.raises(McpError, match="does not hold") as e:  # the daemon's append endpoint refuses it
         tools.add_node(PROJECT, "Mask", {}, "ghost")
+    assert e.value.code == "unknown_node"
     with pytest.raises(McpError, match="limit"):
         tools.add_node(PROJECT, "Concept", {"blob": "x" * 20000})
     assert tools.get_graph(PROJECT)["data"]["graph"]["nodes"] == []
@@ -504,16 +507,24 @@ def test_an_nda_project_gets_numbers_ids_and_paths_only(daemon):
     assert rows and all(r["host"] == "mcp:stdio" for r in rows)
 
 
-def test_scrub_nda_withholds_pixels_and_free_text_but_not_numbers_ids_paths():
+def test_scrub_nda_is_an_allowlist_of_ids_numbers_and_structural_strings():
     blob = base64.b64encode(bytes(range(256)) * 4).decode("ascii")
+    run = "run_01JA0000000000000000000000"
+    key = "ab" * 32
     value = {
-        "run_id": "run_1",
-        "path": "gates/run_1.1.json",
+        "run_id": "run_1",  # a structural key: its string passes whatever it holds
+        "report": run,  # an id passes under any key
+        "outputHash": key,  # so does a 64-hex hash
+        "path": "gates/run_1.1.json",  # a path is a string like any other
         "score": 0.93,
         "ok": True,
+        "none": None,
         "label": "Client Tower",
         "thumbnail": "x",
         "tiles": [[0, 0, 64, 64]],
+        "params": {"move": "push_in", "engine": "fake", "mood": "Client lobby", "nested": {"move": "Client"}},
+        "move": "outside params",  # an enum key passes only directly under `params`
+        "edges": [{"id": "p->e", "source": "p", "target": "e", "sourceHandle": "image16"}],
         "nested": [
             {
                 "prompt": "secret",
@@ -521,27 +532,41 @@ def test_scrub_nda_withholds_pixels_and_free_text_but_not_numbers_ids_paths():
                 "uri": "data:image/png;base64,AAAA",
                 "blob": blob,
                 "raw": b"\x89PNG",
+                "kind": "data:image/png;base64,AAAA",  # image data is withheld even under a structural key
             }
         ],
         "empty_label": "",
     }
     clean, withheld = scrub_nda(value)
-    assert clean["run_id"] == "run_1" and clean["path"] == "gates/run_1.1.json" and clean["score"] == 0.93
-    assert clean["ok"] is True and clean["tiles"] == [[0, 0, 64, 64]] and clean["empty_label"] == ""
-    assert clean["label"] == mcp_server.WITHHELD_TEXT and clean["thumbnail"] == mcp_server.WITHHELD_PIXELS
+    assert clean["run_id"] == "run_1" and clean["report"] == run and clean["outputHash"] == key
+    assert clean["score"] == 0.93 and clean["ok"] is True and clean["none"] is None
+    assert clean["tiles"] == [[0, 0, 64, 64]] and clean["empty_label"] == ""
+    assert clean["edges"] == value["edges"]
+    assert clean["params"]["move"] == "push_in" and clean["params"]["engine"] == "fake"
+    T, P = mcp_server.WITHHELD_TEXT, mcp_server.WITHHELD_PIXELS
+    assert clean["path"] == clean["label"] == clean["move"] == clean["params"]["mood"] == T
+    assert clean["params"]["nested"]["move"] == T and clean["thumbnail"] == P
     n = clean["nested"][0]
-    assert n["prompt"] == mcp_server.WITHHELD_TEXT
-    assert n["b64"] == n["uri"] == n["blob"] == n["raw"] == mcp_server.WITHHELD_PIXELS
+    assert n["prompt"] == T
+    assert n["b64"] == n["uri"] == n["blob"] == n["raw"] == n["kind"] == P
     assert set(withheld) == {
+        "path",
         "label",
+        "move",
         "thumbnail",
+        "params.mood",
+        "params.nested.move",
         "nested[0].prompt",
         "nested[0].b64",
         "nested[0].uri",
         "nested[0].blob",
         "nested[0].raw",
+        "nested[0].kind",
     }
-    assert "secret" not in json.dumps(clean) and "AAAA" not in json.dumps(clean)
+    dumped = json.dumps(clean)
+    assert (
+        "secret" not in dumped and "AAAA" not in dumped and "Client" not in dumped and "gates/" not in dumped
+    )
 
 
 # ---------------------------------------------------------------------------- the human-only envelope command

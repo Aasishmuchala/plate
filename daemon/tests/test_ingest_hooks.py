@@ -80,10 +80,17 @@ def _set_project_policy(settings: Settings, policy: dict | None) -> Project:
     return project
 
 
+def _project_index(settings: Settings):
+    """The project's index connection. An Index opens existing projects only (T144), so register the
+    project folder first, as `POST /projects` does; the folder is the one `_project_json_path` falls back to."""
+    index = Index(settings.home)
+    index.set_project_root(PROJECT, settings.projects_dir / PROJECT)
+    return index.project(PROJECT)
+
+
 def _ingest(settings: Settings, packet: Path) -> tuple[dict, list[dict], dict]:
     """begin + finish on the project's real index; returns (record, events, effective policy or None)."""
-    index = Index(settings.home)
-    with index.project(PROJECT) as conn:
+    with _project_index(settings) as conn:
         ingest.begin_ingest(conn, packet)
         pid = _manifest(packet)["packet_id"]
         rec = ingest.finish_ingest(conn, CAS(settings.projects_dir / PROJECT / "assets"), pid)
@@ -161,8 +168,7 @@ def test_wrong_pixel_share_is_replaced_with_a_note_not_an_error():
 
 
 def test_policy_is_a_no_op_without_project_or_settings(settings):
-    index = Index(settings.home)
-    with index.project(PROJECT) as conn:
+    with _project_index(settings) as conn:
         m = _manifest()
         assert ingest.reapply_project_policy(conn, ROOM_A, m) == [] and m == _manifest()
         _set_project_policy(settings, None)  # project.json without settings.policy
@@ -194,7 +200,7 @@ def test_locked_class_removes_ids_from_editable_ids(settings):
 def test_reapply_updates_the_manifest_in_memory(settings):
     _set_project_policy(settings, {"locked_classes": ["vegetation", "sky"]})
     m = _manifest()
-    with Index(settings.home).project(PROJECT) as conn:
+    with _project_index(settings) as conn:
         notes: list[str] = []
         assert ingest.reapply_project_policy(conn, ROOM_A, m, notes=notes) == []
     editable = set(m["policy"]["editable_ids"])
@@ -205,7 +211,7 @@ def test_reapply_updates_the_manifest_in_memory(settings):
 def test_lint_threshold_over_the_unlabelled_share_is_an_error(settings):
     _set_project_policy(settings, {"lint_threshold": 0.05})
     m = _manifest()
-    with Index(settings.home).project(PROJECT) as conn:
+    with _project_index(settings) as conn:
         assert ingest.reapply_project_policy(conn, ROOM_A, m) == []  # room_a has no unlabelled ids
         m["id_legend"]["coverage"]["unlabelled_share"] = 0.2
         errors = ingest.reapply_project_policy(conn, ROOM_A, m)
@@ -214,14 +220,14 @@ def test_lint_threshold_over_the_unlabelled_share_is_an_error(settings):
     legend = json.loads((ROOM_A / "id_legend.json").read_text(encoding="utf-8"))
     sign = next(e for e in legend["entries"] if e["id"] == "o:d5cf2e02")
     sign["class_source"], sign["pixel_share"] = "unlabelled", 0.12  # the legend itself says it
-    with Index(settings.home).project(PROJECT) as conn:
+    with _project_index(settings) as conn:
         assert ingest.reapply_project_policy(conn, ROOM_A, _manifest(), legend=legend)
 
 
 def test_malformed_project_policy_fails_closed(settings):
     project = _set_project_policy(settings, {"locked_classes": "vegetation"})
     m = _manifest()
-    with Index(settings.home).project(PROJECT) as conn:
+    with _project_index(settings) as conn:
         assert "locked_classes must be a list" in ingest.reapply_project_policy(conn, ROOM_A, m)[0]
         for bad in (True, "0.1", 2, -0.5):
             project.doc["settings"]["policy"] = {"lint_threshold": bad}
@@ -237,7 +243,7 @@ def test_explicit_project_root_wins(settings, tmp_path):
     elsewhere.doc["settings"]["policy"] = {"locked_classes": ["water"]}
     elsewhere.save()
     m = _manifest()
-    with Index(settings.home).project(PROJECT) as conn:
+    with _project_index(settings) as conn:
         assert ingest.reapply_project_policy(conn, ROOM_A, m, project_root=elsewhere.root) == []
     assert "o:c8a9bf52" not in m["policy"]["editable_ids"]
 

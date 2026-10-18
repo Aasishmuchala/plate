@@ -86,14 +86,16 @@ export async function createProject(body: CreateProjectBody): Promise<ProjectSum
   return made ?? { project_id: body.project_id, custody: body.custody, engine_pins: body.engine_pins };
 }
 
-/** `GET /projects/{id}/graph` returns the graph itself or `{graph}`. */
+/** `GET /projects/{id}/graph` returns the graph itself or `{graph}`; its `revision` (decision 77) is kept, so the
+ * store saves against the revision it opened (T147). */
 export async function getProjectGraph(projectId: string): Promise<LoadableGraph> {
   const body = await fetchJson<unknown>(`/projects/${enc(projectId)}/graph`);
   const graph = isRecord(body) && isRecord(body.graph) ? body.graph : body;
   if (!isRecord(graph) || !Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) {
     throw new Error(`project ${projectId}: the daemon returned no graph`);
   }
-  return { schema: 1, nodes: graph.nodes, edges: graph.edges } as LoadableGraph;
+  const revision = typeof graph.revision === "number" ? { revision: graph.revision } : {};
+  return { schema: 1, nodes: graph.nodes, edges: graph.edges, ...revision } as LoadableGraph;
 }
 
 // ---------------------------------------------------------------------------------------------------- runs

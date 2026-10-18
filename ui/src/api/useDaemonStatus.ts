@@ -1,11 +1,14 @@
-// Status-bar hook: polls `/api/v0/health` (no token needed), reports whether this tab holds a token, and keeps the
-// last bus `alert` (T71: unattended-spend and nightly-job alerts the daemon publishes) until it is dismissed.
+// Status-bar hook: polls `/api/v0/health` (no token needed), reports the token state, and keeps the last bus
+// `alert` (T71: unattended-spend and nightly-job alerts the daemon publishes) until it is dismissed.
+// T147: the token state is honest (`present`, `rejected` once any call answered 401, `none`: api/client), and the
+// daemon coming back (`down` -> `up`) sends a pending graph save at once instead of waiting for the next retry.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { create } from "zustand";
 import { hub } from "../canvas/runEvents";
 import type { BusRecord } from "../canvas/runTypes";
-import { getHealth, getToken, type Health } from "./client";
+import { saveIfPending } from "../store";
+import { getHealth, type Health, onTokenChange, tokenGeneration, tokenState, type TokenState } from "./client";
 
 export type DaemonState = "checking" | "up" | "down";
 
@@ -21,7 +24,9 @@ export interface DaemonAlert {
 export interface DaemonStatus {
   state: DaemonState;
   health: Health | null;
+  /** This tab holds a token the daemon has not refused. */
   tokenPresent: boolean;
+  tokenState: TokenState;
   lastAlert: DaemonAlert | null;
   dismissAlert: () => void;
 }
@@ -71,23 +76,31 @@ export function useLastAlert(): { lastAlert: DaemonAlert | null; dismissAlert: (
   return { lastAlert, dismissAlert };
 }
 
+/** The token state, re-read whenever a call is refused or a token is set. */
+export function useTokenState(): TokenState {
+  return useSyncExternalStore(onTokenChange, () => tokenState());
+}
+
+/** How many tokens were set in this tab (bumped by a paste), for re-reading everything with the new one. */
+export function useTokenGeneration(): number {
+  return useSyncExternalStore(onTokenChange, tokenGeneration);
+}
+
 export function useDaemonStatus(pollMs = 15000): DaemonStatus {
-  const [status, setStatus] = useState<Pick<DaemonStatus, "state" | "health" | "tokenPresent">>({
-    state: "checking",
-    health: null,
-    tokenPresent: false,
-  });
+  const [status, setStatus] = useState<Pick<DaemonStatus, "state" | "health">>({ state: "checking", health: null });
+  const token = useTokenState();
   const { lastAlert, dismissAlert } = useLastAlert();
+  const seen = useRef<DaemonState>("checking");
 
   useEffect(() => {
     let alive = true;
     const check = () => {
       getHealth().then(
         (health) => {
-          if (alive) setStatus({ state: health.ok ? "up" : "down", health, tokenPresent: getToken() !== null });
+          if (alive) setStatus({ state: health.ok ? "up" : "down", health });
         },
         () => {
-          if (alive) setStatus({ state: "down", health: null, tokenPresent: getToken() !== null });
+          if (alive) setStatus({ state: "down", health: null });
         },
       );
     };
@@ -99,5 +112,12 @@ export function useDaemonStatus(pollMs = 15000): DaemonStatus {
     };
   }, [pollMs]);
 
-  return { ...status, lastAlert, dismissAlert };
+  // The daemon is back: send what is waiting rather than wait for the next retry.
+  useEffect(() => {
+    const was = seen.current;
+    seen.current = status.state;
+    if (was === "down" && status.state === "up") saveIfPending();
+  }, [status.state]);
+
+  return { ...status, tokenPresent: token === "present", tokenState: token, lastAlert, dismissAlert };
 }

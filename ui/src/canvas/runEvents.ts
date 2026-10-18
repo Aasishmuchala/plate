@@ -8,8 +8,13 @@
 // `&after=<seq>` and never replays the project's history; `hub.onKind(kind, handler)` routes the records that are
 // not about one run's state (`alert`, `packet.ingested`, `plugin.job`, `run.accepted`, `graph.saved`,
 // `packet.superseded`); `hub.follow(projectId)` keeps the open project's stream up so those arrive between Makes.
+// T147: the cursor is the raw SSE id of the newest record, `<epoch>.<seq>` since T144, passed back as `after`
+// untouched (never parsed into a number, so a reindex's new epoch is never mistaken for an old seq; a bare integer
+// id from an older daemon is kept as its seq). `followGraphSaves(projectId)` follows the project and hands every
+// `graph.saved` (with the revision it names) to the graph store, which reloads or flags a conflict.
 
 import { API_PREFIX, type EventSourceLike, getToken, type RunEvent, sse } from "../api/client";
+import { noteRemoteSave } from "../store";
 import { getGateReport, getRun } from "./runApi";
 import { useRunStore } from "./runStore";
 import { type BusRecord, isRunState, isTerminal, type RunWire } from "./runTypes";
@@ -29,15 +34,43 @@ const browserFactory: EventSourceFactory = (url) => {
   }
 };
 
+/** A project stream's cursor: the last SSE id as sent (`<epoch>.<seq>`), or the seq of an older daemon's bare id. */
+export type EventCursor = string | number;
+
 /**
- * `/api/v0/events?project_id=…&token=…[&after=<seq>]` (the only route that takes the token in the query). `after` is
- * the hub's cursor for a project it has seen before; the first open of a project has none.
+ * `/api/v0/events?project_id=…&token=…[&after=<cursor>]` (the only route that takes the token in the query). `after`
+ * is the hub's cursor for a project it has seen before; the first open of a project has none.
  */
-export function projectEventsUrl(projectId: string, token: string | null, after?: number | null): string {
+export function projectEventsUrl(projectId: string, token: string | null, after?: EventCursor | null): string {
   const q = new URLSearchParams({ project_id: projectId });
   if (token) q.set("token", token);
-  if (typeof after === "number" && Number.isFinite(after)) q.set("after", String(after));
+  if (typeof after === "string" && after !== "") q.set("after", after);
+  else if (typeof after === "number" && Number.isFinite(after)) q.set("after", String(after));
   return `${API_PREFIX}/events?${q.toString()}`;
+}
+
+interface CursorAt {
+  /** What goes back as `after`. */
+  cursor: EventCursor;
+  /** The id's epoch (null: a bare id), so a new epoch replaces the cursor whatever its seq. */
+  epoch: string | null;
+  seq: number | null;
+}
+
+/** Where a record moves a cursor: its raw SSE id, else its seq. Null when it carries neither. */
+function cursorOf(id: string | null, rec: BusRecord): CursorAt | null {
+  const seq = typeof rec.seq === "number" && Number.isFinite(rec.seq) ? rec.seq : null;
+  const dot = id === null ? -1 : id.lastIndexOf(".");
+  if (id !== null && dot > 0) return { cursor: id, epoch: id.slice(0, dot), seq };
+  // a bare id (an older daemon) is the record's seq; with no seq the id string goes back as it came
+  if (seq !== null) return { cursor: seq, epoch: null, seq };
+  return id !== null ? { cursor: id, epoch: null, seq: null } : null;
+}
+
+/** A later record never lowers the cursor within one epoch; a record from another epoch (a rebuild) replaces it. */
+function advances(cur: CursorAt | undefined, next: CursorAt): boolean {
+  if (!cur || cur.epoch !== next.epoch) return true;
+  return cur.seq === null || next.seq === null || next.seq > cur.seq;
 }
 
 /** The bus record inside an SSE message, or null for keep-alives and anything that is not a record. */
@@ -66,7 +99,7 @@ interface ProjectStream {
 export class RunEventHub {
   private streams = new Map<string, ProjectStream>();
   private perRun = new Map<string, { close: () => void; handlers: Set<RecordHandler> }>();
-  private cursors = new Map<string, number>();
+  private cursors = new Map<string, CursorAt>();
   private kindHandlers = new Map<string, Set<RecordHandler>>();
   private factory: EventSourceFactory;
 
@@ -104,9 +137,10 @@ export class RunEventHub {
     this.cursors.clear();
   }
 
-  /** The highest `seq` seen on a project's stream, or null before its first record (the next open has no cursor). */
-  cursor(projectId: string): number | null {
-    return this.cursors.get(projectId) ?? null;
+  /** The newest record's SSE id on a project's stream (`<epoch>.<seq>`; an older daemon's bare id as its seq), or
+   * null before its first record (the next open has no cursor). */
+  cursor(projectId: string): EventCursor | null {
+    return this.cursors.get(projectId)?.cursor ?? null;
   }
 
   /**
@@ -150,12 +184,14 @@ export class RunEventHub {
   private openProject(projectId: string): ProjectStream {
     const open = this.streams.get(projectId);
     if (open) return open;
-    const source = this.factory(projectEventsUrl(projectId, getToken(), this.cursors.get(projectId)));
+    const source = this.factory(projectEventsUrl(projectId, getToken(), this.cursor(projectId)));
     const handlers = new Map<string, Set<RecordHandler>>();
     source.onmessage = (ev: MessageEvent) => {
       const rec = parseRecord(ev.data);
       if (!rec) return;
-      if (typeof rec.seq === "number" && rec.seq > (this.cursors.get(projectId) ?? 0)) this.cursors.set(projectId, rec.seq);
+      const id = typeof ev.lastEventId === "string" && ev.lastEventId !== "" ? ev.lastEventId : null;
+      const next = cursorOf(id, rec);
+      if (next && advances(this.cursors.get(projectId), next)) this.cursors.set(projectId, next);
       // Group records (siblings.ranked) carry no run id: every watcher of the project sees them.
       const targets = rec.run_id ? [handlers.get(rec.run_id)] : [...handlers.values()];
       for (const set of targets) for (const h of set ?? []) h(rec);
@@ -218,6 +254,28 @@ export class RunEventHub {
 
 /** The canvas's hub. Tests swap the EventSource factory with `hub.setFactory`. */
 export const hub = new RunEventHub();
+
+/** The revision a `graph.saved` record names (`data.revision`), or null when it names none. */
+export function savedRevision(rec: BusRecord): number | null {
+  const v = rec.data?.["revision"];
+  return typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : null;
+}
+
+/**
+ * Follow the open project (as `hub.follow`) and give the graph store every `graph.saved` of it: another writer's
+ * save is reloaded, or is a conflict over unsaved changes; this tab's own is ignored. Returns the stop function.
+ */
+export function followGraphSaves(projectId: string, on: RunEventHub = hub): () => void {
+  const stopKind = on.onKind("graph.saved", (rec) => {
+    if (typeof rec.project_id === "string" && rec.project_id !== projectId) return;
+    noteRemoteSave(projectId, savedRevision(rec));
+  });
+  const stopFollow = on.follow(projectId);
+  return () => {
+    stopKind();
+    stopFollow();
+  };
+}
 
 const unwatchers = new Map<string, () => void>();
 

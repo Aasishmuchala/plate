@@ -9,6 +9,10 @@ approve the quotes under the project's per-run cap. Threading contract (copied f
   * slow pure I/O (the daemon health and projects calls, the job poller's daemon calls) runs on a
     QThread while the main thread spins a local QEventLoop, so Max stays responsive and no widget is
     touched off-thread;
+  * the daemon calls inside an action this dock starts (Send's hashing, the POST, following the
+    ingest) are pumped: the dock hands the action a config whose transport.PUMP_KEY ("_pump") is its
+    _pump_events, so transport runs each call on a worker thread while the main thread processes
+    events (the controller's _options is wrapped for that; nothing else changes in what it returns);
   * renders block Max by nature, so the log narrates and processes events to never feel dead.
 
 The job poller (plate_max.jobs, made by the controller) runs on this dock's QTimer: it starts with
@@ -28,11 +32,13 @@ from __future__ import annotations
 
 import html as _html
 import os
+import threading
 from typing import Any
 
 from PySide6 import QtCore, QtWidgets  # type: ignore
 
-from .. import policy
+from .. import policy, transport
+from ..config import load_config
 from . import controller as ctl
 
 # Apple-dark design language (palette and STYLE copied from MaxGaffer's dock): flat surfaces, ONE
@@ -155,6 +161,8 @@ class PlateDock(QtWidgets.QWidget):
         self.ctrl.io = self._run_blocking_io  # daemon waits run off-thread, Max stays alive
         self._workers: list[_Worker] = []
         self._busy = False
+        self._pumping = False  # inside an action: its daemon calls get config["_pump"]
+        self._wrap_options()
         self._loading = False
         self._loading_project = False
         self._io_depth = 0  # local event loops spinning (a daemon wait): the poller holds off
@@ -418,8 +426,10 @@ class PlateDock(QtWidgets.QWidget):
 
     # ================================================================= plumbing
     def _log(self, msg: str, err: bool = False) -> None:
+        """One log line, always as rich text in one container (only its colour says error): a line
+        left to Qt's plain-or-rich guess shows &#x27; and &amp; literally."""
         text = _html.escape(str(msg))
-        self.log.append(f'<span style="color:{ERR}">{text}</span>' if err else text)
+        self.log.append(f'<span style="white-space:pre-wrap;color:{ERR if err else TEXT}">{text}</span>')
         bar = self.log.verticalScrollBar()
         bar.setValue(bar.maximum())
         QtWidgets.QApplication.processEvents()
@@ -444,6 +454,37 @@ class PlateDock(QtWidgets.QWidget):
         if "e" in box:
             raise RuntimeError(box["e"])
         return box.get("r")
+
+    @staticmethod
+    def _pump_events() -> None:
+        """transport's pump (run_with_pump): Max's events, from the main thread only."""
+        if threading.current_thread() is threading.main_thread():
+            QtWidgets.QApplication.processEvents()
+
+    def _wrap_options(self) -> None:
+        """Wrap the controller's _options (LiveController; a controller without one is left alone) so
+        that, while this dock runs an action, the options carry a config with transport.PUMP_KEY set
+        to _pump_events: the action's hash, post and ingest follow then run on a worker thread while
+        Max's events are processed. A controller wrapped by an earlier dock is re-wrapped from its
+        original, so the open dock is the one asked."""
+        current = getattr(self.ctrl, "_options", None)
+        original = getattr(current, "plate_original", current)
+        if not callable(original):
+            return
+
+        def pumped(*args: Any, **kwargs: Any) -> Any:
+            opts = original(*args, **kwargs)
+            if self._pumping and isinstance(opts, dict):
+                cfg = dict(opts.get("config") or load_config())
+                cfg[transport.PUMP_KEY] = self._pump_events
+                opts["config"] = cfg
+            return opts
+
+        pumped.plate_original = original  # type: ignore[attr-defined]
+        try:
+            self.ctrl._options = pumped
+        except (AttributeError, TypeError):  # a controller that takes no attributes keeps its own
+            pass
 
     def _progress(self, done: int, total: int, message: str) -> None:
         """The callback handed to controller actions (safe to call from any thread)."""
@@ -787,15 +828,18 @@ class PlateDock(QtWidgets.QWidget):
         return True
 
     def _guarded(self, name: str, work) -> None:
-        """Run work() with the busy lifecycle; an exception is logged, never raised into Max."""
+        """Run work() with the busy lifecycle; an exception is logged, never raised into Max. The
+        action's daemon calls are pumped meanwhile (_wrap_options): the Send flow passes the pump."""
         if self._busy:
             return
         self._set_busy(True)
+        self._pumping = True
         try:
             work()
         except Exception as e:  # noqa: BLE001
             self._log(f"{name} failed: {type(e).__name__}: {e}", err=True)
         finally:
+            self._pumping = False
             self._set_busy(False)
 
     def _show_results(self, name: str, results: list[dict[str, Any]], sends: bool = True) -> None:

@@ -10,9 +10,14 @@ send_packet.run once per camera, so the preflight runs again at the start of eve
 Per camera, in this order (any failure stops that camera, records why, and moves on to the next):
 
   colour    bridge.colour.detect_colour_pipeline(): an unknown mode stops before anything renders
-  lint      policy.lint_scene(): scaled / shifted / hidden camera, no V-Ray, node names with ':'. With
-            recipe.level_and_crop (default true, decision 58) a tilt-corrected or vertically shifted
-            camera that bridge.camera_level can plan is a SHIFTED_CAMERA warning, not a refusal
+  lint      policy.lint_scene(): scaled / shifted / hidden camera, no V-Ray, node names with ':',
+            two geometry nodes or two cameras sharing a name (DUPLICATE_NODE_NAME,
+            DUPLICATE_CAMERA_NAME), a camera name that cannot be a shot id (BAD_SHOT_SLUG), lens or
+            exposure values that are not positive finite numbers (BAD_LENS) and a non-finite pose
+            (BAD_POSE), all with nothing rendered (decision 81). The shot id and the project id are
+            made here too, so neither can fail after the render. With recipe.level_and_crop (default
+            true, decision 58) a tilt-corrected or vertically shifted camera that bridge.camera_level
+            can plan is a SHIFTED_CAMERA warning, not a refusal
   backup    bridge.safety.backup() when options.backup (before the scene is touched)
   preflight every legend record that will be hashed in memory is checked against the payload limit
             (PAYLOAD_TOO_LARGE names the node and the size): nothing oversize reaches the hash step
@@ -34,14 +39,18 @@ Per camera, in this order (any failure stops that camera, records why, and moves
   hash      BLAKE3 of every file and payload from the daemon (POST /api/v0/hash, decision 5b); the
             big ones by path: id_legend.json, and the scene digest written as scene_digest.txt
             (file role x_scene_digest)
-  manifest  packet.build_manifest + packet.write_packet (the manifest last)
+  manifest  packet.build_manifest + packet.write_packet (the manifest last, strict JSON: a NaN is
+            a ValueError, so SendAbort("manifest"), never a manifest that is not JSON)
   post      transport.post_packet (200/202 ok; 409, 422, 426 reported), with a timeout that grows
             with the folder and one re-post after a timeout; then events_url is followed for a few
             seconds and result.ingest says "ingested", "failed: <errors>" (the camera fails) or
             "ingesting"
 
 run() never raises across cameras; every outcome is a SendResult carrying status_code, events_url,
-packet_id and ingest. Every pymxs read goes through rt.runtime().
+packet_id and ingest. A camera stopped at "manifest" or later whose folder has no manifest.json has
+that folder removed (nothing can ingest it, and the scene must change before a re-send), unless
+options.keep_failed_packets; one stopped earlier (legend, hash) keeps its render for inspection.
+Every pymxs read goes through rt.runtime().
 """
 
 from __future__ import annotations
@@ -59,7 +68,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .. import PACKET_VERSION, autotag, digest, packet, policy, transport
+from .. import PACKET_VERSION, autotag, digest, fsutil, packet, policy, transport
 from .. import legend as legend_mod
 from ..bridge import camera_level, colour, elements, hashing, render, safety
 from ..bridge.scene import current_frame, get_camera, rt_attr, scene_path, set_prop
@@ -87,6 +96,9 @@ LEVEL_AND_CROP_DEFAULT = True  # recipe.level_and_crop when nothing sets it (dec
 DATA_ELEMENTS_FLOAT = ("zdepth", "cryptomatte_object", "cryptomatte_material", "world_position")
 REQUIRED_ELEMENTS = ("beauty", *elements.DEFAULT_ELEMENTS)
 OK_STATUS = (200, 202)
+# A SendAbort at one of these stages that leaves the packet folder without manifest.json removes the
+# folder (options.keep_failed_packets keeps it); earlier stages keep the render for inspection.
+ORPHAN_STAGES = ("manifest", "post", "ingest")
 
 # Why a Send stopped before anything rendered (SendResult.code; stage "preflight").
 PREFLIGHT_UNREACHABLE = "PREFLIGHT_UNREACHABLE"
@@ -198,6 +210,7 @@ OPTION_KEYS = (
     "post_timeout_s",
     "ingest_follow_s",
     "level_and_crop",
+    "keep_failed_packets",
 )
 
 
@@ -553,8 +566,13 @@ def legend_nodes(
     when the node's plate_planar user property sets it (autotag.planar_overrides; otherwise the
     legend's class rule decides). A covered name that is not a scene geometry node (a proxy or
     scatter item) still enters, unlabelled (so locked). A manifest id that is not the Cryptomatte
-    hash of its name stops the Send."""
-    by_name = {str(n["name"]): n for n in scene_nodes}
+    hash of its name stops the Send. Two scene nodes with one name stop it too, at "lint" with
+    DUPLICATE_NODE_NAME (they share one Cryptomatte id, so no single layer may decide its class):
+    never "last wins"."""
+    duplicates = policy.duplicate_node_problems(scene_nodes)  # grouped by name
+    if duplicates:
+        raise SendAbort("lint", "lint: " + "; ".join(p["detail"] for p in duplicates), duplicates)
+    by_name = {str(n["name"]): n for n in scene_nodes}  # one node per name now
     nodes: list[dict[str, Any]] = []
     warnings: list[str] = []
     named: set[str] = set()
@@ -677,6 +695,21 @@ def _project_id(options: Any) -> str:
         return packet.slugify(stem) if stem else "untitled"
     except packet.ManifestError:
         return "untitled"
+
+
+def packet_ids(camera: str, options: Any) -> tuple[str, str]:
+    """(shot_id, project_id) for the manifest, made at the lint step so neither can fail after the
+    render: a camera name that cannot be a shot id is SendAbort("lint") with BAD_SHOT_SLUG (the same
+    problem policy.lint_scene reports), a project id that cannot be a slug SendAbort("lint") too."""
+    problems = policy.shot_slug_problems(camera)
+    if problems:
+        raise SendAbort("lint", "lint: " + "; ".join(p["detail"] for p in problems), problems)
+    shot_id = packet.slugify(camera)
+    try:
+        project_id = _project_id(options)
+    except packet.ManifestError as exc:
+        raise SendAbort("lint", f"project: {exc}: choose a project id with ASCII letters or digits") from exc
+    return shot_id, project_id
 
 
 def _supersedes(options: Any, camera: str) -> str | None:
@@ -844,6 +877,7 @@ def _send_one(
     if not report.passed:
         raise SendAbort("lint", "lint: " + "; ".join(report), report.problems)
     result.warnings.extend(f"{w['code']}: {w['detail']}" for w in report.warnings)
+    shot_id, project_id = packet_ids(camera, options)
 
     if option(options, "backup", False):
         step("backup")
@@ -859,7 +893,19 @@ def _send_one(
         journal.record("recipe", camera, detail=f"{recipe.engine_id} {recipe.preset}".strip())
     try:
         _render_and_write(
-            result, recipe, node, detected, colour_block, out_root, config, options, step, journal, level_on
+            result,
+            recipe,
+            node,
+            detected,
+            colour_block,
+            out_root,
+            config,
+            options,
+            step,
+            journal,
+            level_on,
+            shot_id=shot_id,
+            project_id=project_id,
         )
     except SendAbort as abort:
         if journal is not None:
@@ -887,8 +933,13 @@ def _render_and_write(
     step: Callable[[str], None],
     journal: safety.Journal | None,
     level_on: bool = False,
+    *,
+    shot_id: str | None = None,
+    project_id: str | None = None,
 ) -> None:
     camera = result.camera
+    if shot_id is None or project_id is None:  # made before the render, never after it
+        shot_id, project_id = packet_ids(camera, options)
 
     def note(stage: str, detail: str = "") -> None:
         if journal is not None:
@@ -1045,8 +1096,8 @@ def _render_and_write(
             files,
             leg,
             pol,
-            _project_id(options),
-            packet.slugify(camera),
+            project_id,
+            shot_id,
             {"version": max_version(), "python": platform.python_version()},
             {"name": "vray", "version": vray_version(renderer_class)},
             colour_block,
@@ -1060,6 +1111,8 @@ def _render_and_write(
         packet.write_packet(root, manifest, leg, hashes=hashes)
     except packet.ManifestError as exc:
         raise SendAbort("manifest", f"manifest: {exc}") from exc
+    except ValueError as exc:  # strict JSON refused a NaN or an infinity: the last guard
+        raise SendAbort("manifest", f"manifest: a value has no JSON form ({exc})") from exc
     note("manifest", packet_id)
 
     step("post")
@@ -1080,6 +1133,27 @@ def _render_and_write(
     if status == 409:
         raise SendAbort("post", f"daemon already holds a different packet under this id (HTTP 409): {body}")
     raise SendAbort("post", f"daemon rejected the packet (HTTP {status}): {body}")
+
+
+def settle_failed_folder(result: SendResult, aborted_at: str | None, options: Any) -> None:
+    """For a camera that failed with its packet folder still lacking manifest.json: a SendAbort at
+    ORPHAN_STAGES removes the folder (fsutil.remove_tree; result.packet_dir becomes None) unless
+    options.keep_failed_packets; otherwise, or when it cannot be removed, the folder stays and a
+    warning says so."""
+    folder = Path(str(result.packet_dir))
+    if aborted_at in ORPHAN_STAGES and not option(options, "keep_failed_packets", False):
+        if fsutil.remove_tree(folder):
+            result.packet_dir = None
+            result.warnings.append(
+                f"the packet folder {folder} had no manifest, so the daemon could never ingest it: it "
+                "was removed (set keep_failed_packets to keep failed renders)"
+            )
+            return
+        result.warnings.append(f"the packet folder {folder} has no manifest and could not be removed")
+    result.warnings.append(
+        f"the render is kept in {folder} for inspection; it has no manifest, so the "
+        "daemon never ingests it (delete it when done)"
+    )
 
 
 def follow_ingest(result: SendResult, body: Any, config: dict[str, Any], options: Any) -> None:
@@ -1110,8 +1184,9 @@ def run(
     under out_root (the daemon's packets folder: /hash refuses paths outside it). daemon_base is the
     daemon URL (default: config.json's). options: recipes {camera: recipe}, progress(done, total,
     message), backup, config (token, daemon_url), project_id, frame, supersedes (an id or {camera: id}),
-    custody, session, staging_dir, working_space, max_unlabelled_share, journal. Returns one SendResult
-    per camera; never raises across cameras."""
+    custody, session, staging_dir, working_space, max_unlabelled_share, journal, keep_failed_packets
+    (keep a folder a manifest-stage failure left without manifest.json). Returns one SendResult per
+    camera; never raises across cameras."""
     opts = normalise_options(options)
     recipes: dict[str, Any] = dict(opts.get("recipes") or {})
     refused: dict[str, str] = {}
@@ -1167,11 +1242,13 @@ def run(
             _result.stage = stage
             notify_progress(progress, _index, total, f"{_camera}: {stage}")
 
+        aborted_at: str | None = None
         try:
             if camera in refused:
                 raise SendAbort("recipe", f"recipe: {refused[camera]}")
             _send_one(result, Path(out_root), config, options, saved, step)
         except SendAbort as abort:
+            aborted_at = abort.stage
             result.ok = False
             result.stage = abort.stage
             result.code = abort.code or result.code
@@ -1188,10 +1265,7 @@ def run(
             result.ok = False
             result.errors.append(f"{result.stage}: {type(exc).__name__}: {exc}")
         if result.packet_dir and not (Path(result.packet_dir) / "manifest.json").is_file():
-            result.warnings.append(
-                f"the render is kept in {result.packet_dir} for inspection; it has no manifest, so the "
-                "daemon never ingests it (delete it when done)"
-            )
+            settle_failed_folder(result, aborted_at, options)
         notify_progress(
             progress,
             index + 1,

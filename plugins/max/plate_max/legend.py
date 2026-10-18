@@ -7,7 +7,9 @@ runs in Max's Python; plate_spec.cryptomatte_id is the reference it is tested ag
 
 Each entry's id is the hash of its name and nothing else, so two visible nodes (or two different
 materials) with one name would merge into one ID with one class: that is a LegendError, not a
-warning. Entries also carry a digest, the BLAKE3 of the node's or material's record; BLAKE3 is not
+warning. Send refuses such a scene before it renders (policy.lint_scene, DUPLICATE_NODE_NAME, whose
+detail starts with the same words, policy.duplicate_node_text) and again when it builds the legend
+inputs (actions.send_packet.legend_nodes), so this check is the last net. Entries also carry a digest, the BLAKE3 of the node's or material's record; BLAKE3 is not
 in the standard library, so the caller passes the hash function.
 
 planar (decision 43) is a sender-side class rule: an object entry of class architecture, ground or
@@ -149,10 +151,14 @@ def build_id_legend(
 
     def claim(entry_id: str, name: str, what: str) -> None:
         if entry_id in seen:
+            if seen[entry_id] != name:
+                raise LegendError(
+                    f"cryptomatte hash collision: {name!r} and {seen[entry_id]!r} both give {entry_id}"
+                )
             raise LegendError(
-                f"duplicate visible {what} name {name!r}"
-                if seen[entry_id] == name
-                else f"cryptomatte hash collision: {name!r} and {seen[entry_id]!r} both give {entry_id}"
+                policy_mod.duplicate_node_text(name)
+                if what == "node"
+                else f"duplicate visible {what} name {name!r}"
             )
         seen[entry_id] = name
 

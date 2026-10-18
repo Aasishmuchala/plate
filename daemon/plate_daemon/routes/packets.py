@@ -148,7 +148,9 @@ def post_packet(
         )
     packet_id = prepared.packet_id
     owner = c.index.locate_packet(packet_id) or prepared.project_id
-    with c.index.project(owner) as conn:
+    # Packet-first registration: a packet may arrive before its project, so this is one of the few opens that
+    # creates the index (index.UnknownProject everywhere else, T144).
+    with c.index.project(owner, create=True) as conn:
         try:
             status, _rec = begin_ingest(
                 conn, body.packet_path, sender=body.sender.model_dump(), prepared=prepared, now=c.now()

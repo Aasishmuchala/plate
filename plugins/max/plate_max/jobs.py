@@ -19,9 +19,22 @@ and this poller, on the dock's timer, picks it up, does the work in the open sce
 
 Rules: one job at a time (a tick that finds a job running, or the dock busy, does nothing); an action
 that fails or raises answers ok false with the text, and nothing raises into Max; a Light or Scout job
-whose packet came from another .max than the open one fails with that reason rather than relighting
-the wrong scene; an answer the daemon did not take because it was away is posted again first on the
-next tick; a daemon that does not answer is asked less often (up to once a minute) until it does.
+whose packet came from another .max than the open one, or from a .max of that name bound to another
+project than the job's, fails with that reason rather than relighting the wrong scene (when the
+packet's manifest is not in this dock's packets folder, or names no .max, nothing can be compared: the
+log says "packet <id>: scene check skipped (<why>)" and the job runs); an answer the daemon did not take
+because it was away is posted again first on the next tick; a daemon that does not answer (or refuses
+the token, or a token that cannot be sent) is asked less often (up to once a minute) until it does,
+and said once per change of message.
+
+Lost claims. The daemon marks a job claimed in the same transaction that lists it, so a claim whose
+answer never arrives (the poll timed out while the daemon was slow) leaves the job claimed with nobody
+working on it. On start, and after any poll that timed out, the poller first asks
+    GET  /api/v0/plugin/jobs?state=claimed&since=0
+and takes up every job claimed after this poller was made (started_utc): one it never ran is run (one
+per tick, before any new claim); one it already ran, whose answer the daemon never took, is answered
+ok false with "claim recovered after a lost answer" (a re-render is never repeated). Claims older than
+the dock are the daemon's lease's (plugin_queue.CLAIM_LEASE_S): they go back to the queue on their own.
 
 Standard library only, no Qt (tests/test_stdlib_only.py): the dock hands start() its QTimer, and the
 daemon calls go through the controller's io (the dock's off-thread runner), so Max stays responsive
@@ -35,6 +48,7 @@ import math
 import re
 import urllib.parse
 from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +60,9 @@ DEFAULT_INTERVAL_S = 5.0
 CLAIM_LIMIT = 1  # one job at a time: the others stay queued for the next tick (or another dock)
 JOBS_PATH = "/api/v0/plugin/jobs"
 POLL_TIMEOUT_S = 3.0
+RECOVER_LIMIT = 50  # claimed jobs asked for when recovering lost claims
+RECOVERED_DETAIL = "claim recovered after a lost answer"
+JOBS_KEYS = ("jobs",)  # what a GET /plugin/jobs answer must hold to be the daemon's
 RESULT_TIMEOUT_S = 10.0
 RUN_TIMEOUT_S = 10.0
 ASSET_TIMEOUT_S = 120.0
@@ -157,6 +174,20 @@ def _fail(detail: str) -> dict[str, Any]:
     return {"ok": False, "detail": _clip(detail)}
 
 
+def _utc(text: Any) -> datetime | None:
+    """An ISO-8601 stamp of the daemon's (2026-10-17T09:41:07.123456Z) as an aware datetime, or None."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    value = text.strip()
+    if value.endswith(("Z", "z")):
+        value = value[:-1] + "+00:00"
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
+
+
 def _errors(result: Any) -> list[str]:
     errors = getattr(result, "errors", None)
     if errors is None and isinstance(result, Mapping):
@@ -170,7 +201,8 @@ class Poller:
     job_options(cameras, project_id, progress) gives the send options (recipes, custody) and its
     note_packet(camera, packet_id) learns the relit packet. Hooks: log(message, err=False), busy()
     (True skips the tick: the artist is in the middle of something), on_start(job) and
-    on_finish(job, body) around each job."""
+    on_finish(job, body) around each job. started_utc (when the poller was made) marks the claims
+    that can be this dock's when a claim's answer was lost (module docstring)."""
 
     def __init__(
         self,
@@ -202,6 +234,9 @@ class Poller:
         self._skip = 0
         self._failures = 0
         self._unsent: list[tuple[str, dict[str, Any]]] = []
+        self.started_utc = datetime.now(timezone.utc)
+        self._recovery_due = False  # ask for claimed jobs before the next claim (start, a poll timeout)
+        self._recovery: list[dict[str, Any]] = []  # claimed jobs taken back, run one per tick
         self._handlers: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]] = {
             ACTION_LIGHT: self._light_match,
             ACTION_VANTAGE: self._vantage_preview,
@@ -219,6 +254,7 @@ class Poller:
             self.stop()
             timer.timeout.connect(self.tick)
             self._timer = timer
+        self._recovery_due = True  # a claim answered while the dock was away may be waiting
         timer.start(max(1, int(round(self.interval_s * 1000))))
         return True
 
@@ -257,23 +293,39 @@ class Poller:
         self.active = True
         try:
             return self.poll_once()
+        except (transport.TransportError, ValueError) as exc:  # a token, an answer: ask less often
+            self._backoff(f"job poller: {exc}")
+            return []
         except Exception as exc:  # noqa: BLE001 a timer callback must never raise into Max
-            self.last_error = f"{type(exc).__name__}: {exc}"
-            self._log(f"job poller: {self.last_error}", err=True)
+            why = f"job poller: {type(exc).__name__}: {exc}"
+            if why != self.last_error:
+                self._log(why, err=True)
+            self.last_error = why
             return []
         finally:
             self.active = False
 
     def poll_once(self) -> list[dict[str, Any]]:
-        """Post any answer still owed, then claim at most one queued job, run it and post its answer.
-        Returns a record {id, action, body, posted} per job handled."""
+        """Post any answer still owed, take up lost claims when due (module docstring), then claim at
+        most one queued job, run it and post its answer. Returns a record {id, action, body, posted}
+        per job handled."""
         cfg = self._cfg()
         if self._unsent and not self._flush(cfg):
             return []
+        if self._recovery_due and not self._recover_claims(cfg):
+            return []
+        if self._recovery:
+            return [self._take_up(self._recovery.pop(0), cfg)]
         params = {"claim": True, "since": self.cursor, "limit": CLAIM_LIMIT}
         try:
-            answer = self._call(lambda: transport.get_json(JOBS_PATH, cfg, POLL_TIMEOUT_S, params))
-        except transport.TransportError as exc:
+            answer = self._call(
+                lambda: transport.get_json(JOBS_PATH, cfg, POLL_TIMEOUT_S, params, keys=JOBS_KEYS)
+            )
+        except transport.DaemonTimeout as exc:  # the daemon may have claimed a job for this lost answer
+            self._recovery_due = True
+            self._backoff(f"job poll: {exc}")
+            return []
+        except (transport.TransportError, ValueError) as exc:
             self._backoff(f"job poll: {exc}")
             return []
         self._recovered()
@@ -315,6 +367,61 @@ class Poller:
             self.handled = [*self.handled, record][-HISTORY:]
             self._hook(self._on_finish, job, body)
         return record
+
+    # ------------------------------------------------------------------ lost claims
+    def _claimed_here(self, job: Mapping[str, Any]) -> bool:
+        """The job was claimed after this poller was made (so the lost answer may have been ours)."""
+        claimed = _utc(job.get("claimed_utc"))
+        return claimed is not None and claimed > self.started_utc
+
+    def _recover_claims(self, cfg: Mapping[str, Any]) -> bool:
+        """GET the claimed jobs and keep the ones claimed since started_utc for _take_up; False (backing
+        off, the recovery still due) when the daemon does not answer."""
+        params = {"state": "claimed", "since": 0, "limit": RECOVER_LIMIT}
+        try:
+            answer = self._call(
+                lambda: transport.get_json(JOBS_PATH, cfg, POLL_TIMEOUT_S, params, keys=JOBS_KEYS)
+            )
+        except (transport.TransportError, ValueError) as exc:
+            self._backoff(f"job recovery: {exc}")
+            return False
+        self._recovery_due = False
+        self._recovered()
+        owed = {job_id for job_id, _body in self._unsent}
+        waiting = {str(job.get("id")) for job in self._recovery}
+        listed = answer.get("jobs") if isinstance(answer, dict) else None
+        found = [
+            job
+            for job in (listed if isinstance(listed, list) else [])
+            if isinstance(job, dict)
+            and job.get("id")
+            and str(job.get("id")) not in owed | waiting
+            and self._claimed_here(job)
+        ]
+        if found:
+            self._log(f"job poller: {len(found)} claimed job(s) taken up again after a lost answer")
+        self._recovery.extend(found)
+        return True
+
+    def _take_up(self, job: dict[str, Any], cfg: Mapping[str, Any]) -> dict[str, Any]:
+        """A recovered claim: run it when this poller never did, else answer it ok false."""
+        seq = job.get("seq")
+        if isinstance(seq, int) and seq > self.cursor:
+            self.cursor = seq
+        job_id = str(job.get("id"))
+        if any(record.get("id") == job_id for record in self.handled):
+            body = clean_body(_fail(RECOVERED_DETAIL))
+            self._log(f"job {job_id}: {RECOVERED_DETAIL} (it already ran here)", err=True)
+            record = {
+                "id": job_id,
+                "action": str(job.get("action") or ""),
+                "body": body,
+                "posted": "not posted",
+            }
+            record["posted"] = self._post_result(job_id, body, cfg)
+            self.handled = [*self.handled, record][-HISTORY:]
+            return record
+        return self.run_job(job, cfg)
 
     # ------------------------------------------------------------------ the daemon
     def _cfg(self) -> dict[str, Any]:
@@ -460,26 +567,64 @@ class Poller:
             self._log(str(message))
 
     def _scene_mismatch(self, job: Mapping[str, Any], cfg: Mapping[str, Any]) -> str | None:
-        """Why the open scene is not the job's (its packet's manifest names another .max), or None.
-        No check is possible (None) when the packet is not in this dock's packets folder."""
-        from .bridge.scene import rt_attr
+        """Why the open scene is not the job's, or None. The packet's manifest names the .max it came
+        from (compared by file name, case-folded as Windows spells it); when that matches, the job's
+        project must be the one the open scene is bound to (_project_mismatch), because two client
+        folders can each hold a master.max. When the manifest is not in this dock's packets folder, or
+        names no .max (sent unsaved), nothing can be compared: the log says the check was skipped and
+        the job runs."""
+        from .bridge.scene import rt_attr, scene_path
 
         packet_id = str(job.get("packet_id") or "")
-        if not packet_id or "/" in packet_id or "\\" in packet_id:
-            return None
-        manifest_path = packets_dir(dict(cfg)) / packet_id / "manifest.json"
+        if not packet_id:
+            return self._unchecked(packet_id, "the job names no packet")
+        if "/" in packet_id or "\\" in packet_id or packet_id in (".", ".."):
+            return self._unchecked(packet_id, "the packet id is not a folder name")
+        root = packets_dir(dict(cfg))
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            return None
-        wanted = ((manifest.get("scene_hash") or {}).get("max_file") or {}).get("name")
+            manifest = json.loads((root / packet_id / "manifest.json").read_text(encoding="utf-8-sig"))
+        except OSError:
+            return self._unchecked(
+                packet_id, f"its manifest.json is not in this dock's packets folder {root}"
+            )
+        except ValueError:
+            return self._unchecked(packet_id, "its manifest.json is not readable JSON")
+        scene_hash = manifest.get("scene_hash") if isinstance(manifest, dict) else None
+        max_file = scene_hash.get("max_file") if isinstance(scene_hash, dict) else None
+        wanted = max_file.get("name") if isinstance(max_file, dict) else None
         if not isinstance(wanted, str) or not wanted:
-            return None
+            return self._unchecked(packet_id, "it was sent from an unsaved scene: its manifest names no .max")
         open_now = str(rt_attr("maxFileName") or "")
-        if open_now.casefold() == wanted.casefold():
-            return None
-        shown = open_now or "an unsaved scene"
-        return f"the open scene is {shown}, but packet {packet_id} came from {wanted}: open it and run the node again"
+        if open_now.casefold() != wanted.casefold():
+            shown = open_now or "an unsaved scene"
+            return f"the open scene is {shown}, but packet {packet_id} came from {wanted}: open it and run the node again"
+        return self._project_mismatch(job, cfg, scene_path(), open_now)
+
+    def _unchecked(self, packet_id: str, why: str) -> None:
+        self._log(f"packet {packet_id or '?'}: scene check skipped ({why})")
+        return None
+
+    def _project_mismatch(
+        self, job: Mapping[str, Any], cfg: Mapping[str, Any], scene: str, name: str
+    ) -> str | None:
+        """Why the open scene's project (resolve_project_id: its sidecar, config.json's project_id, its
+        stem) is not the job's, or None. A binding that cannot be read refuses the job too: the dock
+        never guesses which project a scene belongs to."""
+        from .ui.controller import resolve_project_id
+
+        wanted = job.get("project_id")
+        if not isinstance(wanted, str) or not wanted:
+            return None  # the daemon always names it; an older one may not: the file name matched
+        try:
+            bound = resolve_project_id(scene or None, cfg)
+        except Exception as exc:  # noqa: BLE001 an unreadable sidecar, a stem that names no project
+            return f"cannot tell which project the open scene {name} belongs to ({exc}): fix it and run the node again"
+        if bound != wanted:
+            return (
+                f"the open scene {name} is bound to project {bound}, but the job is for project {wanted}: "
+                "open that project's scene (or bind this one in the dock) and run the node again"
+            )
+        return None
 
     def _note_packet(self, camera: str, packet_id: Any) -> None:
         note = getattr(self.controller, "note_packet", None)

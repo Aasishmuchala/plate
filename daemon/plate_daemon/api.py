@@ -53,9 +53,18 @@ pipeline runs it left in a worker state (`Pipeline.resume`); then the nightly sc
 starts unless `PLATE_NIGHTLY=0`, and stops on shutdown. A scheduler that cannot be built or started is
 logged and never keeps the API from serving.
 
-Unknown API paths answer 404 `{"error": "not_found", "detail": "no route /api/..."}` for every method (a
-catch-all registered after the route modules), so a sender never sees `405 Method Not Allowed` or the UI's
-HTML. The built UI (`ui/dist`) is served at `/` when it exists: `index.html` with `Cache-Control: no-cache`
+Unknown API paths answer 404 `{"error": "not_found", "detail": "no route /api/..."}` for every method (HEAD,
+OPTIONS and TRACE included; `/api` and `/api/` too: a catch-all registered after the route modules), so a sender
+never sees `405 Method Not Allowed` or the UI's HTML. `GET /api/v0/health` also answers HEAD.
+
+Hardening (the stress test's api-fuzz findings): `BodyCap` refuses a JSON request body above
+`Settings.json_max_bytes` (`PLATE_JSON_MAX_MB`, default 8 MiB) with 413 `too_large` before anything reads it, and a
+POST/PUT/PATCH sent chunked, with no length, with 411 `length_required`; `/assets*` and `/hash*` keep their own
+caps. Whatever a route lets escape is rendered as JSON, never the plain-text 500: `ProjectError` 422
+`project_unreadable`, `index.UnknownProject` 404 `{"error": "not_found", "project_id": ...}` (a route opened the
+index of a project that has none; opening never creates one, T144), `IllegalTransition` 409, `sqlite3.OperationalError` 507 `disk_full` or 503 `busy`, a NUL
+byte in a path 422 `bad_path`, `OSError` 507 `disk_full` (ENOSPC) or 422 `filesystem`, and anything else 500
+`internal` with the exception's class name (the traceback stays in the log, never in the body). The built UI (`ui/dist`) is served at `/` when it exists: `index.html` with `Cache-Control: no-cache`
 and a same-origin Content-Security-Policy, the hashed `assets/*.js|css` immutable; otherwise `/` says how
 to build it. Every response carries `X-Content-Type-Options: nosniff`. Errors raised as
 `routes.ApiError(status, body)` are rendered as JSON; body validation errors are reshaped to
@@ -64,6 +73,7 @@ to build it. Every response carries `X-Content-Type-Options: nosniff`. Errors ra
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -81,7 +91,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.datastructures import MutableHeaders
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -101,25 +111,28 @@ from .budgets import ALERT_KIND
 from .cas import CAS
 from .config import Settings, check_project_id
 from .engine_fake import FakeEngine
-from .index import Index
+from .index import Index, UnknownProject
 from .ingest import finish_ingest, get_packet, pending_ingests
 from .ledger import Ledger
 from .llm import judge_node
 from .lock import ProjectLocked
+from .machine import IllegalTransition
 from .nodes import runner as node_runner
 from .pipeline import Pipeline, PipelineError
 from .pixels_client import DepthFn, OcrAdapter, PixelsClient, PixelsError, PixelsUnavailable
-from .projects import Project
-from .routes import API, ApiError, Ctx, include_all
+from .projects import Project, ProjectError
+from .routes import API, ApiError, Ctx, illegal, include_all
 from .routes import alerts as alert_routes
 from .sse import Bus
 from .timeutil import iso, utcnow
 
 __all__ = [
     "API",
+    "API_METHODS",
     "UI_CSP",
     "UI_NOT_BUILT",
     "ApiError",
+    "BodyCap",
     "DaemonPipeline",
     "LazyDepth",
     "LazyOcr",
@@ -141,7 +154,10 @@ UI_CSP = (
     "style-src 'self' 'unsafe-inline'"
 )
 IMMUTABLE = "public, max-age=31536000, immutable"  # Vite names every built asset by its content hash
-API_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+API_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"]
+BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+# The routes that cap their own bodies (assets.py reads a stream to its limit; hash takes payloads).
+OWN_CAP_PREFIXES = (f"{API}/assets", f"{API}/hash")
 NIGHTLY_OFF = frozenset({"0", "off", "false", "no"})  # as scheduler.NightlyConfig reads PLATE_NIGHTLY
 PIXELS_PROBE_TTL_S = 30.0
 REVISION_LOCK_WAIT_S = 5.0
@@ -422,6 +438,56 @@ class SecurityHeaders:
         await self.app(scope, receive, send_with_headers)
 
 
+def _content_length(raw: str) -> int | None:
+    """A Content-Length value as a non-negative integer, None when it is not one."""
+    raw = raw.strip()
+    return int(raw) if raw.isascii() and raw.isdigit() else None
+
+
+class BodyCap:
+    """Plain ASGI, wrapped around `AuthMiddleware` (so it runs first) for `/api/` paths other than the assets and
+    hash routes, which cap their own bodies: a `Content-Length` above `limit_bytes` is 413
+    `{"error": "too_large", "limit_bytes": N}`, and a POST/PUT/PATCH that is chunked (Transfer-Encoding) or has a
+    Content-Length that is not a number is 411 `{"error": "length_required"}`. Neither reads the body, and both
+    close the connection, so a 50 MiB upload costs the daemon a header parse. A request with no Content-Length
+    and no Transfer-Encoding has no body (HTTP/1.1) and passes."""
+
+    def __init__(self, app: ASGIApp, limit_bytes: int):
+        self.app = app
+        self.limit_bytes = limit_bytes
+
+    @staticmethod
+    def covers(path: str) -> bool:
+        return path.startswith("/api/") and not path.startswith(OWN_CAP_PREFIXES)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not self.covers(scope.get("path", "")):
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        lengths = [_content_length(v) for v in headers.getlist("content-length")]
+        if scope.get("method") in BODY_METHODS and (
+            headers.get("transfer-encoding") is not None or any(n is None for n in lengths)
+        ):
+            await self._refuse(send, 411, {"error": "length_required"})
+            return
+        if any(n is not None and n > self.limit_bytes for n in lengths):
+            await self._refuse(send, 413, {"error": "too_large", "limit_bytes": self.limit_bytes})
+            return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _refuse(send: Send, status: int, body: dict[str, Any]) -> None:
+        payload = json.dumps(body).encode("utf-8")
+        headers = [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+            (b"connection", b"close"),  # the unread body is not left on a kept-alive connection
+        ]
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": payload})
+
+
 class UiFiles(StaticFiles):
     """`ui/dist` with cache and content-security headers: HTML is revalidated on every load (`no-cache`) and
     carries `UI_CSP`; the content-hashed `assets/*.js|css` never change, so they are immutable."""
@@ -473,9 +539,11 @@ def create_app(
         root = index.project_root(project_id) or settings.projects_dir / check_project_id(project_id)
 
         def record(key: str, ext: str, nbytes: int) -> None:
+            # The index is a cache: the object is safe in the folder. UnknownProject: the project has no index
+            # yet (opening one never makes it); a rebuild finds the object.
             try:
                 index.record_asset(project_id, key, ext, nbytes)
-            except sqlite3.Error as e:  # the index is a cache: the object is safe in the folder
+            except (sqlite3.Error, UnknownProject) as e:
                 log.warning("asset %s of %s not indexed: %s (plate reindex fixes it)", key, project_id, e)
 
         return CAS(root / "assets", on_put=record)
@@ -676,6 +744,8 @@ def create_app(
                 finish(pid, packet_id)
 
     app.add_middleware(AuthMiddleware, settings=settings)
+    # Outside the auth check, so an oversized body is refused without being read.
+    app.add_middleware(BodyCap, limit_bytes=settings.json_max_bytes)
     app.add_middleware(SecurityHeaders)  # added last, so outermost: the auth refusals carry it too
     app.state.settings = settings
     app.state.engine = engine
@@ -705,6 +775,58 @@ def create_app(
     async def _validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
         return JSONResponse({"errors": [_fmt_validation(e) for e in exc.errors()]}, status_code=422)
 
+    # What a route lets escape is still JSON. Starlette picks the handler by the exception's most specific class,
+    # so ProjectError (a ValueError) is not taken by the ValueError handler.
+
+    @app.exception_handler(ProjectError)
+    async def _project_error(_request: Request, exc: ProjectError) -> JSONResponse:
+        return JSONResponse({"error": "project_unreadable", "detail": str(exc)}, status_code=422)
+
+    @app.exception_handler(UnknownProject)
+    async def _unknown_project(_request: Request, exc: UnknownProject) -> JSONResponse:
+        # A route opened the index of a project that has none: the project does not exist (nothing was created).
+        body: dict[str, Any] = {"error": "not_found", "project_id": exc.project_id}
+        if exc.project_id is None:
+            body["detail"] = str(exc)
+        return JSONResponse(body, status_code=404)
+
+    @app.exception_handler(IllegalTransition)
+    async def _illegal_transition(_request: Request, exc: IllegalTransition) -> JSONResponse:
+        err = illegal(exc)
+        return JSONResponse(err.body, status_code=err.status)
+
+    @app.exception_handler(sqlite3.OperationalError)
+    async def _sqlite_error(_request: Request, exc: sqlite3.OperationalError) -> JSONResponse:
+        detail = str(exc)
+        if "disk is full" in detail:
+            return JSONResponse({"error": "disk_full", "detail": detail}, status_code=507)
+        return JSONResponse({"error": "busy", "retry": True, "detail": detail}, status_code=503)
+
+    @app.exception_handler(ValueError)
+    async def _value_error(_request: Request, exc: ValueError) -> JSONResponse:
+        if "embedded null" in str(exc):  # os.stat / open / mkdir on a path with a NUL byte
+            return JSONResponse({"error": "bad_path", "detail": "a path cannot contain NUL"}, status_code=422)
+        raise exc  # not ours: the Exception handler answers it (and the server logs the traceback)
+
+    @app.exception_handler(OSError)
+    async def _os_error(_request: Request, exc: OSError) -> JSONResponse:
+        what = str(exc.strerror or exc)
+        detail = what if exc.filename is None else f"{what}: {exc.filename}"
+        if exc.errno == errno.ENOSPC:
+            return JSONResponse({"error": "disk_full", "detail": detail}, status_code=507)
+        code = errno.errorcode.get(exc.errno, "unknown") if exc.errno is not None else "unknown"
+        return JSONResponse({"error": "filesystem", "errno": code, "detail": detail}, status_code=422)
+
+    @app.exception_handler(Exception)
+    async def _internal_error(_request: Request, exc: Exception) -> JSONResponse:
+        # Outermost handler (ServerErrorMiddleware): it sends this, then re-raises so the server logs the
+        # traceback. It sits outside SecurityHeaders, so the header is set here.
+        return JSONResponse(
+            {"error": "internal", "exception": type(exc).__name__},
+            status_code=500,
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
+
     # ------------------------------------------------------------------ health (no auth)
 
     recent_alerts = RecentAlerts(lambda: app.state.ctx, lambda: app.state.clock())
@@ -718,7 +840,8 @@ def create_app(
             log.warning("plugin status not read for /health: %s: %s", type(e).__name__, e)
             return {"last_poll_utc": None, "queued": None}
 
-    @app.get(f"{API}/health")
+    # FastAPI's GET routes do not answer HEAD on their own; the plugin's handshake probe may use it.
+    @app.api_route(f"{API}/health", methods=["GET", "HEAD"])
     def health() -> dict[str, Any]:
         return {
             "ok": True,
@@ -736,9 +859,16 @@ def create_app(
 
     # After every route module and before the UI mount: a path no router knows, or a method its route does
     # not take, answers a JSON 404 rather than a 405 or the UI's HTML.
+    def not_found(rest: str) -> JSONResponse:
+        return JSONResponse({"error": "not_found", "detail": f"no route /api/{rest}"}, status_code=404)
+
+    @app.api_route("/api", methods=API_METHODS, include_in_schema=False)
+    def api_root_not_found() -> JSONResponse:  # `/api` without the slash is the same answer as `/api/`
+        return not_found("")
+
     @app.api_route("/api/{rest:path}", methods=API_METHODS, include_in_schema=False)
     def api_not_found(rest: str) -> JSONResponse:
-        return JSONResponse({"error": "not_found", "detail": f"no route /api/{rest}"}, status_code=404)
+        return not_found(rest)
 
     # ------------------------------------------------------------------ the built UI at /
 

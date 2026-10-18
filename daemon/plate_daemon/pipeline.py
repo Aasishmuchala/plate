@@ -30,9 +30,10 @@ The stages of `execute`, in the state machine's order:
 Every transition is published on the bus as `{"kind": "run.state", "run_id", "from", "to"}` and, where the
 ledger has a kind for it, appended to the project's hash-chained `runs.jsonl` with enough fields to rebuild
 the index from the folder. A best-of-N group is ranked and published as `siblings.ranked` when its last
-sibling ends. Bus failures are logged, never fatal. Ledger failures are logged too, except for `quoted` and
-`approved`: a quote or an approval the ledger cannot record is cancelled (`ledger_unavailable`, 503) before
-anything is spent, so the folder never misses a run that could bill.
+sibling ends. Bus failures are logged, never fatal. A ledger record is never dropped (Wave 12 below): `quoted`,
+`approved` and `override` fail closed (a quote or an approval the ledger cannot record is cancelled,
+`ledger_unavailable` 503, before anything is spent; an override is refused and nothing changes), and every
+other kind the file cannot take waits in the index's ledger outbox until it can.
 
 What `quote_node` decides before a run row exists (wave 8, decisions 33, 34, 40 and 44):
 
@@ -70,8 +71,8 @@ Wave 9 (router plan T92; decisions 46, 47, 50, 51, 54 and 55):
 - Base. An Edit whose `image` input is fed by a take (any node but a Plate) starts from that take's
   `outputHash` (`inputs.base`, `base_node`, `base_run`), 422 `no_base` when it has none in the CAS. Egress
   sends the base, the composite lands on the base, the text lock restores from the plate, and the gates score
-  against the plate inside the union of this mask, the base run's and what the base changed
-  (`normalized.mask_union_key`), so outside the union the output is the plate bit for bit.
+  against the plate inside the union of this mask and the base run's (`normalized.mask_union_key`), so
+  outside the union the output is the plate bit for bit (Wave 12 below: the base must be a take of its node).
 - Mask to engines. An engine whose manifest declares a `mask` input (and whose adapter takes one) gets the
   staged mask in the egress geometry (`inputs.mask`, 0/255 grey PNG; `normalized.mask_sent`).
 - Recipe tokens. `params.tokens` (`{"[TOKEN]": text}`) override a recipe's token defaults
@@ -94,6 +95,62 @@ Wave 10 (router plan T113):
   no number (or any other `@ref...` word, such as `@ref0` or `@ref1a`), or any token on an engine that
   declares no `reference_images` input. `inputs.prompt` is the substituted text (what the quote shows, the
   ledger records and the engine receives); `inputs.prompt_raw` keeps the artist's text when it differed.
+
+Wave 12 (router plan T129; decisions 72 and 80):
+
+- A base is a take of its node. `base_input` takes an `outputHash` only when it is `outputs[0]` (or
+  `result_key`) of a run of the feeding node in this project that ended DONE, or GATE_FAIL with a recorded
+  override (`base_take_for`). Anything else is 422 `base_not_a_take` (an upload or a foreign blob: import it
+  first, `POST /import` gates it) or `base_gate_fail`. The lineage (`lineage_depth`: the chain of
+  `inputs.base_run`, an import counting as one generation) plus this generation must stay within
+  `canvas_rules.MAX_GENERATION_DEPTH`, else 422 `DEPTH_EXCEEDED` naming the chain; a take relayed through
+  another node's `outputHash` is measured the same way. The run stores `base_run`, `base_state`,
+  `base_override_reason` and `base_depth`, and the gate report carries them as its top-level `base`.
+  `prior_mask` is the base run's `mask_union_key`, else its `mask_key`; there is no pixel-difference term, and a
+  base run with neither fails NORMALIZING (`base_mask_missing`).
+- The quote validates what the run will need, before a run row: `priority` (422 `bad_priority`; 0 is the
+  client-deadline class), every number in `params` finite (`bad_params`), the editable mask itself
+  (`editable_mask_from_spec`: `mask_empty`, `mask_size`, `bad_mask`), Mask ids that are legend ids of the
+  packet (`bad_mask`), a Mask node's `outputHash` at the plate's size (`mask_size`), and, on a manifest engine,
+  the adapter's `validate_params` on exactly what staging sends (`engine_params`; `bad_params` with the
+  adapter's message). A recipe path that is not a runnable recipe is `unknown_recipe` naming the path only.
+- Attempts are numbered and the run row made under a per-node lock (`node_lock`), so concurrent quotes of one
+  node number 1..N; an attempt past `ATTEMPT_MAX` is 422 `attempt_exhausted`. A quote that fails after its row
+  exists leaves no DRAFT or QUOTED row behind (`quote failed: <error>`, CANCELLED).
+- Approval. The daily and unattended caps count the spend of every project index in this home
+  (`budgets.spend_snapshot_all`; approvals in this process are serialised so the count stays true), and a
+  quote that lapsed or was made after `now` (the clock moved) is EXPIRED and ledgered `expired`.
+
+Wave 12 (router plan T145; decisions 73 and 75):
+
+- The ledger. One `Ledger` per project (`ledger_for`, with this pipeline's clock; T134 memoises its reads).
+  `FAIL_CLOSED_KINDS` are `quoted`, `approved` and `override`. Before an append, the project's
+  `ledger_outbox` is drained in order (`drain_ledger_outbox`: always when the caller passes `conn`, else when
+  this process parked something there); a record of any other kind that cannot be appended, or that would
+  overtake rows still parked, is parked behind them (`enqueue_outbox`, WARNING `queued in the ledger outbox`).
+  The outbox is also drained on boot (`resume`) and by the executor's watch (`orphaned_runs`). Records written
+  with `conn` carry `data.event_seq`, the run's newest `run_events` seq. A `failed` record whose reason is
+  `submit_state_unknown` carries `data.billing_unknown: true` and never `refunded` (the provider may hold it).
+- One run's records in transition order, once each. `after` holds a per-run lock and ledgers every
+  transition since the last one this process ledgered for the run (only the newest when it has seen none),
+  each with the `event_seq` of the newest event before the next transition: an approval a cancel overtook is
+  still on the record, before its `cancelled`, and the second of two racing calls writes nothing.
+- Execution. `start_runs(project_id, run_ids, background=...)` is the one way a route starts runs: with
+  `PLATE_RUN_WORKERS=0` (`executor.inline`, what the test suite sets) a BackgroundTask runs `execute_all` as
+  before; otherwise `executor.RunExecutor` (default 8 workers) drives them off the request pool, at most the
+  route's `max_inflight` at a time (the manifest route's, else `max_inflight` on a manifest-less engine's
+  route dict, else 2). The pool and its watch start on first use (`start_runs` or the boot `resume`), so a
+  process that only drives its own runs (the CLI) never starts them; `close()` stops it. The watch re-drives
+  pipeline runs in a worker state that nothing in this process is driving and whose last move is older than
+  `ORPHAN_GRACE_S` (a driver in another process, the CLI, is left alone while it is moving).
+- `execute` retries a step that hits a busy or locked index (`sqlite3.OperationalError`) after 0.5, 1, 2, 4,
+  then 8 s, up to `BUSY_RETRIES` in a row, then re-raises; it stops driving (the run keeps its state for the
+  next boot) once the executor is stopped.
+- Boot. `resume` notes `resume` on every run it picks up and hands them to the executor (inline: the old
+  serial loop). A run in FETCHING, NORMALIZING or GATING that already has `RESUME_LIMIT` (2) `resume` notes from
+  those states is FAILED `resume_limit` instead of a third attempt (the result blob stays in the CAS).
+- `project_list` lists a folder whose `project.json` does not read as `{"project_id", "root", "broken": true,
+  "detail"}` (WARNING) instead of hiding it.
 """
 
 from __future__ import annotations
@@ -104,16 +161,18 @@ import importlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
+import sqlite3
 import struct
 import threading
 import time
 import zlib
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -127,21 +186,23 @@ from .cas import CAS, hash_bytes, hash_file
 from .config import Settings, check_project_id
 from .custody import CustodyViolation, Grade, project_allowed, require_route, route_allowed
 from .db import loads
+from .executor import DEFAULT_MAX_INFLIGHT, RunExecutor
 from .idempotency import canonical_json
 from .index import Index, packet_entry
-from .ledger import Ledger
-from .machine import annotate, create_run, get_run, transition
+from .ledger import Ledger, drain_outbox, enqueue_outbox, outbox_count
+from .machine import IllegalTransition, annotate, append_note, create_run, get_run, transition
 from .models import Quote, Run, RunCreate
 from .projects import Project, ProjectError
+from .quotes import QuoteExpired, approve_group, quote_run
 from .quotes import approve as approve_one
-from .quotes import approve_group, quote_run
 from .states import TERMINAL, WORKER_STATES, Priority, RunState
-from .timeutil import utcnow
-from .worker import GateOutcome, rank_siblings, siblings
+from .timeutil import parse_iso, utcnow
+from .worker import GateOutcome, rank_siblings, route_key, siblings
 from .worker import step as worker_step
 
 __all__ = [
     "ASSUMED_OK",
+    "ATTEMPT_MAX",
     "AdapterBridge",
     "CustodyViolation",
     "FAKE_ENGINE_ID",
@@ -159,10 +220,12 @@ __all__ = [
     "adapter_class",
     "decode_png16",
     "encode_png16",
+    "index_busy",
     "is_pipeline_run",
     "project_head",
     "repeat_canonical",
     "repeat_key",
+    "run_workers",
     "subgraph_snapshot",
 ]
 
@@ -201,7 +264,23 @@ SUBGRAPH_KEY = "subgraph"
 REPEAT_EXCLUDED_INPUTS = (SUBGRAPH_KEY, ROUTER_KEY)  # snapshots, not what the engine is asked to do
 REPEAT_KEY_HEX = 16
 # A ledger record of these kinds is the only proof of a quote or an approval: without it the run stops.
-FAIL_CLOSED_KINDS = frozenset({"quoted", "approved"})
+# Decision 73: a record of these kinds is in the folder or the request is refused; quoted and approved are also
+# cancelled (nothing may spend without them), an override simply changes nothing.
+FAIL_CLOSED_KINDS = frozenset({"quoted", "approved", "override"})
+CANCEL_ON_LOSS_KINDS = frozenset({"quoted", "approved"})
+SUBMIT_STATE_UNKNOWN = "submit_state_unknown"
+# Decision 75: the run executor. 0 workers runs inline through a BackgroundTask (the test suite sets it).
+RUN_WORKERS_ENV = "PLATE_RUN_WORKERS"
+DEFAULT_RUN_WORKERS = 8
+BUSY_BACKOFF_S = (0.5, 1.0, 2.0, 4.0, 8.0)  # then 8 s again, up to BUSY_RETRIES in a row
+BUSY_RETRIES = 10
+RESUME_NOTE = "resume"
+RESUME_LIMIT = 2  # earlier resume notes in a local stage: the next boot fails the run instead
+RESUME_LIMITED = frozenset({RunState.FETCHING, RunState.NORMALIZING, RunState.GATING})
+ORPHAN_GRACE_S = 60.0  # a run that moved more recently may have a driver in another process (the CLI)
+CLOSE_TIMEOUT_S = 5.0
+LEDGER_MEMO = 4096  # runs whose last ledgered transition this process remembers
+ROUTE_MEMO = 1024
 MASK_KEY_PARAMS = ("maskHash", "samHash")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _RECIPE_ID = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -209,7 +288,19 @@ DEFAULT_FEATHER_PX = 8.0
 DEFAULT_POLL_INTERVAL_S = 2.0
 DEFAULT_POLL_TIMEOUT_S = 3600.0
 STAGE_CACHE = 8
-PACKET_CACHE = 2
+PACKET_CACHE = 4
+# Wave 12 (T129): attempts are numbered under a per-node lock and stop here (decision 80).
+ATTEMPT_MAX = 1_000_000
+# A legend id as the packet schema writes it: object and material Cryptomatte hashes, Tier C segment labels.
+MASK_ID = re.compile(r"^(o:[0-9a-f]{8}|m:[0-9a-f]{8}|s:[0-9]{5})$")
+# Decision 72: the states a base take may be in (GATE_FAIL only with a recorded override); the lineage walk's cap.
+BASE_STATES = ("DONE", "GATE_FAIL")
+LINEAGE_MAX_HOPS = 8
+# Params that steer PLATE and never reach an engine: recipe tokens (decision 50) and the AI-layer upscale switch
+# (`layer_upscale.PARAM`, T100). `engine_params` drops them; the quote validates what is left.
+PLATE_PARAMS = frozenset({"tokens", "upscale_layers"})
+# What the quote's mask probe refuses (decision 80); any other failure to build the mask is left for staging.
+MASK_REFUSALS = frozenset({"mask_empty", "mask_size", "bad_mask", "mask_locked", "mask_missing"})
 # Wave 9 (T92): reference images (decision 46), the Edit-on-upstream base (decision 47), ingress hooks (55).
 REFERENCE_INPUT = "reference_images"
 REFERENCE_HANDLE = "refs"
@@ -260,6 +351,37 @@ class PipelineError(ValueError):
         self.code = code
         self.status = status
         self.extra = extra
+
+
+def run_workers(env: Mapping[str, str] | None = None) -> int:
+    """`PLATE_RUN_WORKERS`: the run executor's workers (default 8; 0 runs inline). A value that is not a whole
+    number of at least 0 is a warning and the default."""
+    raw = (os.environ if env is None else env).get(RUN_WORKERS_ENV, "").strip()
+    if not raw:
+        return DEFAULT_RUN_WORKERS
+    try:
+        n = int(raw)
+    except ValueError:
+        n = -1
+    if n < 0:
+        log.warning("%s=%r is not a whole number >= 0; using %d", RUN_WORKERS_ENV, raw, DEFAULT_RUN_WORKERS)
+        return DEFAULT_RUN_WORKERS
+    return n
+
+
+def index_busy(e: BaseException) -> bool:
+    """A write that waited out the index's busy timeout (another connection held it): worth a retry."""
+    text = str(e).lower()
+    return isinstance(e, sqlite3.OperationalError) and ("locked" in text or "busy" in text)
+
+
+@dataclass
+class _RunMoves:
+    """One run in this process: the lock that keeps its ledger records in transition order, and the
+    `run_events` seq of the last transition already ledgered (None: none seen yet)."""
+
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    seq: int | None = None
 
 
 def is_pipeline_run(run: Run) -> bool:
@@ -359,6 +481,32 @@ def _image_size(data: bytes) -> tuple[int, int] | None:
         return int(w), int(h)
     img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
     return None if img is None else (int(img.shape[1]), int(img.shape[0]))
+
+
+def _non_finite(params: Any) -> tuple[str, float] | None:
+    """(where, value) of the first float in `params` (mappings and lists, walked without recursion) that is
+    not finite (`inf`, `-inf`, `nan`), else None."""
+    stack: list[tuple[str, Any]] = [("params", params)]
+    while stack:
+        where, value = stack.pop()
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                return where, value
+        elif isinstance(value, Mapping):
+            stack.extend((f"{where}.{k}", v) for k, v in reversed(list(value.items())))
+        elif isinstance(value, (list, tuple)):
+            stack.extend((f"{where}[{i}]", v) for i, v in reversed(list(enumerate(value))))
+    return None
+
+
+class _QuoteTransport:
+    """What a manifest adapter is built with at the quote (`check_engine_params`): it validates, it never sends."""
+
+    def handle_request(self, request: Any) -> Any:
+        raise RuntimeError("an adapter built at the quote never sends a request")
+
+    def close(self) -> None:
+        return None
 
 
 def _plain(record: Any) -> dict[str, Any]:
@@ -752,6 +900,8 @@ class Pipeline:
         self.depth_fn = depth_fn
         self.last_human_utc: datetime | None = None
         self._lock = threading.RLock()
+        self._node_locks: dict[tuple[str, str], threading.Lock] = {}  # (project, node) -> attempt numbering
+        self._approval_lock = threading.Lock()  # one cap decision at a time, so the summed spend stays true
         self._staged: OrderedDict[tuple[str, int], Staged] = OrderedDict()
         self._packets: OrderedDict[tuple[str, str], PacketView] = OrderedDict()
         self._inner: dict[str, Any] = {}
@@ -763,6 +913,21 @@ class Pipeline:
         self._hook_failed: dict[tuple[str, int], str] = {}  # (run, attempt) -> the reason code step() records
         # route_health.Tracker (T85/T107 attach it); None: no route is ever marked degraded.
         self.route_tracker: Any = None
+        # Decision 73: one Ledger per project; per-run ledger order; projects with records parked in the outbox.
+        self._ledgers: dict[str, Ledger] = {}
+        self._moves: OrderedDict[str, _RunMoves] = OrderedDict()
+        self._outbox_dirty: set[str] = set()
+        # Decision 75: runs drive on a bounded pool (started on first use), never on the request pool.
+        self._driving: dict[tuple[str, str], int] = {}  # (project, run) -> drivers in this process
+        self._routes: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+        self.executor = RunExecutor(
+            self._execute_pair,
+            workers=run_workers(),
+            max_inflight_for=self.max_inflight_for,
+            route_key_for=self.route_key_for,
+        )
+        self._executor_live = False
+        self._closed = False
 
     # ------------------------------------------------------------------ projects
 
@@ -1193,17 +1358,27 @@ class Pipeline:
 
     def load_recipe(self, ref: Any, project_id: str | None = None) -> Any:
         """A runnable still recipe by id (the project's `recipes/` folder, then the studio's, then the package:
-        decision 50), or by a `.yaml` path (`recipes.load_runnable`)."""
+        decision 50), or by a `.yaml` path (`recipes.load_runnable`). A path that is not a runnable recipe is
+        refused naming the path only: the parser's context would quote the file's lines (decision 80)."""
         from . import recipes
 
         if not isinstance(ref, str) or not (
             _RECIPE_ID.match(ref) or Path(ref).suffix.lower() in (".yaml", ".yml")
         ):
             raise PipelineError(f"recipe {ref!r}: a recipe id or a .yaml path", code="unknown_recipe")
+        by_path = not _RECIPE_ID.match(ref)
         try:
             r = recipes.load_runnable(ref, project_dir=self.project_dir(project_id) if project_id else None)
         except recipes.RecipeError as e:
+            if by_path:
+                raise PipelineError(
+                    f"recipe {ref}: not a readable runnable recipe file", code="unknown_recipe"
+                ) from None
             raise PipelineError(str(e), code="unknown_recipe") from e
+        except Exception:  # a document that is not a recipe mapping at all
+            raise PipelineError(
+                f"recipe {ref}: not a readable runnable recipe file", code="unknown_recipe"
+            ) from None
         if r.kind not in ("still_edit", "still_rephotograph"):
             raise PipelineError(
                 f"recipe {r.id} is a {r.kind} recipe; an Edit node takes a still recipe", code="recipe_kind"
@@ -1393,7 +1568,9 @@ class Pipeline:
 
         A Mask node's `ids`, `maskHash` (painted) and `samHash` (segmented) are one union (decision 34):
         `{"kind": "union", "ids", "keys", "source"}` when it carries a CAS mask, `{"kind": "ids", ...}` when it
-        has ids only. `params.textLock` does not enter here: the packet's `policy.text_lock` always wins."""
+        has ids only. `params.textLock` does not enter here: the packet's `policy.text_lock` always wins. Every
+        id must be a legend id of the packet (decision 80, `check_mask_id`: 422 `bad_mask` naming it), and an
+        `outputHash` a CAS key."""
         g = canvas_rules.as_graph(graph)
         by_id = {n["id"]: n for n in g.nodes}
         up: dict[str, list[str]] = {}
@@ -1418,7 +1595,11 @@ class Pipeline:
             params = mask_node.get("params") if isinstance(mask_node.get("params"), Mapping) else {}
             source = f"mask:{mask_node['id']}"
             raw_ids = params.get("ids")
-            ids = [str(i) for i in raw_ids] if isinstance(raw_ids, list) else []
+            if raw_ids is not None and not isinstance(raw_ids, list):
+                raise PipelineError(
+                    f"Mask node {mask_node['id']}: ids must be a list of legend ids", code="bad_mask"
+                )
+            ids = [self.check_mask_id(mask_node["id"], i, pv) for i in raw_ids or ()]
             keys: list[str] = []
             for name in MASK_KEY_PARAMS:
                 key = params.get(name)
@@ -1435,6 +1616,10 @@ class Pipeline:
             elif ids:
                 spec = {"kind": "ids", "ids": ids, "source": source}
             elif isinstance(mask_node.get("outputHash"), str):
+                if not _HEX64.match(mask_node["outputHash"]):
+                    raise PipelineError(
+                        f"Mask node {mask_node['id']}: outputHash must be a CAS key (64 hex)", code="bad_mask"
+                    )
                 spec = {"kind": "cas", "key": mask_node["outputHash"], "source": source}
             else:
                 raise PipelineError(
@@ -1455,9 +1640,45 @@ class Pipeline:
                 raise PipelineError(f"ids {locked} are locked by the packet policy", code="mask_locked")
         return spec
 
+    def check_mask_id(self, node_id: str, cid: Any, pv: PacketView) -> str:
+        """A Mask node's id as the packet knows it: `o:`/`m:` + 8 hex or `s:` + 5 digits (the schema's legend id),
+        listed in the packet's legend (an `s:` label may also be one its segment map carries). 422 `bad_mask`
+        naming the id otherwise, before a run row (decision 80)."""
+        if not isinstance(cid, str) or not MASK_ID.match(cid):
+            shown = cid if isinstance(cid, str) else repr(cid)
+            raise PipelineError(
+                f"Mask node {node_id}: {shown!r} is not a legend id (o: or m: and 8 hex digits, s: and 5 digits)",
+                code="bad_mask",
+                id=shown,
+            )
+        if cid in self.legend_ids(pv):
+            return cid
+        if cid.startswith("s:"):
+            seg = pv.segments()
+            if seg is not None and bool((np.asarray(seg) == int(cid[2:])).any()):
+                return cid
+        raise PipelineError(
+            f"Mask node {node_id}: {cid} is not an id of packet {pv.packet_id}", code="bad_mask", id=cid
+        )
+
+    @staticmethod
+    def legend_ids(pv: PacketView) -> frozenset[str]:
+        """Every id the packet's legend lists (cached on the packet view)."""
+        hit = pv._cache.get("legend_ids")
+        if hit is None:
+            entries = (pv.legend or {}).get("entries") if isinstance(pv.legend, Mapping) else None
+            hit = frozenset(
+                str(e["id"]) for e in entries or () if isinstance(e, Mapping) and isinstance(e.get("id"), str)
+            )
+            pv._cache["legend_ids"] = hit
+        return hit
+
     def check_mask_keys(self, project_id: str, spec: Mapping[str, Any], pv: PacketView) -> None:
-        """A union's CAS masks exist and decode at the plate's size (when the manifest states it)."""
+        """A union's CAS masks (and a Mask node's `outputHash`) exist and decode at the plate's size (when the
+        manifest states it)."""
         keys = list(spec.get("keys") or ())
+        if spec.get("kind") == "cas" and isinstance(spec.get("key"), str):
+            keys.append(spec["key"])
         if not keys:
             return
         cas = self.cas_for(project_id)
@@ -1553,11 +1774,17 @@ class Pipeline:
         self, conn: Any, project_id: str, graph: Any, node_id: str, pv: PacketView
     ) -> dict[str, Any] | None:
         """Decision 47: an Edit whose `image` input is fed by a take (any node but a Plate) starts from it:
-        `{base: <its outputHash>, base_node, base_run}` (`base_run` the latest DONE run of that node whose first
-        output is the hash, else None). None when a Plate (or nothing) feeds `image`: nothing changes. 422
-        `no_base` when the take has no output in the CAS (an Edit never silently falls back to the plate),
-        `bad_base` when the source is not a still, `ambiguous_base` for two takes, `base_size` for a take that
-        is not the plate's size."""
+        `{base, base_node, base_run, base_state, base_override_reason, base_depth}`. None when a Plate (or
+        nothing) feeds `image`: nothing changes. 422 `no_base` when the take has no output in the CAS (an Edit
+        never silently falls back to the plate), `bad_base` when the source is not a still, `ambiguous_base`
+        for two takes, `base_size` for a take that is not the plate's size.
+
+        Decision 72, after those checks: the hash must be a take of that node in this project
+        (`base_take_for`: DONE, or GATE_FAIL with a recorded override), else 422 `base_not_a_take` or
+        `base_gate_fail`; and the take's lineage plus this generation must stay within
+        `canvas_rules.MAX_GENERATION_DEPTH`, else 422 `DEPTH_EXCEEDED` with the chain of run ids. A hash that is
+        another node's take (relayed through this one's `outputHash`) is measured on its own lineage first, so a
+        relayed take too deep to build on says so."""
         g = canvas_rules.as_graph(graph)
         by_id = {n["id"]: n for n in g.nodes}
         target = by_id.get(node_id) or {}
@@ -1603,22 +1830,104 @@ class Pipeline:
                 code="base_size",
                 node=src["id"],
             )
-        return {"base": key, "base_node": src["id"], "base_run": self.base_run_for(conn, src["id"], key)}
+        take = self.base_take_for(conn, src["id"], key)
+        if take is None:
+            relayed = self.base_take_for(conn, None, key)
+            if relayed is not None:  # another node's take: too deep is the stronger refusal
+                self.check_depth(conn, node_id, relayed.id)
+            raise PipelineError(
+                f"{src['id']} outputHash {key[:12]} is not a take of that node in this project; an upload or a "
+                "foreign blob is never a base (import it first)",
+                code="base_not_a_take",
+                node=src["id"],
+            )
+        from .export import recorded_override
+
+        override = recorded_override(conn, take.id) if take.state is S.GATE_FAIL else None
+        if take.state is S.GATE_FAIL and not override:
+            raise PipelineError(
+                f"{src['id']} take {key[:12]} (run {take.id}) failed its gates; override it with a reason before "
+                "building on it",
+                code="base_gate_fail",
+                node=src["id"],
+                run_id=take.id,
+            )
+        depth = self.check_depth(conn, node_id, take.id)
+        return {
+            "base": key,
+            "base_node": src["id"],
+            "base_run": take.id,
+            "base_state": take.state.value,
+            "base_override_reason": override,
+            "base_depth": depth,
+        }
+
+    def check_depth(self, conn: Any, node_id: str, base_run: str) -> int:
+        """The base run's lineage depth; 422 `DEPTH_EXCEEDED` (the chain of run ids in the message) when one
+        more generation on top of it passes `canvas_rules.MAX_GENERATION_DEPTH` (doctrine 7)."""
+        chain, capped = self._lineage(conn, base_run)
+        depth = LINEAGE_MAX_HOPS if capped else len(chain)
+        if depth + 1 > canvas_rules.MAX_GENERATION_DEPTH:
+            raise PipelineError(
+                f"{node_id} would be generation {depth + 1} from the plate (base lineage "
+                f"{' <- '.join(chain)}); at most {canvas_rules.MAX_GENERATION_DEPTH} generations",
+                code="DEPTH_EXCEEDED",
+                chain=chain,
+            )
+        return depth
 
     @staticmethod
-    def base_run_for(conn: Any, node_id: str, key: str) -> str | None:
-        """The latest DONE run of `node_id` whose first output is `key`, or None."""
-        for row in conn.execute(
-            "SELECT id, normalized FROM runs WHERE node_id = ? AND state = ? ORDER BY updated_utc DESC, id DESC",
-            (node_id, S.DONE.value),
-        ):
+    def base_take_for(conn: Any, node_id: str | None, key: str) -> Run | None:
+        """The newest run of `node_id` (of any node when None) in this project whose `outputs[0]` or
+        `result_key` is `key` and whose state is DONE or GATE_FAIL, else None (decision 72)."""
+        sql = "SELECT id, normalized, result_key FROM runs WHERE state IN (?, ?)"
+        args: list[Any] = list(BASE_STATES)
+        if node_id is not None:
+            sql += " AND node_id = ?"
+            args.append(node_id)
+        for row in conn.execute(sql + " ORDER BY updated_utc DESC, id DESC", args):
             try:
                 outs = (loads(row[1]) or {}).get("outputs") or []
             except (TypeError, ValueError, AttributeError):
-                continue
-            if outs and outs[0] == key:
-                return str(row[0])
+                outs = []
+            if (outs and outs[0] == key) or row[2] == key:
+                return get_run(conn, str(row[0]))
         return None
+
+    @classmethod
+    def base_run_for(cls, conn: Any, node_id: str, key: str) -> str | None:
+        """The id of `base_take_for(conn, node_id, key)` (the name before Wave 12), or None."""
+        take = cls.base_take_for(conn, node_id, key)
+        return take.id if take is not None else None
+
+    @staticmethod
+    def _lineage(conn: Any, run_id: str | None) -> tuple[list[str], bool]:
+        """(`run_id` and the `inputs.base_run` of each run before it, newest first; capped): the walk stops at a
+        cycle or after `LINEAGE_MAX_HOPS` runs (capped True). A run not in the index ends the chain, counted
+        once (it was a generation; nothing more is known of it)."""
+        chain: list[str] = []
+        rid = run_id
+        while isinstance(rid, str) and rid:
+            if rid in chain or len(chain) >= LINEAGE_MAX_HOPS:
+                return chain, True
+            chain.append(rid)
+            row = conn.execute("SELECT inputs FROM runs WHERE id = ?", (rid,)).fetchone()
+            try:
+                inputs = loads(row[0]) if row is not None else None
+            except (TypeError, ValueError):
+                inputs = None
+            rid = inputs.get("base_run") if isinstance(inputs, Mapping) else None
+        return chain, False
+
+    def lineage_chain(self, conn: Any, run_id: str | None) -> list[str]:
+        """The run ids of `run_id`'s lineage, newest first (at most `LINEAGE_MAX_HOPS`)."""
+        return self._lineage(conn, run_id)[0]
+
+    def lineage_depth(self, conn: Any, run_id: str | None) -> int:
+        """1 + the lineage depth of the run's `inputs.base_run`, 0 for none (an import or a take on the plate is
+        1); a cycle or a chain of more than `LINEAGE_MAX_HOPS` runs counts as `LINEAGE_MAX_HOPS`."""
+        chain, capped = self._lineage(conn, run_id)
+        return LINEAGE_MAX_HOPS if capped else len(chain)
 
     def next_attempt(
         self,
@@ -1628,7 +1937,9 @@ class Pipeline:
         params: Mapping[str, Any],
         route: Mapping[str, Any],
     ) -> int:
-        """1 + the highest attempt of this node's earlier runs of the same request (decision 40), else 1."""
+        """1 + the highest attempt of this node's earlier runs of the same request (decision 40), else 1. 422
+        `attempt_exhausted` once that would pass `ATTEMPT_MAX` (decision 80). `quote_node` calls it under the
+        node's lock, so two concurrent quotes never take the same number."""
         want = repeat_canonical(inputs, params, route)
         best = 0
         for row in conn.execute(
@@ -1640,7 +1951,22 @@ class Pipeline:
                 continue
             if same:
                 best = max(best, int(row[0] or 0))
+        if best >= ATTEMPT_MAX:
+            raise PipelineError(
+                f"{node_id} has made this request {best} times; the limit is {ATTEMPT_MAX} attempts (change the "
+                "request: prompt, params or mask)",
+                code="attempt_exhausted",
+                attempts=best,
+            )
         return best + 1
+
+    def node_lock(self, project_id: str, node_id: str) -> threading.Lock:
+        """The lock attempt numbering and run creation of one node hold (decision 80)."""
+        with self._lock:
+            lock = self._node_locks.get((project_id, node_id))
+            if lock is None:
+                lock = self._node_locks[(project_id, node_id)] = threading.Lock()
+            return lock
 
     def quote_node(
         self,
@@ -1656,10 +1982,13 @@ class Pipeline:
         `retired_pin`, `pin_conflict` and `render_it` (blocking mode); `CustodyViolation` (403) when no route of
         the engine is allowed; after the mask, the base (`no_base`, `bad_base`, `ambiguous_base`, `base_size`)
         and the references (`references_unsupported`, `too_many_references`, `reference_missing`), then the
-        prompt's `@refK` tokens (`bad_ref_token`). Body (all
+        prompt's `@refK` tokens (`bad_ref_token`), then (decision 80) `bad_priority`, non-finite params
+        (`bad_params`), the editable mask itself (`mask_empty`, `mask_size`, `bad_mask`), the manifest adapter's
+        `validate_params` (`bad_params`), `bad_attempt` and `attempt_exhausted`. Body (all
         optional): engine_id, route_id, packet_id, task, shot_class, recipe, prompt, params (`params.tokens`
         fills a recipe's tokens and never reaches the engine), preset, region_crop, feather_px, priority,
-        attempt (server-side when absent)."""
+        attempt (server-side when absent, numbered under the node's lock). A failure once the run row exists
+        cancels it (`quote failed: <error>`) before the error goes on."""
         now = now or self.clock()
         project = self.load_project(project_id)
         if project is None:
@@ -1763,28 +2092,80 @@ class Pipeline:
             params["negative_prompt"] = negative
         inputs[ROUTER_KEY] = router
         inputs[SUBGRAPH_KEY] = subgraph_snapshot(project.graph, upstream)
-        attempt = body.get("attempt")
-        if attempt is None:
-            attempt = self.next_attempt(conn, node_id, inputs, params, route)
-        spec = RunCreate(
-            project_id=project_id,
-            packet_id=packet_id,
-            node_id=node_id,
-            priority=Priority.parse(body.get("priority") or "interactive"),
-            inputs=inputs,
-            params=params,
-            route=route,
-            attempt=int(attempt),
-        )
-        run = create_run(conn, spec, now=now)
-        self.index.remember(run.id, project_id)
+        # Decision 80: everything the run will need, before a run row exists.
         try:
-            run, q = quote_run(conn, run.id, now=now, manifests=self.manifests)
+            priority = Priority.parse(body["priority"] if body.get("priority") is not None else "interactive")
         except ValueError as e:
-            transition(conn, run.id, S.CANCELLED, actor="system", reason=f"could not be priced: {e}"[:500])
-            raise PipelineError(f"could not price {engine_id}: {e}", code="unpriceable") from e
-        self.after(conn, project_id, run.id, S.DRAFT)
+            raise PipelineError(str(e), code="bad_priority") from e
+        bad = _non_finite(params)
+        if bad is not None:
+            raise PipelineError(
+                f"{bad[0]} is {bad[1]!r}; every number a run is asked for must be finite",
+                code="bad_params",
+                param=bad[0],
+            )
+        self.probe_mask(node_id, mask, pv, self.cas_for(project_id))
+        self.check_engine_params(route, params)
+        attempt = body.get("attempt")
+        if attempt is not None and (
+            isinstance(attempt, bool) or not isinstance(attempt, int) or not 1 <= attempt <= ATTEMPT_MAX
+        ):
+            raise PipelineError(
+                f"attempt {attempt!r}: a whole number from 1 to {ATTEMPT_MAX}, or none (the daemon numbers it)",
+                code="bad_attempt",
+            )
+        run: Run | None = None
+        try:
+            with self.node_lock(project_id, node_id):
+                if attempt is None:
+                    attempt = self.next_attempt(conn, node_id, inputs, params, route)
+                spec = RunCreate(
+                    project_id=project_id,
+                    packet_id=packet_id,
+                    node_id=node_id,
+                    priority=priority,
+                    inputs=inputs,
+                    params=params,
+                    route=route,
+                    attempt=int(attempt),
+                )
+                run = create_run(conn, spec, now=now)
+                self.index.remember(run.id, project_id)
+                try:
+                    run, q = quote_run(conn, run.id, now=now, manifests=self.manifests)
+                except ValueError as e:
+                    transition(
+                        conn, run.id, S.CANCELLED, actor="system", reason=f"could not be priced: {e}"[:500]
+                    )
+                    raise PipelineError(f"could not price {engine_id}: {e}", code="unpriceable") from e
+            self.after(conn, project_id, run.id, S.DRAFT)
+        except Exception as e:
+            if run is not None:
+                self._cancel_failed_quote(conn, project_id, run.id, e)
+            raise
         return run, q
+
+    def _cancel_failed_quote(self, conn: Any, project_id: str, run_id: str, err: BaseException) -> None:
+        """A quote that failed after its run row was made leaves no DRAFT or QUOTED row: CANCELLED (`quote
+        failed: <error type>`), published, and ledgered when a `quoted` record may exist. Errors here are
+        logged; the caller re-raises the original."""
+        try:
+            before = get_run(conn, run_id).state
+            if before in TERMINAL:
+                return
+            transition(
+                conn, run_id, S.CANCELLED, actor="system", reason=f"quote failed: {type(err).__name__}"[:500]
+            )
+            if before is S.QUOTED:
+                self.after(conn, project_id, run_id, before)
+            else:
+                self.publish(
+                    project_id,
+                    run_id,
+                    {"kind": "run.state", "run_id": run_id, "from": before.value, "to": S.CANCELLED.value},
+                )
+        except Exception as e:  # the original error is what the caller sees
+            log.warning("run %s could not be cancelled after its quote failed: %s", run_id, e)
 
     # ------------------------------------------------------------------ approval and queueing
 
@@ -1801,7 +2182,9 @@ class Pipeline:
     ) -> list[Run]:
         """QUOTED -> APPROVED for the run, or for its whole best-of-N group. Custody is re-checked first for
         every run (the project's custody may have tightened since the quote). An approval the ledger cannot
-        record cancels the group (503 `ledger_unavailable`)."""
+        record cancels the group (503 `ledger_unavailable`). The daily and unattended caps count the spend of
+        every project index in this home (`budgets.spend_snapshot_all`, decision 80); a quote that lapsed or
+        was made after `now` is EXPIRED, ledgered `expired`, and `QuoteExpired` goes on."""
         now = now or self.clock()
         run = get_run(conn, run_id)
         self.require_custody(run)
@@ -1814,11 +2197,26 @@ class Pipeline:
             except Exception as e:  # the bus is for watchers
                 log.warning("budget alert for %s not published: %s", run_id, e)
 
-        kwargs = {"policy": self.policy, "last_human_interaction_utc": self.last_human_utc, "on_alert": alert}
-        if run.sibling_group:
-            runs = approve_group(conn, run.sibling_group, by, envelope_id, now, **kwargs)
-        else:
-            runs = [approve_one(conn, run_id, by, envelope_id, now, **kwargs)]
+        kwargs: dict[str, Any] = {
+            "policy": self.policy,
+            "last_human_interaction_utc": self.last_human_utc,
+            "on_alert": alert,
+        }
+        with self._approval_lock:  # decision 80: the caps count every project, one decision at a time
+            if by != "human":  # a human approves without asking the caps
+                kwargs["spent"] = budgets.spend_snapshot_all(self.index, now, self.last_human_utc)
+            try:
+                if run.sibling_group:
+                    runs = approve_group(conn, run.sibling_group, by, envelope_id, now, **kwargs)
+                else:
+                    runs = [approve_one(conn, run_id, by, envelope_id, now, **kwargs)]
+            except QuoteExpired as e:
+                for rid in getattr(e, "run_ids", None) or ():
+                    try:  # QUOTED -> EXPIRED is in the folder too
+                        self.after(conn, project_id, rid, S.QUOTED)
+                    except Exception as e2:
+                        log.warning("expired run %s not published or ledgered: %s", rid, e2)
+                raise
         try:
             for r in runs:
                 self.after(conn, project_id, r.id, S.QUOTED, note=reason)
@@ -1843,11 +2241,39 @@ class Pipeline:
             raise PipelineError(f"mask {key[:12]} is not a {w} x {h} grey PNG", code="mask_size")
         return raw > 127
 
+    def probe_mask(self, node_id: str, spec: Mapping[str, Any], pv: PacketView, cas: CAS) -> None:
+        """The quote's mask probe (decision 80): `editable_mask_from_spec` at the manifest's plate size (the
+        plate is not decoded here). Its mask refusals (`MASK_REFUSALS`) surface as they are; a packet layer that
+        cannot be read is left for staging to report (it fails the run there, with the same message)."""
+        w, h = self.plate_size(pv)
+        try:
+            self.editable_mask_from_spec(spec, pv, cas, shape=(h, w))
+        except PipelineError as e:
+            if e.code in MASK_REFUSALS:
+                raise
+            log.warning("mask of %s not probed at the quote: %s", node_id, e)
+        except (OSError, ValueError) as e:  # an undecodable layer is a staging failure, not a mask refusal
+            log.warning("mask of %s not probed at the quote: %s: %s", node_id, type(e).__name__, e)
+
     def editable_mask(self, run: Run, pv: PacketView, cas: CAS) -> np.ndarray:
-        """What the run may change: its mask spec, always within the packet's editable ids and never on a
-        locked id (decision 34; every path, so nothing composites onto a locked id)."""
-        spec = run.inputs.get("mask") or {"kind": "ids", "ids": pv.editable_ids()}
-        h, w = pv.plate16().shape[:2]
+        """What the run may change: its mask spec (`editable_mask_from_spec`; the packet's editable ids when the
+        run names none)."""
+        return self.editable_mask_from_spec(
+            run.inputs.get("mask") or {"kind": "ids", "ids": pv.editable_ids()}, pv, cas
+        )
+
+    def editable_mask_from_spec(
+        self,
+        spec: Mapping[str, Any],
+        pv: PacketView,
+        cas: CAS,
+        shape: tuple[int, int] | None = None,
+    ) -> np.ndarray:
+        """What a mask spec may change: always within the packet's editable ids and never on a locked id
+        (decision 34; every path, so nothing composites onto a locked id). `shape` (h, w) defaults to the
+        decoded plate's; the quote passes the manifest's (`probe_mask`), so `mask_empty`, `mask_size` and
+        `bad_mask` are refused before a run row (decision 80)."""
+        h, w = shape if shape is not None else pv.plate16().shape[:2]
         kind = spec.get("kind")
         if kind == "frame":
             mask = np.ones((h, w), dtype=bool)
@@ -1860,7 +2286,7 @@ class Pipeline:
             for key in spec.get("keys") or ():
                 mask |= self._grey_mask(cas, key, w, h)
         else:
-            raise PipelineError(f"unknown mask kind {kind!r}")
+            raise PipelineError(f"unknown mask kind {kind!r}", code="bad_mask")
         mask = mask & pv.editable_px((h, w)) & ~pv.locked_px((h, w))
         if not mask.any():
             raise PipelineError(
@@ -1868,6 +2294,52 @@ class Pipeline:
                 code="mask_empty",
             )
         return mask
+
+    def engine_params(self, route: Mapping[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:
+        """What staging sends the engine for a run's `params` on `route` (the vendor payload's `params`): the
+        params less what only PLATE reads (`PLATE_PARAMS`). Every route maps them the same way today; the quote
+        validates exactly this (decision 80)."""
+        return {k: v for k, v in params.items() if k not in PLATE_PARAMS}
+
+    @staticmethod
+    def make_adapter(
+        cls: type, manifest: Any, route: Any, *, transport: Any, staging_dir: Path | None = None
+    ) -> Any:
+        """A `plate_engines` adapter as staging builds it: the manifest, the route, the transport, and the
+        adapter's `staging_dir` under PLATE_HOME when it takes one (results never land in the OS temp)."""
+        kwargs: dict[str, Any] = {}
+        if staging_dir is not None and "staging_dir" in inspect.signature(cls).parameters:
+            kwargs["staging_dir"] = staging_dir
+        return cls(manifest, route, transport=transport, **kwargs)
+
+    def check_engine_params(self, route: Mapping[str, Any], params: Mapping[str, Any]) -> None:
+        """Decision 80: a manifest engine's adapter, built as staging builds it (on a transport that never
+        sends), validates `engine_params(route, params)` at the quote; `ParamError` / `InputError` are 422
+        `bad_params` with the adapter's message. In-process engines (`fake`, `engines`) have no adapter."""
+        eid = route.get("engine_id")
+        if eid == FAKE_ENGINE_ID or eid in self.engines:
+            return
+        manifest = self.manifests.get(eid)
+        if manifest is None:
+            raise PipelineError(f"unknown engine {eid!r}", code="unknown_engine")
+        rid = route.get("route_id") or route.get("provider")
+        r = next((x for x in manifest.routes if x.route_id == rid), None)
+        cls = adapter_class(manifest, r) if r is not None else None
+        if cls is None:
+            raise PipelineError(f"no adapter speaks {eid} via {rid}", code="no_adapter")
+        from plate_engines.adapters.base import InputError, ParamError
+
+        transport = None if r.upload_visibility == "local" else _QuoteTransport()
+        try:
+            adapter = self.make_adapter(cls, manifest, r, transport=transport)
+        except Exception as e:
+            raise PipelineError(
+                f"{eid} via {rid}: the adapter cannot be built ({type(e).__name__}: {e})", code="no_adapter"
+            ) from e
+        try:
+            adapter.validate_params(self.engine_params(route, params))
+        except (ParamError, InputError) as e:
+            raise PipelineError(str(e), code="bad_params") from e
 
     def engine_manifest(self, run: Run) -> Any:
         """What egress sizes the plate for. A local model with no declared sizes takes the frame at native
@@ -2078,7 +2550,7 @@ class Pipeline:
         payload: dict[str, Any] = {
             "engine_id": run.route.engine_id,
             "inputs": inputs,
-            "params": dict(run.params),
+            "params": self.engine_params(run.route_dict, run.params),
         }
         if seed_payload.get("variant") is not None:
             payload["variant"] = seed_payload["variant"]
@@ -2129,12 +2601,15 @@ class Pipeline:
                 packet_dir=pv.root,
             )
             transport = self.egress_for(run.project_id).transport(erun, route)
-        kwargs: dict[str, Any] = {}
-        if (
-            "staging_dir" in inspect.signature(cls).parameters
-        ):  # results stay under PLATE_HOME, not the OS temp
-            kwargs["staging_dir"] = self.settings.home / "cache" / "adapters" / run.id
-        bridge = AdapterBridge(cls(manifest, route, transport=transport, **kwargs))
+        bridge = AdapterBridge(
+            self.make_adapter(
+                cls,
+                manifest,
+                route,
+                transport=transport,
+                staging_dir=self.settings.home / "cache" / "adapters" / run.id,
+            )
+        )
         with self._lock:
             self._inner[run.id] = bridge
         return bridge
@@ -2182,25 +2657,34 @@ class Pipeline:
             records[name] = _plain(record)
         return data, records
 
-    def prior_mask(self, run: Run, pv: PacketView, cas: CAS, base16: np.ndarray) -> np.ndarray:
-        """What the base already changed (decision 47): its run's `mask_union_key`, else its `mask_key`, together
-        with the pixels where the base differs from the plate. For a pipeline take the difference lies inside
-        its masks; for a take made elsewhere (no DONE run behind it, or a node whose stored mask does not cover
-        its own upstream) the difference is what the chain changed, so this run is never failed for it."""
-        plate16 = pv.plate16()
-        h, w = plate16.shape[:2]
-        prior = np.any(base16 != plate16, axis=2)
+    def prior_mask(self, run: Run, pv: PacketView, cas: CAS) -> np.ndarray:
+        """What the base already changed (decisions 47 and 72): its run's `mask_union_key`, else its `mask_key`.
+        There is no pixel-difference term (it made "outside the union is the plate" true by definition): a base
+        run whose masks cannot be read fails the run (`base_mask_missing`, NORMALIZING -> FAILED)."""
+        h, w = pv.plate16().shape[:2]
         rid = run.inputs.get("base_run")
+        norm: Mapping[str, Any] = {}
         if isinstance(rid, str):
             try:
                 with self.index.project(run.project_id) as conn:
                     norm = get_run(conn, rid).normalized or {}
-                key = norm.get("mask_union_key") or norm.get("mask_key")
-                if isinstance(key, str) and cas.exists(key):
-                    prior |= self._grey_mask(cas, key, w, h)
-            except Exception as e:  # the pixel difference alone is never smaller than what changed
-                log.warning("mask of base run %s not read for %s: %s", rid, run.id, e)
-        return prior
+            except Exception as e:
+                log.warning("base run %s of %s not read: %s", rid, run.id, e)
+        for name in ("mask_union_key", "mask_key"):
+            key = norm.get(name)
+            if not isinstance(key, str) or not _HEX64.match(key) or not cas.exists(key):
+                continue
+            try:
+                return self._grey_mask(cas, key, w, h)
+            except PipelineError as e:
+                log.warning("%s of base run %s not usable for %s: %s", name, rid, run.id, e)
+        with self._lock:
+            self._hook_failed[(run.id, run.attempt)] = "base_mask_missing"  # step() records it as the reason
+        raise PipelineError(
+            f"the base run {rid or '(none)'} has no readable mask (mask_union_key / mask_key): what the base "
+            "changed is unknown, so nothing can be composited on it",
+            code="base_mask_missing",
+        )
 
     def normalize(self, run: Run, cas: CAS) -> dict[str, Any]:
         """NORMALIZING: the engine's bytes (after the ingress hooks) back onto the plate, or onto the run's base
@@ -2257,7 +2741,7 @@ class Pipeline:
         if hooks is not None:
             out["ingress_hooks"] = hooks
         if base_key:
-            union = staged.mask | self.prior_mask(run, pv, cas, under)
+            union = staged.mask | self.prior_mask(run, pv, cas)
             out["base"] = base_key
             out["mask_union_key"] = cas.put_bytes(_mask_png(union), "png")
             out["composite"]["mask_union_share"] = float(union.mean())
@@ -2337,6 +2821,7 @@ class Pipeline:
             mask = self._grey_mask(cas, norm["mask_union_key"], w, h)
         if norm.get("base"):
             extra["base_hash"] = norm["base"]
+        base = self.base_record(run)
         report = gating.run_gates(
             pv.plate16(),
             out16,
@@ -2351,10 +2836,13 @@ class Pipeline:
             crypto_material=pv.crypto("material") if pv.tier == "A" else None,
             extra_metrics=extra,
         )
+        stored = report.model_dump(mode="json")
+        if base is not None:  # decision 72: the sidecar says what the take was built on
+            stored["base"] = base
         project_dir = self.project_dir(run.project_id)
         svc = self.report_service(run.project_id)
         if svc is not None:
-            path = svc.write(run.id, report)
+            path = svc.write(run.id, stored)
         else:
             from plate_gates.report import write
 
@@ -2365,10 +2853,22 @@ class Pipeline:
             ref = Path(path).as_posix()
         return GateOutcome(
             passed=report.verdict != "fail",
-            report=report.model_dump(mode="json"),
+            report=stored,
             score=gating.score_of(report),
             report_path=ref,
         )
+
+    @staticmethod
+    def base_record(run: Run) -> dict[str, Any] | None:
+        """`{run_id, state, override_reason, depth}` of the take a run was built on (decision 72), or None."""
+        if not run.inputs.get("base"):
+            return None
+        return {
+            "run_id": run.inputs.get("base_run"),
+            "state": run.inputs.get("base_state"),
+            "override_reason": run.inputs.get("base_override_reason"),
+            "depth": run.inputs.get("base_depth"),
+        }
 
     # ------------------------------------------------------------------ driving
 
@@ -2410,29 +2910,62 @@ class Pipeline:
         self, run_id: str | Run, project_id: str | None = None, *, max_steps: int = 100_000
     ) -> RunState:
         """Drive a QUEUED (or resumed) run to a terminal state, sleeping between idle polls. `run_id` may be
-        the Run itself."""
+        the Run itself. A busy or locked index is retried with backoff (`BUSY_BACKOFF_S`, `BUSY_RETRIES` in a
+        row, then re-raised); once the executor is stopped the run is left where it is for the next boot."""
         if isinstance(run_id, Run):
             project_id, run_id = project_id or run_id.project_id, run_id.id
         pid = project_id or self.index.locate_run(run_id)
         if pid is None:
             raise KeyError(f"run {run_id} is not in any project index")
         cas = self.cas_for(pid)
-        state = S.QUEUED
-        with self.index.project(pid) as conn:
-            for _ in range(max_steps):
-                before = get_run(conn, run_id).state
-                if before in TERMINAL or before not in WORKER_STATES:
-                    state = before
-                    break
-                state = self.step(conn, pid, run_id, cas)
-                if state in TERMINAL:
-                    break
-                if state is before:
-                    self.sleep(self.poll_interval_s)
-            else:
-                raise RuntimeError(f"run {run_id} did not finish within {max_steps} steps")
+        key = (pid, run_id)
+        with self._lock:  # the executor's watch never takes a run this process is driving
+            self._driving[key] = self._driving.get(key, 0) + 1
+        try:
+            state = self._drive(pid, run_id, cas, max_steps)
+        finally:
+            with self._lock:
+                left = self._driving.get(key, 1) - 1
+                if left > 0:
+                    self._driving[key] = left
+                else:
+                    self._driving.pop(key, None)
         self._rank_group(pid, run_id)
         return state
+
+    def _drive(self, pid: str, run_id: str, cas: CAS, max_steps: int) -> RunState:
+        busy = 0
+        with self.index.project(pid) as conn:
+            for _ in range(max_steps):
+                try:
+                    before = get_run(conn, run_id).state
+                    if before in TERMINAL or before not in WORKER_STATES:
+                        return before
+                    if self.executor.stop_event.is_set():
+                        log.info("run %s left in %s: the run executor is stopping", run_id, before.value)
+                        return before
+                    state = self.step(conn, pid, run_id, cas)
+                except sqlite3.OperationalError as e:
+                    if not index_busy(e) or busy >= BUSY_RETRIES:
+                        raise
+                    delay = BUSY_BACKOFF_S[min(busy, len(BUSY_BACKOFF_S) - 1)]
+                    busy += 1
+                    log.warning(
+                        "run %s: the project index is busy (%s); retry %d of %d in %g s",
+                        run_id,
+                        e,
+                        busy,
+                        BUSY_RETRIES,
+                        delay,
+                    )
+                    self.sleep(delay)
+                    continue
+                busy = 0
+                if state in TERMINAL:
+                    return state
+                if state is before:
+                    self.sleep(self.poll_interval_s)
+        raise RuntimeError(f"run {run_id} did not finish within {max_steps} steps")
 
     def execute_all(self, project_id: str, run_ids: list[str]) -> dict[str, str]:
         """Background entry point: run each queued run to its end; a crash of one never stops the others."""
@@ -2445,25 +2978,191 @@ class Pipeline:
                 out[rid] = f"error: {type(e).__name__}"
         return out
 
-    def resume(self) -> list[str]:
-        """Drive on every pipeline run a stopped daemon left in a worker state (start-up; the worker's STAGING
-        rules still apply, so nothing is resubmitted blind). Returns the run ids it picked up."""
-        picked: list[str] = []
+    # ------------------------------------------------------------------ the run executor (decision 75)
+
+    def start_runs(self, project_id: str, run_ids: Iterable[str], *, background: Any = None) -> None:
+        """Drive these QUEUED runs to their end, off the request: inline (`PLATE_RUN_WORKERS=0`) as a
+        BackgroundTask of `background` (in this thread when there is none), else on the run executor."""
+        ids = [run_ids] if isinstance(run_ids, str) else list(run_ids)
+        if not ids:
+            return
+        if self.executor.inline:
+            if background is not None:
+                background.add_task(self.execute_all, project_id, ids)
+            else:
+                self.execute_all(project_id, ids)
+            return
+        self._start_executor()
+        self.executor.submit(project_id, ids)
+
+    def _start_executor(self) -> bool:
+        """Start the pool and its orphan watch on first use; False when inline or closed."""
+        if self.executor.inline:
+            return False
+        with self._lock:
+            if self._closed:
+                return False
+            if self._executor_live:
+                return True
+            self._executor_live = True
+        try:
+            self.executor.start()
+        except RuntimeError as e:  # closed meanwhile (shutdown): the runs stay QUEUED for the next boot
+            log.warning("run executor not started: %s", e)
+            return False
+        self.executor.watch(self.orphaned_runs)
+        return True
+
+    def close(self, timeout_s: float = CLOSE_TIMEOUT_S) -> bool:
+        """Stop the run executor (queued runs stay QUEUED for the next boot). True when every worker ended."""
+        with self._lock:
+            self._closed = True
+        return self.executor.stop(timeout_s)
+
+    def _execute_pair(self, project_id: str, run_id: str) -> RunState:
+        return self.execute(run_id, project_id)
+
+    def _route_of(self, project_id: str, run_id: str) -> dict[str, Any]:
+        key = (project_id, run_id)
+        with self._lock:
+            hit = self._routes.get(key)
+        if hit is not None:
+            return hit
+        with self.index.project(project_id) as conn:
+            route = get_run(conn, run_id).route_dict
+        with self._lock:
+            self._routes[key] = route
+            while len(self._routes) > ROUTE_MEMO:
+                self._routes.popitem(last=False)
+        return route
+
+    def route_max_inflight(self, route: Mapping[str, Any]) -> int:
+        """The route's `max_inflight`: the manifest route's (by route id, then provider), else a manifest-less
+        engine's own route dict's, else `executor.DEFAULT_MAX_INFLIGHT` (2)."""
+        manifest = self.manifests.get(route.get("engine_id")) if route.get("engine_id") else None
+        if manifest is not None:
+            routes = list(manifest.routes)
+            hit = next((r for r in routes if r.route_id == route.get("route_id")), None) or next(
+                (r for r in routes if r.provider == route.get("provider")), None
+            )
+            if hit is not None:
+                return max(1, int(hit.max_inflight))
+        declared = route.get("max_inflight")
+        if isinstance(declared, int) and not isinstance(declared, bool) and declared >= 1:
+            return declared
+        return DEFAULT_MAX_INFLIGHT
+
+    def max_inflight_for(self, project_id: str, run_id: str) -> int:
+        return self.route_max_inflight(self._route_of(project_id, run_id))
+
+    def route_key_for(self, project_id: str, run_id: str) -> str:
+        return route_key(self._route_of(project_id, run_id))
+
+    def orphaned_runs(self) -> list[tuple[str, str]]:
+        """The executor's watch: `(project_id, run_id)` of every pipeline run in a worker state that nothing in
+        this process is driving and whose last move is older than `ORPHAN_GRACE_S` (its driver died: a step that
+        raised past its retries, a lost thread). Each project's ledger outbox is drained on the way."""
         states = tuple(s.value for s in WORKER_STATES)
         marks = ",".join("?" * len(states))
+        cutoff = utcnow() - timedelta(seconds=ORPHAN_GRACE_S)
+        with self._lock:
+            driving = set(self._driving)
+        out: list[tuple[str, str]] = []
         for pid in self.index.project_ids():
-            with self.index.project(pid) as conn:
-                ids = [
-                    r[0]
-                    for r in conn.execute(
-                        f"SELECT id FROM runs WHERE state IN ({marks}) ORDER BY created_utc, id", states
-                    )
-                ]
-                todo = [rid for rid in ids if is_pipeline_run(get_run(conn, rid))]
+            try:
+                with self.index.project(pid) as conn:
+                    self.drain_ledger_outbox(conn, pid)
+                    rows = conn.execute(
+                        f"SELECT id, updated_utc FROM runs WHERE state IN ({marks}) ORDER BY created_utc, id",
+                        states,
+                    ).fetchall()
+                    for rid, updated in ((r[0], r[1]) for r in rows):
+                        if (pid, rid) in driving:
+                            continue
+                        try:
+                            moved = parse_iso(updated)
+                        except ValueError:
+                            moved = None
+                        if moved is not None and moved > cutoff:
+                            continue
+                        if is_pipeline_run(get_run(conn, rid)):
+                            out.append((pid, rid))
+            except Exception as e:  # one unreadable index never stops the watch
+                log.warning("orphan scan of project %s failed: %s: %s", pid, type(e).__name__, e)
+        return out
+
+    def resume(self) -> list[str]:
+        """Drive on every pipeline run a stopped daemon left in a worker state (start-up; the worker's STAGING
+        rules still apply, so nothing is resubmitted blind). Each project's ledger outbox is drained first; each
+        run gets a `resume` note and goes to the executor (inline: driven here, one after another). A run in
+        FETCHING, NORMALIZING or GATING with `RESUME_LIMIT` earlier `resume` notes from those states is FAILED
+        `resume_limit` instead. Returns the run ids it picked up."""
+        picked: list[str] = []
+        for pid in self.index.project_ids():
+            try:
+                todo = self._resume_project(pid)
+            except Exception as e:  # one broken project never keeps the others from resuming
+                log.warning("resume of project %s failed: %s: %s", pid, type(e).__name__, e)
+                continue
             if todo:
-                self.execute_all(pid, todo)
+                self.start_runs(pid, todo)
                 picked.extend(todo)
         return picked
+
+    def _resume_project(self, pid: str) -> list[str]:
+        states = tuple(s.value for s in WORKER_STATES)
+        marks = ",".join("?" * len(states))
+        with self._lock:
+            driving = set(self._driving)
+        todo: list[str] = []
+        with self.index.project(pid) as conn:
+            self.drain_ledger_outbox(conn, pid)
+            ids = [
+                r[0]
+                for r in conn.execute(
+                    f"SELECT id FROM runs WHERE state IN ({marks}) ORDER BY created_utc, id", states
+                )
+            ]
+            for rid in ids:
+                if (pid, rid) in driving:
+                    continue
+                run = get_run(conn, rid)
+                if not is_pipeline_run(run) or self._resume_limited(conn, pid, run):
+                    continue
+                append_note(
+                    conn,
+                    rid,
+                    kind=RESUME_NOTE,
+                    actor="system",
+                    reason=f"the daemon started with this run in {run.state.value}; driving it on",
+                )
+                todo.append(rid)
+        return todo
+
+    def _resume_limited(self, conn: Any, project_id: str, run: Run) -> bool:
+        """FAILED `resume_limit` for a run the daemon already stopped on twice in a local stage (a result that
+        kills the process would otherwise crash every boot). True when the run was failed."""
+        if run.state not in RESUME_LIMITED:
+            return False
+        limited = tuple(s.value for s in RESUME_LIMITED)
+        marks = ",".join("?" * len(limited))
+        n = conn.execute(
+            f"SELECT COUNT(*) FROM run_events WHERE run_id = ? AND kind = ? AND to_state IN ({marks})",
+            (run.id, RESUME_NOTE, *limited),
+        ).fetchone()[0]
+        if n < RESUME_LIMIT:
+            return False
+        kept = (
+            f"the result blob is kept at {run.result_key}" if run.result_key else "no result blob was fetched"
+        )
+        reason = f"the daemon stopped twice while driving this run; {kept}"
+        try:
+            transition(conn, run.id, S.FAILED, actor="system", reason=reason, reason_code="resume_limit")
+        except IllegalTransition:  # it moved meanwhile: not ours to fail
+            return False
+        log.error("run %s failed resume_limit in %s: %s", run.id, run.state.value, reason)
+        self.after(conn, project_id, run.id, run.state)
+        return True
 
     def cancel(
         self, conn: Any, project_id: str, run_id: str, *, actor: str = "human", reason: str | None = None
@@ -2519,15 +3218,71 @@ class Pipeline:
     def after(
         self, conn: Any, project_id: str, run_id: str, before: RunState, *, note: str | None = None
     ) -> None:
-        """Publish and ledger the move a run just made from `before` to its current state."""
-        run = get_run(conn, run_id)
-        event = {"kind": "run.state", "run_id": run_id, "from": before.value, "to": run.state.value}
-        if run.reason_code:
-            event["reason_code"] = run.reason_code
-        self.publish(project_id, run_id, event)
-        kind = LEDGER_KINDS.get(run.state)
-        if kind is not None:
-            self.ledger(project_id, kind, run, note=note, conn=conn)
+        """Publish the move a run just made from `before` to its current state, and ledger it.
+
+        Under the run's ledger lock, every transition since the last one this process ledgered for the run is
+        written, in order, each once (decision 73): an approval a racing cancel overtook is still recorded
+        before its `cancelled`, and the second of two calls that saw the same move writes nothing. A run this
+        process has not seen yet gets its newest transition only. `note` goes on the first record written."""
+        moves = self._moves_for(run_id)
+        with moves.lock:
+            run = get_run(conn, run_id)
+            event = {"kind": "run.state", "run_id": run_id, "from": before.value, "to": run.state.value}
+            if run.reason_code:
+                event["reason_code"] = run.reason_code
+            self.publish(project_id, run_id, event)
+            self._ledger_moves(conn, project_id, run, moves, note=note)
+
+    def _moves_for(self, run_id: str) -> _RunMoves:
+        with self._lock:
+            moves = self._moves.get(run_id)
+            if moves is None:
+                moves = self._moves[run_id] = _RunMoves()
+                while len(self._moves) > LEDGER_MEMO:
+                    self._moves.popitem(last=False)
+            else:
+                self._moves.move_to_end(run_id)
+            return moves
+
+    @staticmethod
+    def _transitions_since(conn: Any, run_id: str, after_seq: int | None) -> list[tuple[int, RunState, int]]:
+        """`(transition seq, to_state, event_seq)` for the run's transitions after `after_seq` (only the newest
+        when None, or when the run's events end before `after_seq`: the index was rebuilt under this process),
+        where `event_seq` is the newest event before the next transition (decision 73)."""
+        top, last = conn.execute(
+            "SELECT MAX(seq), MAX(CASE WHEN kind = 'transition' THEN seq END) FROM run_events WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if last is None:
+            return []
+        if after_seq is None or top < after_seq:
+            after_seq = int(last) - 1
+        rows = conn.execute(
+            "SELECT seq, kind, to_state FROM run_events WHERE run_id = ? AND seq > ? ORDER BY seq",
+            (run_id, after_seq),
+        ).fetchall()
+        out: list[list[Any]] = []
+        for seq, kind, to_state in ((r[0], r[1], r[2]) for r in rows):
+            if kind == "transition":
+                out.append([int(seq), RunState(to_state), int(seq)])
+            elif out:
+                out[-1][2] = int(seq)
+        return [(t, st, ev) for t, st, ev in out]
+
+    def _ledger_moves(
+        self, conn: Any, project_id: str, run: Run, moves: _RunMoves, *, note: str | None = None
+    ) -> None:
+        """Ledger the run's transitions since `moves.seq` (the caller holds `moves.lock`)."""
+        todo = self._transitions_since(conn, run.id, moves.seq)
+        if todo and todo[-1][1] is not run.state:  # it moved again meanwhile: build from the newer row
+            run = get_run(conn, run.id)
+        for seq, to_state, event_seq in todo:
+            kind = LEDGER_KINDS.get(to_state)
+            if kind is not None:
+                snap = run if to_state is run.state else run.model_copy(update={"state": to_state})
+                self.ledger(project_id, kind, snap, note=note, conn=conn, data={"event_seq": event_seq})
+                note = None
+            moves.seq = seq
 
     @staticmethod
     def routing_data(run: Run) -> dict[str, Any]:
@@ -2545,32 +3300,38 @@ class Pipeline:
         self, conn: Any, project_id: str, run_id: str, kind: str, err: BaseException
     ) -> None:
         """CANCELLED with `ledger_unavailable`: the run's quote or approval is not in the folder's ledger, so it
-        must not spend. Published on the bus; the `cancelled` record is attempted (and only warned about)."""
+        must not spend. Published on the bus; the `cancelled` record is written or parked in the outbox. The
+        record that failed stays unwritten: every move up to this cancel counts as ledgered."""
+        moves = self._moves_for(run_id)
         try:
-            before = get_run(conn, run_id).state
-            if before in TERMINAL:
-                return
-            transition(
-                conn,
-                run_id,
-                S.CANCELLED,
-                actor="system",
-                reason=f"ledger_unavailable: the {kind} record could not be written ({type(err).__name__})",
-                reason_code="ledger_unavailable",
-            )
-            run = get_run(conn, run_id)
-            self.publish(
-                project_id,
-                run_id,
-                {
-                    "kind": "run.state",
-                    "run_id": run_id,
-                    "from": before.value,
-                    "to": run.state.value,
-                    "reason_code": "ledger_unavailable",
-                },
-            )
-            self.ledger(project_id, "cancelled", run, conn=conn)
+            with moves.lock:
+                before = get_run(conn, run_id).state
+                if before in TERMINAL:
+                    return
+                transition(
+                    conn,
+                    run_id,
+                    S.CANCELLED,
+                    actor="system",
+                    reason=f"ledger_unavailable: the {kind} record could not be written ({type(err).__name__})",
+                    reason_code="ledger_unavailable",
+                )
+                run = get_run(conn, run_id)
+                self.publish(
+                    project_id,
+                    run_id,
+                    {
+                        "kind": "run.state",
+                        "run_id": run_id,
+                        "from": before.value,
+                        "to": run.state.value,
+                        "reason_code": "ledger_unavailable",
+                    },
+                )
+                done = self._transitions_since(conn, run_id, None)
+                if done:
+                    moves.seq = done[-1][0]
+                self.ledger(project_id, "cancelled", run, conn=conn)
         except Exception as e:  # the 503 still goes out; the index says what state the run is in
             log.error("run %s could not be cancelled after the ledger failed: %s", run_id, e)
 
@@ -2586,8 +3347,12 @@ class Pipeline:
     ) -> None:
         """Append one record for `run` to the project's runs.jsonl (state and fields the index rebuild reads).
 
-        Any failure is a warning, except for `quoted` and `approved`: then the run is cancelled
-        (`ledger_unavailable`, through `conn` or a connection of its own) and `PipelineError` 503 is raised."""
+        With `conn`, the record carries `data.event_seq` (the run's newest `run_events` seq; a caller's own
+        `data.event_seq` wins) and the project's ledger outbox is drained first. A record that cannot be
+        appended is never dropped (decision 73): `quoted` and `approved` cancel the run (`ledger_unavailable`,
+        through `conn` or a connection of its own) and raise `PipelineError` 503, `override` raises it and
+        changes nothing, and every other kind is parked in the outbox (WARNING `queued in the ledger outbox`),
+        as is one that would overtake records still parked there."""
         route = run.route_dict
         rec: dict[str, Any] = {
             "kind": kind,
@@ -2598,6 +3363,11 @@ class Pipeline:
             "node_id": run.node_id,
         }
         data: dict[str, Any] = {"state": run.state.value, "packet_id": run.packet_id}
+        given = extra.get("data") if isinstance(extra.get("data"), Mapping) else {}
+        if conn is not None and "event_seq" not in given:
+            seq = self.event_seq(conn, run.id)
+            if seq is not None:
+                data["event_seq"] = seq
         if kind in ("quoted", "submitted"):
             data.update(self.routing_data(run))
         if kind == "quoted":
@@ -2641,7 +3411,9 @@ class Pipeline:
                 data["reason_code"] = run.reason_code
             if run.error:
                 rec["reason"] = run.error[:500]
-            if not run.provider_job_id and kind in ("failed", "cancelled"):
+            if run.reason_code == SUBMIT_STATE_UNKNOWN:  # the provider may hold the job: never a refund
+                data["billing_unknown"] = True
+            elif not run.provider_job_id and kind in ("failed", "cancelled"):
                 data["refunded"] = True
         if note:
             rec["reason"] = note[:500]
@@ -2649,12 +3421,26 @@ class Pipeline:
         data.update(rec.pop("data", None) or {})
         rec["data"] = data
         rec = {k: v for k, v in rec.items() if v is not None and v != ""}
+        if conn is not None or project_id in self._outbox_dirty:
+            self._drain_before_append(conn, project_id)
+        if kind not in FAIL_CLOSED_KINDS and project_id in self._outbox_dirty:
+            self._park(conn, project_id, kind, run, rec, "earlier records are still waiting there")
+            return
         try:
-            Ledger(self.project_dir(project_id), clock=self.clock).append(rec)
+            self.ledger_for(project_id).append(rec)
         except Exception as e:
-            if kind not in FAIL_CLOSED_KINDS:  # the index holds the state; reindex cannot see this one
-                log.warning("ledger record %s for %s not written: %s", kind, run.id, e)
+            if kind not in FAIL_CLOSED_KINDS:  # the index holds the state; the outbox keeps the record
+                self._park(conn, project_id, kind, run, rec, f"{type(e).__name__}: {e}")
                 return
+            if kind not in CANCEL_ON_LOSS_KINDS:  # an override: refused, and nothing about the run changes
+                log.error("ledger record %s for %s not written: %s; refused", kind, run.id, e)
+                raise PipelineError(
+                    f"the project ledger is unavailable ({type(e).__name__}: {e}); the {kind} of run {run.id} "
+                    "was not recorded and nothing was changed",
+                    code="ledger_unavailable",
+                    status=503,
+                    run_id=run.id,
+                ) from e
             log.error("ledger record %s for %s not written: %s; the run is cancelled", kind, run.id, e)
             if conn is not None:
                 self._cancel_unledgered(conn, project_id, run.id, kind, e)
@@ -2672,19 +3458,99 @@ class Pipeline:
                 run_id=run.id,
             ) from e
 
+    def ledger_for(self, project_id: str) -> Ledger:
+        """The project's one `Ledger` (built with this pipeline's clock; rebuilt when its folder moved)."""
+        root = Path(self.project_dir(project_id))
+        with self._lock:
+            led = self._ledgers.get(project_id)
+            if led is None or led.project_dir != root:
+                led = self._ledgers[project_id] = Ledger(root, clock=self.clock)
+            return led
+
+    @staticmethod
+    def event_seq(conn: Any, run_id: str) -> int | None:
+        """The run's newest `run_events` seq (decision 73's `data.event_seq`), None when it has none."""
+        try:
+            row = conn.execute("SELECT MAX(seq) FROM run_events WHERE run_id = ?", (run_id,)).fetchone()
+        except sqlite3.Error as e:
+            log.warning("event seq of run %s not read: %s", run_id, e)
+            return None
+        return int(row[0]) if row is not None and row[0] is not None else None
+
+    def drain_ledger_outbox(self, conn: Any, project_id: str) -> int:
+        """Append what the project's ledger outbox holds, in order (`ledger.drain_outbox`); returns how many
+        records went in. A failure is a warning: the rows stay for the next append, boot or watch."""
+        try:
+            n = drain_outbox(conn, self.ledger_for(project_id))
+            left = outbox_count(conn)
+        except Exception as e:
+            log.warning("ledger outbox of %s not drained: %s: %s", project_id, type(e).__name__, e)
+            return 0
+        with self._lock:
+            if left:
+                self._outbox_dirty.add(project_id)
+            else:
+                self._outbox_dirty.discard(project_id)
+        if n:
+            log.info("ledger outbox of %s: %d record(s) appended, %d waiting", project_id, n, left)
+        return n
+
+    def _drain_before_append(self, conn: Any, project_id: str) -> None:
+        if conn is not None:
+            self.drain_ledger_outbox(conn, project_id)
+            return
+        try:
+            with self.index.project(project_id) as own:
+                self.drain_ledger_outbox(own, project_id)
+        except Exception as e:
+            log.warning("ledger outbox of %s not drained: %s: %s", project_id, type(e).__name__, e)
+
+    def _park(self, conn: Any, project_id: str, kind: str, run: Run, rec: dict[str, Any], why: str) -> None:
+        """Put a record the ledger cannot take now into the project's outbox (decision 73)."""
+        try:
+            if conn is not None:
+                enqueue_outbox(conn, rec, clock=self.clock)
+            else:
+                with self.index.project(project_id) as own:
+                    enqueue_outbox(own, rec, clock=self.clock)
+        except Exception as e:
+            log.error(
+                "ledger record %s for %s not written (%s) and not queued in the ledger outbox either: %s: %s",
+                kind,
+                run.id,
+                why,
+                type(e).__name__,
+                e,
+            )
+            return
+        with self._lock:
+            self._outbox_dirty.add(project_id)
+        log.warning("ledger record %s for %s queued in the ledger outbox: %s", kind, run.id, why)
+
     # ------------------------------------------------------------------ helpers for the routes
 
     def project_list(self) -> list[dict[str, Any]]:
-        """The head of every known project.json: indexed projects plus folders under projects_dir."""
+        """The head of every known project.json: indexed projects plus folders under projects_dir. A folder
+        whose project.json does not read is listed as `{"project_id", "root", "broken": true, "detail"}` (its
+        indexed id, else the folder name; WARNING) instead of being hidden."""
         seen: dict[str, dict[str, Any]] = {}
-        roots = [self.project_dir(pid) for pid in self.index.project_ids()]
+        roots: list[tuple[str | None, Path]] = [
+            (pid, Path(self.project_dir(pid))) for pid in self.index.project_ids()
+        ]
         pdir = self.settings.projects_dir
         if pdir is not None and pdir.is_dir():
-            roots.extend(p for p in sorted(pdir.iterdir()) if (p / "project.json").is_file())
-        for root in roots:
+            roots.extend((None, p) for p in sorted(pdir.iterdir()) if (p / "project.json").is_file())
+        for known, root in roots:
             try:
                 project = Project.load(root)
-            except (FileNotFoundError, ProjectError, ValueError):
+            except FileNotFoundError:
+                continue
+            except (ProjectError, ValueError, OSError) as e:
+                pid = known or root.name
+                if pid not in seen:
+                    detail = f"{type(e).__name__}: {e}"[:500]
+                    log.warning("project %s at %s does not read: %s", pid, root, detail)
+                    seen[pid] = {"project_id": pid, "root": str(root), "broken": True, "detail": detail}
                 continue
             seen.setdefault(project.project_id, project_head(project))
         return [seen[k] for k in sorted(seen)]

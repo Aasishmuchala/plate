@@ -1,7 +1,7 @@
 import type { Connection } from "@xyflow/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { UNSEEN_GEOMETRY_LABEL, type Graph } from "./nodeTypes";
-import { createInitialGraph, graphFromWire, graphToWire, useGraphStore } from "./store";
+import { createInitialGraph, graphFromWire, graphToWire, noteRemoteSave, useGraphStore } from "./store";
 
 /** The graph these tests start from (the seed's old placeholder; since T98 the store itself starts empty). */
 const SEED: Graph = {
@@ -184,5 +184,58 @@ describe("loadProject / toGraph", () => {
   it("graphToWire keeps handles as null when absent", () => {
     const { nodes, edges } = graphFromWire(wire);
     expect(graphToWire(nodes, edges).edges[0].sourceHandle).toBeNull();
+  });
+});
+
+describe("the daemon's graph revision (T147)", () => {
+  const stored = (revision: number): Graph & { revision: number } => ({ ...SEED, revision });
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] }); // no scheduled save ever leaves
+  });
+
+  afterEach(() => {
+    useGraphStore.setState(createInitialGraph()); // drops what was scheduled
+    vi.useRealTimers();
+  });
+
+  it("starts unknown, and a load that carries the daemon's revision adopts it", () => {
+    expect(createInitialGraph()).toMatchObject({ revision: null, conflict: null, conflictLocal: null, retryInMs: null });
+    state().loadProject(stored(4), "p");
+    expect(state()).toMatchObject({ projectId: "p", revision: 4, saveState: "saved" });
+    state().loadProject(SEED, "q"); // another project, read without one
+    expect(state().revision).toBeNull();
+  });
+
+  it("re-loading the open project with the daemon's copy is not an edit; with a local graph (no revision) it is", () => {
+    state().loadProject(stored(4), "p");
+    state().loadProject({ ...stored(6), nodes: SEED.nodes.slice(0, 2), edges: SEED.edges.slice(0, 1) }, "p");
+    expect(state()).toMatchObject({ revision: 6, saveState: "saved" });
+    expect(state().nodes).toHaveLength(2);
+    state().loadProject(SEED, "p"); // drop-to-restore: the canvas's own graph, saved against revision 6
+    expect(state()).toMatchObject({ revision: 6, saveState: "unsaved" });
+  });
+
+  it("toGraph never carries the revision (saveGraph adds it to the PUT)", () => {
+    state().loadProject(stored(4), "p");
+    expect(state().toGraph()).not.toHaveProperty("revision");
+  });
+
+  it("a conflict holds: edits stay on the canvas, the chip stays conflict and saveNow sends nothing", async () => {
+    state().loadProject(stored(4), "p");
+    useGraphStore.setState({ saveState: "conflict", conflict: { current: 5, sent: 4 } });
+    state().addNode("Edit", { x: 0, y: 0 });
+    expect(state().nodes).toHaveLength(4);
+    expect(state().saveState).toBe("conflict");
+    await state().saveNow();
+    expect(state().saveState).toBe("conflict");
+  });
+
+  it("noteRemoteSave ignores another project and revisions this tab already has", () => {
+    state().loadProject(stored(4), "p");
+    noteRemoteSave("q", 9);
+    noteRemoteSave("p", 4);
+    noteRemoteSave("p", 3);
+    expect(state()).toMatchObject({ revision: 4, saveState: "saved", conflict: null });
   });
 });
