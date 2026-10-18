@@ -16,18 +16,37 @@ router card is `nodes.runner.PREVIEWS["router"]` (`MotionRouterPreview`: `motion
 Motion or CropPair node). A node run a stopped daemon left in flight carries the staging marker, so an
 un-wired Pipeline would pick it up at the boot resume and fail it as an unknown engine.
 
+Wave 9 adds three installs after those, in this order: `people_video.install` (a People node with
+`params.video` is consulted before the Motion runner's still People, so it must wrap `motion_runs`),
+`recomposite.install` (an Edit quote with `params.recomposite_of`) and `layer_upscale.install` (the
+`upscale_ai_layer` ingress hook and the Magnific declaration), then `pipeline.route_tracker =
+route_health.Tracker(home)`, which is what lets `Pipeline.health_board` mark a failing route degraded. Every
+install is idempotent on its Pipeline.
+
+The nightly scheduler's `on_alert` is wired to the bus: each line it appends to `alerts.jsonl` (engine kinds
+and nightly kinds alike) becomes one `alert` record `{kind: "alert", source, level, message, at, alert_kind,
+engine_id?}` with the level mapping of `routes/alerts.py` (`level_of`, `source_of`), the shape the UI's status
+bar reads. The record goes to the project the line names (`data.project_id`), else to every indexed project:
+the line is app-wide and `GET /alerts` keeps the durable copy, the bus is for whoever is watching.
+
 The pixels worker reaches the pipeline through two lazy seams over the app's `PixelsClient` (`app.state.pixels`,
 built on first use and shared with `routes/pixels.py`): `LazyOcr` (the text lock's OCR boxes) and `LazyDepth`
 (the Tier C depth agreement). Nothing connects while the app is built. While no worker answers (none
 listening, or one that refuses our token) OCR finds no boxes with one logged warning, and `pipeline.depth_fn`
 reads None, the gate's "no depth backend" path. `/health` says which: `pixels: inproc | http | unavailable`.
+`/health` also says whether a Max dock is alive and how much work waits for it (`plugin: {last_poll_utc,
+queued}`, from the plugin queue) and how many alert lines were stamped in the last 24 hours (`alerts_recent`);
+a figure that cannot be read is null, never an error.
 
 Each project has its own CAS under its folder (`cas_for(project_id)`: the root the index registered, else
 `<home>/projects/<id>`), and puts are recorded in that project's index. A packet that finished ingesting is
 registered by reference in its project's `packets.json` (the folder is made, with custody C0 only, when the
 packet arrives first) and announced on the bus as `packet.ingested` (project scope, no run id). A packet whose
 manifest `supersedes` another goes through `revisions.on_new_packet` (the old packet's runs are marked, its
-Plate nodes re-bound) and a `packet.superseded` record always follows, from revisions or from here.
+Plate nodes re-bound) and a `packet.superseded` record always follows, from revisions or from here. Then,
+when `carryover.auto_enabled(project)` (the project's `settings.auto_carry_over`, `PLATE_AUTO_CARRY_OVER=0`
+for the whole daemon), `carryover.on_supersede` carries the old packet's accepted layers onto the new one and
+publishes `packet.carried`; an exception there is logged and never fails the ingest.
 
 Lifespan: a background thread finishes the packets a killed daemon left half-hashed and drives on the
 pipeline runs it left in a worker state (`Pipeline.resume`); then the nightly scheduler (`scheduler.Nightly`)
@@ -53,7 +72,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -66,8 +85,19 @@ from starlette.datastructures import MutableHeaders
 from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import __version__, motion_runs, nodes, revisions
+from . import (
+    __version__,
+    carryover,
+    layer_upscale,
+    motion_runs,
+    nodes,
+    people_video,
+    recomposite,
+    revisions,
+    route_health,
+)
 from .auth import AuthMiddleware
+from .budgets import ALERT_KIND
 from .cas import CAS
 from .config import Settings, check_project_id
 from .engine_fake import FakeEngine
@@ -81,8 +111,9 @@ from .pipeline import Pipeline, PipelineError
 from .pixels_client import DepthFn, OcrAdapter, PixelsClient, PixelsError, PixelsUnavailable
 from .projects import Project
 from .routes import API, ApiError, Ctx, include_all
+from .routes import alerts as alert_routes
 from .sse import Bus
-from .timeutil import utcnow
+from .timeutil import iso, utcnow
 
 __all__ = [
     "API",
@@ -94,6 +125,8 @@ __all__ = [
     "LazyOcr",
     "MotionRouterPreview",
     "PixelsSeam",
+    "RecentAlerts",
+    "alert_event",
     "create_app",
 ]
 
@@ -112,6 +145,7 @@ API_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 NIGHTLY_OFF = frozenset({"0", "off", "false", "no"})  # as scheduler.NightlyConfig reads PLATE_NIGHTLY
 PIXELS_PROBE_TTL_S = 30.0
 REVISION_LOCK_WAIT_S = 5.0
+ALERTS_RECENT_WINDOW = timedelta(hours=24)  # `/health` alerts_recent counts the lines stamped within it
 
 
 def _fmt_validation(err: dict[str, Any]) -> str:
@@ -123,12 +157,31 @@ def nightly_disabled(env: Mapping[str, str] | None = None) -> bool:
     return (os.environ if env is None else env).get("PLATE_NIGHTLY", "").strip().lower() in NIGHTLY_OFF
 
 
-def default_nightly(settings: Settings) -> Any:
+def default_nightly(settings: Settings, on_alert: Callable[[dict[str, Any]], None] | None = None) -> Any:
     """The scheduler the lifespan starts. Imported here so a broken scheduler module costs the nightly jobs
-    only, never the API."""
+    only, never the API. `on_alert(line)` gets a copy of every alert line it appends (see `alert_event`)."""
     from .scheduler import Nightly
 
-    return Nightly(settings, ledger_factory=lambda project: Ledger(project.root))
+    return Nightly(settings, ledger_factory=lambda project: Ledger(project.root), on_alert=on_alert)
+
+
+def alert_event(line: Mapping[str, Any]) -> dict[str, Any]:
+    """The bus record for one alert line of `alerts.jsonl`: `kind` is the bus kind (`alert`), the line's own kind is
+    `alert_kind`; `level` and `source` come from the mapping `GET /alerts` uses, so the status bar and the list
+    agree."""
+    kind = line.get("kind")
+    at = line.get("at")
+    event: dict[str, Any] = {
+        "kind": ALERT_KIND,
+        "source": alert_routes.source_of(kind),
+        "level": alert_routes.level_of(dict(line)),
+        "message": str(line.get("message", "")),
+        "at": at if isinstance(at, str) and at else iso(utcnow()),
+        "alert_kind": kind,
+    }
+    if line.get("engine_id"):
+        event["engine_id"] = line["engine_id"]
+    return event
 
 
 def _read_manifest(packet_dir: Any) -> dict[str, Any]:
@@ -155,6 +208,41 @@ def _project_lock(project: Project, wait_s: float = REVISION_LOCK_WAIT_S) -> Ite
         yield
     finally:
         lock.release()
+
+
+class RecentAlerts:
+    """`/health` `alerts_recent`: how many alert lines (all files `GET /alerts` reads) are stamped within the last
+    24 hours. The count is kept until an alert file changes or the minute turns, so the status bar's polling does not
+    re-read every file each time. None when the files cannot be read."""
+
+    def __init__(self, ctx: Callable[[], Ctx], clock: Callable[[], datetime]):
+        self._ctx = ctx
+        self._clock = clock
+        self._guard = threading.Lock()
+        self._memo: tuple[tuple[Any, ...], int] | None = None
+
+    def count(self) -> int | None:
+        try:
+            c = self._ctx()
+            now = self._clock()
+            files: list[tuple[str, int, int]] = []
+            for path, _project in alert_routes.alert_files(c):
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                files.append((str(path), st.st_mtime_ns, st.st_size))
+            sig = (tuple(files), int(now.timestamp() // 60))
+            with self._guard:
+                if self._memo is not None and self._memo[0] == sig:
+                    return self._memo[1]
+            n = len(alert_routes.collect(c, now - ALERTS_RECENT_WINDOW))
+            with self._guard:
+                self._memo = (sig, n)
+            return n
+        except Exception as e:  # health is the plugin's handshake: it never fails over a bad alert file
+            log.warning("alerts_recent not counted: %s: %s", type(e).__name__, e)
+            return None
 
 
 # ---------------------------------------------------------------------------- the pixels worker, lazily
@@ -410,6 +498,8 @@ def create_app(
             nightly = app.state.nightly
             if nightly is None:
                 nightly = app.state.nightly = (nightly_factory or default_nightly)(settings)
+            if getattr(nightly, "on_alert", None) is None:  # a factory that did not wire the bus gets ours
+                nightly.on_alert = publish_alert
             nightly.start()  # False when config.json disables it or it is already started
         except Exception as e:  # the jobs wait for the next start; the API serves regardless
             log.warning("nightly scheduler not started: %s: %s", type(e).__name__, e)
@@ -469,7 +559,25 @@ def create_app(
     nodes.install(pipeline)
     motion_runs.install(pipeline)
     judge_node.install(pipeline)
+    # Wave 9, in this order: People in motion wraps the Motion runner so a People node with `params.video` is
+    # consulted here first; then the free re-mask of a stored take and the AI-layer upscale hook.
+    people_video.install(pipeline)
+    recomposite.install(pipeline)
+    layer_upscale.install(pipeline)
+    pipeline.route_tracker = route_health.Tracker(settings.home)  # degraded routes reach the health board
     node_runner.PREVIEWS["router"] = MotionRouterPreview()
+
+    def publish_alert(line: Mapping[str, Any]) -> None:
+        """`Nightly.on_alert`: one `alert` bus record per line the nightly appended (see `alert_event`)."""
+        event = alert_event(line)
+        data = line.get("data")
+        named = data.get("project_id") if isinstance(data, Mapping) else None
+        known = index.project_ids()
+        for pid in [named] if isinstance(named, str) and named in known else known:
+            try:
+                bus.publish(None, dict(event), project_id=pid)
+            except Exception as e:  # the file is the record; a project the bus cannot write to misses one
+                log.warning("alert %s not published for %s: %s", event["alert_kind"], pid, e)
 
     def announce(project_id: str, packet_id: str, row: Mapping[str, Any]) -> None:
         supersedes = _read_manifest(row.get("path")).get("supersedes") or None
@@ -490,6 +598,23 @@ def create_app(
             supersede(project_id, packet_id, supersedes)
 
     def supersede(project_id: str, packet_id: str, old_id: str) -> None:
+        revise(project_id, packet_id, old_id)
+        carry(project_id, packet_id, old_id)
+
+    def carry(project_id: str, packet_id: str, old_id: str) -> None:
+        """The artist's accepted layers of the old packet ride onto the new one (decision 25), unless the project
+        or `PLATE_AUTO_CARRY_OVER=0` turned that off. The project lock is not held: the ledger takes it per append."""
+        try:
+            project = pipeline.load_project(project_id)
+            if project is None or not carryover.auto_enabled(project):
+                return
+            view = pipeline.packet(project_id, packet_id)
+            carryover.on_supersede(pipeline, project, view, old_id, bus=bus)
+        except Exception as e:  # the packet stays ingested; the carry-over button is the manual route
+            problem = f"{type(e).__name__}: {e}"
+            log.warning("carry-over %s -> %s in %s failed: %s", old_id, packet_id, project_id, problem)
+
+    def revise(project_id: str, packet_id: str, old_id: str) -> None:
         rev: revisions.Revision | None = None
         problem = ""
         try:
@@ -582,6 +707,17 @@ def create_app(
 
     # ------------------------------------------------------------------ health (no auth)
 
+    recent_alerts = RecentAlerts(lambda: app.state.ctx, lambda: app.state.clock())
+
+    def plugin_health() -> dict[str, Any]:
+        """When a Max dock last polled and how many jobs wait for one (`GET /plugin/status` has the detail)."""
+        try:
+            queue = pipeline.node_runner.queue
+            return {"last_poll_utc": queue.last_poll_utc(), "queued": int(queue.counts().get("queued", 0))}
+        except Exception as e:
+            log.warning("plugin status not read for /health: %s: %s", type(e).__name__, e)
+            return {"last_poll_utc": None, "queued": None}
+
     @app.get(f"{API}/health")
     def health() -> dict[str, Any]:
         return {
@@ -590,6 +726,8 @@ def create_app(
             "packet_versions": list(settings.packet_versions),
             "stub_engine": bool(getattr(engine, "stub", False)),
             "pixels": pixels.status(),
+            "plugin": plugin_health(),
+            "alerts_recent": recent_alerts.count(),
         }
 
     include_all(app)

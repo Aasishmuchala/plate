@@ -86,7 +86,7 @@ _B64_IMAGE_PREFIXES = ("iVBORw0KGgo", "/9j/", "_9j_", "R0lGOD", "UklGR", "SUkq",
 # Canvas node kinds (ui/src/nodeTypes.ts): a label that is only a kind ("Mask", "Edit 2") is not an identifier.
 NODE_KINDS = frozenset(
     "plate edit mask comp colour lightmix recolour gate judge croppair motion people set compare export "
-    "review light scout concept".split()
+    "review light scout concept reference frame atmosphere sky".split()
 )
 
 

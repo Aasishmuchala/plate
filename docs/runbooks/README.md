@@ -13,6 +13,9 @@ Short, ordered procedures for the things that go wrong on a delivery day. Each o
 | [manual-pipeline-fallback.md](manual-pipeline-fallback.md) | PLATE itself is down and the work must still go out |
 | [backup-restore.md](backup-restore.md) | backing up, the quarterly restore drill, end-of-project purge, vendor-side deletions |
 | [nightly.md](nightly.md) | what the nightly jobs do and how to read their output |
+| [weather-and-season.md](weather-and-season.md) | a client wants rain, mist, a season or an occasion: which recipe, which classes, what needs a different V-Ray packet |
+| [two-point-perspective.md](two-point-perspective.md) | a V-Ray camera has vertical tilt correction or a vertical shift: level-and-crop, the taller packet, the box measurement |
+| [what-goes-back-to-max.md](what-goes-back-to-max.md) | a change lives in a locked pixel (decorations, fixtures, wet walls, tiles, cars, branches, paving): the Max work and the AI finishing after it |
 
 `backup-restore.md` and `nightly.md` are written by the tooling tasks that own those jobs (backup, purge and reindex; the scheduler); they are linked here so the set is complete in one place.
 

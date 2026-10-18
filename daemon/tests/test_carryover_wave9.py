@@ -183,6 +183,7 @@ def _world(accept: bool):
 def world(plate_env, monkeypatch):
     """room_a with one accepted Edit run, room_a_v2 ingested on top."""
     monkeypatch.setenv("PLATE_SYNC_INGEST", "1")
+    monkeypatch.setenv("PLATE_AUTO_CARRY_OVER", "0")  # T107 carries at ingest; these call it by hand
     yield from _world(accept=True)
 
 
@@ -190,6 +191,7 @@ def world(plate_env, monkeypatch):
 def world_unaccepted(plate_env, monkeypatch):
     """The same, but the artist never accepted the take."""
     monkeypatch.setenv("PLATE_SYNC_INGEST", "1")
+    monkeypatch.setenv("PLATE_AUTO_CARRY_OVER", "0")
     yield from _world(accept=False)
 
 

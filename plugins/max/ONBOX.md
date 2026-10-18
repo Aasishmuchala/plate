@@ -101,9 +101,25 @@ plan item.
 On the conformance scene with the eight markers: with every shift and tilt zero, reproject the
 markers through `plate_spec.project_point(manifest["camera"], p)`: under 0.5 px RMS at 3840 wide,
 principal point within 0.5 px of the centre. Then set a vertical shift of 0.1, and separately auto
-vertical tilt: confirm `policy.lint_scene(cam)` reports `SHIFTED_CAMERA` and `packet.build_camera_block`
-refuses. Measure where the principal point moves for the shift (for the later minor version of the
-spec). Also reproject three known vertices of the TULA building within 1 px (the P0 exit).
+vertical tilt: confirm `policy.lint_scene(cam)` reports `SHIFTED_CAMERA` as a problem and
+`packet.build_camera_block` refuses the camera itself, while `policy.lint_scene(cam, level_and_crop=True)`
+(what Send passes by default) reports it as a warning. Then Send both cameras: Send renders a level copy
+(`__PLATE_level_<camera>`) and crops (decision 58, `bridge/camera_level.py`, `docs/max-plugin.md`
+"Level-and-crop"; the runbook is `docs/runbooks/two-point-perspective.md`). Measure, and write the answers
+into `camera_level.py`:
+
+- the unit of V-Ray's vertical shift: where the principal point moves, in pixels, for `vertical_shift = 0.1`
+  (`SHIFT_UNIT`; read as a fraction of the frame height until measured, open question 14);
+- the sign of a positive shift: does it raise the view (the code puts the frame at the top of the level
+  render for a positive `dy`)?
+- whether a manual `vertical_tilt` value is the full correction of the pitch (what *Guess vertical tilt* sets),
+  by comparing it with auto;
+- the reprojection exit: for a V-Ray Physical Camera with auto vertical tilt, the level-and-crop packet
+  cropped to its `safe_frame` matches the tilt-corrected render within 0.5 px at the eight markers;
+- the temporary copy takes the level pose (`rt.copy`, `objecttransform`), is deleted after the render, and the
+  artist's camera is unchanged; every MAXScript property name there is `TODO-verify`.
+
+Also reproject three known vertices of the TULA building within 1 px (the P0 exit).
 
 ## 5. Element overhead (caps: 15% time, 10% RSS)
 

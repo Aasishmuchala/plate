@@ -22,14 +22,14 @@ Dependency note: versions are pinned exactly. `package-lock.json` was generated 
 
 | folder | what | its own notes |
 |---|---|---|
-| `src/nodeTypes.ts`, `src/canvasRules.ts`, `src/store.ts` | the 19 node kinds and the typed graph model, the pure rules (`canConnect`, `validateEdge`, `generationDepth`, `canAccept`, `applyOverride`), `useGraphStore` | `spec/canvas_rules_vectors.json` is shared with the daemon's `canvas_rules.py` |
-| `src/PlateCanvas.tsx`, `src/App.tsx` | the canvas (status bar, `+ node` palette, node list, toast) and the slots for the editor, viewer and panels | |
-| `src/nodes/` | one component per kind with the shared header (kind, tier, gate, approval, risk), typed handles (`image16`, `mask`, `packet`, `video`, `report`) | `ports.ts` |
-| `src/canvas/` | wiring checks, run store and SSE, the candidate strip, the compare viewer slot, the theme | |
-| `src/makebar/` | engine select filtered by node and custody, preset, N 1 to 6, region crop, quote with countdown, approval dialog, fallback engine list | |
+| `src/nodeTypes.ts`, `src/canvasRules.ts`, `src/store.ts` | the 23 node kinds and the typed graph model, the pure rules (`canConnect`, `validateEdge`, `generationDepth`, `canAccept`, `applyOverride`), `useGraphStore` | `spec/canvas_rules_vectors.json` is shared with the daemon's `canvas_rules.py` |
+| `src/PlateCanvas.tsx`, `src/App.tsx` | the canvas (status bar with the save-state, alert and Max dock chips, `+ node` palette, node list, toast), right-click menus, Tidy, the Enlarge key handling, and the slots for the editor, viewer and panels | |
+| `src/nodes/` | one component per kind with the shared header (kind, tier, gate, approval, risk), typed handles (`image16`, `mask`, `packet`, `video`, `report`, `reference`) | `ports.ts`; `FrameNode.tsx` is the annotation box |
+| `src/canvas/` | wiring checks, run store and SSE, the candidate strip (Set as A / B), the compare viewer slot and its Enlarge stage (`enlarge.css`), the canvas menus (`ContextMenu.tsx`), Tidy (`layout.ts`), the theme | |
+| `src/makebar/` | engine select filtered by node and custody with engine-card numbers, the capability and route-health chips, Compare engines (`quote_many`), preset (not for Edit), N 1 to 6, region crop, quote with countdown and price tier, approval dialog, fallback engine list | |
 | `src/viewer/` | the WebGL2 viewer: wipe, toggle, difference, edge overlay, ΔE00 heatmap, 100% tiles | [src/viewer/README.md](../ui/src/viewer/README.md) |
-| `src/panels/` | Projects, History, Gate, Custody, Timer, verdict keys and the full-scrub gate, drop-to-restore | [src/panels/README.md](../ui/src/panels/README.md) |
-| `src/editors/` | Mask, CropPair, Motion, People, Set, LightMix, Recolour, Light, Scout, and the video player | [src/editors/README.md](../ui/src/editors/README.md) |
+| `src/panels/` | Projects (with the Project Sheet and Apply template), History, Gate, Custody, Timer, Spend, Settings, verdict keys and the full-scrub gate, drop-to-restore | [src/panels/README.md](../ui/src/panels/README.md) |
+| `src/editors/` | Plate, Mask, Edit (recipes, tokens, Save as recipe), Reference, CropPair, Motion, People, Set, LightMix, Recolour (RAL grid, swatches), Light, Scout, Export (clips, batch, cutdowns), Review, the Re-mask bar, the video player and VideoCompare | [src/editors/README.md](../ui/src/editors/README.md) |
 | `src/api/` | the fetch client, token capture and the daemon heartbeat | |
 | `src/test/` | `setup.ts` (jest-dom, RTL cleanup, the jsdom polyfills xyflow needs) and the canvas, panels, editors and viewer suites | |
 
@@ -41,19 +41,21 @@ Dependency note: versions are pinned exactly. `package-lock.json` was generated 
 |---|---|---|
 | `UNKNOWN_NODE` | `unknown node` | |
 | `CYCLE` | `cycle` | the graph stays a DAG so depth is defined |
+| `REFERENCE_ONLY` | `a reference feeds an engine's reference input only; it is never composited` (an edge from a Reference may only target `refs`, `elements` or `sky`) | a reference is an input, never pixels |
+| `ANNOTATION` | `a Frame is an annotation; it takes no edges` | |
 | `CONCEPT_TO_DELIVERY` | `concept tier cannot reach Export` (or `Review`), directly or through other nodes | 1, geometry first |
 | `NO_PLATE_ANCHOR` | `generation must be anchored to a plate camera (source-view-only)` | 2 |
 | `DEPTH_EXCEEDED` | `generation depth > 2 from the plate`, for the target and everything downstream | 7 |
-| `VIDEO_LOCKED` | `motion is locked until the upstream still passes gates and is approved` (or `crop pair`) | 7 |
+| `VIDEO_LOCKED` | `motion is locked until the upstream still passes gates and is approved` (or `crop pair`); it also holds for a still wired to a Motion's `end` input, and the message names the `end still` | 7 |
 | `HIGH_RISK_MOVE` | `<risk> risk move is blocked until it is overridden with a reason` | 7 |
 | `INVENTED_ANGLE` | `a camera override needs an explicit override and the label 'unseen geometry guessed'` | 2 |
 | `SCRUB_REQUIRED` | `'<label>' cannot be accepted without a logged full scrub` | 7 |
 
-Generating nodes (`Edit`, `People`, `Motion`, `CropPair`) each cost one generation of depth. A `PREVIS_NOT_DELIVERABLE` rule (a previs output never reaches Export or Delivery; a Review may show it, watermarked) is part of both rule sets and their shared vectors.
+Generating nodes (`Edit`, `People`, `Motion`, `CropPair`) each cost one generation of depth; `Reference`, `Frame`, `Comp`, `Colour`, `Atmosphere`, `Sky` and the other numeric nodes cost none, and a Reference alone never anchors an Edit (`NO_PLATE_ANCHOR`). The two new codes are checked right after `UNKNOWN_NODE` and `CYCLE`, in both languages. A `PREVIS_NOT_DELIVERABLE` rule (a previs output never reaches Export or Delivery; a Review may show it, watermarked) is part of both rule sets and their shared vectors.
 
 ## The graph is saved for you, and the server owns status
 
-The store saves the graph by itself: 400 ms after any structural change (a node added or removed, a wire, a parameter; not a move), and always right before a quote. Every request carries `X-Plate-Client: ui`, which is how the daemon knows a person is at the keyboard. What the server stores for each node's `gateStatus`, `approved`, `approvedBy` and `scrubLogId` is computed from the run history and the ledger, not taken from the browser; the answer to the save is applied back onto the nodes. A save the daemon refuses (a wire that breaks a canvas rule) marks that wire as refused and shows the reason.
+The store saves the graph by itself: 400 ms after any structural change (a node added or removed, a wire, a parameter), 1.5 s after a drag of nodes ends (a positions-only save), and always right before a quote. The status bar chip reads `saved HH:MM:SS`, `unsaved`, `saving…` or, in red, `save failed: <message>`; the tab title is `PLATE · <project>` with a trailing ` *` while there is something unsaved. A project with no open graph shows an empty-state card; no placeholder nodes are loaded. Every request carries `X-Plate-Client: ui`, which is how the daemon knows a person is at the keyboard. What the server stores for each node's `gateStatus`, `approved`, `approvedBy` and `scrubLogId` is computed from the run history and the ledger, not taken from the browser; the answer to the save is applied back onto the nodes. A save the daemon refuses (a wire that breaks a canvas rule) marks that wire as refused and shows the reason.
 
 ## Daemon routes the UI calls
 
@@ -61,8 +63,8 @@ Every route below is in the daemon (under `/api/v0`). Bearer token on all of the
 
 | route | used by | what it answers |
 |---|---|---|
-| `GET /engines[?project_id=]` | Make bar | manifest summaries: routes with provider, custody grade and status, parameters, presets, price, legal sizes; `project_id` adds `allowed`. The daemon's own fake engine is listed when it runs on the fake |
-| `GET /recipes` | Edit editor | the runnable recipes (id, title, kind, engine, shot class, mask classes) |
+| `GET /engines[?project_id=]` | Make bar | manifest summaries: routes with provider, custody grade, status and `health` (`ok`, `degraded`, `down`, `suspended`), parameters, presets, price, legal sizes and `capabilities` (`largest_size`, `image_tail`, `reference_images_max`, `elements`, `price_unit`, `runnable`, `unverified`); `project_id` adds `allowed`. The daemon's own fake engine is listed when it runs on the fake |
+| `GET /recipes[?project_id=&kind=]` | Edit and Motion editors, Apply template | the runnable recipes from the shipped, studio and project folders: id, title, kind, engine, shot class, mask classes, `origin`, `group`, `thumbnail`, `task`, the open `tokens` and their `overrides` |
 | `GET /projects/{id}/packets[?status=all]` | Plate editor | the project's packets with plate hash and size, camera name, `supersedes` and `superseded_by` |
 | `GET /packets/{id}/summary` | Plate and Mask editors | size, plate, camera, policy and the legend entries (`editable`, `locked`, `planar`) of an ingested packet |
 | `GET /projects/{id}/runs[?node_id=&state=&limit=]` | History panel, Export and Review editors | run views, newest first |
@@ -74,7 +76,24 @@ Every route below is in the daemon (under `/api/v0`). Bearer token on all of the
 | `POST /runs/{id}/export` | Export editor | the exported file, its sidecar and format; a GATE_FAIL take needs an override reason |
 | `POST /projects/{id}/review` | Review editor | the review zip: path, size, takes |
 | `POST /projects/{id}/import` | none yet (API) | an external render (Higgsfield, Runway or a file by hand) imported as a run and gated |
-| `POST /runs/{id}/deliver` | none yet (API) | a video delivery format from a finished clip take |
+| `POST /runs/{id}/deliver` | Export editor (clip takes), video player Deliver… | a video delivery format from a finished clip take |
+| `POST /assets?kind=reference&project_id=` | Reference editor | stores an uploaded PNG or JPEG (at most 32 MiB) as an 8-bit RGB PNG with no metadata, a side over 4096 px shrunk (`scaled_from`), and lists it in the project's `references.json`; answers `{hash, width, height, kind, project_id, scaled_from}` |
+| `GET /projects/{id}/references` | Reference editor | the project's uploaded references: hash, size, bytes, upload time, note |
+| `POST /recipes` | Edit editor, Save as recipe | writes a schema-1 recipe to the studio or project folder (`scope`, `project_id`, `overwrite`, `recipe`); 409 `recipe_exists`, 422 for a bad document or an engine not in the manifests |
+| `GET /recipes/{id}/assemble[?project_id=&tokens=]` | Edit and Motion editors | the prompt and negative prompt the recipe would send, with `unfilled` and `unfilled_tokens`, from the Project Sheet and the `tokens` overrides |
+| `GET /engines/cards[?project_id=&task=&shot_class=]` | Make bar, Motion editor | the engine cards folded from the project's ledger (`n`, `passes`, `wilson_lower_95`, `mean_cost`, `steering`); no project answers `[]` |
+| `GET /alerts[?since=&limit=]` | none yet (API; the status bar follows the event bus) | the lines of every alert file, newest first, each with a kind, a `level`, a message, the time and the engine or project it names |
+| `POST /projects/{id}/export` | Export editor, Batch export | many takes through the single export's guards: `{exported, refused}`; `run_ids` or `accepted`, `out_dir`, `format`, `name_pattern` |
+| `POST /runs/{id}/cutdown` | Export editor, Cutdown | a 9:16, 4:5, 1:1 or 16:9 downsample-only crop of an approved master, with its lineage, the IPTC AI marker and a `.cutdown.json`; `{path, sidecar, box}` |
+| `GET /projects/{id}/settings`, `PUT /projects/{id}/settings` | Projects panel, Project Sheet | the 14 Project Sheet fields with their defaults, `default_engine`, `auto_carry_over` and the policy; the PUT replaces the keys it carries |
+| `GET /projects/{id}/spend[?since=&by=]`, `GET /spend?all_projects=1` | Spend tab | the ledger folded into quoted, billed, accepted and cost per accepted, by engine, day or week |
+| `GET /docs/`, `GET /docs/{name}.md` | Settings, Help | the repo's `docs/**.md` as Markdown, confined to the docs folder |
+| `GET /templates[?project_id=]` | Projects panel, Apply template | the shipped and project graph templates: id, title, nodes per packet, `set` |
+| `POST /projects/{id}/templates/apply` | Projects panel, Max dock Send + quote | lays one chain per packet, quotes every new Edit and optionally auto-approves under the cap: `{nodes_added, edits, runs, total_usd, refused, awaiting_approval, graph}` |
+| `POST /projects/{id}/nodes/{node}/quote_many` | Make bar, Compare engines | quotes one node on 2 to 5 engines as one sibling group: `{sibling_group, runs, total_usd}`; all or nothing |
+| `POST /packets/{id}/carry-over` | Plate editor | carries the approved layers of the packet this one supersedes (or `from_packet_id`) onto it: one `carried` or `dropped` result per layer |
+| `GET /plugin/status` | the Max dock chip in the status bar | `{last_poll_utc, queued, claimed}` of the dock's job queue |
+| `POST /runs/{id}/recomposite` | Re-mask bar | a free re-mask of a stored raw take (`feather_px`, `grow_px`, `mask_hash`): quoted at 0 USD, approved as a person, run, answered as `GET /runs/{id}` |
 | `POST /projects/{id}/tierc`, `/kit` | Projects panel, Import client plate | a Tier C plate (consent record required) or a client kit, ingested as a packet |
 | `PUT /projects/{id}/custody` | Projects panel, Custody row | the project's NDA flag and allowed grades; loosening needs a reason |
 
@@ -98,4 +117,4 @@ PLATE_HOME="$HOME/plate-smoke-home" PLATE_FAKE_ENGINE=1 PLATE_PIXELS_INPROC=1 PL
 
 ## Routes without a canvas control
 
-Two routes have no canvas control yet: importing an external render (`POST /projects/{id}/import`) and the video delivery formats (`POST /runs/{id}/deliver`). Everything else the UI calls is in the daemon. `docs/VERIFICATION.md` records which of these were exercised in a real browser.
+Two routes have no canvas control yet: importing an external render (`POST /projects/{id}/import`; `plate import` does it) and the alert list (`GET /alerts`; the status bar shows the latest alert from the event bus). The numeric nodes Comp, Colour, Atmosphere and Sky have a node and a Make bar entry but no parameter panel, so their values are set on the node's `params`. Everything else the UI calls is in the daemon. `docs/VERIFICATION.md` records which of these were exercised in a real browser.

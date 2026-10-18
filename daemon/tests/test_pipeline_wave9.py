@@ -649,6 +649,7 @@ def test_an_ingress_hook_runs_on_the_engine_bytes_before_restore(sync_settings, 
             seen.append((run.id, staged.opaque_name, pv.packet_id))
             return shift_right(data, DRIFT_PX), {"shift_px": DRIFT_PX}
 
+        pl.ingress_hooks.clear()  # create_app registers the AI-layer upscale (T107); only `shift` is under test
         pl.ingress_hooks.append(("shift", shift))
         packet_id = _setup(c, auth)
         _put_graph(
@@ -731,6 +732,7 @@ def test_a_degraded_route_is_named_in_the_quote_and_never_routed_to(sync_setting
 def test_no_tracker_or_an_unreadable_one_degrades_nothing(sync_settings, auth):
     with _client(sync_settings) as c:
         pl = c.app.state.pipeline
+        pl.route_tracker = None  # create_app attaches a Tracker (T107); this test is about having none
         assert pl.route_tracker is None and pl.degraded_routes() == {}
 
         class Broken:

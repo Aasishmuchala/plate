@@ -433,12 +433,16 @@ def test_a_magnific_mode_without_a_declaration_never_calls_magnific(sync_setting
     """A run whose params say magnific but whose quote did not declare it (quoted before the install): the free
     local pass runs and the record says why."""
     monkeypatch.setenv("PLATE_LIVE", "1")
+    install = layer_upscale.install
+    monkeypatch.setattr(
+        layer_upscale, "install", lambda _pl: None
+    )  # create_app installs it (T107): not for this run
     with _client(sync_settings) as c:
         pl = c.app.state.pipeline
         _setup(c, auth)
         run, quote = _quote(c, {"params": {"upscale_layers": "magnific"}})  # before install: not declared
         assert quote.price_usd == pytest.approx(FAKE_PRICE)
-        up = layer_upscale.install(pl)
+        up = install(pl)
         up.magnific_factory = lambda *a: pytest.fail("Magnific must not be called for an undeclared pass")
         done = _approve(c, auth, run.id)
         assert done["state"] == "DONE", done.get("error")
