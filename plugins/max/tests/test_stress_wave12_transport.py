@@ -340,7 +340,9 @@ def test_the_four_calls_pump_when_the_config_carries_one(tmp_path):
         assert transport.post_packet(tmp_path, cfg)["status_code"] == 202
         after_post = len(pumped)
         assert transport.follow_ingest("/e", cfg)["ingest"] == "ingested"
-    assert after_hash >= 3 and after_post - after_hash >= 3 and len(pumped) - after_post >= 3
+    # The contract is that each call pumps while it waits; the count depends on the runner's scheduling
+    # (a loaded CI box saw 2 pumps in a 0.5 s wait), so each phase only has to pump at least once.
+    assert after_hash >= 1 and after_post - after_hash >= 1 and len(pumped) - after_post >= 1
     calls = len(pumped)
     with http_stub(respond) as (url, _seen):
         transport.hash_payloads({"scene": b"{}"}, {"token": TOKEN, "daemon_url": url})

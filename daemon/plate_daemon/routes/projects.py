@@ -13,7 +13,8 @@
   stores one carry `revision` next to `nodes`/`edges`. A `PUT` that sends a `revision` other than the stored one
   is 409 `{"error": "graph_conflict", "current", "sent"}` (one that sends none is an old client: accepted).
   Before any rule runs a graph is held to `projects.check_graph` (string node ids and kinds, string edge ends:
-  else 422, UNKNOWN_NODE for a node; over 4 MiB: 422 `graph_too_large`).
+  else 422, UNKNOWN_NODE for a node; over 4 MiB: 422 `graph_too_large`; one node's `params` over 256 KiB of
+  compact JSON: 422 `params_too_large` with the `node_id`, its `bytes` and the `limit_bytes`).
 - `POST /projects/{id}/nodes {kind, params?, label?, connect_from?, position?}` (201) appends one node, id
   `<kind>-<n>` for the smallest free n, with an edge from each `connect_from` node, through the same status
   derivation and rules as `PUT`: `{node_id, revision, graph, violations}`. It is how an agent adds a node
@@ -70,7 +71,7 @@ from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
-from .. import __version__, canvas_rules
+from .. import __version__, canvas_rules, recipes
 from ..config import check_project_id
 from ..custody import CustodyViolation
 from ..ledger import Ledger, LedgerError
@@ -78,9 +79,11 @@ from ..lock import ProjectLocked
 from ..pipeline import PipelineError, project_head
 from ..projects import (
     GRAPH_MAX_BYTES,
+    NODE_PARAMS_MAX_BYTES,
     GraphShapeError,
     GraphTooLarge,
     Lock,
+    NodeParamsTooLarge,
     Project,
     ProjectError,
     check_custody,
@@ -343,6 +346,18 @@ def create_project(request: Request, body: ProjectBody) -> JSONResponse:
     try:
         project = Project.create(root, pid, custody, now=c.now())
     except FileExistsError as e:
+        # Windows raises FileExistsError (WinError 183) where POSIX raises NotADirectoryError when a parent
+        # of the root is a file; that is a filesystem refusal, not an existing project.
+        blocker = next((p for p in (root, *root.parents) if p.exists() and not p.is_dir()), None)
+        if blocker is not None:
+            raise ApiError(
+                422,
+                {
+                    "error": "filesystem",
+                    "errno": "ENOTDIR",
+                    "detail": f"{blocker} is a file, so {root} cannot be made",
+                },
+            ) from e
         raise ApiError(409, {"error": "exists", "project_id": pid, "detail": str(e)}) from e
     except ProjectError as e:
         raise ApiError(422, {"errors": [str(e)]}) from e
@@ -545,14 +560,26 @@ def _refused(problems: list[dict[str, Any]]) -> ApiError:
 
 
 def _shape_checked(graph: dict[str, Any]) -> None:
-    """`projects.check_graph` as the routes answer it: 422 `graph_too_large`, a node's problem as an
-    UNKNOWN_NODE refusal (never a 500 from an id that is an object), anything else as `errors`."""
+    """`projects.check_graph` as the routes answer it: 422 `graph_too_large`, 422 `params_too_large` (one node's
+    params over `NODE_PARAMS_MAX_BYTES`), a node's problem as an UNKNOWN_NODE refusal (never a 500 from an id
+    that is an object), anything else as `errors`."""
     try:
         check_graph(graph)
     except GraphTooLarge as e:
         raise ApiError(
             422,
             {"error": "graph_too_large", "errors": [str(e)], "bytes": e.size, "limit_bytes": GRAPH_MAX_BYTES},
+        ) from e
+    except NodeParamsTooLarge as e:  # before the generic ProjectError, which would be `errors` alone
+        raise ApiError(
+            422,
+            {
+                "error": "params_too_large",
+                "errors": [str(e)],
+                "node_id": e.node_id,
+                "bytes": e.size,
+                "limit_bytes": NODE_PARAMS_MAX_BYTES,
+            },
         ) from e
     except GraphShapeError as e:
         if e.code is not None:
@@ -818,11 +845,37 @@ def put_custody(request: Request, project_id: str, body: CustodyBody) -> dict[st
 # ---------------------------------------------------------------------------- quoting a node
 
 
+def _check_recipe_path(project: Project, node_id: str, body: NodeQuoteBody) -> None:
+    """Decision 88: a recipe named by file path (in the body, else in the node's `params.recipe`) must lie in
+    the project's `recipes/` folder, the studio's or the shipped one. Checked here, before the pipeline loads
+    anything, so the 422 `unknown_recipe` says why; the pipeline's own answer for a path it cannot read names
+    the path only. A recipe id is not looked at."""
+    ref = body.recipe
+    if not ref:
+        try:
+            nodes = canvas_rules.as_graph(project.graph).nodes
+        except (ValueError, TypeError, KeyError):
+            return  # a graph that does not read is the pipeline's to refuse
+        node = next((n for n in nodes if n.get("id") == node_id), None)
+        params = node.get("params") if node is not None else None
+        ref = params.get("recipe") if isinstance(params, Mapping) else None
+    if not isinstance(ref, str) or not recipes.names_a_file(ref):
+        return
+    try:
+        recipes.check_recipe_path(ref, project.root)
+    except recipes.RecipeError:
+        # Names the path as the pipeline's own refusals do (an NDA project's MCP withholds it); no file text.
+        raise pipeline_error(
+            PipelineError(f"recipe {ref}: {recipes.PATH_REFUSAL}", code="unknown_recipe")
+        ) from None
+
+
 @router.post("/projects/{project_id}/nodes/{node_id}/quote")
 def quote_node(request: Request, project_id: str, node_id: str, body: NodeQuoteBody) -> dict[str, Any]:
     c = ctx(request)
-    _project(request, project_id)
+    project = _project(request, project_id)
     _touch_if_human(request)
+    _check_recipe_path(project, node_id, body)
     with c.index.project(project_id) as conn:
         try:
             run, quote = c.pipeline.quote_node(conn, project_id, node_id, body.model_dump(), now=c.now())

@@ -559,7 +559,9 @@ def test_follow_ingest_reports_the_failure_errors():
         out = transport.follow_ingest(
             url + "/api/v0/packets/pkt_X/events", {"token": TOKEN, "daemon_url": url}
         )
-    assert out["ingest"] == "failed: a: bad; b: worse"
+    assert out["ingest"] == "failed: a: bad; b: worse", (
+        out
+    )  # the problem field says why if it stayed ingesting
 
 
 def test_follow_ingest_polls_one_second_apart_until_the_window_ends():

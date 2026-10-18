@@ -372,7 +372,8 @@ class Poller:
     def _claimed_here(self, job: Mapping[str, Any]) -> bool:
         """The job was claimed after this poller was made (so the lost answer may have been ours)."""
         claimed = _utc(job.get("claimed_utc"))
-        return claimed is not None and claimed > self.started_utc
+        # `>=`: a claim made in the same clock tick as the poller (Windows time.time() ticks ~15 ms) is ours.
+        return claimed is not None and claimed >= self.started_utc
 
     def _recover_claims(self, cfg: Mapping[str, Any]) -> bool:
         """GET the claimed jobs and keep the ones claimed since started_utc for _take_up; False (backing

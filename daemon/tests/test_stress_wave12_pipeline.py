@@ -27,6 +27,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import statistics
 import threading
 import time
 from collections import Counter
@@ -437,7 +438,13 @@ def test_45_slow_approvals_run_on_the_executor_and_never_freeze_the_api(
                 stop.set()
                 prober.join(15)
         assert health_codes and set(health_codes) == {200}
-        assert max(health_s) < 1.0, max(health_s)
+        # The attack this pins froze the API for the whole run (30 s+). One slow probe on a loaded runner
+        # (windows-latest saw a 2.2 s outlier) is not a freeze: the median must stay fast and no probe may
+        # take more than 5 s.
+        assert statistics.median(health_s) < 0.5 and max(health_s) < 5.0, (
+            statistics.median(health_s),
+            max(health_s),
+        )
         assert max(active_seen) <= 4, max(active_seen)
         assert engine.submit_count == 45
 
