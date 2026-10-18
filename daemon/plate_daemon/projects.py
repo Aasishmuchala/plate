@@ -19,6 +19,8 @@ whatever a client sends, and only a literal `true` written by the server (`mark_
 project's `UNSET_CUSTODY`) survives `Project.create` and `Project.load`. `check_graph` is what the routes hold a
 client's graph to (objects with string ids and kinds, edges with string ends, at most `GRAPH_MAX_BYTES`); the
 folder itself only needs lists of objects, so a graph the server stored before those checks still loads.
+A node's `params` is held to `NODE_PARAMS_MAX_BYTES` of compact JSON on top of that (`NodeParamsTooLarge`,
+decision 88): one node cannot take the whole graph's 4 MiB.
 """
 
 from __future__ import annotations
@@ -48,13 +50,16 @@ REVIEW_DIR = "review"
 LOCK_NAME = "project.lock"
 UNSET = "unset"  # the server's mark on the custody of a project a packet made first
 GRAPH_MAX_BYTES = 4 * 1024 * 1024  # a client's graph, compact JSON: 4 MiB
+NODE_PARAMS_MAX_BYTES = 262144  # one node's `params`, compact JSON: 256 KiB (decision 88)
 GRAPH_REVISION = "graph_revision"
 
 __all__ = [
     "GRAPH_MAX_BYTES",
+    "NODE_PARAMS_MAX_BYTES",
     "GraphShapeError",
     "GraphTooLarge",
     "Lock",
+    "NodeParamsTooLarge",
     "Project",
     "ProjectError",
     "ProjectLocked",
@@ -74,6 +79,16 @@ class GraphTooLarge(ProjectError):
     def __init__(self, size: int):
         self.size = size
         super().__init__(f"graph is {size} bytes; the limit is 4 MiB")
+
+
+class NodeParamsTooLarge(ProjectError):
+    """One node's `params` over `NODE_PARAMS_MAX_BYTES` (the routes answer 422 `params_too_large`)."""
+
+    def __init__(self, node_id: str, size: int):
+        self.node_id, self.size = node_id, size
+        super().__init__(
+            f"node {node_id!r}: params are {size} bytes; the limit is {NODE_PARAMS_MAX_BYTES // 1024} KiB"
+        )
 
 
 class GraphShapeError(ProjectError):
@@ -138,8 +153,9 @@ def _check_graph_lists(graph: Any) -> dict[str, Any]:
 def check_graph(graph: Any) -> dict[str, Any]:
     """A client's graph, before any rule reads it: every node an object with a non-empty string `id` and a
     string `kind` (read where the canvas rules read it: the node's `data` object when it has one, else the
-    node), every edge an object with string `source` and `target`, and at most `GRAPH_MAX_BYTES` as compact
-    JSON. `GraphShapeError` (UNKNOWN_NODE for a node) or `GraphTooLarge`, both `ProjectError`s."""
+    node), every edge an object with string `source` and `target`, at most `GRAPH_MAX_BYTES` as compact JSON,
+    and no node whose `params` are over `NODE_PARAMS_MAX_BYTES` as compact JSON. `GraphShapeError` (UNKNOWN_NODE
+    for a node), `GraphTooLarge` or `NodeParamsTooLarge`, all `ProjectError`s."""
     _check_graph_lists(graph)
     for i, node in enumerate(graph["nodes"]):
         nid = node.get("id")
@@ -158,6 +174,16 @@ def check_graph(graph: Any) -> dict[str, Any]:
     size = len(json.dumps(graph, separators=(",", ":")).encode())
     if size > GRAPH_MAX_BYTES:
         raise GraphTooLarge(size)
+    for node in graph["nodes"]:
+        # Where the canvas rules read it: the node's `data` object when it has one, else the node (either may
+        # hold `params`; both are held to the cap).
+        for holder in (node, node["data"]) if isinstance(node.get("data"), dict) else (node,):
+            if not holder.get("params"):
+                continue
+            text = json.dumps(holder["params"], separators=(",", ":"), ensure_ascii=False)
+            n = len(text.encode("utf-8", "surrogatepass"))  # a lone surrogate in a string is still counted
+            if n > NODE_PARAMS_MAX_BYTES:
+                raise NodeParamsTooLarge(node["id"], n)
     return graph
 
 

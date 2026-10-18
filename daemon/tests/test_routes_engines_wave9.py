@@ -476,11 +476,13 @@ def test_assemble_refusals(client, auth):
         assert r.status_code == 422, bad
 
 
-def test_assemble_never_reads_a_file_path(client, auth, tmp_path, monkeypatch):
-    """`load_runnable` treats `x.yaml` as a path; the route takes ids only."""
-    loose = tmp_path / "loose.yaml"
+def test_assemble_never_reads_a_file_path(client, auth, plate_env, monkeypatch):
+    """`load_runnable` treats `x.yaml` as a path (inside a recipe folder, decision 88); the route takes ids only."""
+    studio = plate_env / "recipes"
+    studio.mkdir()
+    loose = studio / "loose.yaml"
     loose.write_text(yaml.safe_dump(recipe_doc("loose")), encoding="utf-8")
-    monkeypatch.chdir(tmp_path)  # a relative `loose.yaml` would resolve here if the route let it through
+    monkeypatch.chdir(studio)  # a relative `loose.yaml` would resolve here if the route let it through
     assert recipes.load_runnable("loose.yaml").id == "loose"
     r = client.get(f"{API}/recipes/loose.yaml/assemble", headers=auth)
     assert r.status_code == 404 and r.json()["error"] == "unknown_recipe"

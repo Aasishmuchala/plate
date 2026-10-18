@@ -14,6 +14,10 @@ shadowing an earlier id: `shipped` (this package: the three P1 recipes and Lensb
 runnable), `studio` (`<app-data>/recipes/`) and `project` (`<project>/recipes/`). `save_runnable` writes the
 second and third; the shipped folder is never written. The schema is in README.md.
 
+A recipe named by file path (`load_runnable(path)`) must resolve inside one of those folders (`recipe_roots`,
+decision 88): a path anywhere else is refused before the file is opened, so an API caller cannot make the
+daemon read, parse or quote an arbitrary YAML file. A symlink is judged by where it points.
+
 Nothing here talks to a vendor or a model: the composer (`plate_daemon.llm.composer`) calls `assemble` for its
 template-only path and for the text it hands the model.
 """
@@ -39,6 +43,7 @@ __all__ = [
     "DEFAULT_NEGATIVE_PROMPT",
     "KINDS",
     "ORIGINS",
+    "PATH_REFUSAL",
     "RECIPES_DIR",
     "RISKS",
     "Recipe",
@@ -52,14 +57,17 @@ __all__ = [
     "arch_prefix",
     "assemble",
     "assemble_runnable",
+    "check_recipe_path",
     "fill_tokens",
     "get_recipe",
     "is_recipe_id",
     "list_runnable",
     "load_runnable",
     "mat_tells",
+    "names_a_file",
     "parse_runnable",
     "project_recipes_dir",
+    "recipe_roots",
     "repair",
     "repairs",
     "risk_for",
@@ -94,12 +102,14 @@ DEFAULT_NEGATIVE_PROMPT = (
     "restyled materials, text, logos, captions"
 )
 _BRACKET = re.compile(r"\[([^\]]+)\]")
-_ID = re.compile(r"^[a-z][a-z0-9_]*$")
+_ID = re.compile(r"[a-z][a-z0-9_]*")  # matched with `fullmatch`: a `$` would accept a trailing "\n"
 # A recipe id is a file name; these are device names on Windows whatever the extension.
 _RESERVED_IDS = frozenset(
     {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
 )
 _CAS_HASH = re.compile(r"^[0-9a-f]{16,128}$")
+# Why a recipe file path outside the recipe folders is refused (`check_recipe_path`; the quote route words it too).
+PATH_REFUSAL = "recipe paths must live in the project's recipes/ folder, the studio recipes folder or the shipped recipes"
 
 
 class RecipeError(ValueError):
@@ -457,7 +467,7 @@ def _runnable_from(doc: Any, where: str, origin: str = "shipped") -> RunnableRec
     if not isinstance(doc, dict) or doc.get("schema") != 1:
         raise RecipeError(f"{where}: expected a mapping with schema: 1")
     rid = str(_text(doc, "id", where))
-    if not _ID.match(rid):
+    if not _ID.fullmatch(rid):
         raise RecipeError(f"{where}: id {rid!r} must be lower_snake_case")
     if rid in _RESERVED_IDS:
         raise RecipeError(f"{where}: id {rid!r} is a reserved device name on Windows; pick another")
@@ -540,7 +550,7 @@ def is_recipe_id(name: str) -> bool:
     """True for a string that can name a runnable recipe (and so a file `<id>.yaml`): lower_snake_case, not a
     Windows device name. A caller that takes an id from outside checks this before `load_runnable`, which would
     treat anything ending in `.yaml` as a file path."""
-    return bool(_ID.match(name)) and name not in _RESERVED_IDS
+    return bool(_ID.fullmatch(name)) and name not in _RESERVED_IDS
 
 
 def parse_runnable(doc: Any, origin: str = "project") -> RunnableRecipe:
@@ -626,8 +636,7 @@ def list_runnable(project_dir: Path | str | None = None) -> list[str]:
 
 
 def _origin_of(path: Path) -> str:
-    """Which folder a recipe loaded by file path belongs to; a file anywhere else is the artist's own, so it
-    counts as project."""
+    """Which folder a recipe loaded by file path belongs to (the path is already confined to a recipe folder)."""
     here = path.resolve().parent
     for origin, folder in (("shipped", RECIPES_DIR), ("studio", studio_dir())):
         if here == folder.resolve():
@@ -635,11 +644,48 @@ def _origin_of(path: Path) -> str:
     return "project"
 
 
+def recipe_roots(project_dir: Path | str | None = None) -> list[Path]:
+    """The folders a recipe file may be named from, resolved (existing or not): the shipped recipes, the
+    studio's and, with `project_dir`, that project's `recipes/` folder."""
+    roots = [RECIPES_DIR, studio_dir()]
+    if project_dir is not None:
+        roots.append(project_recipes_dir(project_dir))
+    return [r.resolve() for r in roots]
+
+
+def names_a_file(name_or_path: str | Path) -> bool:
+    """Does `load_runnable` read `name_or_path` as a file path (a `.yaml`/`.yml` suffix, or a file that
+    exists) rather than as a recipe id?"""
+    p = Path(name_or_path)
+    if p.suffix in (".yaml", ".yml"):
+        return True
+    try:
+        return p.is_file()
+    except OSError:  # a name too long for the file system is not a file
+        return False
+
+
+def check_recipe_path(path: Path | str, project_dir: Path | str | None = None) -> Path:
+    """`path` resolved (links followed), when it lies inside a recipe folder (`recipe_roots`); else
+    `RecipeError` before the file is opened. The message names the file's name only, never a line of it."""
+    p = Path(path)
+    try:
+        rp = p.resolve()
+    except (OSError, ValueError, RuntimeError):  # a NUL byte, a link loop
+        rp = None
+    if rp is None or not any(rp.is_relative_to(root) for root in recipe_roots(project_dir)):
+        raise RecipeError(f"{p.name}: {PATH_REFUSAL}")
+    return rp
+
+
 def load_runnable(name_or_path: str | Path, project_dir: Path | str | None = None) -> RunnableRecipe:
     """A runnable recipe by id (`night_relight_changelist`: project folder, then studio, then shipped) or by
-    file path (`plate run my.yaml`)."""
+    file path (`plate run my.yaml`). A path must lie in one of the recipe folders (`recipe_roots`: the shipped
+    folder, the studio's and, with `project_dir`, the project's `recipes/`): anything else is a `RecipeError`
+    before the file is read."""
     p = Path(name_or_path)
-    if p.suffix in (".yaml", ".yml") or p.is_file():
+    if names_a_file(p):
+        check_recipe_path(p, project_dir)
         origin = _origin_of(p)
     else:
         name = str(name_or_path)

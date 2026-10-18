@@ -3,9 +3,11 @@
 App data is `platformdirs.user_data_dir("Plate", appauthor=False)` (`%LOCALAPPDATA%\\Plate` on Windows,
 `~/Library/Application Support/Plate` on macOS); `PLATE_HOME` moves the folder, `PLATE_CONFIG` moves
 `config.json`, and `PLATE_TOKEN_FILE` names a file holding only the token, which wins over
-`config.json["token"]`. Inside the home: `config.json`, `index/<project_id>.sqlite` (WAL; never on a
-network share, `ensure_local`), `logs/`, `cache/`, `packets/` (the default packet folder) and `projects/`
-(where a project lives when the index has no other root registered for it).
+`config.json["token"]`. Either token must be one line of printable ASCII without spaces, 16-256
+characters (`check_token`: a `ConfigError` at start, which never quotes the token). Inside the home:
+`config.json`, `index/<project_id>.sqlite` (WAL; never on a network share, `ensure_local`), `logs/`,
+`cache/`, `packets/` (the default packet folder) and `projects/` (where a project lives when the index has
+no other root registered for it).
 
 `config.json` is one file shared by daemon, Max plugin and installer: `{"token", "daemon_url"}` plus the
 plugin's `repo_path` and `packets_dir`. `ensure_config` creates it owner-only with a 32-byte urlsafe token
@@ -42,6 +44,7 @@ PACKET_VERSIONS = ["0.1"]
 UNSPECIFIED_HOSTS = {"0.0.0.0", "::", "[::]", "", "*"}
 DEV_ORIGINS = ("http://127.0.0.1:5173", "http://localhost:5173")
 MIN_TOKEN_FILE_LEN = 16
+MAX_TOKEN_FILE_LEN = 256
 SECRET_MODE = 0o600  # config.json holds the token: owner-only from the moment it is created
 # <repo>/ui/dist: config.py -> plate_daemon -> daemon -> repo.
 REPO_UI_DIST = Path(__file__).resolve().parents[2] / "ui" / "dist"
@@ -151,17 +154,30 @@ def ensure_config(config_path: Path, port: int = DEFAULT_PORT) -> dict[str, Any]
     return cfg
 
 
+def check_token(token: str, source: str) -> str:
+    """`token` when it can be a bearer token: one line of printable ASCII (0x21 to 0x7e) with no whitespace,
+    `MIN_TOKEN_FILE_LEN` to `MAX_TOKEN_FILE_LEN` characters (decision 88). A token file that gained a second
+    line ("# rotated ..."), a space or a non-ASCII character would otherwise become a bearer token no client
+    can send. `source` names where it was read; the message never quotes the token."""
+    if (
+        not isinstance(token, str)
+        or not MIN_TOKEN_FILE_LEN <= len(token) <= MAX_TOKEN_FILE_LEN
+        or not all("\x21" <= ch <= "\x7e" for ch in token)
+    ):
+        raise ConfigError(
+            f"{source}: the token must be one line of printable ASCII without spaces, "
+            f"{MIN_TOKEN_FILE_LEN}-{MAX_TOKEN_FILE_LEN} characters"
+        )
+    return token
+
+
 def read_token_file(path: Path) -> str:
     try:
         # utf-8-sig: a token file written by PowerShell 5.1 may carry a BOM.
         token = path.read_text(encoding="utf-8-sig").strip()
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         raise ConfigError(f"PLATE_TOKEN_FILE={path}: cannot read it ({e})") from e
-    if len(token) < MIN_TOKEN_FILE_LEN:
-        raise ConfigError(
-            f"PLATE_TOKEN_FILE={path}: the token must be at least {MIN_TOKEN_FILE_LEN} characters"
-        )
-    return token
+    return check_token(token, f"PLATE_TOKEN_FILE={path}")
 
 
 @dataclass(frozen=True)
@@ -208,12 +224,15 @@ class Paths:
         """The bearer token: PLATE_TOKEN_FILE's contents when set, else config.json's `token`."""
         if self.token_file is not None:
             return read_token_file(self.token_file)
-        return str(self.ensure_config(port)["token"])
+        return check_token(self.ensure_config(port)["token"], f"{self.config_path}: token")
 
 
 def load_config(paths: Paths | None = None, port: int = DEFAULT_PORT) -> dict[str, Any]:
-    """config.json as a dict (created on first use)."""
-    return (paths or Paths.from_env()).ensure_config(port)
+    """config.json as a dict (created on first use). A token in it that is not a bearer token is a `ConfigError`."""
+    paths = paths or Paths.from_env()
+    cfg = paths.ensure_config(port)
+    check_token(cfg["token"], f"{paths.config_path}: token")
+    return cfg
 
 
 # ---------------------------------------------------------------------------- settings

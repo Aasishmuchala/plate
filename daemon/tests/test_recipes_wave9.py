@@ -242,13 +242,33 @@ def test_the_origin_key_is_derived_never_written():
     assert recipes.load_runnable("derived").origin == "studio"
 
 
-def test_a_loose_file_loaded_by_path_counts_as_project(tmp_path):
-    loose = tmp_path / "loose.yaml"
-    loose.write_text(yaml.safe_dump(doc_for("loose")), encoding="utf-8", newline="\n")
-    assert recipes.load_runnable(loose).origin == "project"
+def test_a_file_loaded_by_path_takes_its_origin_from_the_folder_it_lives_in(tmp_path):
+    project = tmp_path / "proj"
+    (project / "recipes").mkdir(parents=True)
+    mine = project / "recipes" / "loose.yaml"
+    mine.write_text(yaml.safe_dump(doc_for("loose")), encoding="utf-8", newline="\n")
+    assert recipes.load_runnable(mine, project).origin == "project"
     assert recipes.load_runnable(recipes.RECIPES_DIR / "croppair_pushin.yaml").origin == "shipped"
     recipes.save_runnable(doc_for("in_studio"), "studio")
     assert recipes.load_runnable(recipes.studio_dir() / "in_studio.yaml").origin == "studio"
+
+
+def test_a_file_outside_the_recipe_folders_is_not_loaded_by_path(tmp_path):
+    """Decision 88: a path must lie in the project's recipes/ folder, the studio's or the shipped one."""
+    project = tmp_path / "proj"
+    (project / "recipes").mkdir(parents=True)
+    loose = tmp_path / "loose.yaml"
+    loose.write_text(yaml.safe_dump(doc_for("loose")), encoding="utf-8", newline="\n")
+    with pytest.raises(RecipeError, match="must live in"):
+        recipes.load_runnable(loose)
+    with pytest.raises(RecipeError, match="must live in"):
+        recipes.load_runnable(loose, project)
+    mine = project / "recipes" / "loose.yaml"
+    mine.write_bytes(loose.read_bytes())
+    # the project's folder only counts for that project
+    with pytest.raises(RecipeError, match="must live in"):
+        recipes.load_runnable(mine)
+    assert recipes.load_runnable(mine, project).id == "loose"
 
 
 @pytest.mark.parametrize(

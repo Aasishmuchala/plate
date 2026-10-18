@@ -67,7 +67,7 @@ def test_a_missing_or_short_token_file_is_an_error(tmp_path, monkeypatch):
     short = tmp_path / "short.txt"
     short.write_text("abc", encoding="utf-8")
     monkeypatch.setenv("PLATE_TOKEN_FILE", str(short))
-    with pytest.raises(ConfigError, match="at least"):
+    with pytest.raises(ConfigError, match="16-256 characters"):
         Settings.load()
 
 
