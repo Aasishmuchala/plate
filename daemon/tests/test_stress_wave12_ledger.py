@@ -292,7 +292,9 @@ def test_records_on_an_unchanged_10000_record_file_is_fast_the_second_time(led: 
         again = led.records()
         best = min(best, time.perf_counter() - t)
     assert len(again) == 10_000
-    assert best < 0.005, f"second records() took {best * 1000:.1f} ms"
+    # The finding was a full re-read of 10,000 records on every action (seconds). 50 ms leaves room for a
+    # Windows runner's slower stat and file open (6.8 ms was seen there) while still proving the memo.
+    assert best < 0.05, f"second records() took {best * 1000:.1f} ms"
 
 
 def test_records_sees_a_record_another_ledger_instance_appended(led: Ledger):

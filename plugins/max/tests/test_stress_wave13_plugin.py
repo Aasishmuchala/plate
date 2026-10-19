@@ -268,7 +268,18 @@ def test_load_save_default_to_the_open_scene(scene, tmp_path):
     assert recipes.load_recipes()["CAM_a"].preset == "x"
 
 
+def _needs_room(expected: Path) -> None:
+    """Skip when the runner's temp folder is so deep that `expected` would not fit the platform's path limit
+    (windows-latest tmp paths are ~95 characters: a 200-character stem beside the scene is over MAX_PATH there;
+    the limit itself is pinned by test_windows_adds_the_259_character_path_limit on virtual paths)."""
+    if not recipes.fits_filesystem(expected):
+        pytest.skip(
+            f"the temp path is too deep for {expected.name[:24]}... beside the scene on this platform"
+        )
+
+
 def test_a_200_character_stem_stays_beside_the_scene(scene, tmp_path):
+    _needs_room(tmp_path / "jobs" / ("a" * 200 + ".plate.json"))
     max_file = save_scene(scene, tmp_path / "jobs", "a" * 200 + ".max")
     path = recipes.sidecar_path(max_file)
     assert path == tmp_path / "jobs" / ("a" * 200 + ".plate.json")
@@ -279,6 +290,7 @@ def test_a_200_character_stem_stays_beside_the_scene(scene, tmp_path):
 
 def test_the_name_limit_is_255_utf8_bytes_not_characters(scene, tmp_path):
     suffix = len(recipes.SIDECAR_SUFFIX)
+    _needs_room(tmp_path / ("a" * (255 - suffix) + ".plate.json"))
     fits = tmp_path / ("a" * (255 - suffix) + ".max")
     over = tmp_path / ("a" * (255 - suffix + 1) + ".max")
     assert recipes.sidecar_path(fits) == tmp_path / ("a" * (255 - suffix) + ".plate.json")
@@ -310,7 +322,8 @@ def test_windows_adds_the_259_character_path_limit(monkeypatch, tmp_path):
     assert recipes.WINDOWS_MAX_PATH == 259
     exact = virtual_path(259, "Clubhouse.plate.json")
     over = virtual_path(260, "Clubhouse.plate.json")
-    assert recipes.fits_filesystem(over) and recipes.fits_filesystem(exact)  # not Windows: only the name
+    if not recipes.platform_is_windows():
+        assert recipes.fits_filesystem(over) and recipes.fits_filesystem(exact)  # only the name counts
     monkeypatch.setattr(recipes, "platform_is_windows", lambda: True)
     assert recipes.fits_filesystem(exact) and not recipes.fits_filesystem(over)
     # the sidecar of a scene whose natural sidecar path is 259 characters stays beside it, 260 moves
@@ -372,6 +385,7 @@ def test_a_fallback_folder_that_cannot_be_written_is_still_a_message(scene, tmp_
 
 
 def test_the_backup_of_a_long_scene_lands_in_the_temp_folder(scene, tmp_path):
+    _needs_room(tmp_path / "jobs" / ("a" * 200 + ".plate-backup.20261019-120000.max"))
     max_file = save_scene(scene, tmp_path / "jobs", "a" * 254 + ".max")
     stamp = "20261019-120000"
     dest = safety.backup_path_for(max_file, stamp)
@@ -393,6 +407,7 @@ def test_the_backup_of_a_long_scene_lands_in_the_temp_folder(scene, tmp_path):
 
 def test_the_backup_can_overflow_before_the_sidecar_does(scene, tmp_path):
     # 244 + len(".plate.json") = 255 fits; 244 + the backup's suffix does not
+    _needs_room(tmp_path / "jobs" / ("a" * 244 + ".plate.json"))
     max_file = save_scene(scene, tmp_path / "jobs", "a" * 244 + ".max")
     assert recipes.sidecar_path(max_file) == tmp_path / "jobs" / ("a" * 244 + ".plate.json")
     dest = safety.backup_path_for(max_file, "20261019-120000")

@@ -590,7 +590,10 @@ def test_a_second_daemon_on_the_folder_leaves_the_first_daemons_run_alone(
 
         _wait(b_quotes, 10, "daemon B could not write the project once A stopped")
         doc = on_disk(folder)
-        assert doc["pid"] == b.proc.pid and doc["daemon_id"] != lease.identity().daemon_id
+        # On Windows a venv python.exe is a launcher, so Popen.pid is not the daemon's own pid.
+        assert doc["daemon_id"] != lease.identity().daemon_id and doc["pid"] != os.getpid()
+        if sys.platform != "win32":
+            assert doc["pid"] == b.proc.pid
     finally:
         if b is not None:
             b.kill()

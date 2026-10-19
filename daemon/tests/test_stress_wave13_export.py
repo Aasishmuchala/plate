@@ -213,7 +213,8 @@ def test_in_flight_releases_and_unlinks_when_the_block_raises(tmp_path):
 def test_a_second_writer_on_one_marker_is_refused_but_a_probe_only_delays_it(tmp_path):
     marker = tmp_path / f".take.png.{TAG}.lock"
     with in_flight(marker):
-        with pytest.raises(Exception, match="(?i)lock"), in_flight(marker):
+        # portalocker words a held lock as "...lock..." on POSIX and "[Errno 13] Permission denied" on Windows
+        with pytest.raises(Exception, match="(?i)lock|permission denied|errno 13"), in_flight(marker):
             pass
     # a sweeper's probe holds the lock for an instant while a writer is starting: the writer waits it out
     import portalocker
