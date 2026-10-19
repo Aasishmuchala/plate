@@ -241,7 +241,9 @@ def test_a_killed_writer_stops_being_in_flight_without_anyone_releasing_it(tmp_p
         # Kill the process that holds the lock. On Windows proc is a venv launcher whose child does the
         # work, so proc.kill() alone would leave the lock held; os.kill on the real pid is TerminateProcess
         # there and SIGKILL on POSIX: no cleanup runs either way.
-        os.kill(proc.writer_pid, signal.SIGKILL if hasattr(signal, "SIGKILL") else signal.SIGTERM)  # type: ignore[attr-defined]
+        # SIGTERM with no handler ends a Python process without running its finally blocks on POSIX, and is
+        # TerminateProcess on Windows: the lock is released by the OS, never by the writer.
+        os.kill(proc.writer_pid, signal.SIGTERM)  # type: ignore[attr-defined]
         proc.kill()
         proc.wait(timeout=30)
         proc.stdout.close()
