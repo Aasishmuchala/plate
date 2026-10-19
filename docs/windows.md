@@ -15,6 +15,10 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1
 
 Optional: `winget install --id Gyan.FFmpeg -e` so the video-gate tests run instead of skipping (or point `PLATE_FFMPEG` and `PLATE_FFPROBE` at the binaries). Install OpenImageIO's `oiiotool` and set `PLATE_OIIOTOOL` when the P0 packet spikes need it.
 
+One-shot recheck of everything on this box (bootstrap, the whole suite, the stress target, the smoke, and with `-Max` the plugin install), with a report in `%LOCALAPPDATA%\Plate\recheck-<stamp>.txt`:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\recheck.ps1 -Max
+```
 ## Where things live
 
 | what | path |
