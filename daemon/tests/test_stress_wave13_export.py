@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -165,7 +166,8 @@ _WRITER = textwrap.dedent(
     with in_flight(out / f".{name}.{tag}.lock"):
         (out / f".{name}.{tag}{suffix}.part").write_bytes(b"partial")
         (out / f".{name}.{tag}{suffix}").write_bytes(b"half an image")
-        print("ready", flush=True)
+        import os
+        print("ready", os.getpid(), flush=True)
         time.sleep(120)
     """
 )
@@ -181,7 +183,9 @@ def _spawn_writer(tmp_path: Path, out: Path, name: str, tag: str) -> subprocess.
         text=True,
     )
     assert proc.stdout is not None
-    assert proc.stdout.readline().strip() == "ready", "the child writer did not start"
+    word, pid = proc.stdout.readline().split()
+    assert word == "ready", "the child writer did not start"
+    proc.writer_pid = int(pid)  # type: ignore[attr-defined]  # the process holding the lock (not a launcher)
     return proc
 
 
@@ -234,7 +238,11 @@ def test_a_killed_writer_stops_being_in_flight_without_anyone_releasing_it(tmp_p
     try:
         assert is_in_flight(marker) is True  # alive: another process holds it
     finally:
-        proc.kill()  # SIGKILL on POSIX, TerminateProcess on Windows: no cleanup runs
+        # Kill the process that holds the lock. On Windows proc is a venv launcher whose child does the
+        # work, so proc.kill() alone would leave the lock held; os.kill on the real pid is TerminateProcess
+        # there and SIGKILL on POSIX: no cleanup runs either way.
+        os.kill(proc.writer_pid, signal.SIGKILL if hasattr(signal, "SIGKILL") else signal.SIGTERM)  # type: ignore[attr-defined]
+        proc.kill()
         proc.wait(timeout=30)
         proc.stdout.close()
     assert marker.is_file()  # the dead writer's marker is still there ...

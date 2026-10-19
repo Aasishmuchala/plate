@@ -671,7 +671,8 @@ def test_the_send_flow_hands_the_action_a_pump_and_only_while_it_runs(qt):
         dock.cam_list.item(0).setSelected(True)
         dock._on_send()
         [cfg] = ctrl.configs
-        assert cfg[transport.PUMP_KEY] == dock._pump_events and ctrl.pumped >= 3
+        # pumped at least once: the count depends on the runner (a loaded macos-latest saw 2 in the wait)
+        assert cfg[transport.PUMP_KEY] == dock._pump_events and ctrl.pumped >= 1
         assert "Sent, ingesting (packet pkt_1)" in dock.log.toPlainText()
         assert "config" not in ctrl._options(["CAM_main"], None)  # outside an action: no pump
         second = dockmod.PlateDock(ctrl)  # a new dock re-wraps the original, never the wrapper

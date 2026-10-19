@@ -602,3 +602,171 @@ Wave 12 adds no vendor or render-box exit. These two lines continue the section 
 26. **`plate timer` with the dock open (decision 71).** Connect the Max dock and close the canvas. After 30 idle minutes, `plate timer start <deliverable>` in a terminal must not lift the unattended cap: agent approvals past the USD 20 unattended cap are still refused (`unattended_cap`). The dock's own requests must not lift it either. Any request from the canvas lifts it.
 
 The stress workflow (`.github/workflows/stress.yml`, `workflow_dispatch`) has not run on `windows-latest` yet. Start it once by hand after this wave is pushed. `docs/stress.md` lists the checks that skip there.
+
+## 13. Wave 13 (T151 to T162): every remaining stress finding
+
+Written by the Wave 13 verification pass (router task T162, Opus 5.5) on 2026-10-19 between 05:10 and 08:50 IST, on the same Mac. Commit `3d55f43` (T154, completing `aa302ac`) plus the uncommitted Wave 13 tree (T151 to T153 and T155 to T161, and the edits below). Nothing called a vendor: every daemon here ran the fake engine, and every adapter met its recorded fixtures.
+
+### 13.1 What failed and the fixes
+
+The first `make ci` passed with no edit (row 1). Five things still needed one. The three `git grep` checks of 13.3 found one route and two docs that predate Wave 13. Three stress checks still expected the behaviour from before Wave 13, and one of them, once moved to the new contract, found a real defect. Each fix is the smallest one that keeps decisions 83 to 93. `make stress`, both smokes, `scripts/test.sh` and the closing `make ci` ran after the fixes.
+
+- **The Motion quote read `detail_resolvability` directly (decision 84).** T152 moved the Edit quote (`quote_node` → `render_it(conn)`) onto the stored `packet_router` row. A Motion or CropPair quote whose plate has a motion packet still built its router card from `motion_runs._detail`, which decodes the still's Z and object Cryptomatte and calls `router_math.detail_resolvability` on every quote. Fix in `daemon/plate_daemon/motion_runs.py`: `router_card(..., conn=None)` and `_stored_detail`. With the quote's `conn`, a motion-packet card takes the still's D from `Pipeline.router_summary`. That is the row written at ingest, or computed and stored if absent, so the still is no longer decoded. The preview route (no `conn`) and the still-only branch, which needs the Z for the move itself, are unchanged. New test: `daemon/tests/test_motion_runs.py::test_a_motion_quote_takes_the_stills_d_from_the_stored_router_summary`. It asserts the row is there after ingest, that `_still_geometry` is never called at the quote, and that the card's `D_px_median` equals the row's.
+- **A kill -9 in an export's first instant left a hidden `.lock` in the client folder for an hour (decision 87).** `crash sigkill-export-part` aged every leftover two hours before the retry, a Wave 12 workaround that hid the new rule. It now ages only a temp with no marker (the planted one). Run that way, it found a defect: a real SIGKILL at 30 ms leaves the in-flight marker alone, with no temp yet, on each of the four runs here (`SIGKILL left ['.run_…exr.<tag>.lock']`). T153's sweep kept a free marker found alone under the one-hour rule, so the retry left `.run_….exr.<tag>.lock` beside the shipped pair. Fix in `daemon/plate_daemon/export.py` (`sweep_stale`): a marker nobody holds goes at once, alone or not. This is safe because the marker name carries a unique tag. A live writer that has not locked its marker yet has written nothing beside it, and once the marker is gone its later temps fall under the age rule, which keeps young files. T153's test `test_stress_wave13_export.py::test_sweep_stale_follows_the_marker_not_the_age` now expects the young lone marker to be removed. The module docstring, `CHANGELOG.md` decision 87 and `docs/stress.md` say so.
+- **`mcp_cli_imports outbound-log-failure` pinned the Wave 12 behaviour.** It asserted that `run_node`'s and `add_node`'s `outbound_log_failed` name the run and the node the daemon had already made. After T157 (decision 91) nothing is made. The check now asserts `outbound_log_failed`, no run, no new node, and no `run_id` or `node_id` in either message. The script docstring and `docs/stress.md` were updated to match.
+- **`engine_faults submit-timeout` only noted a crash that did not exit.** Decision 85 makes the scripted crash end the process with code 70 on the executor's threads, so the note became a check: the daemon must exit by itself with return code 70 within 10 s. The harness still kills a daemon that does not, and that is now a finding. On `1f272f2` only this new leg would find a defect, and `docs/stress.md` says so.
+- **Two docs still described the lockfile without the lease.** `docs/windows.md` said a project on the NAS is "protected by the project lockfile only". The repo's `CLAUDE.md` (Windows rules) said the same. Both now name `lease.json` and the 409 `project_leased`.
+
+Two process notes. The first `make ci` ran across a system sleep: its `real` was 9845 s, but pytest's own clock read 1221 s. `alarm` does not count while the Mac sleeps, so the 1800 s alarm never fired. Every later run here was wrapped in `caffeinate -i -s`, and those wall times are real. Some edits above landed while that first `make ci` was in pytest, so the closing `make ci` (row 7) is the one that counts.
+
+### 13.2 Command record
+
+All commands ran from the repo root, one after another (rows 1 to 7). Row 1's lint step ran before any edit of 13.1.
+
+| # | command | exit | key output |
+|---|---|---|---|
+| 1 | `perl -e 'alarm shift; exec @ARGV' 1800 make ci` (first; some 13.1 edits landed during its pytest step) | 0 | `SELFTEST PASS`; hazard selftest `13 planted hazards caught`, scan `clean (1079 files scanned, 2 allowlist entries)`; `All checks passed!`, `580 files already formatted`; licences `18 files scanned, 7 blocked models absent`; pytest `7651 passed, 2 skipped in 1221.56s`, 4K gate `run_gates 3840x2160: wall 4.61s` (`4.94s` with overlays); `scripts/tests` `117 passed`; `all 28 claims hold (136 tests passed)`; vitest `Test Files 31 passed (31)`, `Tests 863 passed (863)`; `built in 1.46s` |
+| 2 | `.venv/bin/python scripts/stress/mcp_cli_imports.py --only outbound-log-failure`, `crash.py --only sigkill-export-part` (after their 13.1 updates) | 0 / 1, then 0 | the MCP check `ok`; the crash check `FINDING ... holds ['.run_….exr.<tag>.lock', ...]` twice in a row (the lone marker), then `ok` after the `sweep_stale` fix |
+| 3 | `perl -e 'alarm shift; exec @ARGV' 3600 make stress` | 0 | nine scripts, each `0 findings`; last line `stress: 9 scripts, 75 checks, 75 ok, 0 skipped, 0 findings (290 s)`; `sigkill-export-part` `SIGKILL left ['.run_01M58ZZK2SP4PWQEASS']; 1 in-flight marker(s) left by the kill: the retry runs at once, nothing aged`; `submit-timeout` `DONE` (exited 70 by itself, no harness kill) |
+| 4 | `perl -e 'alarm shift; exec @ARGV' 900 .venv/bin/python scripts/smoke_e2e.py` | 0 | 36 steps `ok`: UI suite `863 passed`, wiring `19 passed`, `16 engines incl. fake`, ingest `0.3 s`, quote `router ai_by_region`, `DONE in 0.8 s`, export `640x268 (crop y 46)`, `full_frame` `640x360`, rescore `versions [1, 2]`, `@ref` quote on nano-banana-2.1, G2 autosave, `night_chain` refused `['no_base']`; last line `SMOKE PASS` |
+| 5 | `.venv/bin/python -m plate_daemon.cli smoke` | 0 | last line `fixture smoke: 17 adapters ok`; 8 skipped (the same 8 as section 10) |
+| 6 | `PYTEST_ADDOPTS=-rs scripts/test.sh` | 0 | the same eleven steps in the same order: hazard `clean (1079 files scanned, 2 allowlist entries)`, `580 files already formatted`, pytest `7652 passed, 2 skipped in 1193.45s`, 4K gate `run_gates 3840x2160: wall 4.60s`, scripts `117 passed`, claims 28 and 136, vitest `863 passed (863)`, built; last line `All PLATE checks passed.`; `real 1280.55` (21 min 21 s). The two skips are the same as in Wave 12: `test_previs.py:396` (no drawtext in this ffmpeg) and `test_stress_wave12_ingest.py:241` (`needs an environment without imagecodecs`) |
+| 7 | `perl -e 'alarm shift; exec @ARGV' 1800 make ci` (closing, every edit in place) | 0 | `SELFTEST PASS`; hazard selftest `13 planted hazards caught`, scan `clean (1079 files scanned, 2 allowlist entries)`; `All checks passed!`, `580 files already formatted`; licences `18 files scanned, 7 blocked models absent`; pytest `7652 passed, 2 skipped in 1199.13s`, 4K gate `run_gates 3840x2160: wall 4.52s` (`4.86s` with overlays); `scripts/tests` `117 passed`; `all 28 claims hold (136 tests passed)`; vitest `Test Files 31 passed (31)`, `Tests 863 passed (863)`; `built in 1.43s`; `real 1286.40` (21 min 26 s) |
+| 8 | the three `git grep` checks in 13.3 | 0 (each found matches; every match was read) | after the fixes, no test, doc or route pins the old behaviour |
+
+Per stress script (row 3):
+
+| script | checks | ok | skipped | findings | seconds |
+|---|---|---|---|---|---|
+| `api_fuzz` | 17 | 17 | 0 | 0 | 16 |
+| `doctrine` | 4 | 4 | 0 | 0 | 11 |
+| `money` | 9 | 9 | 0 | 0 | 64 |
+| `crash` | 8 | 8 | 0 | 0 | 25 |
+| `engine_faults` | 8 | 8 | 0 | 0 | 67 |
+| `scale` | 4 | 4 | 0 | 0 | 68 |
+| `ui` | 3 | 3 | 0 | 0 | 3 |
+| `max_plugin` | 11 | 11 | 0 | 0 | 18 |
+| `mcp_cli_imports` | 11 | 11 | 0 | 0 | 16 |
+
+The measured lines the stress run printed: `scale` `autosave-storm` 150 overlapping PUTs all 200, PUT p50 0.05 s, max 0.09 s, `/health` max 49 ms; `ingest-unlisted-ids` ingest 0.3 s, cold quote 0.26 s at 640x360; `ledger-reread` 50,005 records, approve median 8 ms, quote median 15 ms; `engine_faults` `inflight-threads` `{'QUEUED': 43, 'RUNNING': 2}`; `max_plugin` `hash-503-retry` waited `[1.0]` before the second `/hash`.
+
+### 13.3 What no test, doc or route may still pin
+
+- **The lock is per write, and the lease keeps a second daemon out.** Search: `git grep -n -i "per write\|each write\|lockfile only\|lock only\|two daemons"` and `git grep -n -i "project lock\|project\.lock"`. Every doc that says the lock is taken per write names the lease in the same paragraph or row: `docs/artist-manual.md:80`, `docs/runbooks/backup-restore.md:91,143`, `docs/runbooks/daemon-wont-start.md:16,55`, and the lease test's docstring (`test_stress_wave13_lease.py:7`). `CHANGELOG.md:72` is the Wave 12 entry ("unsupported until a lease lands"), kept as history beside Wave 13's decision 83 entry. Two places did not name it, and both are fixed (13.1): `docs/windows.md:28` and `CLAUDE.md:41`. Other hits are about something else: `lock.py`'s module docstring describes the lease, and "per call" in other modules is not about the lock.
+- **No route reads `detail_resolvability` at the quote.** Search: `git grep -n "detail_resolvability"`, every call site read. The Edit quote goes `quote_node` → `render_it(pv, task, conn)` → `router_summary` (the `packet_router` row). The Motion/CropPair quote goes `_quote_kling` → `router_card(..., conn=conn)` → `_stored_detail` → `router_summary` (fixed in 13.1). Without a `conn`, only three places compute D: `PacketView.detail_resolvability` (what `router_summary` and `warm_router` call), the Motion editor's router preview (`RouterPreview.preview`: numbers only, no run, no quote) and `cli._router_check`. The last is the in-process `plate run` preflight for recipes that declare `router_check`; it is not a route, and the daemon quote it leads to reads the row.
+- **No `settle_failed_folder` caller drops the transport flag.** Search: `git grep -n "settle_failed_folder"`. There is one caller, `send_packet.py:1304`, in the per-camera loop of `send_packet`. It passes `transport_failure=transport_failure`, which the `except transport.TransportError` branch sets from `daemon_failed(exc)`. No other action (`batch_cameras`, `send_motion`, `light`) settles a folder itself. `keep_failed_packets` appears only in `send_packet.py`.
+
+### 13.4 The numbers
+
+| measure | after Wave 12 | after Wave 13 |
+|---|---|---|
+| pytest, every package | 7446 passed, 2 skipped | **7652 passed, 2 skipped** (+206: the Wave 13 test files below and this pass's one test; the same two skips) |
+| vitest | 835 (29 files) | **863** (31 files; +14 in `viewerCache.test.ts`, +14 in `stripHydration.test.tsx`) |
+| `scripts/tests` | 117 | 117 |
+| stress target | 9 scripts, 75 checks | 9 scripts, **75 checks**, 0 findings, 290 s (three checks moved to the Wave 13 contract, 13.1) |
+| fixture CLI smoke | 17 adapters ok, 8 skipped | 17 adapters ok, 8 skipped |
+| scripted end-to-end smoke | 36 steps, `SMOKE PASS` | 36 steps, `SMOKE PASS` |
+| claims as tests | 28 claims, 136 tests | 28 claims, 136 tests (`claims.yaml`, `README.md` and `client-explainer.md` untouched, as the wave planned) |
+| hazard scan | clean, 1067 files, 2 allowlist entries | clean, **1079 files**, 2 allowlist entries |
+| ruff | 570 files | **580 files** |
+| `make ci` wall time | 17 min 58 s (pytest 991 s) | 21 min 26 s (pytest 1199 s), under `caffeinate` |
+
+New Wave 13 test files and their test counts: `daemon/tests/test_stress_wave13_lease.py` 16, `test_stress_wave13_pipeline.py` 8, `test_stress_wave13_export.py` 20, `test_stress_wave13_api.py` 21, `test_stress_wave13_budgets.py` 7, `test_stress_wave13_mcp.py` 9, `gates/tests/test_video_unscored.py` 7, `pixels/tests/test_ingress_format.py` 6, `plugins/max/tests/test_stress_wave13_plugin.py` 24, `ui/src/test/viewerCache.test.ts` 14, `ui/src/test/stripHydration.test.tsx` 14; plus this pass's one test in `test_motion_runs.py`.
+
+### 13.5 Decisions 83 to 93
+
+| # | decision | status | tests |
+|---|---|---|---|
+| 83 | A project is leased by one daemon at a time (`lease.json`, 20 s heartbeat, 90 s TTL, 409 `project_leased` on writes, reads served, no adoption of a leased project's runs) | done on this Mac (two daemons, one folder); the NAS from two machines is box-day item 27 | `test_stress_wave13_lease.py` (16), e.g. `test_a_second_identity_is_refused_with_the_first_holders_host_and_pid`, `test_a_lease_91_s_old_is_taken_over_with_a_warning_naming_the_old_pid`, `test_a_live_foreign_lease_is_refused_and_one_from_a_dead_pid_on_this_host_is_not`, `test_a_live_foreign_lease_refuses_writes_409_and_serves_reads`, `test_resume_and_the_orphan_watch_leave_a_leased_projects_runs_alone`, `test_a_second_daemon_on_the_folder_leaves_the_first_daemons_run_alone`, `test_plate_reindex_still_works_on_a_leased_project` |
+| 84 | The router's inputs are computed once, at ingest (`packet_router`, `ROUTER_SUMMARY_VERSION` `2026.10.19`) | done (the Motion quote completed in 13.1) | `test_stress_wave13_pipeline.py::test_the_router_summary_is_stored_at_ingest_and_the_quote_reads_it` (no decode, under 0.5 s), `test_a_row_of_an_older_version_is_recomputed_and_replaced`, `test_a_rebuild_leaves_the_table_empty_and_the_next_quote_refills_it`, `test_a_warm_up_that_fails_is_a_warning_and_the_quote_computes_lazily`, `test_z_and_the_object_cryptomatte_come_from_one_open_of_the_exr`; `test_motion_runs.py::test_a_motion_quote_takes_the_stills_d_from_the_stored_router_summary`; stress `scale ingest-unlisted-ids` (cold quote 0.26 s) |
+| 85 | A scripted crash exits the process on every execution path (`os._exit(70)`) | done | `test_stress_wave13_pipeline.py::test_a_scripted_crash_exits_the_process_and_the_restart_spends_once` (`PLATE_RUN_WORKERS` 4 and 0); stress `engine_faults submit-timeout` (now asserts code 70) |
+| 86 | Result format is recorded, not judged; non-finite results fail `normalize_error` | done | `test_stress_wave13_pipeline.py::test_a_result_reaches_done_with_its_format_recorded`, `test_a_float_tiff_with_a_nan_inside_the_mask_fails_normalizing`; `pixels/tests/test_ingress_format.py` (6) |
+| 87 | An export in flight holds a marker; the sweep follows the marker, not the age | done (the lone marker completed in 13.1); delivery writers claim their names too | `test_stress_wave13_export.py` (20), e.g. `test_a_kill_minus_nine_leftover_is_swept_by_an_export_seconds_later`, `test_sweep_stale_follows_the_marker_not_the_age`, `test_a_live_exports_marker_keeps_its_files_and_a_dead_ones_are_swept`, `test_a_marker_less_temp_follows_the_one_hour_rule`, `test_a_cutdown_sweeps_a_dead_cutdowns_leftovers_and_keeps_a_live_ones`, `test_embed_and_place_has_exactly_one_winner_among_eight_racing_deliveries`, `test_two_deliveries_racing_to_one_name_over_the_route_have_one_winner`, `test_the_dead_seed_copy_is_gone_and_the_claim_stays_shared`; stress `crash sigkill-export-part` |
+| 88 | Inputs the daemon trusts are validated on load (token 16 to 256 printable ASCII on one line, recipe paths confined, `NODE_PARAMS_MAX_BYTES` 262144) | done | `test_stress_wave13_api.py` (21), e.g. `test_a_token_file_with_a_second_line_is_a_config_error`, `test_a_config_json_token_with_a_space_names_config_json`, `test_a_recipe_path_outside_the_recipe_folders_is_refused_before_it_is_read`, `test_a_link_out_of_a_recipe_folder_is_judged_by_where_it_points`, `test_a_300_kib_prompt_is_422_params_too_large_and_200_kib_is_stored`, `test_an_appended_node_is_held_to_the_same_cap`, `test_a_name_ending_in_a_newline_is_422_and_leaves_no_such_path`; stress `api_fuzz recipe-yaml-leak`, `newline-slugs`, `max_plugin token-second-line` |
+| 89 | Externally declared spend never blocks automation | done | `test_stress_wave13_budgets.py` (7), e.g. `test_a_declared_import_above_the_cap_warns_and_blocks_no_approval`, `test_the_unattended_cap_does_not_count_a_declared_import_either`, `test_a_vendor_priced_run_still_trips_the_daily_cap`, `test_the_ledger_still_carries_the_declared_price_and_plate_spend_is_unchanged`; stress `mcp_cli_imports declared-cost-bound` |
+| 90 | A metric that was not measured says so (`camera_lock`, `flicker` on fewer than two frames are `unscored`) | done | `gates/tests/test_video_unscored.py` (7), e.g. `test_camera_lock_on_a_one_frame_clip_is_unscored_and_decodes_nothing`, `test_flicker_on_a_one_frame_clip_is_unscored`, `test_the_assembled_report_has_no_camera_lock_value_and_says_why`, `test_control_a_twelve_frame_static_clip_still_scores_and_passes`; `gates/tests/test_video_gates.py` (updated by T156) |
+| 91 | MCP mutating tools probe the outbound log before acting; finite `--new-envelope` arguments | done | `test_stress_wave13_mcp.py` (9), e.g. `test_a_failed_probe_stops_the_tool_before_any_post_reaches_the_daemon`, `test_an_unwritable_outbound_log_stops_run_node_estimate_and_add_node_and_reads_nothing`, `test_a_non_finite_or_out_of_range_envelope_argument_is_a_usage_error_and_makes_nothing`; stress `mcp_cli_imports outbound-log-failure` (updated, 13.1), `cli-envelope-edges` |
+| 92 | A render is never kept for a daemon failure; long scene names get an app-data sidecar | done on the fake; a real scene is box-day items 28 and 29 | `plugins/max/tests/test_stress_wave13_plugin.py` (24), e.g. `test_a_503_on_the_first_hash_after_the_render_removes_the_packet_folder`, `test_keep_failed_packets_keeps_the_render_of_a_daemon_failure`, `test_a_daemon_that_refuses_keeps_the_render_for_inspection`, `test_the_unlabelled_share_abort_still_keeps_its_render`, `test_a_long_stem_keeps_its_sidecar_under_app_data`, `test_the_name_limit_is_255_utf8_bytes_not_characters`, `test_windows_adds_the_259_character_path_limit`, `test_send_proceeds_for_a_254_character_scene_and_logs_where_the_backup_went`; stress `max_plugin hash-503-retry` (one 503, then the retry: the Send still succeeds) |
+| 93 | The viewer caches decoded images by asset (320 MiB, 4 entries); strips hydrate from history on project open | done | `ui/src/test/viewerCache.test.ts` (14), e.g. "A (plate) + B1, then B2 and B3 with the same A: one fetch for A, one per B", "fetches the plate once across take switches and a remount, and uploads on every source change"; `ui/src/test/stripHydration.test.tsx` (14), e.g. "a best-of-3 group fills the strip with its three candidates; an ungrouped newest run comes back alone", "a RUNNING take is shown and watched: an EventSource opens for it and its next state moves the chip", "a node with a run in flight from this session is not replaced; the other nodes still hydrate" |
+
+### 13.6 Every finding and where it ended
+
+The router plan's outcome table, in short form: the 39 lows and the 8 items Wave 12 dropped. "W12" means fixed in Wave 12 by the task named, and pinned by its `test_stress_wave12_*.py` file. A bold task id is a Wave 13 task.
+
+| finding | outcome |
+|---|---|
+| unbounded-result-download | W12 T130 (streamed downloads, `FETCH_MAX_BYTES`, magic check) |
+| result-format-unrecorded | **T152** (decision 86) |
+| runway-succeeded-no-output-terminal | W12 T138, T130 |
+| attempt-poison | W12 T128, T129 |
+| newline-slugs | W12 `fullmatch`; **T154** the cross-route newline suite |
+| unbounded-body | W12 T132, T128; **T154** the per-node params cap |
+| decode-bomb | W12 T136 |
+| pattern-width | W12 T127 |
+| docs-long-name | W12 T132 |
+| graph-unhashable-id | W12 T128 |
+| method-404 | W12 T132 |
+| recipe-yaml-leak | W12 T129 (path only); **T154** recipe paths confined |
+| symlink-manifest | W12 T135 |
+| expired-and-failclosed-cancel-not-ledgered | W12 T129, T145 |
+| fake-crash-not-exiting-in-background | **T152** (decision 85) |
+| sigkill-export-part-left | W12 T127 (one-hour sweep); **T153** liveness-based sweep, completed by T162 (lone marker) |
+| quote-ttl-clock-back | W12 T129 |
+| no-overall-http-deadline | W12 T142 |
+| malformed-token-raises-and-leaks | W12 T142 (plugin); **T154** the daemon's own token file |
+| transient-daemon-error-loses-render | W12 T142 (`/hash` retries); **T158** the manifest-less folder removed |
+| any-200-counts-as-sent | W12 T142 |
+| dock-log-shows-html-entities | W12 T142 |
+| long-scene-name-breaks-sidecar | W12 T141 (clear message); **T158** long names work |
+| import-decodes-before-size-check | W12 T137 |
+| mcp-outbound-log-failure-after-spend | W12 T146 (ids in the error); **T157** probe before acting |
+| import-still-named-mp4-is-a-clip | W12 T137 (refused); **T156** one-frame metrics unscored |
+| import-long-extension-500 | W12 T137 |
+| kit-camera-name-escapes-folder | W12 T137 |
+| cli-envelope-edges | W12 T143, T126, T129; **T157** the MCP `--new-envelope` leg |
+| kit-exr-header-unbounded | W12 T135 |
+| declared-import-cost-unbounded | W12 T137 (ceiling); **T155** external spend outside the caps |
+| reload-in-debounce-loses-edits | W12 T147 |
+| viewer-4k-refetch | **T159** (decision 93) |
+| token-status-misleading | W12 T147 |
+| makebar-raw-html-error | W12 T147 |
+| strip-not-hydrated-after-reload | **T160** (decision 93) |
+| graph-validate-superquadratic | W12 T133 |
+| quote-cold-4k-over-2s | **T152** (decision 84), completed by T162 for the Motion quote |
+| ingest-unlisted-ids-quadratic | W12 T135 |
+| dropped: second-daemon-same-project-adopts-runs | **T151** (decision 83) |
+| dropped: quote-cold-4k-over-2s | **T152** |
+| dropped: viewer-4k-refetch | **T159** |
+| dropped: strip-not-hydrated-after-reload | **T160** |
+| dropped: fake-crash-not-exiting-in-background | **T152** |
+| dropped: result-format-unrecorded | **T152** |
+| dropped: the attackers' Playwright scripts | by design: harness files, not findings; pinned by `saveResilience.test.tsx` (T147) and `scripts/stress/ui.py` (T149) |
+| dropped: "folded into tasks rather than separate" (19 lows) | each fixed in Wave 12 by the task T148's list names; the rows above name the file that pins it |
+
+The section 12.3 gap is closed as well. T153 moved the delivery writers (`guard.embed_and_place`, `fcpxml.write`, `video.exr_sequence`) onto `export.claim` and removed the dead seed copy `export.export_run`. The other by-design items are in the router plan's Wave 13 list: Tier C of any plate size, a deliberate one-frame import, no void for an import declaration, `lie_low` truncation, and the UTF-16 token fallback.
+
+### 13.7 Partial tasks
+
+None. No Wave 13 test file records `not reproducible on 83fb756`, and every one of T151 to T161 had passed when this pass started (its dependency list). The one repro note that names the commit is T151's module docstring, and it is a reproduction, not a miss: "Re-run on 83fb756 (test (3) without the lease checks): daemon B logged `resumed 1 pipeline run(s) a stopped daemon left in flight` and A's ledger for the run read `quoted, approved, submitted, failed`, the `failed` written by B." Two Wave 13 decisions were not fully met by their tasks, and this pass completed them (13.1): decision 84 for the Motion quote and decision 87 for a lone marker.
+
+### 13.8 Wave 13 open questions running on their defaults
+
+The build used these defaults (router plan, open questions 41 to 45; 41 is carried from Wave 12). Each is a decision for Aasish. Changing one is a small task.
+
+| # | question | default in effect |
+|---|---|---|
+| 41 | Seedance 2.5 Motion routes | Runway-only, unchanged from 12.6: the Atlas, BytePlus and WaveSpeed Seedance manifests declare no `negative_prompt` |
+| 42 | Lease scope | writes only: graph, runs, assets and review bundles are served to any daemon, so a second machine can look at a NAS project while the first one drives it; every write is 409 `project_leased` |
+| 43 | Lease TTL and heartbeat | 90 s TTL, 20 s heartbeat (`HEARTBEAT_S = LEASE_TTL_S / 4.5`); `PLATE_LEASE_TTL_S` tunes it, and a value that is not a positive finite number falls back to 90 with a warning; a lease of a dead process on the same host is taken over at once |
+| 44 | External import spend and the caps | recorded with `external: true` and left out of the daily and unattended caps; the ledger, `plate spend` and `Spend.external_today_usd` still show it; a declaration above the daily cap answers 201 with a `warnings` line |
+| 45 | Recipe paths over the API | confined to the project's `recipes/`, the studio recipes folder and the shipped recipes (`recipes.recipe_roots`); anything else is 422 `unknown_recipe` with "recipe paths must live in ..." and no line of the file |
+
+### 13.9 Box-day lines added by Wave 13
+
+These three lines continue the section 9 checklist, after items 25 and 26 (section 12.7):
+
+27. **The lease on the NAS from two machines (T151, decision 83).** Open one project folder on the NAS from the render box's daemon and from a second machine's daemon. While the first runs, the second's writes (a graph save from its canvas, a Send from its dock) are refused 409 `project_leased`, and its dock shows the 409 text naming the first machine and pid. Its reads still work. Stop the first daemon cleanly: the lease is removed and the second writes at once. Kill the first instead (Task Manager): the second takes the lease over within 90 s and logs a warning. Also check that a 30 s SMB hiccup on the share does not lose the lease.
+28. **A 250-character scene name (T158, decision 92).** In Max 2026, save a scene whose file stem is 250 characters in a folder deep enough that `<stem>.plate.json` would pass Windows' 259-character path limit. Bind it to a project and Send. The sidecar lives under `%LOCALAPPDATA%\Plate\sidecars\<hash>.plate.json`, the dock shows the note saying where, the binding survives a Max restart, and the scene backup lands in the temp folder.
+29. **A daemon restart mid-send (T158, decision 92).** Start a Send on a real camera and restart the daemon after the render, while the plugin is at the legend or hash stage. After T142's retries the Send fails with a daemon error, and the manifest-less packet folder is removed (the dock's warning names it). With `keep_failed_packets` on, the folder stays. Re-sending once the daemon is back ingests normally.
+
+The Wave 13 tree has not run on `windows-latest` yet. Push it, then confirm that the CI leg passes, including `test_windows_adds_the_259_character_path_limit` (the MAX_PATH case that failed on run 39171560042 and that T158 owns). Then start the stress workflow once by hand (`.github/workflows/stress.yml`, `workflow_dispatch`).

@@ -32,8 +32,8 @@ read a home's files and its SQLite index; the only index writes are the quote-cl
 To show that a check bites, point it at the code it was written against: `git archive 1f272f2 spec daemon pixels
 engines gates plugins/max tools docs fixtures/packets | tar -x -C <scratch>` and run with
 `PLATE_STRESS_SRC=<scratch>`; the scripts then put that tree's packages ahead of this checkout's, for the daemon and
-for the two in-process scripts. On 1f272f2 every check finds its defect except `engine_faults`'s `submit-timeout`
-(see there).
+for the two in-process scripts. On 1f272f2 every check finds its defect; `engine_faults`'s `submit-timeout` finds
+only its Wave 13 leg there (see there).
 
 Measured on this Mac (Apple silicon, 2026-10-19, fake engine, nothing else running): the whole target takes about five
 minutes (308 s); per script below. On 1f272f2 it takes about 13 minutes, most of it the defects themselves (a storm
@@ -148,9 +148,9 @@ corrupt2b, ro_attack, disk_attack and export_sig.
   free space, so no RAM disk or tmpfs is needed and nothing is skipped; the quote route's ENOSPC mapping needs a
   really full disk and is covered by daemon/tests/test_stress_wave12_api.py.
 - `sigkill-export-part` (sigkill-export-part-left): exports killed with SIGKILL at 30 to 250 ms leave a hidden temp
-  (planted when no kill lands mid-write). A temp the kill left beside its in-flight marker is swept by the next
-  export of the name seconds later, however young (Wave 13, decision 87); the planted one has no marker, so it is
-  aged past the one-hour window first.
+  (planted when no kill lands mid-write). What the kill left with its in-flight marker (the marker alone, at 30 ms
+  on this Mac, or the marker and its temps) is swept by the next export of the name seconds later, however young
+  (Wave 13, decision 87); the planted temp has no marker, so it is aged past the one-hour window first.
 
 ## engine_faults
 
@@ -169,11 +169,13 @@ flags, the daemon's settings and the file system.
 - `resume-starvation` (resume-serial-starvation): after a SIGKILL with two runs RUNNING, the restarted daemon polls
   both (read from the fake's journal), and both finish once the vendor does.
 - `submit-timeout` (submit-timeout-recorded-as-refunded): the provider took the job and the daemon died before it saw
-  the id (`crash_after_submit_before_persist`; the run executor logs the scripted crash and carries on, so the
-  harness kills the process): the restarted daemon re-stages on the same key, one job at the provider, no refund
-  recorded. The attacker's variant, an httpx timeout from a non-idempotent provider, cannot be injected into an
-  unpatched daemon (the fake is idempotent); its `submit_state_unknown` / `billing_unknown` classification is
-  unit-tested. This check passes on 1f272f2 too, whose boot recovery already re-staged a lost submit.
+  the id (`crash_after_submit_before_persist`): the scripted crash ends the daemon with code 70 on the run
+  executor's thread (Wave 13, decision 85; until then the executor logged it and carried on and the harness killed
+  the process, which is now a finding), and the restarted daemon re-stages on the same key, one job at the
+  provider, no refund recorded. The attacker's variant, an httpx timeout from a non-idempotent provider, cannot be
+  injected into an unpatched daemon (the fake is idempotent); its `submit_state_unknown` / `billing_unknown`
+  classification is unit-tested. The restart legs pass on 1f272f2 too, whose boot recovery already re-staged a
+  lost submit; the code-70 leg is Wave 13's.
 - `poll-transient` (poll-transient-error-fails-run): the fake's journal swapped for a folder for a few polls (its
   writes raise OSError, a transport fault) gives `poll_fault` notes, and the run finishes once the writes work.
 - `unbounded-download` (unbounded-result-download): a result that is not an image (`output: text`) puts nothing into

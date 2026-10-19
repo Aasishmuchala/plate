@@ -38,7 +38,7 @@ Windows 10/11 x64 is the primary runtime (the daemon, the GPU worker and the Max
 - Every text read or write passes `encoding="utf-8"` (the Windows default is cp1252); JSON is written with `newline="\n"`.
 - No `:` or other Windows-forbidden characters in generated file names (timestamps too: use `20261017T094107Z`); assume a case-insensitive filesystem; keep content-addressed paths short (MAX_PATH 260; LongPathsEnabled is optional, never assumed).
 - Moves into the CAS use `os.replace` with retry and backoff (Windows and Defender hold new files briefly). Copies or hardlinks, never symlinks.
-- **SQLite WAL is unsafe on SMB.** `index.sqlite` lives in the local app-data folder keyed by project id, never inside a project folder (projects may sit on the NAS); a project on a share is protected by its lockfile only.
+- **SQLite WAL is unsafe on SMB.** `index.sqlite` lives in the local app-data folder keyed by project id, never inside a project folder (projects may sit on the NAS); a project on a share is protected by its per-write lockfile and by its lease (`lease.json`: one daemon writes a project at a time).
 - Gates locate `ffmpeg`, `ffprobe` and `oiiotool` on PATH or via `PLATE_FFMPEG` / `PLATE_FFPROBE` / `PLATE_OIIOTOOL`, call them with argument lists, and skip cleanly when absent. No POSIX tools.
 - The GPU worker is stub mode by default; the `cuda` extra (torch built for CUDA 12.8+, needed for the RTX 5090's sm_120) is for the box only and is never installed by tests or bootstrap.
 - npm scripts are shell-neutral (node scripts, rimraf, cross-env; no `rm -rf`, `cp`, `FOO=bar cmd`). PowerShell scripts are ASCII and run in Windows PowerShell 5.1 and pwsh 7.

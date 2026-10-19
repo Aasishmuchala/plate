@@ -25,7 +25,7 @@ Optional: `winget install --id Gyan.FFmpeg -e` so the video-gate tests run inste
 | daemon logs | `%LOCALAPPDATA%\Plate\logs\daemon.out.log`, `daemon.err.log` |
 | Max startup script | `%LOCALAPPDATA%\Autodesk\3dsMax\2026 - 64bit\ENU\scripts\startup` |
 
-Project folders and packets may sit on the NAS (a UNC path such as `\\nas\plate\...`). They are protected by the project lockfile only. The SQLite index never goes on the share.
+Project folders and packets may sit on the NAS (a UNC path such as `\\nas\plate\...`). Each write takes the project lockfile (`project.lock`, per write), and the project lease (`lease.json`, Wave 13) keeps a second daemon's writes out while the first one's heartbeat is fresh: they are refused 409 `project_leased`, reads still work ([runbooks/daemon-wont-start.md](runbooks/daemon-wont-start.md), section I). The SQLite index never goes on the share.
 
 **Long paths.** Content-addressed paths are kept short so everything fits under MAX_PATH (260). Enabling long paths is optional: `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled = 1` (admin, then reboot). PLATE never assumes it.
 

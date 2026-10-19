@@ -630,3 +630,34 @@ def test_router_preview_reads_the_motion_packet_of_the_plate(env, monkeypatch):
     assert card["verdict"] in ("ai_interpolate", "rendered_endpoints_plus_clay", "render_move", "unknown")
     assert isinstance(card["disocclusion_fraction"], float) and isinstance(card["orbit_deg"], float)
     assert card["blocks"] is (card["verdict"] == "render_move")
+
+
+def test_a_motion_quote_takes_the_stills_d_from_the_stored_router_summary(env, monkeypatch):
+    """T162 (Wave 13 decision 84): with a motion packet starting at the plate, the Motion quote's router card takes
+    the still's D from the index's `packet_router` row written at ingest; the still is not decoded for it."""
+    env.project()
+    hero = env.packet(DOLLY_HERO)
+    env.packet(DOLLY)
+    with env.pipeline.index.project(PROJECT) as conn:
+        row = conn.execute("SELECT json FROM packet_router WHERE packet_id = ?", (hero,)).fetchone()
+    assert row is not None  # the warm-up at the end of the ingest
+    stored = json.loads(row["json"])
+    edit = env.approved_edit(hero)
+    env.put_graph([_plate(hero), edit, {"id": "m", "kind": "Motion"}], [("p", "e"), ("e", "m")])
+    cards: list[tuple[bool, Any]] = []
+    real_card = motion_runs.router_card
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        out = real_card(*args, **kwargs)
+        cards.append((kwargs.get("conn") is not None, out[0]))
+        return out
+
+    def no_decode(_pv: Any) -> Any:
+        raise AssertionError("the still was decoded for the router card at the quote")
+
+    monkeypatch.setattr(motion_runs, "router_card", spy)
+    monkeypatch.setattr(motion_runs, "_still_geometry", no_decode)
+    r = env.quote("m")
+    assert r.status_code == 200, r.text
+    ((with_conn, verdict),) = cards
+    assert with_conn and verdict.numbers["D_px_median"] == stored["D_px_median"]

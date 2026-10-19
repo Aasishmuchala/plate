@@ -16,8 +16,8 @@ unpatched (`python -m plate_daemon`) and inject the same faults from outside, wi
 - inflight-threads: 45 approvals of runs that never finish (`timeout`) answer at once and /health stays under 1 s.
 - resume-starvation: after a SIGKILL with two runs in flight, the restarted daemon polls both, not one at a time.
 - submit-timeout: the provider took the job and the daemon died before it saw the id
-  (`crash_after_submit_before_persist`; the harness kills the process if the scripted crash does not): the
-  restarted daemon adopts or re-stages it on the same key (one job at the provider), never records a refund,
+  (`crash_after_submit_before_persist`; the scripted crash ends the process with code 70, Wave 13 decision 85,
+  and the harness kills it if it does not, which is a finding): the restarted daemon adopts or re-stages it on the same key (one job at the provider), never records a refund,
   never resubmits blind. The attacker's variant, an httpx timeout raised by a non-idempotent provider after it
   created the job, cannot be injected into an unpatched daemon; its classification (`submit_state_unknown`,
   `billing_unknown`) is pinned by daemon/tests/test_stress_wave12_pipeline.py and test_stress_wave12_worker.py,
@@ -211,10 +211,10 @@ def submit_timeout() -> None:
         deadline = time.monotonic() + 10
         while d.alive() and time.monotonic() < deadline:
             time.sleep(0.2)
-        if (
-            d.alive()
-        ):  # the run executor logs a SimulatedCrash and carries on: end the process as a crash would
-            note("the scripted crash did not end the process; the harness killed it")
+        # Wave 13 (decision 85): the scripted crash ends the process with code 70 on the executor's threads too
+        code_70 = not d.alive() and d.proc is not None and d.proc.returncode == 70
+        check(code_70, "the scripted crash did not end the process with code 70; the harness killed it")
+        if d.alive():
             d.kill(_lib.sigkill())
         d.start(env={"PLATE_FAKE_ENGINE": "1"})
         run = d.wait_run(rid, 90)

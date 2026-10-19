@@ -272,13 +272,30 @@ def motion_packet_for(pipeline: Any, project: Any, hero_packet_id: str, named: s
     return found[0] if len(found) == 1 else None
 
 
+def _stored_detail(pipeline: Any, conn: Any, pv: Any) -> dict[str, Any] | None:
+    """The still's D from its stored router summary (decision 84, `Pipeline.router_summary`: the row written at
+    ingest, computed and stored when absent), or None when it cannot be had (Tier C, no Z or Cryptomatte)."""
+    try:
+        return pipeline.router_summary(conn, pv)
+    except Exception as e:  # the router informs the policy; it is never why a quote cannot be made
+        log.info("detail resolvability of %s not measured: %s", pv.packet_id, e)
+        return None
+
+
 def router_card(
-    pipeline: Any, project_id: str, pv: Any, *, motion_packet_id: str | None = None, mode: str | None = None
+    pipeline: Any,
+    project_id: str,
+    pv: Any,
+    *,
+    motion_packet_id: str | None = None,
+    mode: str | None = None,
+    conn: Any = None,
 ) -> tuple[Any, str, str | None]:
     """(RouterVerdict, source, motion packet id). `source` is `motion_packet` (the rendered camera path from the
     packet's first to its last frame), `still` (no motion packet: a crop pair keeps the camera, so the start and
     end camera are the still's own) or `none` (Tier C or no Z: a human decides). The mode is the daemon's
-    (`PLATE_ROUTER_MODE`, advisory by default), never the request's."""
+    (`PLATE_ROUTER_MODE`, advisory by default), never the request's. With the project index `conn` (the quote)
+    a motion packet's card takes the still's D from the stored router summary, so the still is not decoded."""
     from plate_gates import router_math
 
     mode = router_math.router_mode(mode)
@@ -286,8 +303,12 @@ def router_card(
     if project is None:
         raise PipelineError(f"no project {project_id}", code="not_found", status=404)
     motion = motion_packet_for(pipeline, project, pv.packet_id, motion_packet_id)
-    geometry = _still_geometry(pv)
-    detail = _detail(pv, geometry)
+    geometry = None
+    if motion is not None and conn is not None and hasattr(pipeline, "router_summary"):
+        detail = _stored_detail(pipeline, conn, pv)
+    else:
+        geometry = _still_geometry(pv)
+        detail = _detail(pv, geometry)
     if motion is not None:
         packet_motion, z_first, z_last = router_math.load_motion(motion.root)
         verdict = router_math.route_move(packet_motion, z_first, z_last, mode=mode, detail=detail)
@@ -778,7 +799,9 @@ class MotionRunner:
         )
         if motion is not None:
             try:
-                verdict, _source, _mp = router_card(pl, project_id, pv, motion_packet_id=motion.packet_id)
+                verdict, _source, _mp = router_card(
+                    pl, project_id, pv, motion_packet_id=motion.packet_id, conn=conn
+                )
                 router = verdict.model_dump(mode="json")
             except Exception as e:  # the router informs the policy; it is never why a quote cannot be made
                 log.warning("router verdict for %s/%s not measured: %s", project_id, node_id, e)
