@@ -17,8 +17,8 @@ with an APP1 Orientation tag put in front.
 - fifo-imports: 45 imports of FIFOs are 422 not_a_file at once and /health keeps answering (POSIX only).
 - concurrent-run-node and concurrent-add-node: 6 run_node calls on one node are 6 attempts that all run; 12
   add_node calls leave 12 nodes.
-- outbound-log-failure: when outbound.jsonl cannot be written, the error names the run (and the node) the
-  daemon already made, so the agent can find it before a retry.
+- outbound-log-failure: when outbound.jsonl cannot be written, run_node and add_node are `outbound_log_failed`
+  before the daemon is asked to act (Wave 13, decision 91): no run, no spend, no node, and no id to look up.
 - still-named-mp4: a PNG renamed .mp4 is refused unreadable_video, not imported as a one-frame clip.
 - exif-orientation: a JPEG whose EXIF turns it 90 degrees becomes an upright Tier C packet.
 - declared-cost-bound: an import's declared cost over 1,000 USD, or not finite, is 422 and makes no run.
@@ -335,6 +335,7 @@ def outbound_log_failure() -> None:
         tools.get_graph(p)  # the first call makes the log
         if not log.exists():
             skip("the MCP tools wrote no outbound.jsonl to make read-only")
+        nodes = len(d.api("GET", f"/projects/{p}/graph").json()["nodes"])
         mode = log.stat().st_mode
         os.chmod(log, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
         try:
@@ -352,23 +353,21 @@ def outbound_log_failure() -> None:
                 node_err = e
         finally:
             os.chmod(log, mode | stat.S_IWUSR)
+    # Wave 13 (decision 91): the mutating tools probe the log before the daemon acts, so nothing is started.
     runs = runs_of(d, p)
     if check(
         isinstance(run_err, mcp.McpError) and run_err.code == "outbound_log_failed",
         f"run_node -> {run_err!r:.160}",
     ):
-        made = [r["id"] for r in runs if r["id"] in run_err.message]
-        check(len(made) == 1, f"the error does not name the run it started: {run_err.message[:200]}")
+        check(not runs, f"run_node started {len(runs)} run(s) with the log unwritable")
+        check("run_id" not in run_err.message, f"the error names a run: {run_err.message[:200]}")
     if check(
         isinstance(node_err, mcp.McpError) and node_err.code == "outbound_log_failed",
         f"add_node -> {node_err!r:.160}",
     ):
         g = d.api("GET", f"/projects/{p}/graph").json()
-        colours = [n["id"] for n in g["nodes"] if n["kind"] == "Colour"]
-        check(
-            any(f"node_id {c}" in node_err.message for c in colours),
-            f"the error names no node: {node_err.message[:200]}",
-        )
+        check(len(g["nodes"]) == nodes, f"add_node added a node with the log unwritable: {len(g['nodes'])}")
+        check("node_id" not in node_err.message, f"the error names a node: {node_err.message[:200]}")
 
 
 def still_named_mp4() -> None:

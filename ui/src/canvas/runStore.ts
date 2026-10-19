@@ -7,6 +7,11 @@
 // T101: the A/B pair is two sides, each a plate, a run or a node's output, and `setCompareSide` sets either one.
 // Only a candidate against its own plate is `scrubEligible`: the scrub (and so the verdict keys and accept) stays
 // bound to that pairing, and any other pairing is for looking only. `enlarged` is the viewer filling the canvas.
+//
+// T160 (decision 93): `hydrate` fills a node's strip from run history when a project opens (the panels store reads
+// `GET /projects/{id}/runs` and hands each generating node its newest Make). It works as `startRuns` does, except that
+// it never replaces a strip holding a run still in flight from this session. Ranks and picks start empty; the same
+// runs read again (a History refresh) keep the ranking and the pick the strip already had.
 
 import { create } from "zustand";
 import { useGraphStore } from "../store";
@@ -109,6 +114,12 @@ export interface RunStoreState {
   enlarged: boolean;
   /** Replace a node's candidate set with the runs of one Make (one run, or a best-of-N group). */
   startRuns: (nodeId: string, runs: CandidateRun[]) => void;
+  /**
+   * Fill a node's strip with the runs of its newest Make read from history (T160): like `startRuns`, but a strip
+   * that holds a non-terminal run is left alone, and an empty list changes nothing. Ranks and picks start empty
+   * (the strip's own runs read again keep theirs).
+   */
+  hydrate: (nodeId: string, runs: CandidateRun[]) => void;
   /** Merge a run read from the daemon (GET /runs/{id}); unknown runs are added under their node. */
   upsertRun: (run: CandidateRun, nodeId?: string) => void;
   setRunState: (runId: string, state: RunState) => void;
@@ -266,6 +277,18 @@ function writePickToGraph(c: Candidate): void {
   }));
 }
 
+/** The best-of-N group of a set of runs: the first run that names one. */
+const groupOfRuns = (runs: CandidateRun[]): string | null =>
+  runs.map((r) => r.sibling_group ?? r.quote?.sibling_group ?? null).find((g) => g) ?? null;
+
+/** True when the node's strip holds a run that is not terminal yet (a Make of this session still in flight). */
+export function holdsLiveRun(s: Pick<RunStoreState, "candidates" | "byNode">, nodeId: string): boolean {
+  return (s.byNode[nodeId]?.runIds ?? []).some((id) => {
+    const c = s.candidates[id];
+    return c !== undefined && !isTerminal(c.state);
+  });
+}
+
 let flashTimer: ReturnType<typeof setTimeout> | null = null;
 let flashSeq = 0;
 
@@ -288,6 +311,23 @@ export const useRunStore = create<RunStoreState>()((set, get) => ({
       const group = runs.map((r) => r.sibling_group ?? r.quote?.sibling_group ?? null).find((g) => g) ?? null;
       const byNode = { ...s.byNode, [nodeId]: { runIds: runs.map((r) => r.id), group, ranked: null, picked: null } };
       return { candidates, byNode };
+    }),
+  hydrate: (nodeId, runs) =>
+    set((s) => {
+      if (runs.length === 0 || holdsLiveRun(s, nodeId)) return {};
+      const entry = s.byNode[nodeId];
+      const runIds = runs.map((r) => r.id);
+      // The runs the strip already shows, read again: refresh them and keep the strip's ranking and pick.
+      const same =
+        entry !== undefined && entry.runIds.length === runIds.length && runIds.every((id) => entry.runIds.includes(id));
+      const candidates = { ...s.candidates };
+      if (!same) for (const id of entry?.runIds ?? []) delete candidates[id];
+      for (const run of runs) candidates[run.id] = candidateFrom(run, nodeId, same ? s.candidates[run.id] : undefined);
+      const group = groupOfRuns(runs);
+      const next: NodeRuns = same
+        ? { ...entry, runIds, group: group ?? entry.group }
+        : { runIds, group, ranked: null, picked: null };
+      return { candidates, byNode: { ...s.byNode, [nodeId]: next } };
     }),
   upsertRun: (run, nodeId) =>
     set((s) => {

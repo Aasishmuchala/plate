@@ -148,7 +148,9 @@ corrupt2b, ro_attack, disk_attack and export_sig.
   free space, so no RAM disk or tmpfs is needed and nothing is skipped; the quote route's ENOSPC mapping needs a
   really full disk and is covered by daemon/tests/test_stress_wave12_api.py.
 - `sigkill-export-part` (sigkill-export-part-left): exports killed with SIGKILL at 30 to 250 ms leave a hidden temp
-  (planted when no kill lands mid-write); once older than the in-flight window the next export of the name sweeps it.
+  (planted when no kill lands mid-write). A temp the kill left beside its in-flight marker is swept by the next
+  export of the name seconds later, however young (Wave 13, decision 87); the planted one has no marker, so it is
+  aged past the one-hour window first.
 
 ## engine_faults
 
@@ -250,8 +252,9 @@ loopback client and the CLIs as subprocesses on the daemon's home.
 - `concurrent-run-node` (mcp-run-node-same-node-race): 6 concurrent run_node calls on one node are attempts 1 to 6
   and all six finish.
 - `concurrent-add-node` (mcp-add-node-lost-update): 12 concurrent add_node calls leave 12 nodes.
-- `outbound-log-failure` (mcp-outbound-log-failure-after-spend): with outbound.jsonl read-only, run_node's and
-  add_node's `outbound_log_failed` name the run and the node the daemon made.
+- `outbound-log-failure` (mcp-outbound-log-failure-after-spend): with outbound.jsonl read-only, run_node and
+  add_node are `outbound_log_failed` before the daemon is asked to act (Wave 13, decision 91): no run, no node, and
+  the message names neither. Until Wave 13 the run was made and the error named it.
 - `still-named-mp4` (import-still-named-mp4-is-a-clip): a PNG renamed .mp4 is 422 `unreadable_video`, no run.
 - `exif-orientation` (tierc-ignores-exif-orientation): a JPEG cutdown of a take with an EXIF Orientation 6 tag put in
   front becomes an upright Tier C packet.

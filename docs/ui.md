@@ -63,11 +63,11 @@ The daemon stores a `graph_revision` in `project.json`; every `GET /projects/{id
 
 | situation | what the store does |
 |---|---|
-| the save fails and might pass: a network error, a 5xx, 409 `graph_busy` (another save of the project was in progress for more than 5 s), 429 `too_many_saves` (more than four saves already waiting) | the chip stays red, `save failed: <message>`, and the save is retried after 1, 2, 4 and 8 seconds and then every 15, until it succeeds or you open another project. When the daemon heartbeat goes from down to up the store saves at once if `saveState` is not `saved` |
+| the save fails and might pass: a network error, a 5xx, 409 `graph_busy` (another save of the project was in progress for more than 5 s), 429 `too_many_saves` (more than four saves already waiting), 409 `project_leased` (another daemon holds the project's lease and its heartbeat is less than 90 s old; the chip shows the daemon's text) | the chip stays red, `save failed: <message>`, and the save is retried after 1, 2, 4 and 8 seconds and then every 15, until it succeeds or you open another project. When the daemon heartbeat goes from down to up the store saves at once if `saveState` is not `saved` |
 | 422, a wire that breaks a canvas rule | not retried; the wire is marked refused with the reason (the daemon's answer is the truth) |
 | 409 `graph_conflict` (`current`, `sent`) | the daemon holds a newer revision than the one sent. `saveState` becomes `conflict`, the chip reads `conflict: reload`, and nothing is written. **Reload** fetches the stored graph and replaces the local one. The only local work kept is an Edit's prompt text, in `conflictLocal` and offered as **copy prompt**; every other local change is dropped |
 | the `PUT` carries no `revision` (an older client) | accepted without a check; the daemon only enforces the protocol on clients that send one |
-| the graph is over 4 MiB, or a node or edge has no string id | 422 `graph_too_large` or the shape errors (`UNKNOWN_NODE` for an id that is an object or array), never a 500; a request body over 8 MiB is refused 413 before it is read |
+| the graph is over 4 MiB, a node's `params` are over 256 KiB, or a node or edge has no string id | 422 `graph_too_large`, 422 `params_too_large` (with the `node_id`, the `bytes` and the `limit_bytes`) or the shape errors (`UNKNOWN_NODE` for an id that is an object or array), never a 500; a request body over 8 MiB is refused 413 before it is read |
 
 **Debounce ceiling.** The 400 ms debounce is capped at `SAVE_MAX_WAIT_MS = 2000`: typing without a pause still saves at least every two seconds.
 
@@ -80,6 +80,29 @@ The daemon stores a `graph_revision` in `project.json`; every `GET /projects/{id
 ### Token states
 
 The status bar chip has three token states. `token: present`: a token is in `sessionStorage`. `token: rejected`: the health check or any call answered 401, so the token this tab holds is not the daemon's (the chip no longer claims `present` just because something is stored). `token: missing`: the tab has no token, and a box appears to paste the `#token=` value into. An error from the daemon that is not JSON (a proxy's HTML page, a bare 502) is shown as `<status> <statusText> (non-JSON response)`, never as the body.
+
+## Decoded images are cached by asset
+
+The compare viewer decodes every A and B image into half floats (or a bitmap for an 8-bit source) before it uploads it to the GPU, and the fetch is the cost: a 3840 x 2160 plate is 66 MB of half floats. `viewer/loaders.ts` therefore keeps an LRU of decoded images, `PixelCache`, keyed by `url|encoding|WxH` (a viewer URL names a stored asset by its hash, so a cached image is never stale). The plate is fetched once per compare session while only the B side changes: the plate and four takes of it cost five fetches, not eight.
+
+| limit | value |
+|---|---|
+| bytes | `VIEWER_CACHE_BYTES` = 320 MiB of decoded pixels (a half-float image counts its buffer, a bitmap `width * height * 4`) |
+| entries | `VIEWER_CACHE_ENTRIES` = 4 |
+| too big | one image larger than the whole byte budget is never cached |
+| eviction | least recently used first, until both limits hold |
+| not cached | a source that carries its own bytes (`data`), and a load that was aborted before it finished |
+
+`pixelCache` is the shared instance every viewer slot reads through; `setPixelCacheLimits({ bytes, entries })` resizes it and exists for tests, and `loadImage(src, signal, cache)` takes another cache. The renderer still uploads to the GPU on every source change; only the fetch and decode are saved.
+
+## Candidate strips come back when a project opens
+
+A candidate strip used to start empty after a reload, with "no output yet" over a node that had been run an hour ago. Now, when a project opens and its run list loads (`GET /projects/{id}/runs`), each generating node on the canvas (Edit, People, Motion, CropPair) gets its newest Make back:
+
+- **Which runs.** The rows that share the newest row's best-of-N group (`quote.sibling_group`), else the newest row alone, at most six (`MAX_CANDIDATES`). Older Makes stay in the History tab.
+- **Read in full.** Each is fetched with `GET /runs/{id}`, because a list row carries no outputs and no gate detail; a GATE_FAIL whose report has no checks also reads `GET /runs/{id}/gate`, so the strip shows the failing check. The take can be compared and picked as if it had just been made.
+- **In flight.** A run that is not terminal is watched over SSE (`watchRun`), so a take that was RUNNING when you reloaded finishes in front of you.
+- **Nothing is overwritten.** A strip that already holds a run in flight from this session is left alone (`runStore.hydrate`); ranks and picks start empty; a project with no runs keeps its empty strips. A failure to read one node's runs is logged once and does not stop the other nodes.
 
 ## Daemon routes the UI calls
 
@@ -101,7 +124,7 @@ Every route below is in the daemon (under `/api/v0`). Bearer token on all of the
 | `POST /runs/{id}/accept`, `/scrub` | verdict panel | the logged full scrub and the acceptance that needs it |
 | `POST /runs/{id}/export` | Export editor | the exported file, its sidecar and format; a GATE_FAIL take needs an override reason |
 | `POST /projects/{id}/review` | Review editor | the review zip: path, size, takes |
-| `POST /projects/{id}/import` | none yet (API) | an external render (Higgsfield, Runway or a file by hand) imported as a run and gated |
+| `POST /projects/{id}/import` | none yet (API) | an external render (Higgsfield, Runway or a file by hand) imported as a run and gated; a declared `cost_usd` is external spend (outside the automation caps), and one above the daily cap answers 201 with a `warnings` line |
 | `POST /runs/{id}/deliver` | Export editor (clip takes), video player Deliver… | a video delivery format from a finished clip take |
 | `POST /assets?kind=reference&project_id=` | Reference editor | stores an uploaded PNG or JPEG (at most 32 MiB) as an 8-bit RGB PNG with no metadata, a side over 4096 px shrunk (`scaled_from`), and lists it in the project's `references.json`; answers `{hash, width, height, kind, project_id, scaled_from}` |
 | `GET /projects/{id}/references` | Reference editor | the project's uploaded references: hash, size, bytes, upload time, note |

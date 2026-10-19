@@ -151,6 +151,34 @@ Wave 12 (router plan T145; decisions 73 and 75):
   those states is FAILED `resume_limit` instead of a third attempt (the result blob stays in the CAS).
 - `project_list` lists a folder whose `project.json` does not read as `{"project_id", "root", "broken": true,
   "detail"}` (WARNING) instead of hiding it.
+
+Wave 13 (router plan T151; decision 83):
+
+- Project leases. A project another daemon's live lease covers (`lease.held_by_other`) is left alone by
+  `resume` and by the executor's watch (`orphaned_runs`): its runs stay with that daemon, with a WARNING
+  `project <id> is leased by <host> pid <pid>: its runs stay with that daemon` at most once per project per
+  `lease.LEASE_TTL_S`. Every write goes through `project.lock`, which raises `lease.ProjectLeased` (409
+  `project_leased`); `quote_node` and `approve` ask first (`refuse_if_leased`), so a refused quote leaves no run
+  row behind. A `quoted` or `approved` record the lease refuses cancels the run in this index only
+  (`project_leased`, nothing ledgered: the folder never had it) and `ProjectLeased` goes on; an `override`
+  changes nothing; any other kind waits in the ledger outbox as for any other failure. `project_head` (so `GET
+  /projects`) carries `lease: {host, pid, daemon_id, heartbeat_utc, live, mine}` or None.
+
+Wave 13 (router plan T152; decisions 84, 85 and 86):
+
+- The router's inputs are computed once, at ingest. `router_summary(conn, pv)` reads `detail_resolvability`'s
+  answer from the index's `packet_router` row (`ROUTER_SUMMARY_VERSION`); a missing row, or one of another
+  version, is computed (`PacketView.detail_resolvability`: Z and the object Cryptomatte from one open of the EXR)
+  and stored. `warm_router` runs at the end of an ingest (`api.create_app`'s finish) for a Tier A packet with a
+  beauty EXR; a failure there is a WARNING and the quote computes lazily. `quote_node` passes its connection to
+  `render_it`, so a quote never decodes the EXR for the router once the row exists.
+- A scripted crash exits the process on every execution path. With `crash_exits_process` (set by
+  `python -m plate_daemon`), `execute` turns a `SimulatedCrash` into `os._exit(70)`: the executor's threads, the
+  inline BackgroundTask and the boot resume die as a crashed daemon would, like the dev `step` route already did.
+- The result's format is recorded, not judged. `normalized.ingress` carries `raw_format`, `raw_bit_depth`,
+  `raw_channels`, `alpha_dropped`, `alpha_transparent` and `lossy` (`plate_pixels.ingress.result_info`); the
+  gate report names a lossy container, a dropped alpha and a fully transparent one in `backend_notes`
+  (`result_notes`). A float result with a non-finite pixel fails NORMALIZING (`normalize_error`, `non-finite`).
 """
 
 from __future__ import annotations
@@ -166,6 +194,7 @@ import os
 import re
 import sqlite3
 import struct
+import sys
 import threading
 import time
 import zlib
@@ -180,12 +209,12 @@ import cv2
 import numpy as np
 from blake3 import blake3
 
-from . import budgets, canvas_rules
-from .adapter import PollResult, lookup_fn, submit_is_idempotent
+from . import budgets, canvas_rules, lease
+from .adapter import PollResult, SimulatedCrash, lookup_fn, submit_is_idempotent
 from .cas import CAS, hash_bytes, hash_file
 from .config import Settings, check_project_id
 from .custody import CustodyViolation, Grade, project_allowed, require_route, route_allowed
-from .db import loads
+from .db import dumps, loads, tx
 from .executor import DEFAULT_MAX_INFLIGHT, RunExecutor
 from .idempotency import canonical_json
 from .index import Index, packet_entry
@@ -196,7 +225,7 @@ from .projects import Project, ProjectError
 from .quotes import QuoteExpired, approve_group, quote_run
 from .quotes import approve as approve_one
 from .states import TERMINAL, WORKER_STATES, Priority, RunState
-from .timeutil import parse_iso, utcnow
+from .timeutil import iso, parse_iso, utcnow
 from .worker import GateOutcome, rank_siblings, route_key, siblings
 from .worker import step as worker_step
 
@@ -222,9 +251,11 @@ __all__ = [
     "encode_png16",
     "index_busy",
     "is_pipeline_run",
+    "lease_view",
     "project_head",
     "repeat_canonical",
     "repeat_key",
+    "result_notes",
     "run_workers",
     "subgraph_snapshot",
 ]
@@ -260,6 +291,8 @@ DEFAULT_SHOT_CLASS = "wide"
 ASSUMED_OK = "assumed ok: no canary signal yet"
 ALERTS_JSONL = "alerts.jsonl"
 ROUTER_KEY = "router"
+# Decision 84: the version of the `packet_router` rows this code writes; a row of another version is recomputed.
+ROUTER_SUMMARY_VERSION = "2026.10.19"
 SUBGRAPH_KEY = "subgraph"
 REPEAT_EXCLUDED_INPUTS = (SUBGRAPH_KEY, ROUTER_KEY)  # snapshots, not what the engine is asked to do
 REPEAT_KEY_HEX = 16
@@ -268,7 +301,18 @@ REPEAT_KEY_HEX = 16
 # cancelled (nothing may spend without them), an override simply changes nothing.
 FAIL_CLOSED_KINDS = frozenset({"quoted", "approved", "override"})
 CANCEL_ON_LOSS_KINDS = frozenset({"quoted", "approved"})
+LEASED = "project_leased"  # decision 83: the reason code of a run a foreign lease stopped in this index
 SUBMIT_STATE_UNKNOWN = "submit_state_unknown"
+CRASH_EXIT_CODE = 70  # decision 85: what a scripted SimulatedCrash exits with under crash_exits_process
+# Decision 86: what NORMALIZING records about the engine's result (plate_pixels.ingress.result_info).
+RESULT_INFO_KEYS = (
+    "raw_format",
+    "raw_bit_depth",
+    "raw_channels",
+    "alpha_dropped",
+    "alpha_transparent",
+    "lossy",
+)
 # Decision 75: the run executor. 0 workers runs inline through a BackgroundTask (the test suite sets it).
 RUN_WORKERS_ENV = "PLATE_RUN_WORKERS"
 DEFAULT_RUN_WORKERS = 8
@@ -691,17 +735,25 @@ class PacketView:
         return self._cache["locked_px"]
 
     def detail_resolvability(self) -> dict[str, Any]:
-        """`router_math.detail_resolvability` on this still (Tier A: Z and the object Cryptomatte; cached)."""
+        """`router_math.detail_resolvability` on this still (Tier A: Z and the object Cryptomatte; cached). Z and
+        the Cryptomatte come from one open of the EXR unless the Cryptomatte is already decoded (T152)."""
         if "detail" not in self._cache:
             from plate_gates import router_math
-            from plate_pixels.exr import read_elements
+            from plate_pixels import exr as exr_io
 
             exr = self.files.get("beauty_exr")
-            pair = self.crypto("object")
-            if exr is None or pair is None:
+            if exr is None:
+                raise PipelineError(f"packet {self.packet_id} has no Z and object Cryptomatte")
+            path = self.root / exr["path"]
+            if "crypto_object" in self._cache:
+                pair = self._cache["crypto_object"]
+                z = exr_io.read_elements(path, self.manifest, ["zdepth"])["zdepth"]
+            else:
+                z, pair = exr_io.read_z_and_cryptomatte(path, self.manifest, "object")
+                self._cache["crypto_object"] = pair
+            if pair is None:
                 raise PipelineError(f"packet {self.packet_id} has no Z and object Cryptomatte")
             zd = next((e for e in exr.get("elements") or () if e.get("element") == "zdepth"), {})
-            z = read_elements(self.root / exr["path"], self.manifest, ["zdepth"])["zdepth"]
             cam = self.manifest.get("camera") or {}
             self._cache["detail"] = router_math.detail_resolvability(
                 z,
@@ -883,6 +935,7 @@ class Pipeline:
         policy: budgets.Policy | None = None,
         ocr: Any = None,
         depth_fn: Callable[[np.ndarray], np.ndarray] | None = None,
+        crash_exits_process: bool = False,
     ):
         self.settings = settings
         self.index = index
@@ -898,6 +951,8 @@ class Pipeline:
         self.policy = policy or budgets.Policy()
         self.ocr = ocr
         self.depth_fn = depth_fn
+        # Decision 85: a scripted SimulatedCrash ends the process (python -m plate_daemon), on every path.
+        self.crash_exits_process = crash_exits_process
         self.last_human_utc: datetime | None = None
         self._lock = threading.RLock()
         self._node_locks: dict[tuple[str, str], threading.Lock] = {}  # (project, node) -> attempt numbering
@@ -928,6 +983,7 @@ class Pipeline:
         )
         self._executor_live = False
         self._closed = False
+        self._lease_warned: dict[str, float] = {}  # project -> monotonic time of the last "is leased" WARNING
 
     # ------------------------------------------------------------------ projects
 
@@ -943,6 +999,35 @@ class Pipeline:
         return self.index.project_root(project_id) or self.settings.projects_dir / check_project_id(
             project_id
         )
+
+    def leased_elsewhere(self, project_id: str) -> lease.LeaseInfo | None:
+        """Decision 83: another daemon's live lease on the project (None: none, or leases are off in this
+        process), with a WARNING at most once per project per `LEASE_TTL_S`."""
+        holder = lease.held_by_other(self.project_dir(project_id))
+        if holder is None:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            last = self._lease_warned.get(project_id)
+            warn = last is None or now - last >= lease.LEASE_TTL_S
+            if warn:
+                self._lease_warned[project_id] = now
+        if warn:
+            log.warning(
+                "project %s is leased by %s pid %s: its runs stay with that daemon",
+                project_id,
+                holder.host,
+                holder.pid,
+            )
+        return holder
+
+    def refuse_if_leased(self, project_id: str) -> None:
+        """`lease.ProjectLeased` when another daemon's live lease covers the project (asked before a quote or an
+        approval makes or moves a run row; `project.lock` refuses the write itself either way)."""
+        root = self.project_dir(project_id)
+        holder = lease.held_by_other(root)
+        if holder is not None:
+            raise lease.ProjectLeased.of(holder, Path(root).absolute())
 
     def load_project(self, project_id: str) -> Project | None:
         root = self.project_dir(project_id)
@@ -979,7 +1064,8 @@ class Pipeline:
 
     # ------------------------------------------------------------------ packets and custody
 
-    def packet(self, project_id: str, packet_id: str) -> PacketView:
+    def _ingested_row(self, project_id: str, packet_id: str) -> Any:
+        """The packet's index row (path, status, manifest_blake3), refused unless the packet is ingested."""
         with self.index.project(project_id) as conn:
             row = conn.execute(
                 "SELECT path, status, manifest_blake3 FROM packets WHERE packet_id = ?", (packet_id,)
@@ -993,6 +1079,10 @@ class Pipeline:
                 status=409,
                 status_now=row["status"],
             )
+        return row
+
+    def packet(self, project_id: str, packet_id: str) -> PacketView:
+        row = self._ingested_row(project_id, packet_id)
         key = (packet_id, row["manifest_blake3"])
         with self._lock:
             hit = self._packets.get(key)
@@ -1296,10 +1386,64 @@ class Pipeline:
             picked["reference_token"] = self.reference_token(engine_id)
         return picked
 
-    def render_it(self, pv: PacketView, task: str) -> dict[str, Any]:
+    def router_summary(self, conn: Any, pv: PacketView) -> dict[str, Any]:
+        """Decision 84: `detail_resolvability`'s answer for the packet, from its `packet_router` row when that
+        row is of `ROUTER_SUMMARY_VERSION`; otherwise computed (the EXR decoded once) and stored, replacing an
+        older row. A row that will not parse is recomputed; a store that fails is logged and the answer stands."""
+        row = conn.execute(
+            "SELECT json FROM packet_router WHERE packet_id = ? AND version = ?",
+            (pv.packet_id, ROUTER_SUMMARY_VERSION),
+        ).fetchone()
+        if row is not None:
+            try:
+                hit = json.loads(row["json"])
+            except ValueError as e:
+                log.warning("router summary of %s does not parse (%s); recomputing", pv.packet_id, e)
+            else:
+                if isinstance(hit, dict):
+                    return hit
+        d = pv.detail_resolvability()
+        try:
+            with tx(conn):
+                conn.execute(
+                    "INSERT OR REPLACE INTO packet_router (packet_id, version, json, computed_utc) "
+                    "VALUES (?, ?, ?, ?)",
+                    (pv.packet_id, ROUTER_SUMMARY_VERSION, dumps(_plain(d)), iso(self.clock())),
+                )
+        except sqlite3.Error as e:  # a cache: the next quote computes it again
+            log.warning("router summary of %s not stored: %s", pv.packet_id, e)
+        return d
+
+    def warm_router(self, project_id: str, packet_id: str) -> dict[str, Any] | None:
+        """Decision 84, at the end of an ingest: the router summary of an ingested Tier A packet with a beauty EXR,
+        computed and stored now so its first quote decodes nothing for the router. None for any other packet, and
+        for any failure (a WARNING; the quote computes it lazily). The packet is read into a view of its own,
+        never into the packet cache: only the row outlives the warm-up (a packet nobody quotes holds no decoded
+        layers, and a share that goes away later reads as gone)."""
+        t0 = time.monotonic()
+        try:
+            row = self._ingested_row(project_id, packet_id)
+            pv = PacketView.load(packet_id, row["path"], row["manifest_blake3"])
+            if pv.tier != "A" or "beauty_exr" not in pv.files:
+                return None
+            with self.index.project(project_id) as conn:
+                d = self.router_summary(conn, pv)
+        except Exception as e:
+            log.warning(
+                "router summary for %s not computed at ingest (%s: %s); the first quote computes it",
+                packet_id,
+                type(e).__name__,
+                e,
+            )
+            return None
+        log.info("router summary for %s computed in %.2f s", packet_id, time.monotonic() - t0)
+        return d
+
+    def render_it(self, pv: PacketView, task: str, conn: Any = None) -> dict[str, Any]:
         """Doctrine 4 before spend: the detail the frame can resolve, as `run.inputs["router"]`. Advisory
         unless `PLATE_ROUTER_MODE=blocking`, where a `vray_only` frame is refused (409 `render_it`); people
-        stay allowed (AI for people by region is the router's own exception)."""
+        stay allowed (AI for people by region is the router's own exception). With `conn` (the project index)
+        the numbers come from `router_summary`, so the EXR is decoded only when no current row exists."""
         from plate_gates import router_math
 
         try:
@@ -1315,7 +1459,7 @@ class Pipeline:
                 "reasons": ["render-it: Tier C has relative depth only; a person decides (PACKET.md 11)"],
             }
         try:
-            d = pv.detail_resolvability()
+            d = self.router_summary(conn, pv) if conn is not None else pv.detail_resolvability()
         except Exception as e:  # advisory numbers: a packet they cannot be read from is unknown, not refused
             log.warning("render-it numbers for %s not computed: %s", pv.packet_id, e)
             return {
@@ -1988,11 +2132,13 @@ class Pipeline:
         optional): engine_id, route_id, packet_id, task, shot_class, recipe, prompt, params (`params.tokens`
         fills a recipe's tokens and never reaches the engine), preset, region_crop, feather_px, priority,
         attempt (server-side when absent, numbered under the node's lock). A failure once the run row exists
-        cancels it (`quote failed: <error>`) before the error goes on."""
+        cancels it (`quote failed: <error>`) before the error goes on. A project another daemon leases is
+        `lease.ProjectLeased` (409) before anything else is read (decision 83)."""
         now = now or self.clock()
         project = self.load_project(project_id)
         if project is None:
             raise PipelineError(f"no project {project_id}", code="not_found", status=404)
+        self.refuse_if_leased(project_id)
         g = canvas_rules.as_graph(project.graph)
         node = next((n for n in g.nodes if n.get("id") == node_id), None)
         if node is None:
@@ -2042,7 +2188,7 @@ class Pipeline:
         route = self.pick_route(
             project_id, pv, engine_id, body.get("route_id"), task=task, shot_class=shot_class
         )
-        router = self.render_it(pv, task)
+        router = self.render_it(pv, task, conn)
         router["reasons"] = [*router["reasons"], *route.get("reasons", ())]
         region_crop = body.get("region_crop")
         if region_crop is None:
@@ -2184,8 +2330,10 @@ class Pipeline:
         every run (the project's custody may have tightened since the quote). An approval the ledger cannot
         record cancels the group (503 `ledger_unavailable`). The daily and unattended caps count the spend of
         every project index in this home (`budgets.spend_snapshot_all`, decision 80); a quote that lapsed or
-        was made after `now` is EXPIRED, ledgered `expired`, and `QuoteExpired` goes on."""
+        was made after `now` is EXPIRED, ledgered `expired`, and `QuoteExpired` goes on. A project another
+        daemon leases is `lease.ProjectLeased` (409) with nothing moved (decision 83)."""
         now = now or self.clock()
+        self.refuse_if_leased(project_id)
         run = get_run(conn, run_id)
         self.require_custody(run)
         if by == "human":
@@ -2224,6 +2372,10 @@ class Pipeline:
             if e.code == "ledger_unavailable":  # one unrecorded approval stops the group: none of it is spent
                 for r in runs:
                     self._cancel_unledgered(conn, project_id, r.id, "approved", e)
+            raise
+        except lease.ProjectLeased as e:  # leased since the check: the group stops here, in this index only
+            for r in runs:
+                self._cancel_unledgered(conn, project_id, r.id, "approved", e, code=LEASED, record=False)
             raise
         return runs
 
@@ -2721,6 +2873,7 @@ class Pipeline:
             "resample",
             "region",
             "sizemap_mode",
+            *RESULT_INFO_KEYS,
         )
         out: dict[str, Any] = {
             "outputs": [out_key],
@@ -2836,6 +2989,10 @@ class Pipeline:
             crypto_material=pv.crypto("material") if pv.tier == "A" else None,
             extra_metrics=extra,
         )
+        # Decision 86: the result's format, beside its registration.
+        for note in result_notes(norm.get("ingress")):
+            if note not in report.backend_notes:
+                report.backend_notes.append(note)
         stored = report.model_dump(mode="json")
         if base is not None:  # decision 72: the sidecar says what the take was built on
             stored["base"] = base
@@ -2911,7 +3068,9 @@ class Pipeline:
     ) -> RunState:
         """Drive a QUEUED (or resumed) run to a terminal state, sleeping between idle polls. `run_id` may be
         the Run itself. A busy or locked index is retried with backoff (`BUSY_BACKOFF_S`, `BUSY_RETRIES` in a
-        row, then re-raised); once the executor is stopped the run is left where it is for the next boot."""
+        row, then re-raised); once the executor is stopped the run is left where it is for the next boot. A
+        `SimulatedCrash` exits the process (`CRASH_EXIT_CODE`) when `crash_exits_process` is set (decision 85),
+        else it goes on."""
         if isinstance(run_id, Run):
             project_id, run_id = project_id or run_id.project_id, run_id.id
         pid = project_id or self.index.locate_run(run_id)
@@ -2923,6 +3082,12 @@ class Pipeline:
             self._driving[key] = self._driving.get(key, 0) + 1
         try:
             state = self._drive(pid, run_id, cas, max_steps)
+        except SimulatedCrash as e:  # decision 85: executor thread, BackgroundTask and boot resume alike
+            if self.crash_exits_process:
+                sys.stderr.write(f"plate_daemon: {e}; exiting as a crashed process would\n")
+                sys.stderr.flush()
+                os._exit(CRASH_EXIT_CODE)
+            raise
         finally:
             with self._lock:
                 left = self._driving.get(key, 1) - 1
@@ -3061,7 +3226,8 @@ class Pipeline:
     def orphaned_runs(self) -> list[tuple[str, str]]:
         """The executor's watch: `(project_id, run_id)` of every pipeline run in a worker state that nothing in
         this process is driving and whose last move is older than `ORPHAN_GRACE_S` (its driver died: a step that
-        raised past its retries, a lost thread). Each project's ledger outbox is drained on the way."""
+        raised past its retries, a lost thread). Each project's ledger outbox is drained on the way. A project
+        another daemon leases is skipped (decision 83)."""
         states = tuple(s.value for s in WORKER_STATES)
         marks = ",".join("?" * len(states))
         cutoff = utcnow() - timedelta(seconds=ORPHAN_GRACE_S)
@@ -3070,6 +3236,8 @@ class Pipeline:
         out: list[tuple[str, str]] = []
         for pid in self.index.project_ids():
             try:
+                if self.leased_elsewhere(pid) is not None:  # decision 83: that daemon drives them
+                    continue
                 with self.index.project(pid) as conn:
                     self.drain_ledger_outbox(conn, pid)
                     rows = conn.execute(
@@ -3096,7 +3264,8 @@ class Pipeline:
         rules still apply, so nothing is resubmitted blind). Each project's ledger outbox is drained first; each
         run gets a `resume` note and goes to the executor (inline: driven here, one after another). A run in
         FETCHING, NORMALIZING or GATING with `RESUME_LIMIT` earlier `resume` notes from those states is FAILED
-        `resume_limit` instead. Returns the run ids it picked up."""
+        `resume_limit` instead. A project another daemon leases is skipped, outbox and all (decision 83).
+        Returns the run ids it picked up."""
         picked: list[str] = []
         for pid in self.index.project_ids():
             try:
@@ -3110,6 +3279,8 @@ class Pipeline:
         return picked
 
     def _resume_project(self, pid: str) -> list[str]:
+        if self.leased_elsewhere(pid) is not None:  # decision 83: its runs stay with the lease holder
+            return []
         states = tuple(s.value for s in WORKER_STATES)
         marks = ",".join("?" * len(states))
         with self._lock:
@@ -3297,11 +3468,21 @@ class Pipeline:
         return {k: v for k, v in out.items() if v is not None}
 
     def _cancel_unledgered(
-        self, conn: Any, project_id: str, run_id: str, kind: str, err: BaseException
+        self,
+        conn: Any,
+        project_id: str,
+        run_id: str,
+        kind: str,
+        err: BaseException,
+        *,
+        code: str = "ledger_unavailable",
+        record: bool = True,
     ) -> None:
-        """CANCELLED with `ledger_unavailable`: the run's quote or approval is not in the folder's ledger, so it
-        must not spend. Published on the bus; the `cancelled` record is written or parked in the outbox. The
-        record that failed stays unwritten: every move up to this cancel counts as ledgered."""
+        """CANCELLED with `code` (`ledger_unavailable`): the run's quote or approval is not in the folder's
+        ledger, so it must not spend. Published on the bus; the `cancelled` record is written or parked in the
+        outbox unless `record` is False (a foreign lease refused it: the folder is that daemon's, and this
+        index alone holds the cancel). The record that failed stays unwritten: every move up to this cancel
+        counts as ledgered."""
         moves = self._moves_for(run_id)
         try:
             with moves.lock:
@@ -3313,8 +3494,8 @@ class Pipeline:
                     run_id,
                     S.CANCELLED,
                     actor="system",
-                    reason=f"ledger_unavailable: the {kind} record could not be written ({type(err).__name__})",
-                    reason_code="ledger_unavailable",
+                    reason=f"{code}: the {kind} record could not be written ({type(err).__name__})",
+                    reason_code=code,
                 )
                 run = get_run(conn, run_id)
                 self.publish(
@@ -3325,13 +3506,14 @@ class Pipeline:
                         "run_id": run_id,
                         "from": before.value,
                         "to": run.state.value,
-                        "reason_code": "ledger_unavailable",
+                        "reason_code": code,
                     },
                 )
                 done = self._transitions_since(conn, run_id, None)
                 if done:
                     moves.seq = done[-1][0]
-                self.ledger(project_id, "cancelled", run, conn=conn)
+                if record:
+                    self.ledger(project_id, "cancelled", run, conn=conn)
         except Exception as e:  # the 503 still goes out; the index says what state the run is in
             log.error("run %s could not be cancelled after the ledger failed: %s", run_id, e)
 
@@ -3428,6 +3610,14 @@ class Pipeline:
             return
         try:
             self.ledger_for(project_id).append(rec)
+        except lease.ProjectLeased as e:  # decision 83: the folder is another daemon's for now
+            if kind not in FAIL_CLOSED_KINDS:  # appended once this daemon holds the project again
+                self._park(conn, project_id, kind, run, rec, str(e))
+                return
+            log.warning("ledger record %s for %s refused: %s", kind, run.id, e)
+            if kind in CANCEL_ON_LOSS_KINDS:
+                self._cancel_leased(conn, project_id, run.id, kind, e)
+            raise
         except Exception as e:
             if kind not in FAIL_CLOSED_KINDS:  # the index holds the state; the outbox keeps the record
                 self._park(conn, project_id, kind, run, rec, f"{type(e).__name__}: {e}")
@@ -3457,6 +3647,20 @@ class Pipeline:
                 status=503,
                 run_id=run.id,
             ) from e
+
+    def _cancel_leased(
+        self, conn: Any, project_id: str, run_id: str, kind: str, err: lease.ProjectLeased
+    ) -> None:
+        """A `quoted` or `approved` record a foreign lease refused: the run is CANCELLED `project_leased` in
+        this index only (nothing is ledgered or parked: the folder never had the record)."""
+        if conn is not None:
+            self._cancel_unledgered(conn, project_id, run_id, kind, err, code=LEASED, record=False)
+            return
+        try:
+            with self.index.project(project_id) as own:
+                self._cancel_unledgered(own, project_id, run_id, kind, err, code=LEASED, record=False)
+        except Exception as e2:
+            log.error("run %s could not be cancelled after a lease refused its %s: %s", run_id, kind, e2)
 
     def ledger_for(self, project_id: str) -> Ledger:
         """The project's one `Ledger` (built with this pipeline's clock; rebuilt when its folder moved)."""
@@ -3556,8 +3760,23 @@ class Pipeline:
         return [seen[k] for k in sorted(seen)]
 
 
+def result_notes(ingress: Mapping[str, Any] | None) -> list[str]:
+    """Decision 86: the gate report's `backend_notes` lines for the result's format (`normalized.ingress`)."""
+    if not isinstance(ingress, Mapping):
+        return []
+    notes = []
+    if ingress.get("lossy"):
+        depth = ingress.get("raw_bit_depth")
+        notes.append(f"result container {ingress.get('raw_format')}: lossy {depth}-bit")
+    if ingress.get("alpha_dropped"):
+        notes.append("result alpha dropped")
+    if ingress.get("alpha_transparent"):
+        notes.append("result alpha fully transparent")
+    return notes
+
+
 def project_head(project: Project) -> dict[str, Any]:
-    """What `GET /projects` lists for one project: the head of its project.json."""
+    """What `GET /projects` lists for one project: the head of its project.json, and its lease."""
     return {
         "project_id": project.project_id,
         "custody": project.custody,
@@ -3565,4 +3784,21 @@ def project_head(project: Project) -> dict[str, Any]:
         "engine_pins": project.engine_pins,
         "root": str(project.root),
         "nodes": len(project.graph.get("nodes") or []),
+        "lease": lease_view(project.root),
+    }
+
+
+def lease_view(project_dir: Path | str) -> dict[str, Any] | None:
+    """`{host, pid, daemon_id, heartbeat_utc, live, mine}` of the project's `lease.json`; None without one."""
+    info = lease.read(project_dir)
+    if info is None:
+        return None
+    me = lease.identity()
+    return {
+        "host": info.host,
+        "pid": info.pid,
+        "daemon_id": info.daemon_id,
+        "heartbeat_utc": info.heartbeat_utc,
+        "live": lease.is_live(info),
+        "mine": me is not None and info.daemon_id == me.daemon_id,
     }

@@ -6,22 +6,17 @@ at least 10 non-blank characters; the override is appended to the run's append-o
 `NotExportable` (`status` 409 for a route). The blob is re-verified against its BLAKE3 key first and written
 atomically; an existing destination file is never overwritten.
 
-Two entry points share those rules:
-
-- `export_run(conn, run_id, dest, ...)` copies the stored bytes to one file (the seed's byte copy: no route
-  calls it any more, and it neither decodes nor crops).
-- `export(run, fmt, out_dir, override=None, ...)` is what `plate export` calls: it decodes the run's gated
-  composite (the 16-bit PNG in the CAS), writes it as `tiff16`, `png16` or `exr` with `plate_pixels.imageio`
-  (an EXR is the sRGB display master decoded to linear half float in the packet's working primaries), embeds
-  the run's lineage in the file (`lineage.embed`: the file name is not the only thing that says where it came from) and
-  writes `<name>.gate.json` beside it (the stored gate report plus an `export` block naming the files). The
-  sibling is shared by the formats of one take (tiff16 and exr of the same run and name): a second export adds
-  its file to the block; a report that belongs to another run blocks the export. The image is written under a
-  temp name and moved into place last; a lineage failure leaves nothing behind.
+`export(run, fmt, out_dir, override=None, ...)` is what `plate export` and the export routes call: it decodes
+the run's gated composite (the 16-bit PNG in the CAS), writes it as `tiff16`, `png16` or `exr` with
+`plate_pixels.imageio` (an EXR is the sRGB display master decoded to linear half float in the packet's working
+primaries), embeds the run's lineage in the file (`lineage.embed`: the file name is not the only thing that says
+where it came from) and writes `<name>.gate.json` beside it (the stored gate report plus an `export` block
+naming the files). The sibling is shared by the formats of one take (tiff16 and exr of the same run and name): a
+second export adds its file to the block; a report that belongs to another run blocks the export. The image is
+written under a temp name and moved into place last; a lineage failure leaves nothing behind.
 
 The claim (router plan T127, decision 74). `export` claims its destination instead of checking it: once the
-temp image is written and its lineage embedded (and stale `.part`/temp siblings of the name, older than an
-hour, a kill -9's leftovers, are removed), it creates `dest` with `O_CREAT | O_EXCL`, so of any number of
+temp image is written and its lineage embedded, it creates `dest` with `O_CREAT | O_EXCL`, so of any number of
 exports racing to one name, in one process or several, exactly one wins. A loser whose run's sidecar already
 named the file compares its temp image with it: the same bytes (the run exported again with the same format
 and framing; the lineage's `created_utc` is when the take reached its state, so a re-export is byte-identical)
@@ -33,6 +28,16 @@ names an image that is not there. Before any of it, when `project_dir` is given,
 `<project_dir>/gates` must take a file (`check_project_writable`): the caller marks the gate report shipped
 there afterwards, and a project folder that cannot take the mark refuses with `ProjectUnwritable` (`status`
 503) before a client file is written.
+
+The in-flight marker (router plan T153, decision 87). An export picks a 12-hex tag and writes under
+`.<name>.<tag><suffix>` (the temp image, the `.part` the image writer leaves of it, lineage's own temp), and for
+as long as it does so it holds an exclusive lock on `.<name>.<tag>.lock` (`fsutil.in_flight`). A kill -9 leaves
+those files behind and the OS drops the lock, so `sweep_stale` tells a dead export's leftovers from a live one's
+by trying the lock: a sibling whose marker is held stays; one whose marker is free goes, with its marker,
+whatever its age (a retry seconds after the kill cleans up), and so does a free marker alone (a kill in the
+export's first instant leaves only that); one with no marker keeps the older rule, gone after an hour
+(`STALE_SIBLING_S`). The claim itself (`dest` created empty, then replaced) sits inside the same
+marker; a kill -9 in that instant can still leave the empty claim, which `export` refuses to overwrite.
 
 Framing (router plan T114). When the run's packet declares `camera.safe_frame` (an overscan render, a
 level-and-crop packet, room_a's 2.39:1 band in a 16:9 frame), the safe-frame region is what leaves by default:
@@ -66,6 +71,7 @@ import re
 import sqlite3
 import tempfile
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -76,8 +82,8 @@ import numpy as np
 
 from . import lineage
 from .cas import CAS
-from .fsutil import replace_with_retry, temp_sibling, write_bytes_atomic, write_json_atomic
-from .machine import append_note, get_run, run_events
+from .fsutil import in_flight, is_in_flight, replace_with_retry, write_bytes_atomic, write_json_atomic
+from .machine import append_note, run_events
 from .models import Run
 from .projects import GATES_DIR
 from .states import RunState
@@ -123,44 +129,6 @@ class SafeFrameError(NotExportable):
     def __init__(self, message: str, code: str = "SAFE_FRAME_MISMATCH"):
         super().__init__(message)
         self.code = code
-
-
-def export_run(
-    conn: sqlite3.Connection,
-    run_id: str,
-    dest: Path,
-    *,
-    override: bool = False,
-    reason: str | None = None,
-    cas: CAS | None = None,
-) -> Path:
-    if cas is None:  # no global CAS (router plan T5): the caller passes the run's project CAS
-        raise TypeError("pass the project's CAS (CAS(project_dir / 'assets')); there is no global CAS")
-    dest = Path(dest)
-    run = get_run(conn, run_id)
-    if run.state is RunState.GATE_FAIL:
-        if not override:
-            raise NotExportable(
-                f"run {run_id} failed its gates; export needs override=True and a written reason"
-            )
-        if reason is None or len(reason.strip()) < MIN_OVERRIDE_REASON:
-            raise NotExportable(
-                f"a GATE_FAIL override needs a reason of at least {MIN_OVERRIDE_REASON} characters"
-            )
-    elif run.state is not RunState.DONE:
-        raise NotExportable(
-            f"run {run_id} is {run.state.value}; only DONE (or GATE_FAIL with override) exports"
-        )
-    if not run.result_key:
-        raise NotExportable(f"run {run_id} has no result blob")
-    if not cas.verify(run.result_key):
-        raise NotExportable(f"result blob {run.result_key} is missing or fails its BLAKE3 check")
-    if dest.exists():
-        raise NotExportable(f"{dest} already exists; exports never overwrite")
-    if run.state is RunState.GATE_FAIL:
-        append_note(conn, run_id, kind="override", actor="human", reason=f"override: {reason}")
-    write_bytes_atomic(dest, cas.read_bytes(run.result_key))
-    return dest
 
 
 # ---------------------------------------------------------------------------- the safe frame (T114)
@@ -356,9 +324,10 @@ class Exported:
     repeat: bool = False
 
 
-# A temp or `.part` sibling of an export's name older than this is a dead export's leftover (a kill -9).
+# A temp, `.part` or `.lock` sibling of an export's name with no marker to say it is live: older than this it is
+# a dead export's leftover (a kill -9). One with a marker is judged by the marker, whatever its age.
 STALE_SIBLING_S = 3600.0
-_HEX12 = r"\.[0-9a-f]{12}"
+_TAG12 = r"\.(?P<tag>[0-9a-f]{12})"
 
 
 def check_project_writable(project_dir: Path | str) -> None:
@@ -383,28 +352,65 @@ def _take_utc(conn: sqlite3.Connection, run: Run) -> str:
     return iso(at or run.updated_utc)
 
 
+def _marker_path(out_dir: Path, name: str, tag: str) -> Path:
+    return out_dir / f".{name}.{tag}.lock"
+
+
 def sweep_stale(out_dir: Path, names: Sequence[str], *, older_than_s: float = STALE_SIBLING_S) -> list[Path]:
-    """Remove the hidden temp siblings of `names` in `out_dir` (`.<name>.<12 hex>...`, ending `.part`, `.tmp`
-    or the name's own suffix: what `temp_sibling`, the image writers and `lineage.embed` leave when the process
-    dies) that are older than `older_than_s`. A younger one may be another export in flight and stays. Returns
-    what was removed; a file that cannot be removed is left."""
+    """Remove the hidden temp siblings of `names` in `out_dir` (`.<name>.<12 hex tag>...`, ending `.part`,
+    `.tmp`, `.lock` or the name's own suffix: what `temp_sibling`, the image writers, `lineage.embed` and
+    `export` leave when the process dies), by the in-flight marker rule of the module docstring. A sibling whose
+    `.<name>.<tag>.lock` is held by a live writer stays. One whose marker exists and is free belongs to a dead
+    writer and goes with its marker, however young. One with no marker goes when it is older than
+    `older_than_s`. A marker alone that nobody holds goes too, however young: a kill -9 in the first instant of an
+    export leaves only its marker (T162; a live writer that has not locked it yet has written nothing beside it,
+    and its later temps fall to the age rule). Returns what was removed; a file that cannot be removed is left."""
     patterns = []
     for name in names:
-        ends = "|".join(dict.fromkeys(re.escape(e) for e in (".part", ".tmp", Path(name).suffix) if e))
-        patterns.append(re.compile(rf"\.\.?{re.escape(name)}{_HEX12}.*(?:{ends})"))
+        ends = "|".join(
+            dict.fromkeys(re.escape(e) for e in (".part", ".tmp", ".lock", Path(name).suffix) if e)
+        )
+        patterns.append((name, re.compile(rf"\.\.?{re.escape(name)}{_TAG12}.*(?:{ends})")))
     removed: list[Path] = []
     cutoff = time.time() - older_than_s
     try:
         entries = list(os.scandir(out_dir))
     except OSError:
         return removed
-    for entry in entries:
-        if not entry.name.startswith(".") or not any(p.fullmatch(entry.name) for p in patterns):
-            continue
+    out_dir = Path(out_dir)
+
+    def drop(path: str) -> None:
         try:
-            if entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff:
-                os.unlink(entry.path)
-                removed.append(Path(entry.path))
+            os.unlink(path)
+            removed.append(Path(path))
+        except OSError:
+            pass
+
+    markers: list[tuple[os.DirEntry[str], Path]] = []
+    for entry in entries:
+        if not entry.name.startswith("."):
+            continue
+        hit = next(((n, m) for n, p in patterns if (m := p.fullmatch(entry.name))), None)
+        if hit is None:
+            continue
+        name, match = hit
+        marker = _marker_path(out_dir, name, match["tag"])
+        try:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            if entry.name == marker.name:
+                markers.append((entry, marker))
+            elif not marker.is_file():  # nothing says it is live: the age rule
+                if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                    drop(entry.path)
+            elif not is_in_flight(marker):  # the writer is dead, whatever the file's age
+                drop(entry.path)
+        except OSError:
+            continue
+    for entry, marker in markers:
+        try:
+            if not is_in_flight(marker):  # a dead writer's marker, alone or not (decision 87)
+                drop(entry.path)
         except OSError:
             continue
     return removed
@@ -651,59 +657,67 @@ def export(
         framing=frame,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
-    # the temp name keeps the real extension: the writers and `lineage.embed` pick their codec by it
-    image_tmp = temp_sibling(dest).with_suffix(dest.suffix)
-    try:
-        _write_image(image_tmp, fmt, rgb16, working_space or packet_working_space(conn, run.packet_id))
+    # the temp name keeps the real extension (the writers and `lineage.embed` pick their codec by it) and carries
+    # the tag of this export's in-flight marker: a kill -9 leaves both behind and `sweep_stale` reads them as a pair
+    tag = uuid.uuid4().hex[:12]
+    image_tmp = dest.with_name(f".{dest.name}.{tag}{dest.suffix}")
+    marker = _marker_path(out_dir, dest.name, tag)
+    with in_flight(marker):
         try:
-            lineage.embed(image_tmp, lin)
-        except (lineage.LineageError, OSError) as e:
-            raise NotExportable(
-                f"could not embed lineage in the {fmt} file ({e}); nothing was exported"
-            ) from e
-        sweep_stale(out_dir, (dest.name, report_dest.name))
-        if not claim(dest):  # the claim is the check: one winner per name, whatever races it
-            # a repeat: this run's sidecar already named the file (read before the claim) and the bytes match
-            listed = earlier is not None and dest.name in (earlier.get("files") or [])
-            if listed and _same_bytes(image_tmp, dest):
-                return replace(result, repeat=True)
-            raise NotExportable(f"{dest} already exists; exports never overwrite")
-        report_claimed = False
-        prior = None  # the shared sidecar's bytes, put back if this format does not land
-        try:
-            if earlier is None:  # a new sidecar is claimed too: no other run's format can pair with it
-                report_claimed = claim(report_dest)
-                if not report_claimed:
-                    raise NotExportable(f"{report_dest} already exists; exports never overwrite")
-            else:
-                try:
-                    prior = report_dest.read_bytes()
-                except OSError as e:
-                    raise NotExportable(f"{report_dest} cannot be read ({e}); nothing was exported") from e
-            doc = dict(report)
-            doc["export"] = {
-                "run_id": run.id,
-                "files": [*((earlier or {}).get("files") or []), dest.name],
-                "state": run.state.value,
-                "override_reason": reason if overridden else None,
-                "gate_report": report_ref,
-                "exported_utc": (earlier or {}).get("exported_utc") or iso(utcnow()),
-                **frame.record(),
-            }
-            if overridden and recorded_override(conn, run.id) is None:
-                append_note(conn, run.id, kind="override", actor="human", reason=f"{OVERRIDE_PREFIX}{reason}")
-            write_json_atomic(report_dest, doc, indent=1)
-            replace_with_retry(image_tmp, dest)
-        except BaseException:
-            dest.unlink(missing_ok=True)  # our empty claim: the name is free again
-            if report_claimed:
-                report_dest.unlink(missing_ok=True)
-            elif prior is not None:  # the sidecar another format of the take wrote says what it said
-                try:
-                    write_bytes_atomic(report_dest, prior)
-                except OSError:
-                    pass
-            raise
-    finally:
-        image_tmp.unlink(missing_ok=True)
+            _write_image(image_tmp, fmt, rgb16, working_space or packet_working_space(conn, run.packet_id))
+            try:
+                lineage.embed(image_tmp, lin)
+            except (lineage.LineageError, OSError) as e:
+                raise NotExportable(
+                    f"could not embed lineage in the {fmt} file ({e}); nothing was exported"
+                ) from e
+            sweep_stale(out_dir, (dest.name, report_dest.name))
+            if not claim(dest):  # the claim is the check: one winner per name, whatever races it
+                # a repeat: this run's sidecar already named the file (read before the claim) and the bytes match
+                listed = earlier is not None and dest.name in (earlier.get("files") or [])
+                if listed and _same_bytes(image_tmp, dest):
+                    return replace(result, repeat=True)
+                raise NotExportable(f"{dest} already exists; exports never overwrite")
+            report_claimed = False
+            prior = None  # the shared sidecar's bytes, put back if this format does not land
+            try:
+                if earlier is None:  # a new sidecar is claimed too: no other run's format can pair with it
+                    report_claimed = claim(report_dest)
+                    if not report_claimed:
+                        raise NotExportable(f"{report_dest} already exists; exports never overwrite")
+                else:
+                    try:
+                        prior = report_dest.read_bytes()
+                    except OSError as e:
+                        raise NotExportable(
+                            f"{report_dest} cannot be read ({e}); nothing was exported"
+                        ) from e
+                doc = dict(report)
+                doc["export"] = {
+                    "run_id": run.id,
+                    "files": [*((earlier or {}).get("files") or []), dest.name],
+                    "state": run.state.value,
+                    "override_reason": reason if overridden else None,
+                    "gate_report": report_ref,
+                    "exported_utc": (earlier or {}).get("exported_utc") or iso(utcnow()),
+                    **frame.record(),
+                }
+                if overridden and recorded_override(conn, run.id) is None:
+                    append_note(
+                        conn, run.id, kind="override", actor="human", reason=f"{OVERRIDE_PREFIX}{reason}"
+                    )
+                write_json_atomic(report_dest, doc, indent=1)
+                replace_with_retry(image_tmp, dest)
+            except BaseException:
+                dest.unlink(missing_ok=True)  # our empty claim: the name is free again
+                if report_claimed:
+                    report_dest.unlink(missing_ok=True)
+                elif prior is not None:  # the sidecar another format of the take wrote says what it said
+                    try:
+                        write_bytes_atomic(report_dest, prior)
+                    except OSError:
+                        pass
+                raise
+        finally:
+            image_tmp.unlink(missing_ok=True)
     return result

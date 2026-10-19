@@ -25,6 +25,8 @@ Commands: `backup`, `drill`, `purge`, `reindex`, `alerts`, `vendor-deletions`, `
 
 Copied: everything in the project folder. Left out on purpose: `_work/` (scratch, at any depth), the SQLite index (`*.sqlite`, `-wal`, `-shm`), `assets/.tmp/` (half-written blobs), lock files, temp files of an atomic write in flight, and symlinks. The index is not in the project folder to begin with (WAL is unsafe on SMB), so a backup never carries it.
 
+**`lease.json` is not project content.** It is the running daemon's lease on the folder (host, pid, heartbeat; [daemon-wont-start.md](daemon-wont-start.md), section I). The backup tool copies it like any other file today, since its skip list holds the lock files (`*.lock`, `*.lock.json`, `*.lock.plate`) and the SQLite and temp files, not `lease.json`, so a backup can carry a lease that names a daemon that is no longer there: **never restore it** (the steps below leave it out), and delete it from any copy of a project folder.
+
 A backup is a folder: the same layout as the project plus `backup_manifest.json`, which lists every file with its size and BLAKE3, and the ledger head (record count and hash). It is read-only on the project: it does not take `project.lock`, so it is safe to run while the daemon has the project open. A ledger line caught mid-append is a torn tail that every reader skips.
 
 ```
@@ -74,7 +76,7 @@ plate-tools drill E:\drill\clubhouse --tmp E:\drill\scratch --report E:\backups\
 ## Restoring after a loss
 
 1. Pull the offsite copy to a new folder and run the drill on it (above). Do not restore from a copy that fails.
-2. Copy the folder's contents, minus `backup_manifest.json`, to where the project lives (a short path: the CAS stays under Windows MAX_PATH).
+2. Copy the folder's contents, minus `backup_manifest.json` and `lease.json`, to where the project lives (a short path: the CAS stays under Windows MAX_PATH). If a `lease.json` came along, delete it. A restored lease names a daemon that is not running there and carries the heartbeat of the day it was backed up, so the first daemon to write takes it over at once with a warning; but a plain copy of a folder whose daemon is still running (or stopped less than 90 s ago) carries a live heartbeat, and the copy is refused `project_leased` until that heartbeat lapses.
 3. Rebuild the index on the machine that will run the project: `plate-tools reindex <project>`. The line should say `consistent`. See the next section for what it reports.
 4. Open the project. Everything the folder holds is back: graph, assets, ledger, gate reports, review bundles. What only lived in the old index (quotes, budget envelopes, run and packet event logs, the SSE log) is gone, and `reindex` lists it under `lost`.
 
@@ -86,7 +88,7 @@ The SQLite index is rebuilt from the folder: `project.json`, `packets.json`, `as
 plate-tools reindex D:\Projects\clubhouse          (add --verify to re-hash every blob; slow on a big project)
 ```
 
-It takes the project lock first. The lock is held only while something writes (a graph save, a ledger line), not while the daemon has the project open, so it is usually free: if a write is in flight you get `refused: ... locked by another PLATE process (host pid N since T)`, and a few seconds later the same command works. Because the lock is per write, it does not stop the daemon from starting a run right after the tool lets go: stop the daemon before a reindex that must see a still project. The report compares the ids the folder holds with the ids in the new index (assets, packets, runs). `INCONSISTENT` means something the folder holds is not in the index, usually a run whose packet is not in `packets.json` or a blob that fails `--verify`; the problems are listed by id.
+It takes the project lock first. The lock is held only while something writes (a graph save, a ledger line), not while the daemon has the project open, so it is usually free: if a write is in flight you get `refused: ... locked by another PLATE process (host pid N since T)`, and a few seconds later the same command works. Because the lock is per write, it does not stop the daemon from starting a run right after the tool lets go: stop the daemon before a reindex that must see a still project. The lease does not stop the tool either (`reindex` and `purge` install no lease identity, so a project another daemon holds is still rebuilt), which is one more reason to stop that daemon first. A rebuild leaves the index's `packet_router` table empty; the next quote of each packet refills it ([../engines.md](../engines.md)). The report compares the ids the folder holds with the ids in the new index (assets, packets, runs). `INCONSISTENT` means something the folder holds is not in the index, usually a run whose packet is not in `packets.json` or a blob that fails `--verify`; the problems are listed by id.
 
 ## End-of-project purge
 
@@ -130,7 +132,7 @@ The first lists each run and provider job id that reached a vendor and has no de
 | `unattended_spend` | warn | auto or agent approvals were made with no human present |
 | `unattended_cap_exceeded` | critical | auto and agent spend since the last human passed the unattended cap |
 
-The status-bar line looks like `Budget: USD 12.40 of 50.00 today; USD 3.00 of 20.00 unattended (no human present); 1 active alert(s)`. The caps are the `budgets.Policy` defaults (USD 50 a day, USD 20 unattended after 30 minutes without a human). The scan counts a run's approved price as spent unless the run was refunded (cancelled or failed before it reached the vendor). The ledger only sees approvals, accepts, overrides and logged human minutes, so a person who only browses looks absent: the scan can be stricter than the live check, never looser.
+The status-bar line looks like `Budget: USD 12.40 of 50.00 today; USD 3.00 of 20.00 unattended (no human present); 1 active alert(s)`. The caps are the `budgets.Policy` defaults (USD 50 a day, USD 20 unattended after 30 minutes without a human). The scan counts a run's approved price as spent unless the run was refunded (cancelled or failed before it reached the vendor). The ledger only sees approvals, accepts, overrides and logged human minutes, so a person who only browses looks absent: the scan can be stricter than the live check, never looser. The same goes for money declared on an import: the live caps leave it out (it was spent elsewhere), but the scan reads the ledger's approvals and cannot tell an import from a generation, so a large declaration can still raise a `daily_cap_exceeded` line.
 
 On a critical alert: find the runs (`runs.jsonl`, kind `approved`, `by` of `auto` or `agent:...`), cancel anything still queued, and have a human look at the envelope or the cap before any more agent work runs.
 
@@ -138,7 +140,7 @@ On a critical alert: find the runs (`runs.jsonl`, kind `approved`, `by` of `auto
 
 | you see | cause | do |
 |---|---|---|
-| `refused: ... locked by another PLATE process` | the daemon or another tool was writing at that instant: `project.lock` is taken per write, not held while a project is open | wait a few seconds and run it again; for `purge --apply` and a `reindex` that must see a still project, stop the daemon first. `backup` and dry-run `purge` do not need the lock |
+| `refused: ... locked by another PLATE process` | the daemon or another tool was writing at that instant: `project.lock` is taken per write, not held while a project is open (a second daemon is kept out by the lease, not by this lock: `project_leased` in [daemon-wont-start.md](daemon-wont-start.md), section I) | wait a few seconds and run it again; for `purge --apply` and a `reindex` that must see a still project, stop the daemon first. `backup` and dry-run `purge` do not need the lock |
 | `backup copied but the command failed` | the offsite command exited non-zero or was not found (exit 127) | the local copy is fine; fix the command or the remote, run `backup` again; read `stderr_tail` in the report |
 | `the backup folder and the project folder must not contain each other` | the destination is inside the project (or the reverse) | choose a destination on another disk |
 | `restore drill FAILED` | see the drill section | do not delete the backup; re-run the backup and re-drill |

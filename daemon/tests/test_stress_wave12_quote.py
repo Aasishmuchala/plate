@@ -548,13 +548,16 @@ def test_priority_and_params_are_refused_before_a_run_row(sync_settings, auth):
         assert run.params["candidate_count"] == 2
 
 
-def test_a_recipe_path_that_is_not_a_recipe_names_the_path_only(sync_settings, auth, tmp_path):
+def test_a_recipe_path_that_is_not_a_recipe_names_the_path_only(sync_settings, auth):
     with _client(sync_settings) as c:
         packet_id = _setup(c, auth)
         _put_graph(c, auth, [_plate(packet_id), _mask(), _edit("e")], [_edge("p", "m"), _edge("m", "e")])
-        bad = tmp_path / "notes.yaml"
+        # inside the project's recipes/ folder, where a path is read at all (T154, decision 88)
+        folder = c.app.state.pipeline.project_dir(PROJECT) / "recipes"
+        folder.mkdir()
+        bad = folder / "notes.yaml"
         bad.write_text("token: sk-very-secret-line\n  : [unclosed\n", encoding="utf-8", newline="\n")
-        listy = tmp_path / "list.yaml"
+        listy = folder / "list.yaml"
         listy.write_text("- sk-another-secret\n", encoding="utf-8", newline="\n")
         for path in (bad, listy):
             r = _quote_http(c, auth, "e", recipe=str(path))

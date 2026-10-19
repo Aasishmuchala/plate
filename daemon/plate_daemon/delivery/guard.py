@@ -16,7 +16,9 @@ Every delivered file then gets its lineage embedded (`plate_daemon.lineage.embed
 `<file name>.gate.json` (a sequence gets one for the whole sequence) holding the lineage, the full versioned
 gate report, the verdict, any override, the colour tags and the BLAKE3 of each file. Sidecars carry names,
 never absolute paths. A file is staged under a hidden sibling name, finished, then moved into place with
-`os.replace` (retried on Windows); an existing destination is never overwritten.
+`os.replace` (retried on Windows); an existing destination is never overwritten. The destination is claimed,
+not checked (`export.claim`, `O_CREAT | O_EXCL`): of any number of deliveries racing to one name exactly one
+lands and the others raise `FileExistsError` (a route's 409 `exists`).
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from typing import Any
 from blake3 import blake3
 
 from .. import lineage as lineage_mod
+from ..export import claim
 from ..fsutil import read_json, replace_with_retry, write_json_atomic
 from ..lineage import Lineage
 from ..timeutil import iso, utcnow
@@ -129,7 +132,7 @@ class Provenance:
     ) -> Provenance:
         """Build from a `models.Run`. With `project_dir` and no explicit report, the newest stored report
         (`gates/<run_id>.<n>.json`) is used and referenced. With `conn`, an override is appended to the
-        run's event log exactly as `export.export_run` does."""
+        run's event log exactly as `export.export` does."""
         report, ref = gate_report, None
         if report is None and project_dir is not None:
             from ..gate_reports import Service
@@ -219,11 +222,17 @@ def stage_path(final: Path) -> Path:
 
 
 def embed_and_place(staged: Path, final: Path, lineage: Lineage) -> None:
-    """Write `lineage` into the staged file, then move it to `final`. Never overwrites."""
+    """Write `lineage` into the staged file, claim `final` and move the staged file over the empty claim.
+    Never overwrites: a name that is taken raises FileExistsError, and a failure after the claim gives the
+    name back."""
     lineage_mod.embed(staged, lineage)
-    if final.exists():
+    if not claim(final):
         raise FileExistsError(f"{final} already exists; delivery never overwrites")
-    replace_with_retry(staged, final)
+    try:
+        replace_with_retry(staged, final)
+    except BaseException:
+        final.unlink(missing_ok=True)
+        raise
 
 
 def sequence_stem(pattern_name: str) -> str | None:

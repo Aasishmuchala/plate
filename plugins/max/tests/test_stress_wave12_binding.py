@@ -3,8 +3,9 @@
 A <scene>.plate.json that exists but cannot be used raises SidecarUnreadable instead of reading as
 "unbound" (which fell through to config.json or the stem and sent the packet into another project);
 nothing is ever written over it; a file stem that cannot name a project raises ProjectUnresolved
-instead of becoming "untitled" or "a"; a sidecar path the file system refuses is a message, never a
-bare OSError. The Controller half needs no Qt (the dock half lives in test_ui_dock.py).
+instead of becoming "untitled" or "a"; a sidecar path the file system refuses moves under app data
+(T158) and any other write failure is a message, never a bare OSError. The Controller half needs no Qt
+(the dock half lives in test_ui_dock.py).
 """
 
 from __future__ import annotations
@@ -19,6 +20,13 @@ import pytest
 from plate_max import recipes
 from plate_max.recipes import CameraRecipe, SidecarUnreadable, SidecarUnwritable
 from plate_max.ui import controller as ctl
+
+
+@pytest.fixture(autouse=True)
+def _app_data(monkeypatch, tmp_path):
+    """The long-name sidecars live under PLATE_HOME: keep them inside the test's folder."""
+    monkeypatch.setenv("PLATE_HOME", str(tmp_path / "plate-home"))
+
 
 UNREADABLE = {
     "trailing comma": (b'{"project_id": "clubhouse",}', "not valid JSON"),
@@ -241,23 +249,22 @@ def test_an_unsaved_scene_keeps_untitled(scene):
     assert live.set_project("adhoc") is None and live.project_id() == "adhoc"  # kept in memory only
 
 
-# ---- a sidecar path the file system refuses
-def test_a_249_character_stem_gives_a_clear_message_not_an_oserror(scene, tmp_path):
+# ---- a sidecar path the file system refuses (T158: it moves under app data, it is not an error)
+def test_a_249_character_stem_binds_through_an_app_data_sidecar(scene, tmp_path):
     name = "a" * 249 + ".max"
     max_file = _save_scene(scene, tmp_path / "jobs", name)
     live = ctl.LiveController()
     assert live.project_id() == "a" * 64 and live.binding_problem() is None  # reading it is not an error
     assert recipes.load_recipes(max_file) == {}
-    with pytest.raises(SidecarUnwritable) as caught:
-        live.set_project("clubhouse")
-    message = str(caught.value)
-    assert not isinstance(caught.value, OSError) and isinstance(caught.value, SidecarUnreadable)
-    assert "cannot be written" in message and "shorten the scene's file name" in message
-    assert message.startswith("a" * 40 + "...") and len(message) < 300  # the name is elided, not pasted whole
-    with pytest.raises(SidecarUnwritable):
-        recipes.save_recipes({"CAM_a": CameraRecipe(camera="CAM_a")}, max_file)
-    assert live.project_id() == "a" * 64  # the refused pick did not bind
-    assert not [p for p in (tmp_path / "jobs").iterdir()]  # and no temp file was left in the folder
+    saved = live.set_project("clubhouse")  # was a SidecarUnwritable message before T158
+    assert saved == recipes.sidecar_path(max_file) and saved.parent == recipes.SIDECAR_FALLBACK_DIR
+    assert saved.is_file() and saved.name.endswith(".plate.json") and len(saved.name) < 40
+    assert live.project_id() == "clubhouse"
+    assert ctl.LiveController().project_id() == "clubhouse"  # the next session reads it back
+    recipes.save_recipes({"CAM_a": CameraRecipe(camera="CAM_a", preset="night-relight")}, max_file)
+    assert recipes.load_recipes(max_file)["CAM_a"].preset == "night-relight"
+    assert ctl.scene_project_id(max_file) == "clubhouse"  # the recipes kept the binding
+    assert not [p for p in (tmp_path / "jobs").iterdir()]  # nothing was written beside the scene
 
 
 def test_a_folder_that_refuses_the_write_is_a_message_too(scene, tmp_path, monkeypatch):

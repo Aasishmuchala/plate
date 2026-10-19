@@ -18,6 +18,9 @@ from plate_daemon.budgets import (
     Policy,
     Spend,
     authorize,
+    committed_since,
+    day_start,
+    is_external,
     is_unattended,
     publish_alert,
     spend_snapshot,
@@ -37,6 +40,7 @@ from plate_daemon.quotes import (
     build_quote,
     create_envelope,
     get_envelope,
+    insert_quote,
     quote_run,
     requote_needed,
 )
@@ -47,6 +51,7 @@ S = RunState
 PID = "budget"
 PACKET = "pkt_budget"
 ROUTE = Route(engine_id="fake", provider="fake", region="local")
+EXTERNAL = Route(engine_id="import:manual", provider="external", region="local")
 T0 = datetime(2026, 10, 17, 9, 0, tzinfo=UTC)
 
 
@@ -516,6 +521,128 @@ def test_the_caps_count_every_project_index_in_the_home(idx, tmp_path, caplog):
         assert approve(conn, runs[1], "auto", policy=Policy(per_user_daily_cap_usd=0.1)).state is S.APPROVED
     d = authorize(quoted(0.04), POLICY, None, None, now=T0, spent=Spend(0.0, 19.99, projects=1))
     assert d.code == "unattended_cap" and "across 1 project)" in d.reason
+
+
+# ---------------------------------------------------------------------------- externally declared spend
+
+
+def new_external(conn, usd: float, *, packet: str = PACKET, project: str = PID) -> str:
+    """A QUOTED run on the import route (provider `external`) priced at the declared `usd`."""
+    now = datetime.now(UTC)
+    run = create_run(
+        conn,
+        RunCreate(project_id=project, packet_id=packet, inputs={"plate": uuid.uuid4().hex}, route=EXTERNAL),
+        now=now,
+    )
+    q = Quote(
+        run_id=run.id,
+        provider="external",
+        model="import:manual",
+        model_version="manual",
+        region="local",
+        custody_grade="C0",
+        price_usd=usd,
+        eta_s=0.0,
+        created_utc=now,
+        expires_utc=now + QUOTE_TTL,
+        price_status="declared",
+    )
+    with tx(conn):
+        insert_quote(conn, q)
+        transition(conn, run.id, S.QUOTED, actor="test", now=now, quote_id=q.id, quote_json=q.terms_json())
+    return run.id
+
+
+def reserve_body(conn, run_id: str) -> dict:
+    import json
+
+    (row,) = conn.execute(
+        "SELECT reason FROM run_events WHERE run_id = ? AND kind = 'spend.reserve'", (run_id,)
+    ).fetchall()
+    return json.loads(row["reason"])
+
+
+def test_is_external_reads_the_route_provider():
+    assert is_external(quoted().model_copy(update={"route": EXTERNAL}))
+    assert not is_external(quoted())  # provider "fake"
+    assert not is_external(
+        quoted().model_copy(update={"route": Route(engine_id="x", provider="vendor", region="us")})
+    )
+
+
+def test_an_external_reservation_is_marked_and_both_caps_leave_it_out(idx):
+    """Decision 89: the marker is on the external run's `spend.reserve` body only; every other record keeps the
+    old shape and reads as internal."""
+    now = datetime.now(UTC)
+    with idx.project(PID) as conn:
+        imported = approve(conn, new_external(conn, 60.0), "human")
+        internal = approve(conn, new_quoted(conn), "auto", last_human_interaction_utc=now)
+        assert (imported.reserved_usd, internal.reserved_usd) == (60.0, 0.04)
+        assert reserve_body(conn, imported.id) == {
+            "usd": 60.0,
+            "by": "human",
+            "envelope_id": None,
+            "external": True,
+        }
+        assert "external" not in reserve_body(conn, internal.id)
+        start = day_start(now)
+        assert committed_since(conn, start) == pytest.approx(0.04)
+        assert committed_since(conn, start, include_external=True) == pytest.approx(60.04)
+        assert committed_since(conn, start, unattended_only=True) == pytest.approx(0.04)
+        assert committed_since(conn, start, unattended_only=True, include_external=True) == pytest.approx(
+            0.04
+        )
+        snap = spend_snapshot(conn, now, None)
+        assert snap.today_usd == pytest.approx(0.04) and snap.since_human_usd == pytest.approx(0.04)
+        assert snap.external_today_usd == 60.0
+        # the caps see 0.04, so a 49.9 USD agent run still fits a 50 USD day; with the 60 counted it would not
+        assert authorize(quoted(49.9), POLICY, env(50.0), ATTENDED, now=T0, spent=snap).approve
+        counted = Spend(snap.today_usd + 60.0, snap.since_human_usd)
+        assert authorize(quoted(49.9), POLICY, env(50.0), ATTENDED, now=T0, spent=counted).code == "daily_cap"
+
+
+def test_the_refund_of_an_external_run_is_left_out_with_it(idx):
+    now = datetime.now(UTC)
+    with idx.project(PID) as conn:
+        rid = new_external(conn, 7.0)
+        approve(conn, rid, "human")
+        approve(conn, new_quoted(conn), "auto", last_human_interaction_utc=now)
+        assert spend_snapshot(conn, now, None).external_today_usd == 7.0
+        cancel_run(conn, FakeEngine(), rid)  # never reached a provider: the reservation is refunded
+        kinds = [r["kind"] for r in conn.execute("SELECT kind FROM run_events WHERE run_id = ?", (rid,))]
+        assert kinds.count("spend.refund") == 1
+        start = day_start(now)
+        assert committed_since(conn, start) == pytest.approx(0.04)
+        assert committed_since(conn, start, include_external=True) == pytest.approx(0.04)  # 7 - 7
+        assert spend_snapshot(conn, now, None).external_today_usd == 0.0
+
+
+def test_external_spend_is_summed_across_the_projects_of_the_home(idx, tmp_path):
+    now = datetime.now(UTC)
+    other = "budget-two"
+    with idx.project(PID) as conn:
+        approve(conn, new_external(conn, 60.0), "human")
+        approve(conn, new_quoted(conn), "auto", last_human_interaction_utc=now)
+    with idx.project(other, create=True) as conn:
+        with tx(conn):
+            apply_packet_entry(
+                conn,
+                other,
+                PACKET,
+                {
+                    "shot_id": "s01",
+                    "kind": "still",
+                    "tier": "A",
+                    "packet_version": "0.1.1",
+                    "path": str(tmp_path / "packets" / PACKET),
+                    "manifest_blake3": "a" * 64,
+                },
+            )
+        approve(conn, new_external(conn, 5.5, project=other), "human")
+    spent = spend_snapshot_all(idx, now, None)
+    assert spent.projects == 2 and spent.today_usd == pytest.approx(0.04)
+    assert spent.external_today_usd == pytest.approx(65.5)
+    assert Spend().external_today_usd == 0.0
 
 
 # ---------------------------------------------------------------------------- quotes from manifests

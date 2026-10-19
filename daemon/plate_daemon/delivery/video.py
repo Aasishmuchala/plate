@@ -34,6 +34,7 @@ from typing import Any
 import numpy as np
 
 from .. import lineage as lineage_mod
+from ..export import claim
 from ..fsutil import replace_with_retry
 from .frames import Frames, alpha_is_opaque, is_video_file, open_frames, to_display16
 from .guard import (
@@ -440,16 +441,16 @@ def exr_sequence(
             staged.append((tmp, final))
             _write_exr(tmp, linear)
             lineage_mod.embed(tmp, provenance.lineage)
-        clash = [f.name for _, f in staged if f.exists()]
-        if clash:
-            raise FileExistsError(f"{clash[0]} already exists; delivery never overwrites")
-        done: list[Path] = []
+        claimed: list[Path] = []  # the names this delivery owns: an empty claim until its frame lands
         try:
+            for _, final in staged:  # the claim is the check: of any number of deliveries, one gets the names
+                if not claim(final):
+                    raise FileExistsError(f"{final.name} already exists; delivery never overwrites")
+                claimed.append(final)
             for tmp, final in staged:
                 replace_with_retry(tmp, final)
-                done.append(final)
-        except Exception:
-            for f in done:
+        except BaseException:
+            for f in claimed:
                 f.unlink(missing_ok=True)
             raise
     finally:

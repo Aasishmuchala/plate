@@ -47,10 +47,16 @@ Per camera, in this order (any failure stops that camera, records why, and moves
             "ingesting"
 
 run() never raises across cameras; every outcome is a SendResult carrying status_code, events_url,
-packet_id and ingest. A camera stopped at "manifest" or later whose folder has no manifest.json has
-that folder removed (nothing can ingest it, and the scene must change before a re-send), unless
-options.keep_failed_packets; one stopped earlier (legend, hash) keeps its render for inspection.
-Every pymxs read goes through rt.runtime().
+packet_id and ingest. A camera whose folder has no manifest.json has that folder removed (nothing
+can ingest it) unless options.keep_failed_packets, when it stopped at "manifest", "post" or "ingest",
+or when the daemon failed after the render (a transport.TransportError that daemon_failed accepts:
+unreachable, timed out, 5xx or an answer that is not one, at legend, hash or any later stage;
+decision 92): the scene was fine, so a re-send when the daemon is back renders again and nothing is
+left behind. A scene problem found after the render (the unlabelled-share abort at "legend") and a
+daemon that refuses (401, 403 and 404 on /hash, any other 4xx: the same answer comes again until the
+config or the packets folder changes) keep the render for inspection, as the warning says. A scene
+whose name is too long for a backup beside it gets the backup in the temp folder and a result warning
+that says so. Every pymxs read goes through rt.runtime().
 """
 
 from __future__ import annotations
@@ -97,7 +103,8 @@ DATA_ELEMENTS_FLOAT = ("zdepth", "cryptomatte_object", "cryptomatte_material", "
 REQUIRED_ELEMENTS = ("beauty", *elements.DEFAULT_ELEMENTS)
 OK_STATUS = (200, 202)
 # A SendAbort at one of these stages that leaves the packet folder without manifest.json removes the
-# folder (options.keep_failed_packets keeps it); earlier stages keep the render for inspection.
+# folder (options.keep_failed_packets keeps it); earlier stages keep the render for inspection, unless
+# the daemon failed (a TransportError at any stage: settle_failed_folder(transport_failure=True)).
 ORPHAN_STAGES = ("manifest", "post", "ingest")
 
 # Why a Send stopped before anything rendered (SendResult.code; stage "preflight").
@@ -885,6 +892,9 @@ def _send_one(
             result.backup = str(safety.backup())
         except safety.BackupFailed as exc:
             raise SendAbort("backup", str(exc)) from exc
+        note = safety.backup_note(scene_path(), result.backup)
+        if note:
+            result.warnings.append(note)
     journal = (
         safety.Journal(scene_path(), result.backup, op="send") if option(options, "journal", True) else None
     )
@@ -1135,19 +1145,43 @@ def _render_and_write(
     raise SendAbort("post", f"daemon rejected the packet (HTTP {status}): {body}")
 
 
-def settle_failed_folder(result: SendResult, aborted_at: str | None, options: Any) -> None:
+def daemon_failed(exc: transport.TransportError) -> bool:
+    """Whether exc is the daemon failing (unreachable, timed out, 5xx, an answer that is not one) rather
+    than refusing (Unauthorized, HashRefused, any other 4xx). A re-send finds the first kind mended; the
+    second kind repeats until the config or the packets folder changes, so the render it leaves is kept."""
+    if isinstance(exc, (transport.Unauthorized, transport.HashRefused)):
+        return False
+    status = getattr(exc, "status_code", None)
+    return not (isinstance(status, int) and 400 <= status <= 499)
+
+
+def settle_failed_folder(
+    result: SendResult, aborted_at: str | None, options: Any, *, transport_failure: bool = False
+) -> None:
     """For a camera that failed with its packet folder still lacking manifest.json: a SendAbort at
-    ORPHAN_STAGES removes the folder (fsutil.remove_tree; result.packet_dir becomes None) unless
+    ORPHAN_STAGES, or a daemon failure after the render (transport_failure: daemon_failed, decision 92),
+    removes the folder (fsutil.remove_tree; result.packet_dir becomes None) unless
     options.keep_failed_packets; otherwise, or when it cannot be removed, the folder stays and a
     warning says so."""
     folder = Path(str(result.packet_dir))
-    if aborted_at in ORPHAN_STAGES and not option(options, "keep_failed_packets", False):
+    if (aborted_at in ORPHAN_STAGES or transport_failure) and not option(
+        options, "keep_failed_packets", False
+    ):
         if fsutil.remove_tree(folder):
             result.packet_dir = None
-            result.warnings.append(
-                f"the packet folder {folder} had no manifest, so the daemon could never ingest it: it "
-                "was removed (set keep_failed_packets to keep failed renders)"
-            )
+            if transport_failure:
+                error = str(result.errors[-1]) if result.errors else "no detail"
+                error = error.removeprefix(f"{result.stage}: daemon: ")
+                result.warnings.append(
+                    f"the packet folder {folder} was removed: the daemon failed at {result.stage} "
+                    f"({error}) after the render; re-send when it is back (set keep_failed_packets "
+                    "to keep failed renders)"
+                )
+            else:
+                result.warnings.append(
+                    f"the packet folder {folder} had no manifest, so the daemon could never ingest it: it "
+                    "was removed (set keep_failed_packets to keep failed renders)"
+                )
             return
         result.warnings.append(f"the packet folder {folder} has no manifest and could not be removed")
     result.warnings.append(
@@ -1243,6 +1277,7 @@ def run(
             notify_progress(progress, _index, total, f"{_camera}: {stage}")
 
         aborted_at: str | None = None
+        transport_failure = False
         try:
             if camera in refused:
                 raise SendAbort("recipe", f"recipe: {refused[camera]}")
@@ -1256,6 +1291,7 @@ def run(
             result.problems.extend(abort.problems)
         except transport.TransportError as exc:  # hashing or posting: the daemon said no or went away
             result.ok = False
+            transport_failure = daemon_failed(exc)  # DaemonUnreachable and DaemonTimeout are TransportErrors
             result.errors.append(f"{result.stage}: daemon: {exc}")
         except hashing.PayloadTooLarge as exc:  # the preflight stops these: a last net
             result.ok = False
@@ -1265,7 +1301,7 @@ def run(
             result.ok = False
             result.errors.append(f"{result.stage}: {type(exc).__name__}: {exc}")
         if result.packet_dir and not (Path(result.packet_dir) / "manifest.json").is_file():
-            settle_failed_folder(result, aborted_at, options)
+            settle_failed_folder(result, aborted_at, options, transport_failure=transport_failure)
         notify_progress(
             progress,
             index + 1,

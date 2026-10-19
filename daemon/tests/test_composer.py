@@ -250,10 +250,12 @@ def test_the_change_list_recipe_is_a_change_list():
         ({"kind": "motion_croppair", "croppair": None}, "needs a croppair"),
     ],
 )
-def test_runnable_recipe_validation(tmp_path, patch, match):
+def test_runnable_recipe_validation(patch, match):
     doc = yaml.safe_load((recipes.RECIPES_DIR / "night_relight_changelist.yaml").read_text(encoding="utf-8"))
     doc.update(patch)
-    path = tmp_path / "bad.yaml"
+    # a path is read only from a recipe folder (decision 88)
+    recipes.studio_dir().mkdir(parents=True, exist_ok=True)
+    path = recipes.studio_dir() / "bad.yaml"
     path.write_text(yaml.safe_dump(doc), encoding="utf-8", newline="\n")
     with pytest.raises(RecipeError, match=match):
         recipes.load_runnable(path)

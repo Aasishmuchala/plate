@@ -623,6 +623,7 @@ def test_unlabelled_share_over_the_limit_blocks_the_packet(install_scene, daemon
     [result] = send(["CAM_front"], packets, cfg)
     assert not result.ok and result.stage == "legend"
     assert [p["code"] for p in result.problems] == [policy.UNLABELLED_SHARE]
+    assert (Path(result.packet_dir) / "beauty.exr").is_file()  # a scene problem: the render is kept (T158)
     assert not (Path(result.packet_dir) / "manifest.json").exists()  # never ingestible
     assert any("no manifest" in w for w in result.warnings)
 

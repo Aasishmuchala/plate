@@ -61,6 +61,14 @@ class OutboundLog:
 
     # ------------------------------------------------------------------ writes
 
+    def probe(self) -> None:
+        """Open the log for append and close it again, writing nothing: raises the `OSError` an append would.
+
+        A caller that is about to act on the daemon (the MCP server's mutating tools) probes first, so a log
+        that cannot be written stops the action instead of letting it happen unrecorded."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.close(os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600))
+
     def _append(self, record: dict[str, Any]) -> None:
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"), sort_keys=False) + "\n"
         self.path.parent.mkdir(parents=True, exist_ok=True)

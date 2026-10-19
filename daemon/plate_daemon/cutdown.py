@@ -18,13 +18,18 @@ that fits, `long_side` can only shrink it (INTER_AREA), and a request above the 
   when a lineage is given, write `<name>.cutdown.json = {source_run, box, preset, format|codec,
   gate_report_ref}` beside the file. The file is staged under a hidden sibling name and moved into place, and
   an existing file is never overwritten (FileExistsError). The name is claimed, not checked (`export.claim`,
-  `O_CREAT | O_EXCL`): of any number of cutdowns racing to one name exactly one is written.
+  `O_CREAT | O_EXCL`): of any number of cutdowns racing to one name exactly one is written. The staged file sits
+  in the client's folder under `.<name>.<tag><suffix>` while an in-flight marker `.<name>.<tag>.lock` is held
+  (router plan T153, decision 87: the shape `export.sweep_stale` reads), and the cutdown sweeps the leftovers of
+  its own name first, so a kill -9 mid-encode is cleaned up by the next cutdown or export of that name.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+import uuid
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -32,11 +37,11 @@ import cv2
 import numpy as np
 
 from . import lineage as lineage_mod
-from .delivery.guard import DeliveryError, stage_path
+from .delivery.guard import DeliveryError
 from .delivery.tools import probe_video, run_ffmpeg
 from .delivery.video import BT709
-from .export import claim
-from .fsutil import replace_with_retry, write_json_atomic
+from .export import claim, sweep_stale
+from .fsutil import in_flight, replace_with_retry, write_json_atomic
 from .lineage import Lineage
 
 __all__ = [
@@ -225,6 +230,21 @@ def _place(staged: Path, final: Path, lineage: Lineage | None) -> None:
         raise
 
 
+@contextmanager
+def _staged(out: Path) -> Iterator[Path]:
+    """The hidden path `.<name>.<tag><suffix>` next to `out` to write the cutdown to, with the in-flight marker
+    held for the block (and the staged file removed on the way out): a process that dies in it leaves a pair
+    `export.sweep_stale` recognises. The leftovers of this name and its sidecar are swept first."""
+    tag = uuid.uuid4().hex[:12]
+    staged = out.with_name(f".{out.name}.{tag}{out.suffix}")
+    with in_flight(out.with_name(f".{out.name}.{tag}.lock")):
+        sweep_stale(out.parent, (out.name, sidecar_path(out).name))
+        try:
+            yield staged
+        finally:
+            staged.unlink(missing_ok=True)
+
+
 def _check_destination(out: Path, suffixes: Sequence[str], what: str) -> None:
     if out.suffix.lower() not in suffixes:
         raise CutdownError(f"{out.name}: a {what} is written as {' or '.join(suffixes)}")
@@ -290,8 +310,7 @@ def still_cutdown(
     if (tw, th) != (w, h):
         crop = cv2.resize(crop, (tw, th), interpolation=cv2.INTER_AREA)
     rgb8 = np.rint(np.clip(crop, 0.0, 1.0) * 255.0).astype(np.uint8)  # quantised once
-    staged = stage_path(out)
-    try:
+    with _staged(out) as staged:
         if fmt == "png":
             from plate_pixels import imageio
 
@@ -299,8 +318,6 @@ def still_cutdown(
         else:
             staged.write_bytes(_jpeg_bytes(rgb8, quality))
         _place(staged, out, lineage)
-    finally:
-        staged.unlink(missing_ok=True)
     if lineage is not None:
         write_sidecar(
             out,
@@ -378,45 +395,43 @@ def clip_cutdown(
         f":out_range={BT709.range}:flags=area+accurate_rnd+full_chroma_int,"
         f"format=yuv420p,{BT709.setparams()}"
     )
-    staged = stage_path(out)
     placed = False
-    try:
-        run_ffmpeg(
-            [
-                "-i",
-                str(src),
-                "-map",
-                "0:v:0",
-                "-vf",
-                vf,
-                *_codec_args(codec),
-                "-pix_fmt",
-                "yuv420p",
-                *BT709.ffmpeg_args(),
-                "-an",
-                "-movflags",
-                "+faststart",
-                "-f",
-                "mp4",
-                str(staged),
-            ]
-        )
-        _place(staged, out, lineage)
-        placed = True
-        got = probe_video(out)
-        wrong = {k: (got.get(k), v) for k, v in BT709.expected().items() if got.get(k) != v}
-        if wrong:
-            raise DeliveryError(f"{out.name}: colour tags did not land (got, wanted): {wrong}")
-        if (int(got.get("width") or 0), int(got.get("height") or 0)) != (tw, th):
-            raise DeliveryError(
-                f"{out.name}: size is {got.get('width')} x {got.get('height')}, wanted {tw} x {th}"
+    with _staged(out) as staged:
+        try:
+            run_ffmpeg(
+                [
+                    "-i",
+                    str(src),
+                    "-map",
+                    "0:v:0",
+                    "-vf",
+                    vf,
+                    *_codec_args(codec),
+                    "-pix_fmt",
+                    "yuv420p",
+                    *BT709.ffmpeg_args(),
+                    "-an",
+                    "-movflags",
+                    "+faststart",
+                    "-f",
+                    "mp4",
+                    str(staged),
+                ]
             )
-    except BaseException:
-        if placed:  # a cutdown that failed its own check is not left behind
-            out.unlink(missing_ok=True)
-        raise
-    finally:
-        staged.unlink(missing_ok=True)
+            _place(staged, out, lineage)
+            placed = True
+            got = probe_video(out)
+            wrong = {k: (got.get(k), v) for k, v in BT709.expected().items() if got.get(k) != v}
+            if wrong:
+                raise DeliveryError(f"{out.name}: colour tags did not land (got, wanted): {wrong}")
+            if (int(got.get("width") or 0), int(got.get("height") or 0)) != (tw, th):
+                raise DeliveryError(
+                    f"{out.name}: size is {got.get('width')} x {got.get('height')}, wanted {tw} x {th}"
+                )
+        except BaseException:
+            if placed:  # a cutdown that failed its own check is not left behind
+                out.unlink(missing_ok=True)
+            raise
     if lineage is not None:
         write_sidecar(
             out,

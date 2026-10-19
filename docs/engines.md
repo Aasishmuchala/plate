@@ -59,6 +59,15 @@ Atlas uploads return public OSS URLs, so every Atlas route is `D / public` and i
 
 `RouteDecision` carries `engine_id, version, provider, region, custody_grade` (effective), `price_usd` (the unit price), plus `price_status`, `custody_status` and `fallback_of` so the quote shows when a number is still a placeholder. `estimate_price(manifest, megapixels, seconds, images)` is unit price times the billed quantity times the output count.
 
+## The packet summary behind the render-it verdict (decision 84)
+
+The render-it router ([gates/render_it.md](gates/render_it.md)) is a different router from the one above: before a quote it reads the packet's own depth and IDs (`detail_resolvability`) and says whether AI should be making the shot at all. That answer needs the packet's beauty EXR decoded, which at 4K used to be paid again on the first quote after every restart. It is now computed **once, at ingest**, and stored in the project index:
+
+- **The table.** `packet_router (packet_id, version, json, computed_utc)`, one row per Tier A packet with a beauty EXR. The `json` is `detail_resolvability`'s answer; `version` is the code's `ROUTER_SUMMARY_VERSION`.
+- **Written at ingest.** The last step of a packet's ingest (`Pipeline.warm_router`) computes the row. If that fails it is a warning, not an ingest failure, and the quote computes it lazily.
+- **Read at the quote.** The quote reads the row and decodes the EXR only when the row is absent or its `version` is not the current one, and then stores the fresh answer. A cold 4K quote is therefore under half a second.
+- **Refilled after a reindex.** The table lives in the index, which is a cache, so `plate reindex` (any rebuild from the project folder) leaves it empty, and the **first quote of each packet after a reindex** decodes the EXR once and refills its row. Changing the formula means bumping `ROUTER_SUMMARY_VERSION`; each packet's row is then recomputed by its next quote.
+
 ## Atlas quirks (ported from `~/Desktop/staffage/src/lib/atlas.ts`, each pinned in `engines/tests/test_atlas_contract.py`)
 
 | quirk | atlas.ts |

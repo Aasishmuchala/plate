@@ -14,6 +14,11 @@ edited: a change is a new numbered entry.
 
 M003 (Wave 12, T134) adds `ledger_outbox`: records the project ledger could not take while its file was
 unwritable or its lock was held, parked in order until `ledger.drain_outbox` appends them (Decision 73).
+
+M004 (Wave 13, T152) adds `packet_router`: the render-it router's inputs for a packet (`detail_resolvability`'s
+answer as JSON), computed once at ingest and read by every quote (Decision 84). `version` is the pipeline's
+`ROUTER_SUMMARY_VERSION`; a row of another version is recomputed and replaced. It is a cache: a rebuild from the
+folder leaves it empty and the next quote refills it.
 """
 
 from __future__ import annotations
@@ -177,4 +182,13 @@ M003 = [
     )""",
 ]
 
-MIGRATIONS: list[tuple[int, list[str]]] = [(1, M001), (2, M002), (3, M003)]
+M004 = [
+    """CREATE TABLE packet_router (
+        packet_id TEXT PRIMARY KEY REFERENCES packets(packet_id),
+        version TEXT NOT NULL,
+        json TEXT NOT NULL,
+        computed_utc TEXT NOT NULL
+    )""",
+]
+
+MIGRATIONS: list[tuple[int, list[str]]] = [(1, M001), (2, M002), (3, M003), (4, M004)]

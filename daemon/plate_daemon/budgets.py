@@ -19,6 +19,11 @@ CANCELLED at the provider); the ledger's reconciliation (T13) owns the billed tr
 is per project, so `spend_snapshot(conn, ...)` is one project's total; `spend_snapshot_all(index, ...)` sums
 every project index in this home (decision 80), which is what `Pipeline.approve` passes as `spent`, so the
 daily and unattended caps bound the user, not each project, and a refusal says how many projects it summed.
+
+Money declared for a file made outside PLATE (an import, provider `external`; decision 89) is spent elsewhere:
+its `spend.reserve` body carries `"external": true` (absent on every other run, so older records read as
+internal), and `committed_since` leaves it, and its refunds, out of both caps unless `include_external`. It
+is reported as `Spend.external_today_usd` and stays in the ledger and `plate spend` as it was.
 """
 
 from __future__ import annotations
@@ -116,11 +121,13 @@ class Decision(BaseModel):
 @dataclass(frozen=True)
 class Spend:
     """What the user has already committed: today (UTC day) and, for auto/agent, since the last human.
-    `projects` is how many project indexes were summed (None: one connection's project)."""
+    `projects` is how many project indexes were summed (None: one connection's project).
+    `external_today_usd` is today's externally declared import spend, which the two caps do not count."""
 
     today_usd: float = 0.0
     since_human_usd: float = 0.0
     projects: int | None = None
+    external_today_usd: float = 0.0
 
     @property
     def scope(self) -> str:
@@ -264,15 +271,26 @@ def _note(conn: sqlite3.Connection, run: Run, kind: str, body: dict[str, Any], n
     )
 
 
+def is_external(run: Run) -> bool:
+    """Is this run's route provider `external` (a file imported from outside PLATE, `imports.import_route`)?"""
+    route = run.route
+    provider = route.get("provider") if isinstance(route, dict) else getattr(route, "provider", None)
+    return provider == "external"
+
+
 def reserve(conn: sqlite3.Connection, run: Run, by: str, now: datetime) -> float:
-    """Reserve the quoted price at APPROVED (inside the caller's transaction). Returns the amount."""
+    """Reserve the quoted price at APPROVED (inside the caller's transaction). Returns the amount. The
+    reservation of an external (imported) run is marked `external`: the caps do not count it."""
     if run.quote is None:
         return 0.0  # a run moved by hand with no stored quote has nothing priced to reserve
     usd = float(run.quote.price_usd)
     env_id = run.quote.envelope_id
     if env_id:
         conn.execute("UPDATE budget_envelopes SET spent_usd = spent_usd + ? WHERE id = ?", (usd, env_id))
-    _note(conn, run, SPEND_RESERVE, {"usd": usd, "by": by, "envelope_id": env_id}, now)
+    body: dict[str, Any] = {"usd": usd, "by": by, "envelope_id": env_id}
+    if is_external(run):
+        body["external"] = True
+    _note(conn, run, SPEND_RESERVE, body, now)
     return usd
 
 
@@ -298,8 +316,15 @@ def day_start(now: datetime) -> datetime:
     return now.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def committed_since(conn: sqlite3.Connection, since: datetime, *, unattended_only: bool = False) -> float:
-    """Spend reserved at or after `since`, net of refunds (only auto and agent approvals if asked)."""
+def committed_since(
+    conn: sqlite3.Connection,
+    since: datetime,
+    *,
+    unattended_only: bool = False,
+    include_external: bool = False,
+) -> float:
+    """Spend reserved at or after `since`, net of refunds (only auto and agent approvals if asked). A run whose
+    reservation is marked `external` (decision 89) is left out, refunds and all, unless `include_external`."""
     rows = conn.execute(
         """SELECT run_id, kind, reason FROM run_events WHERE kind IN (?, ?) AND run_id IN
              (SELECT run_id FROM run_events WHERE kind = ? AND at_utc >= ?)""",
@@ -312,7 +337,8 @@ def committed_since(conn: sqlite3.Connection, since: datetime, *, unattended_onl
         usd = float(body.get("usd", 0.0))
         if r["kind"] == SPEND_RESERVE:
             by = str(body.get("by") or "")
-            if not unattended_only or by == "auto" or by.startswith("agent:"):
+            counted = include_external or body.get("external") is not True
+            if counted and (not unattended_only or by == "auto" or by.startswith("agent:")):
                 keep.add(r["run_id"])
             net[r["run_id"]] = net.get(r["run_id"], 0.0) + usd
         else:
@@ -325,9 +351,11 @@ def spend_snapshot(
 ) -> Spend:
     start = day_start(now)
     since = last_human_interaction_utc if last_human_interaction_utc is not None else start
+    today = committed_since(conn, start)
     return Spend(
-        today_usd=committed_since(conn, start),
+        today_usd=today,
         since_human_usd=committed_since(conn, since, unattended_only=True),
+        external_today_usd=round(committed_since(conn, start, include_external=True) - today, 10),
     )
 
 
@@ -335,7 +363,7 @@ def spend_snapshot_all(index: Any, now: datetime, last_human_interaction_utc: da
     """`spend_snapshot` summed over every project index of `index` (`plate_daemon.index.Index`): the caps are
     the user's, whichever project spends (decision 80). A project whose index cannot be opened is skipped with
     a warning (its spend is then not counted; the warning says so)."""
-    today = since = 0.0
+    today = since = external = 0.0
     counted = 0
     for pid in index.project_ids():
         try:
@@ -346,8 +374,14 @@ def spend_snapshot_all(index: Any, now: datetime, last_human_interaction_utc: da
             continue
         today += snap.today_usd
         since += snap.since_human_usd
+        external += snap.external_today_usd
         counted += 1
-    return Spend(today_usd=round(today, 10), since_human_usd=round(since, 10), projects=counted)
+    return Spend(
+        today_usd=round(today, 10),
+        since_human_usd=round(since, 10),
+        projects=counted,
+        external_today_usd=round(external, 10),
+    )
 
 
 def publish_alert(bus: Any, project_id: str, run_id: str | None, decision: Decision) -> int | None:

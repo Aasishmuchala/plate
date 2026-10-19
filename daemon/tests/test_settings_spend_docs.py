@@ -239,8 +239,11 @@ def _ingest_room_a(c: TestClient, auth: dict) -> str:
 
 
 @needs_room_a
-def test_a_quote_with_the_season_swap_recipe_uses_the_sheets_species(sync_settings, auth, tmp_path):
-    recipe = tmp_path / "season_swap.yaml"  # a Wave 9 recipe in shape; written here so the test owns its text
+def test_a_quote_with_the_season_swap_recipe_uses_the_sheets_species(sync_settings, auth):
+    # A Wave 9 recipe in shape; written here so the test owns its text, in the studio folder (a path is read
+    # only from a recipe folder, T154).
+    recipe = sync_settings.home / "recipes" / "season_swap.yaml"
+    recipe.parent.mkdir(parents=True, exist_ok=True)
     recipe.write_text(SEASON_SWAP, encoding="utf-8", newline="\n")
     with TestClient(create_app(sync_settings), base_url=BASE) as c:
         c.app.state.pipeline.sleep = lambda _s: None

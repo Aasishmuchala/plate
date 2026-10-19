@@ -12,7 +12,10 @@ and app-data folder:
   Journal           a JSON breadcrumb per operation under <app data>/logs/journal/, written as it goes
                     so a crash mid-send is diagnosable and recoverable from the backup.
 
-Time stamps in file names never contain ':' (Windows).
+Time stamps in file names never contain ':' (Windows). A scene whose name leaves no room for the
+backup suffix next to it (a file name past 255 bytes, a path past Windows' 259 characters) gets its
+backup in the temp folder as plate-<hash of the scene path>.plate-backup.<ts>.max, the same hash the
+long-name sidecar uses (recipes.scene_key); backup_note says so and Send adds it to the result.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from typing import Any
 
 from ..config import app_data_dir
 from ..fsutil import atomic_write_json
+from ..recipes import fits_filesystem, scene_key
 from ..rt import runtime
 from .scene import rt_attr, scene_path
 
@@ -41,16 +45,41 @@ def _stamp() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
 
-def backup_path_for(scene: str | Path | None, stamp: str | None = None) -> Path:
-    """<scene without .max>.plate-backup.<ts>.max next to the scene, or untitled.plate-backup.<ts>.max
-    in the temp folder for a scene that was never saved."""
-    stamp = stamp or _stamp()
+def _natural_backup_path(scene: str | Path | None, stamp: str) -> tuple[Path, bool]:
+    """(<scene without .max>.plate-backup.<ts>.max next to the scene, or the untitled one in the temp
+    folder; whether the scene's own folder was used)."""
     source = Path(str(scene)) if scene else None
     if source is not None and source.name and source.parent.is_dir():
         base = source.with_suffix("") if source.suffix.lower() == ".max" else source
+        beside = True
     else:
         base = Path(tempfile.gettempdir()) / "untitled"
-    return base.with_name(f"{base.name}{BACKUP_INFIX}{stamp}.max")
+        beside = False
+    return base.with_name(f"{base.name}{BACKUP_INFIX}{stamp}.max"), beside
+
+
+def backup_path_for(scene: str | Path | None, stamp: str | None = None) -> Path:
+    """<scene without .max>.plate-backup.<ts>.max next to the scene, or untitled.plate-backup.<ts>.max
+    in the temp folder for a scene that was never saved. When the natural name does not fit the file
+    system (recipes.fits_filesystem) the backup is plate-<scene hash>.plate-backup.<ts>.max in the temp
+    folder instead."""
+    stamp = stamp or _stamp()
+    natural, beside = _natural_backup_path(scene, stamp)
+    if not beside or fits_filesystem(natural):
+        return natural
+    return Path(tempfile.gettempdir()) / f"plate-{scene_key(str(scene))}{BACKUP_INFIX}{stamp}.max"
+
+
+def backup_note(scene: str | Path | None, dest: str | Path) -> str | None:
+    """A line for the log when the backup for scene is not beside it because the scene's name is too
+    long for one (None otherwise); dest is the path backup() returned."""
+    natural, beside = _natural_backup_path(scene, _stamp())
+    if not beside or fits_filesystem(natural):
+        return None
+    return (
+        f"backup stored in {Path(str(dest)).parent} as {Path(str(dest)).name} "
+        "(the scene name is too long for one beside it)"
+    )
 
 
 def backup() -> Path:

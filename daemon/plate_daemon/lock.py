@@ -9,6 +9,14 @@ holder dies, including after `Popen.kill()`.
 The holder writes `{"host", "pid", "since"}` into the lock file after acquiring it, and the same JSON to
 `<lock>.json` beside it: Windows locks the file's bytes, so a second process cannot read a held lock file
 there and reads the sidecar instead. `ProjectLocked` carries what it found (None when unreadable).
+
+The lock lasts one write, so it cannot keep a second daemon (another machine on the NAS folder) from writing
+the project between ours or from adopting our runs: that is the project lease (`lease.py`, decision 83).
+When this process has a lease identity installed (the daemon does; the CLI tools do not), taking
+`project.lock` (`PROJECT_LOCK_NAME`) first takes or refreshes `<project>/lease.json`, so another daemon's
+live lease raises `lease.ProjectLeased` before anything is written, and the lease is checked again once the
+lock is held (two daemons that both found no lease: the one whose lease was overwritten is refused). The
+home lock (`LOCK_NAME`) takes no lease.
 """
 
 from __future__ import annotations
@@ -22,10 +30,12 @@ from pathlib import Path
 
 import portalocker
 
+from . import lease
 from .fsutil import read_json, write_json_atomic
 from .timeutil import iso, utcnow
 
 LOCK_NAME = ".plate.lock"
+PROJECT_LOCK_NAME = "project.lock"  # equal to projects.LOCK_NAME (not imported: projects imports this module)
 
 
 class ProjectLocked(RuntimeError):
@@ -77,6 +87,9 @@ def project_lock(
 ) -> Iterator[portalocker.Lock]:
     project_dir = Path(project_dir)
     project_dir.mkdir(parents=True, exist_ok=True)
+    leased = name == PROJECT_LOCK_NAME and lease.enabled()
+    if leased:
+        lease.acquire(project_dir)  # another daemon's live lease: ProjectLeased before any write
     path = project_dir / name
     # Mode "w": portalocker opens with "a" and truncates only once the lock is held, so a failed attempt
     # never wipes the holder's JSON.
@@ -87,6 +100,10 @@ def project_lock(
         host, pid, since = read_holder(path)
         raise ProjectLocked(host, pid, since, path=path) from e
     try:
+        if leased:  # a daemon that also found no lease may have written its own since: it won
+            other = lease.held_by_other(project_dir)
+            if other is not None:
+                raise lease.ProjectLeased.of(other, project_dir.absolute())
         info = holder_info()
         fh.write(json.dumps(info))
         fh.flush()

@@ -16,6 +16,10 @@
   is not one the project and the packet allow: a Higgsfield or Runway file is grade D (its plate already went
   to that vendor), so an NDA project refuses it. 409 `approval_refused` (the run is CANCELLED) when an approver
   other than a human is turned down by the budget rules.
+- Declared money is spent elsewhere (decision 89): the run's reservation is marked `external`, so it counts
+  against neither the daily nor the unattended cap (`budgets.committed_since`); the ledger and `plate spend`
+  still carry the price. A `cost_usd` above `per_user_daily_cap_usd` answers 201 with a `warnings` line saying
+  so; under the cap there is no `warnings` key.
 """
 
 from __future__ import annotations
@@ -77,4 +81,14 @@ def import_route(request: Request, project_id: str, body: ImportBody) -> JSONRes
     except IllegalTransition as e:  # the run was cancelled while it was being imported
         raise illegal(e) from e
     with c.index.project(project_id) as conn:
-        return JSONResponse(run_view(conn, run.id), status_code=201)
+        view = run_view(conn, run.id)
+    cap = c.pipeline.policy.per_user_daily_cap_usd
+    if body.cost_usd > cap:
+        view = {
+            **view,
+            "warnings": [
+                f"declared cost {body.cost_usd:.2f} USD is above the daily cap {cap:.2f} USD; it is recorded "
+                "as external spend and does not count against the automation caps"
+            ],
+        }
+    return JSONResponse(view, status_code=201)

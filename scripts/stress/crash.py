@@ -325,9 +325,15 @@ def sigkill_export_part() -> None:
             f.unlink(missing_ok=True)
         planted.write_bytes(b"\0" * 4096)
         left = [planted]
+    # Wave 13 (decision 87): a temp whose in-flight marker the kill left is swept seconds later, whatever its age;
+    # only a marker-less one (the planted temp) waits out Wave 12's one-hour rule, so only that one is aged.
+    marked = [f.name.removesuffix(".lock") for f in left if f.name.endswith(".lock")]
     old = time.time() - 2 * 3600  # older than the sweep's in-flight window
     for f in left:
-        os.utime(f, (old, old))
+        if not any(f.name.startswith(m) for m in marked):
+            os.utime(f, (old, old))
+    if marked:
+        _lib.note(f"{len(marked)} in-flight marker(s) left by the kill: the retry runs at once, nothing aged")
     claimed = out / name
     if claimed.exists() and not (out / f"{rid}.gate.json").exists():
         # A kill after the export claimed its name leaves the image without its sidecar: never adopted as a repeat

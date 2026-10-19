@@ -106,7 +106,8 @@ def test_flicker_flat_ramp_and_pumping(tmp_path):
         fps=24,
     )
     s, r, p = video.flicker(steady), video.flicker(ramp), video.flicker(pump)
-    assert set(s) == {"mean_abs_luma_delta", "p95", "frames"} and s["frames"] == 16
+    assert set(s) == {"mean_abs_luma_delta", "p95", "frames", "status"} and s["frames"] == 16
+    assert s["status"] == r["status"] == p["status"] == "scored"
     assert s["mean_abs_luma_delta"] < 0.1 and s["p95"] < 0.1
     assert r["mean_abs_luma_delta"] == pytest.approx(1.0, abs=0.2)
     assert p["mean_abs_luma_delta"] == pytest.approx(12.0, abs=0.7) and p["p95"] > 11
@@ -115,7 +116,12 @@ def test_flicker_flat_ramp_and_pumping(tmp_path):
 @needs_ffmpeg
 def test_flicker_single_frame_clip(tmp_path):
     clip = pio.write_clip(tmp_path / "one.mp4", [np.zeros((90, 160, 3), np.uint8)], fps=24)
-    assert video.flicker(clip) == {"mean_abs_luma_delta": 0.0, "p95": 0.0, "frames": 1}
+    assert video.flicker(clip) == {
+        "mean_abs_luma_delta": None,
+        "p95": None,
+        "frames": 1,
+        "status": "unscored",
+    }
 
 
 def test_fit_still_centre_crops_to_the_clip_aspect_then_resizes():

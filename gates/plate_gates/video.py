@@ -341,17 +341,20 @@ def duration_check(video: str | Path, min_duration_s: float) -> dict:
 
 
 def flicker(video: str | Path, width: int = 480) -> dict:
-    """{mean_abs_luma_delta, p95, frames}: frame-to-frame change of the mean luma (levels of 255).
+    """{mean_abs_luma_delta, p95, frames, status}: frame-to-frame change of the mean luma (levels of 255).
 
     Every frame is decoded once through ffmpeg at `width` wide. A steady clip sits near 0; exposure pumping from
-    a generative model shows as a high mean and a fat p95.
+    a generative model shows as a high mean and a fat p95. A clip of fewer than two frames has no frame-to-frame
+    change to measure (BUILD_PLAN decision 90): both values are None and status is "unscored", never a 0.0 that
+    would read as a perfectly steady clip. Otherwise status is "scored".
     """
     means = np.array([float(g.mean()) for g in pio.iter_gray_frames(Path(video), width=width)])
     if len(means) < 2:
-        return {"mean_abs_luma_delta": 0.0, "p95": 0.0, "frames": int(len(means))}
+        return {"mean_abs_luma_delta": None, "p95": None, "frames": int(len(means)), "status": "unscored"}
     d = np.abs(np.diff(means))
     return {
         "mean_abs_luma_delta": float(d.mean()),
         "p95": float(np.percentile(d, 95)),
         "frames": int(len(means)),
+        "status": "scored",
     }

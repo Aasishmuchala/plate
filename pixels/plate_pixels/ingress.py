@@ -16,6 +16,13 @@ AI pixels are ever resampled here: the plate is read, never resized.
 ``max_pixels`` (``PLATE_RESULT_MAX_PIXELS``, default 64 000 000) before anything is allocated: a small PNG can
 declare a decode of many gigabytes. An empty or undecodable result is an ``IngressError`` that names its byte
 length and magic.
+
+The result's format is recorded, not judged (router plan T152, decision 86): ``result_info`` names the container
+(``raw_format``: ``png``, ``jpeg``, ``webp``, ``bmp``, ``tiff``, ``unknown``; ``array`` for an in-memory array),
+the decoded bit depth (8, 16 or 32), the channel count (1, 3 or 4), whether an alpha channel was dropped and
+whether it was fully transparent, and whether the container is lossy (JPEG). ``decode_result_with_info`` returns it
+beside the pixels and ``restore`` merges it into its report. A float result with any non-finite value (NaN, inf)
+is an ``IngressError`` before anything is clipped: a NaN must never be cast into the composite.
 """
 
 from __future__ import annotations
@@ -31,7 +38,7 @@ from .imghdr import header_size, magic
 from .imghdr import max_pixels as default_max_pixels
 from .register import estimate, to_gray, warp_to_plate
 
-__all__ = ["IngressError", "decode_result", "restore"]
+__all__ = ["IngressError", "decode_result", "decode_result_with_info", "restore", "result_info"]
 
 _ASPECT_SNAP = 1e-3  # relative aspect difference above which the result is centre-cropped before resampling
 _AREA_BELOW = 0.8  # a reduction to less than this scale is box-filtered (INTER_AREA) instead of Lanczos
@@ -42,13 +49,39 @@ class IngressError(ValueError):
     """The engine result or the size map cannot be mapped back onto the plate."""
 
 
+def result_info(data: bytes | bytearray | memoryview | None, decoded: np.ndarray) -> dict[str, Any]:
+    """What the engine handed back, from its bytes and the array they decoded to (before any channel is dropped):
+    ``{raw_format, raw_bit_depth, raw_channels, alpha_dropped, alpha_transparent, lossy}``. ``data`` None means
+    the result was an in-memory array (``raw_format: "array"``)."""
+    a = np.asarray(decoded)
+    fmt = "array" if data is None else (magic(data) or "unknown")
+    channels = 1 if a.ndim == 2 else int(a.shape[2])
+    has_alpha = a.ndim == 3 and channels == 4
+    return {
+        "raw_format": fmt,
+        "raw_bit_depth": int(a.dtype.itemsize * 8),
+        "raw_channels": channels,
+        "alpha_dropped": bool(has_alpha),
+        "alpha_transparent": bool(has_alpha and a.size > 0 and a[..., 3].max() == 0),
+        "lossy": fmt == "jpeg",
+    }
+
+
 def decode_result(
     result: bytes | bytearray | memoryview | np.ndarray, *, max_pixels: int | None = None
 ) -> np.ndarray:
     """float32 (H, W, 3) RGB in [0, 1] from encoded image bytes (PNG/JPEG/WebP via cv2) or an RGB array.
 
     Encoded bytes are checked before the decode: empty is refused, and so is a header that declares more than
-    ``max_pixels`` (default ``imghdr.max_pixels()``, i.e. ``PLATE_RESULT_MAX_PIXELS``)."""
+    ``max_pixels`` (default ``imghdr.max_pixels()``, i.e. ``PLATE_RESULT_MAX_PIXELS``). A float result with a
+    non-finite value is refused (``decode_result_with_info``)."""
+    return decode_result_with_info(result, max_pixels=max_pixels)[0]
+
+
+def decode_result_with_info(
+    result: bytes | bytearray | memoryview | np.ndarray, *, max_pixels: int | None = None
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """``(decode_result's array, result_info)``: the pixels and what format they came in."""
     if isinstance(result, (bytes, bytearray, memoryview)):
         data = bytes(result)
         if not data:
@@ -68,6 +101,9 @@ def decode_result(
             raise IngressError(
                 f"cannot decode the engine result ({len(data)} bytes, magic {magic(data) or 'unknown'})"
             )
+        if img.ndim == 3 and img.shape[2] not in (3, 4):
+            raise IngressError(f"engine result has {img.shape[2]} channels (1, 3 or 4 expected)")
+        info = result_info(data, img)
         if img.ndim == 2:
             img = np.repeat(img[..., None], 3, axis=2)
         elif img.shape[2] == 4:
@@ -81,16 +117,21 @@ def decode_result(
             a = np.repeat(a[..., None], 3, axis=2)
         if a.ndim != 3 or a.shape[2] not in (3, 4):
             raise IngressError(f"engine result must be (H, W, 3), got {a.shape}")
+        info = result_info(None, a)
         a = a[..., :3]
     if a.dtype == np.uint8:
         f = a.astype(np.float32) / 255.0
     elif a.dtype == np.uint16:
         f = a.astype(np.float32) / 65535.0
     elif np.issubdtype(a.dtype, np.floating):
+        finite = np.isfinite(a).all(axis=2)
+        if not finite.all():
+            n, total = int(finite.size - np.count_nonzero(finite)), int(finite.size)
+            raise IngressError(f"engine result has {n} non-finite pixels of {total}")
         f = np.clip(a.astype(np.float32), 0.0, 1.0)
     else:
         raise IngressError(f"unsupported result dtype {a.dtype}")
-    return np.ascontiguousarray(f)
+    return np.ascontiguousarray(f), info
 
 
 def _plate_float(plate: np.ndarray) -> np.ndarray:
@@ -169,7 +210,8 @@ def restore(
 
     Report: ``shift_px``, ``residual_px``, ``registered`` (residual <= 1 px and shift <= 8 px),
     ``camera_drift`` (shift > 8 px), plus ``dx``, ``dy``, ``warp_applied``, the full ``registration`` record,
-    ``result_size``, ``aspect_crop``, ``resample`` and the ``region``.
+    ``result_size``, ``aspect_crop``, ``resample``, the ``region`` and the result's format (``result_info``:
+    ``raw_format``, ``raw_bit_depth``, ``raw_channels``, ``alpha_dropped``, ``alpha_transparent``, ``lossy``).
     """
     sm = sizemap if isinstance(sizemap, SizeMap) else SizeMap.from_dict(sizemap)
     plate_arr = np.asarray(plate_rgb16)
@@ -178,7 +220,7 @@ def restore(
     if (W, H) != sm.src:
         raise IngressError(f"plate is {W} x {H} but the size map was made for {sm.src[0]} x {sm.src[1]}")
 
-    res = decode_result(result_rgb8)
+    res, info = decode_result_with_info(result_rgb8)
     rh, rw = res.shape[:2]
     pw, ph = sm.padded_size
     res, aspect_crop = _aspect_crop(res, sm.dst[0] / sm.dst[1])
@@ -224,5 +266,6 @@ def restore(
         "resample": resample,
         "region": None if sm.region is None else list(sm.region),
         "sizemap_mode": sm.mode,
+        **info,
     }
     return out, report

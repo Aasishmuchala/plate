@@ -6,10 +6,11 @@
   (`video.first_frame <= 12`, `video.last_frame <= 16`, calibration_needed);
 * camera lock (reprojection.camera_lock): flow median at <= 960 wide; scored only when the clip is MEANT to be
   locked (`expect_locked`, default: no motion packet), because a Kling push-in or a dolly moves by design and
-  the number is then a description, not a fault; hard on RAFT, advisory on DIS (`status_by_backend`);
+  the number is then a description, not a fault; hard on RAFT, advisory on DIS (`status_by_backend`); a clip
+  of fewer than two frames comes back `unscored` (decision 90): no value, no check, a `backend_notes` line;
 * reprojection drift (reprojection.drift) when a motion packet is given (`video.reproj_edge_recall >= 0.8`,
   hard), through the time map (built from the packet fps and the clip fps when none is passed);
-* flicker (video.flicker; reported, no threshold yet);
+* flicker (video.flicker; reported, no threshold yet; `unscored` with a `backend_notes` line under two frames);
 * duration (`video.duration_s >= shot`, hard) against `shot_duration_s`, else the time map's duration;
 * output tags from ffprobe: fps as 'num/den', size, codec, pix_fmt, bit depth, frame count.
 
@@ -98,7 +99,10 @@ def score(
     backend = lock["backend"]
     notes.append(f"flow backend {backend} @{lock['width']}")
     locked = (packet_motion is None) if expect_locked is None else bool(expect_locked)
-    if locked:
+    if locked and lock["status"] == "unscored":
+        # a clip with fewer than two frames has no flow to measure: no value, so no check, so no pass on it
+        notes.append(lock["note"])
+    elif locked:
         values[reprojection.LOCK_METRIC_ID] = float(lock["median_flow_px"])
         if lock["threshold_status"] != "hard":
             notes.append(
@@ -138,6 +142,8 @@ def score(
 
     # flicker (no threshold in ts-2026.10.17-draft: reported only)
     extra["flicker"] = video.flicker(v, width=flicker_width)
+    if extra["flicker"]["status"] == "unscored":
+        notes.append("flicker not scored: fewer than 2 frames")
 
     # duration against the shot
     target = shot_duration_s if shot_duration_s is not None else (float(tm.duration_s) if tm else None)

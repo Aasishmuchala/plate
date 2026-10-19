@@ -17,7 +17,10 @@ What an agent session is, for custody (decision 5a, `docs/custody.md` E1 and E15
   Anthropic API route: D until written terms are filed), the size and BLAKE3 of what was handed over, and the
   run id when there is one. The request line is written BEFORE the result is returned; if it cannot be
   written the agent gets `outbound_log_failed` and nothing else, except the `run_id` / `node_id` the call
-  produced when the daemon had already acted (so the run or node can be found before a retry).
+  produced when the daemon had already acted (so the run or node can be found before a retry). The tools that
+  act (`MUTATING_TOOLS`: `run_node`, `estimate_run`, `add_node`) probe the log first (decision 91,
+  `PlateTools.record_probe`): a log that cannot be opened for append stops the call before the daemon hears
+  of it, so nothing is started or spent unrecorded.
 - On an NDA project the result is an allowlist (decision 78, `scrub_nda`): ids, kinds, hashes, numbers,
   booleans and enum-valued params pass; every other string, at any depth, is withheld and named in
   `withheld` (prompts, labels, names, material names, tokens, folder names, an override's reason and by). No
@@ -50,6 +53,7 @@ import argparse
 import asyncio
 import dataclasses
 import json
+import math
 import os
 import re
 import sys
@@ -84,6 +88,7 @@ __all__ = [
     "ENUM_PARAM_KEYS",
     "LOOPBACK_HOSTS",
     "MCP_HOST",
+    "MUTATING_TOOLS",
     "NOTE",
     "RESERVED_NODE_KEYS",
     "STRUCTURAL_KEYS",
@@ -96,6 +101,7 @@ __all__ = [
     "PlateTools",
     "build_server",
     "default_client",
+    "finite_positive",
     "main",
     "new_envelope",
     "scrub_nda",
@@ -114,6 +120,9 @@ TOOL_NAMES = (
     "compare",
     "export_review",
 )
+# The tools that change a project or spend money (decision 91): each probes the outbound log before the daemon
+# is asked to act. The reads are logged after the fact; a log failure there costs the agent a result, not a run.
+MUTATING_TOOLS = frozenset({"run_node", "estimate_run", "add_node"})
 # Delivery nodes are made by a human: an agent proposes and spends, it never ships.
 AGENT_FORBIDDEN_KINDS = frozenset({"Export", "Review"})
 # Node fields only a human sets (accepting, overriding, the gate verdict). Refused inside `params` too, so a
@@ -143,6 +152,8 @@ RESERVED_NODE_KEYS = frozenset(
 MAX_PARAMS_BYTES = 16 * 1024
 MAX_LABEL_CHARS = 120
 MAX_REVIEW_RUNS = 24
+MAX_ENVELOPE_USD = 1_000_000
+MAX_ENVELOPE_HOURS = 8784  # 366 days
 REVIEW_WATERMARK = "REVIEW"
 REVIEW_MAX_WIDTH = 2048
 ESTIMATE_REASON = "estimate_run: price read, nothing approved"
@@ -549,6 +560,15 @@ class PlateTools:
         except Exception as e:  # nothing leaves the box unlogged (the same rule egress follows)
             raise McpError("outbound_log_failed", _log_failed(call, e), safe=True) from None
 
+    def record_probe(self, call: _Call) -> None:
+        """Open the outbound log of every project the call names for append (writing nothing) BEFORE the daemon
+        is asked to act, so an unwritable log is `outbound_log_failed` with nothing started, spent or added."""
+        try:
+            for root in call.projects.values():
+                OutboundLog.for_project(root, clock=self.clock).probe()
+        except Exception as e:  # the same rule `record` follows: nothing happens unlogged
+            raise McpError("outbound_log_failed", _log_failed(call, e), safe=True) from None
+
     @contextmanager
     def _call(self, tool: str, **args: Any) -> Iterator[_Call]:
         call = _Call(tool=tool, args=args, owner=self)
@@ -615,6 +635,7 @@ class PlateTools:
         ) as call:
             head = self.backend.head(project_id)
             call.touch(head)
+            self.record_probe(call)
             body, sources = self._new_node(kind, params, connect_from)
             # One append under the daemon's save lock (decision 77): it allocates the id, so concurrent adds
             # each get their own node and none is lost.
@@ -681,6 +702,7 @@ class PlateTools:
         with self._call("estimate_run", project_id=project_id, node_id=node_id, engine_id=engine_id) as call:
             head = self.backend.head(project_id)
             call.touch(head)
+            self.record_probe(call)
             body = {"engine_id": engine_id} if engine_id else {}
             quoted = self.backend.call("POST", f"/projects/{project_id}/nodes/{_seg(node_id)}/quote", body)
             run, q = quoted["run"], quoted["quote"]
@@ -720,6 +742,7 @@ class PlateTools:
         ) as call:
             head = self.backend.head(project_id)
             call.touch(head)
+            self.record_probe(call)
             if not isinstance(envelope_id, str) or not envelope_id.strip():
                 raise McpError(
                     "envelope_required",
@@ -1082,6 +1105,22 @@ def new_envelope(
 # ---------------------------------------------------------------------------- the command line
 
 
+def finite_positive(lo: float, hi: float) -> Callable[[str], float]:
+    """An argparse `type`: a finite number greater than `lo` and at most `hi`. `float("inf")`, `nan`, `0`, a
+    negative or a number past the limit (a `--hours 1e12` that would overflow a date) is a usage error."""
+
+    def parse(text: str) -> float:
+        try:
+            value = float(text)
+        except ValueError:
+            value = math.nan
+        if not math.isfinite(value) or not lo < value <= hi:
+            raise argparse.ArgumentTypeError(f"{text!r}: must be a finite number between {lo:g} and {hi:g}")
+        return value
+
+    return parse
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m plate_daemon.mcp_server",
@@ -1094,9 +1133,17 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--project", help="project id for --new-envelope (optional when there is only one project)"
     )
-    p.add_argument("--usd", type=float, help="envelope total in USD")
-    p.add_argument("--hours", type=float, help="envelope lifetime in hours")
-    p.add_argument("--per-run-usd", type=float, help="per-run cap in USD (default: the total)")
+    p.add_argument("--usd", type=finite_positive(0, MAX_ENVELOPE_USD), help="envelope total in USD")
+    p.add_argument(
+        "--hours",
+        type=finite_positive(0, MAX_ENVELOPE_HOURS),
+        help="envelope lifetime in hours (up to 366 days)",
+    )
+    p.add_argument(
+        "--per-run-usd",
+        type=finite_positive(0, MAX_ENVELOPE_USD),
+        help="per-run cap in USD (default: the total)",
+    )
     p.add_argument("--owner", default="agent:mcp", help="envelope owner: agent[:name] or user:name")
     p.add_argument("--daemon-url", help="daemon base URL (default PLATE_DAEMON_URL or the loopback address)")
     return p

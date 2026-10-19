@@ -599,7 +599,9 @@ def test_new_envelope_needs_a_known_project_and_sane_limits(daemon, capsys):
     assert mcp_server.main(["--new-envelope", "--project", "ghost", "--usd", "1", "--hours", "1"]) == 2
     assert "no project ghost" in capsys.readouterr().err
     _project(c)
-    assert mcp_server.main(["--new-envelope", "--project", PROJECT, "--usd", "-1", "--hours", "1"]) == 2
+    with pytest.raises(SystemExit) as refused:  # a non-positive total is a usage error now (argparse exit 2)
+        mcp_server.main(["--new-envelope", "--project", PROJECT, "--usd", "-1", "--hours", "1"])
+    assert refused.value.code == 2
     with pytest.raises(SystemExit):
         mcp_server.main(["--new-envelope", "--usd", "1"])
 

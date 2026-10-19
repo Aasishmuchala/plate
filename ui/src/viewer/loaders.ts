@@ -2,6 +2,9 @@
 // (`GET /api/v0/assets/<hash>?fmt=rgba16f`, T25): width * height * 4 halves for RGBA16F, width * height for R16F
 // heatmaps, rows top-first, no header. 8-bit images and edge masks are ordinary PNGs the browser decodes, with colour
 // management off so the code values arrive untouched. The bearer token goes to this origin only, never elsewhere.
+// T159 (decision 93): decoded A/B images are kept in a small LRU keyed by URL, encoding and declared size, so the
+// plate is fetched once per compare session while only the B side changes. Viewer URLs name CAS hashes (immutable
+// bytes), so a hit never needs revalidating; inline `data` sources skip the cache.
 
 import { getToken } from "../api/client";
 import type { BitmapPixels, HalfPixels, Pixels } from "./renderer";
@@ -83,9 +86,114 @@ async function decodeBitmap(blob: Blob): Promise<ImageBitmap> {
   return createImageBitmap(blob, { colorSpaceConversion: "none", premultiplyAlpha: "none" });
 }
 
-/** A or B: half floats for png16 / exr-half, a decoded bitmap for srgb8. */
-export async function loadImage(src: ImageSource, signal?: AbortSignal): Promise<Pixels> {
-  checkSize(src.width, src.height, "image");
+/** Decoded-image cache budget: room for a 4K plate (66 MB of half floats) and three takes. */
+export const VIEWER_CACHE_BYTES = 320 * 1024 * 1024;
+export const VIEWER_CACHE_ENTRIES = 4;
+
+export interface PixelCacheLimits {
+  bytes: number;
+  entries: number;
+}
+
+export interface PixelCacheStats {
+  entries: number;
+  bytes: number;
+  hits: number;
+  misses: number;
+}
+
+/** What a decoded image holds in memory: its half-float buffer, or 4 bytes a pixel for a bitmap. */
+export function pixelBytes(px: Pixels): number {
+  return px.kind === "half" ? px.data.byteLength : px.width * px.height * 4;
+}
+
+/** The cache key of a fetched A/B source. */
+export function pixelCacheKey(src: ImageSource): string {
+  return `${src.url}|${src.encoding}|${src.width}x${src.height}`;
+}
+
+/** A closed ImageBitmap reports 0 x 0 and can no longer be uploaded. */
+function isClosed(px: Pixels): boolean {
+  return px.kind === "bitmap" && (px.source as { width?: unknown }).width === 0;
+}
+
+/**
+ * LRU of decoded viewer images under a byte and an entry budget. `put` evicts the least recently used entries until
+ * both limits hold; an image larger than the whole byte budget is not cached. Cached bitmaps are not closed here:
+ * closing is the renderer's business, and a bitmap found closed is dropped as a miss.
+ */
+export class PixelCache {
+  private readonly items = new Map<string, { px: Pixels; bytes: number }>();
+  private limits: PixelCacheLimits;
+  private total = 0;
+  private hits = 0;
+  private misses = 0;
+
+  constructor(limits: Partial<PixelCacheLimits> = {}) {
+    this.limits = { bytes: VIEWER_CACHE_BYTES, entries: VIEWER_CACHE_ENTRIES, ...limits };
+  }
+
+  get(key: string): Pixels | undefined {
+    const item = this.items.get(key);
+    if (!item || isClosed(item.px)) {
+      if (item) this.drop(key);
+      this.misses++;
+      return undefined;
+    }
+    this.items.delete(key); // re-insert: Map order is the recency order, oldest first
+    this.items.set(key, item);
+    this.hits++;
+    return item.px;
+  }
+
+  put(key: string, px: Pixels): void {
+    this.drop(key);
+    const bytes = pixelBytes(px);
+    if (bytes > this.limits.bytes || this.limits.entries < 1) return;
+    this.items.set(key, { px, bytes });
+    this.total += bytes;
+    this.evict();
+  }
+
+  setLimits(limits: Partial<PixelCacheLimits>): void {
+    this.limits = { ...this.limits, ...limits };
+    this.evict();
+  }
+
+  clear(): void {
+    this.items.clear();
+    this.total = 0;
+    this.hits = 0;
+    this.misses = 0;
+  }
+
+  stats(): PixelCacheStats {
+    return { entries: this.items.size, bytes: this.total, hits: this.hits, misses: this.misses };
+  }
+
+  private drop(key: string): void {
+    const item = this.items.get(key);
+    if (!item) return;
+    this.items.delete(key);
+    this.total -= item.bytes;
+  }
+
+  private evict(): void {
+    while (this.items.size > 0 && (this.items.size > this.limits.entries || this.total > this.limits.bytes)) {
+      this.drop(this.items.keys().next().value as string);
+    }
+  }
+}
+
+/** The viewer's shared cache: every <Viewer> slot reads through it. */
+export const pixelCache = new PixelCache();
+
+/** Tests: resize the shared cache (an omitted limit goes back to its default). */
+export function setPixelCacheLimits(limits: Partial<PixelCacheLimits> = {}): void {
+  pixelCache.setLimits({ bytes: VIEWER_CACHE_BYTES, entries: VIEWER_CACHE_ENTRIES, ...limits });
+}
+
+async function decodeImage(src: ImageSource, signal?: AbortSignal): Promise<Pixels> {
   if (src.encoding === "srgb8") {
     const blob = src.data
       ? src.data instanceof Blob
@@ -107,6 +215,23 @@ export async function loadImage(src: ImageSource, signal?: AbortSignal): Promise
     data: decodeHalfBuffer(buf),
     linear: src.encoding === "exr-half",
   } satisfies HalfPixels;
+}
+
+/** A or B: half floats for png16 / exr-half, a decoded bitmap for srgb8. A fetched source reads through `cache`; a
+ * load aborted before it is stored leaves the cache as it was. */
+export async function loadImage(
+  src: ImageSource,
+  signal?: AbortSignal,
+  cache: PixelCache = pixelCache,
+): Promise<Pixels> {
+  checkSize(src.width, src.height, "image");
+  if (src.data) return decodeImage(src, signal);
+  const key = pixelCacheKey(src);
+  const hit = cache.get(key);
+  if (hit) return hit;
+  const px = await decodeImage(src, signal);
+  if (!signal?.aborted) cache.put(key, px);
+  return px;
 }
 
 /** An edge-mask PNG. */

@@ -5,10 +5,18 @@
 // Accept (doctrine 7): `acceptRun` needs the run's logged full scrub, posts `/runs/{id}/accept` with it, then marks
 // the producing node approved on the canvas and saves the graph, so the daemon (which owns `approved`) and the
 // canvas rules both see the accepted take.
+//
+// Strips from history (T160, decision 93): once `loadRuns` has the project's runs, each generating node on the
+// canvas gets its newest Make back in its candidate strip (the rows of the newest row's best-of-N group, else that
+// row alone), read in full with `GET /runs/{id}` because a list row carries no outputs or gate checks; the runs still
+// in flight are watched. A node whose read fails is skipped and the rest go on; the pass logs once.
 
 import { create } from "zustand";
-import { acceptRun as postAccept, UI_ACTOR } from "../canvas/runApi";
-import { useRunStore } from "../canvas/runStore";
+import { watchRun } from "../canvas/runEvents";
+import { acceptRun as postAccept, getGateReport, getRun, UI_ACTOR } from "../canvas/runApi";
+import { type CandidateRun, holdsLiveRun, MAX_CANDIDATES, useRunStore } from "../canvas/runStore";
+import { isTerminal } from "../canvas/runTypes";
+import { GENERATING_KINDS, type GraphNode } from "../canvasRules";
 import { useGraphStore } from "../store";
 import type { Point, Size, ViewerMode } from "../viewer/types";
 import { errorMessage, listRuns, postScrub, postVerdict } from "./api";
@@ -132,6 +140,92 @@ function producingNode(answer: { node_id?: string | null } | null, runId: string
   return answer?.node_id ?? runs.find((r) => r.id === runId)?.node_id ?? useRunStore.getState().candidates[runId]?.nodeId ?? null;
 }
 
+// ---------------------------------------------------------------------------- strips from history (T160)
+
+/** The best-of-N group a listed run belongs to: `quote.sibling_group`, else the run's own `sibling_group`. */
+function groupOfRow(row: RunRow): string | null {
+  const r = row as RunRow & { sibling_group?: unknown; quote?: { sibling_group?: unknown } | null };
+  const g = r.quote?.sibling_group ?? r.sibling_group;
+  return typeof g === "string" && g !== "" ? g : null;
+}
+
+const createdAt = (row: RunRow): number => {
+  const t = typeof row.created_utc === "string" ? Date.parse(row.created_utc) : Number.NaN;
+  return Number.isFinite(t) ? t : Number.NEGATIVE_INFINITY;
+};
+
+/**
+ * Per generating node of `nodes`, the listed rows of its newest Make: the rows sharing the newest row's
+ * `quote.sibling_group`, else the newest row alone, at most `MAX_CANDIDATES`, newest first. Rows for other nodes
+ * (a Plate, a Comp, a node no longer on the canvas) are left out.
+ */
+export function newestMakes(rows: readonly RunRow[], nodes: readonly GraphNode[]): Map<string, RunRow[]> {
+  const generating = new Set(nodes.filter((n) => GENERATING_KINDS.has(n.data.kind)).map((n) => n.id));
+  // newest first by created_utc; the daemon's own order (newest first) breaks ties
+  const ordered = rows
+    .map((row, i) => ({ row, i }))
+    .sort((a, b) => createdAt(b.row) - createdAt(a.row) || a.i - b.i)
+    .map((x) => x.row);
+  const byNode = new Map<string, RunRow[]>();
+  for (const row of ordered) {
+    const nodeId = row.node_id;
+    if (!nodeId || !generating.has(nodeId)) continue;
+    const list = byNode.get(nodeId) ?? [];
+    list.push(row);
+    byNode.set(nodeId, list);
+  }
+  const out = new Map<string, RunRow[]>();
+  for (const [nodeId, list] of byNode) {
+    const group = groupOfRow(list[0]);
+    const make = group === null ? [list[0]] : list.filter((r) => groupOfRow(r) === group);
+    out.set(nodeId, make.slice(0, MAX_CANDIDATES));
+  }
+  return out;
+}
+
+/** A run as the strip needs it: `GET /runs/{id}`, plus `/gate` for a GATE_FAIL whose report carries no checks. */
+async function readCandidate(runId: string): Promise<CandidateRun> {
+  const run: CandidateRun = await getRun(runId);
+  if (run.state === "GATE_FAIL" && !run.gate_report?.checks?.length) {
+    try {
+      return { ...run, gate_report: await getGateReport(runId) };
+    } catch {
+      // no report route: the chip says GATE_FAIL without the failing metric
+    }
+  }
+  return run;
+}
+
+/**
+ * Fill the strips of the open project's generating nodes from `rows` (T160). `current` says whether the project is
+ * still the one open; once it is not, nothing more is written. Never throws.
+ */
+async function hydrateStrips(projectId: string, rows: readonly RunRow[], current: () => boolean): Promise<void> {
+  if (!current()) return;
+  const makes = newestMakes(rows, useGraphStore.getState().nodes);
+  const failed: string[] = [];
+  await Promise.all(
+    [...makes].map(async ([nodeId, make]) => {
+      try {
+        if (holdsLiveRun(useRunStore.getState(), nodeId)) return; // this session's Make is still in flight
+        const runs = await Promise.all(make.map((row) => readCandidate(row.id)));
+        if (!current()) return;
+        useRunStore.getState().hydrate(nodeId, runs);
+        const held = useRunStore.getState().byNode[nodeId]?.runIds ?? [];
+        for (const run of runs) {
+          const cand = useRunStore.getState().candidates[run.id];
+          if (held.includes(run.id) && cand && !isTerminal(cand.state)) watchRun(run.id, nodeId, projectId);
+        }
+      } catch (err) {
+        failed.push(`${nodeId}: ${errorMessage(err)}`);
+      }
+    }),
+  );
+  if (failed.length > 0) {
+    console.warn(`candidate strips: ${failed.length} node(s) not restored from history (${failed.join("; ")})`);
+  }
+}
+
 /** After the daemon accepted: approve the producing node with the scrub that allowed it, then save the graph. */
 async function approveOnCanvas(nodeId: string, scrubLogId: string): Promise<Outcome> {
   useGraphStore.getState().setNodeStatus(nodeId, { approved: true, approvedBy: UI_ACTOR, scrubLogId }, { id: scrubLogId, fullScrub: true });
@@ -153,14 +247,22 @@ export const usePanelsStore = create<PanelsState>()((set, get) => ({
       return;
     }
     set({ runsLoading: true, runsError: null, runsProjectId: projectId });
+    let runs: RunRow[];
     try {
-      const runs = await listRuns(projectId);
-      if (get().runsProjectId !== projectId) return; // a newer project was opened meanwhile
-      set({ runs, runsLoading: false });
+      runs = await listRuns(projectId);
     } catch (err) {
       if (get().runsProjectId !== projectId) return;
       set({ runs: [], runsLoading: false, runsError: errorMessage(err) });
+      return;
     }
+    if (get().runsProjectId !== projectId) return; // a newer project was opened meanwhile
+    set({ runs, runsLoading: false });
+    // the strips of the canvas the runs belong to, from their newest Makes (T160)
+    await hydrateStrips(
+      projectId,
+      runs,
+      () => get().runsProjectId === projectId && useGraphStore.getState().projectId === projectId,
+    );
   },
   selectRun: (runId) =>
     set((s) => (s.selectedRunId === runId ? s : { selectedRunId: runId, scrub: EMPTY_SCRUB, outcome: null })),

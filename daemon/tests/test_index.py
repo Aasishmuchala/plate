@@ -1,4 +1,7 @@
-"""index.py: the per-project SQLite cache (WAL, M002 schema) and its rebuild from the project folder."""
+"""index.py: the per-project SQLite cache (WAL, M002 schema) and its rebuild from the project folder.
+
+M004 (router plan T152) adds `packet_router`, the render-it router's inputs per packet: a cache the rebuild leaves
+empty (the next quote refills it)."""
 
 from __future__ import annotations
 
@@ -111,6 +114,7 @@ def test_schema_has_the_plan_columns(settings):
             "attempts",
             "last_error",
         }
+        assert _columns(conn, "packet_router") == {"packet_id", "version", "json", "computed_utc"}
 
 
 def test_a_seed_m001_index_migrates_forward_without_loss(settings):
@@ -172,3 +176,29 @@ def test_rebuild_reports_what_the_folder_cannot_back(tmp_path, settings):
     assert out["assets"] == 1 and out["runs"] == 0
     assert any("pkt_missing" in p for p in out["problems"])
     assert any("torn last line" in p for p in out["problems"])
+
+
+def test_packet_router_rows_name_an_indexed_packet_and_a_rebuild_drops_them(tmp_path, settings):
+    project, idx, _states = _live_project(tmp_path, settings.home)
+    with idx.project("tula-wot") as conn:
+        with tx(conn):
+            conn.execute(
+                "INSERT INTO packet_router (packet_id, version, json, computed_utc) VALUES (?, ?, ?, ?)",
+                ("pkt_a", "2026.10.19", json.dumps({"verdict": "ai_by_region"}), iso(utcnow())),
+            )
+        try:
+            with tx(conn):
+                conn.execute(
+                    "INSERT INTO packet_router (packet_id, version, json, computed_utc) VALUES (?, ?, ?, ?)",
+                    ("pkt_never_sent", "2026.10.19", "{}", iso(utcnow())),
+                )
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError("a router row for a packet the index does not hold was accepted")
+        assert conn.execute("SELECT COUNT(*) FROM packet_router").fetchone()[0] == 1
+    out = idx.rebuild_from_project(project.root)
+    assert out["problems"] == [] and out["packets"] == 2
+    with idx.project("tula-wot") as conn:
+        rows = conn.execute("SELECT COUNT(*) FROM packet_router").fetchone()[0]
+    assert rows == 0  # a cache, not folder truth

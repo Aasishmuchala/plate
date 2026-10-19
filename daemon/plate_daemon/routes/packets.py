@@ -61,6 +61,16 @@ router = APIRouter(prefix=API, dependencies=[Depends(require_token)])
 
 VERSION_RE = re.compile(r"^\s*(\d+)\.(\d+)(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?\s*$")
 PLATE_ROLES = ("display_tiff16", "client_plate")  # tier A display master, tier C client plate
+# The schema's id patterns, matched with `fullmatch`: the validator's `pattern` is a `re.search`, where `$`
+# also matches before a trailing newline, so "pkt_...\n" validates and would name a folder and an event URL.
+PACKET_ID_RE = re.compile(r"pkt_[0-9A-HJKMNP-TV-Z]{26}")
+SLUG_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+MANIFEST_IDS = (
+    ("packet_id", PACKET_ID_RE),
+    ("project_id", SLUG_RE),
+    ("shot_id", SLUG_RE),
+    ("supersedes", PACKET_ID_RE),
+)
 
 
 def major_minor(header: str | None) -> str | None:
@@ -94,6 +104,15 @@ class HashBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     paths: list[str] = Field(default_factory=list, max_length=100_000)
     payloads: dict[str, str] = Field(default_factory=dict)
+
+
+def id_errors(manifest: dict[str, Any]) -> list[str]:
+    """The manifest's ids that do not match the schema's patterns by `fullmatch` (a trailing newline, say)."""
+    return [
+        f"manifest.json: {key} {value!r} does not match the schema's pattern"
+        for key, rx in MANIFEST_IDS
+        if isinstance(value := manifest.get(key), str) and not rx.fullmatch(value)
+    ]
 
 
 # ---------------------------------------------------------------------------- hashing for the plugin
@@ -136,6 +155,8 @@ def post_packet(
         prepared = prepare_ingest(body.packet_path)
     except PacketInvalid as e:
         raise ApiError(422, {"errors": e.errors}) from e
+    if errors := id_errors(prepared.manifest):
+        raise ApiError(422, {"errors": errors})
     if major_minor(prepared.manifest.get("packet_version")) != version:
         raise ApiError(
             422,

@@ -7,6 +7,8 @@
 // T101: a `W × H` chip per side is always on (the decoded size once loaded, else the declared one; `badge-size` still
 // flags a mismatch), and the HUD has Enlarge (only when the host gives `onEnlarge`) and Fullscreen buttons. The
 // viewer keeps `e` and `f` for edges and fit while it has focus; App binds them to enlarge and fullscreen outside it.
+// T159: A and B read through the shared decoded-image cache (`pixelCache`), so a plate that stays on A across take
+// switches or a remount is fetched once; the renderer still uploads on every source change.
 
 import {
   type CSSProperties,
@@ -22,7 +24,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { loadHeat, loadImage, loadMask } from "./loaders";
+import { loadHeat, loadImage, loadMask, pixelCache } from "./loaders";
 import { DE00_MAX, DE00_STOPS, EDGE_COLORS, fitTileSize, type TileCell, tileGrid, tileLayout } from "./math";
 import { type AnalysisKind, DEFAULT_GAIN, ViewerRenderer } from "./renderer";
 import {
@@ -371,7 +373,7 @@ export function Viewer(props: ViewerProps): ReactElement {
   useGpuSource(
     renderer,
     "a",
-    a ? (signal) => loadImage(a, signal) : null,
+    a ? (signal) => loadImage(a, signal, pixelCache) : null,
     (r, px) => {
       r.setImage("a", px);
       if (px) dispatch({ type: "layout", image: { width: px.width, height: px.height } });
@@ -383,7 +385,7 @@ export function Viewer(props: ViewerProps): ReactElement {
   useGpuSource(
     renderer,
     "b",
-    b ? (signal) => loadImage(b, signal) : null,
+    b ? (signal) => loadImage(b, signal, pixelCache) : null,
     (r, px) => {
       r.setImage("b", px);
       setDecoded((d) => ({ ...d, b: px ? { width: px.width, height: px.height } : undefined }));

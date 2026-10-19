@@ -53,6 +53,17 @@ pipeline runs it left in a worker state (`Pipeline.resume`); then the nightly sc
 starts unless `PLATE_NIGHTLY=0`, and stops on shutdown. A scheduler that cannot be built or started is
 logged and never keeps the API from serving.
 
+Project leases (decision 83, `lease.py`): `create_app` installs this process's lease identity unless one is
+installed already, so two apps in one process (the test suite) share one identity and one set of leases. The
+first write to a project takes `<project>/lease.json`; the lifespan runs a `lease.Keeper` that refreshes the
+heartbeat of every lease held, and on shutdown stops it and removes them (`lease.release_all`). A write to a
+project another daemon's live lease covers is 409 `{"error": "project_leased", "host", "pid", "daemon_id",
+"heartbeat_utc", "detail"}`; reads are served. `/health` counts the leases held (`leases`).
+
+Wave 13 (T152): `finish` (the packet ingest's last step) calls `pipeline.warm_router` for an ingested packet, so
+the render-it router's inputs are in the index before `packet.ingested` goes out (decision 84); the pipeline gets
+`crash_exits_process`, so a scripted crash ends the process on every execution path (decision 85).
+
 Unknown API paths answer 404 `{"error": "not_found", "detail": "no route /api/..."}` for every method (HEAD,
 OPTIONS and TRACE included; `/api` and `/api/` too: a catch-all registered after the route modules), so a sender
 never sees `405 Method Not Allowed` or the UI's HTML. `GET /api/v0/health` also answers HEAD.
@@ -99,6 +110,7 @@ from . import (
     __version__,
     carryover,
     layer_upscale,
+    lease,
     motion_runs,
     nodes,
     people_video,
@@ -113,6 +125,7 @@ from .config import Settings, check_project_id
 from .engine_fake import FakeEngine
 from .index import Index, UnknownProject
 from .ingest import finish_ingest, get_packet, pending_ingests
+from .lease import ProjectLeased
 from .ledger import Ledger
 from .llm import judge_node
 from .lock import ProjectLocked
@@ -532,6 +545,8 @@ def create_app(
     replaces the engine manifests on disk (`plate_engines.loader`); `nightly_factory(settings)` builds the
     scheduler the lifespan starts (default `scheduler.Nightly`; kept at `app.state.nightly`)."""
     engine = engine if engine is not None else FakeEngine.from_env(journal=settings.home / "fake_engine.json")
+    if not lease.enabled():  # decision 83; a second app in this process shares the first one's identity
+        lease.install()
     index = Index(settings.home)
     bus = bus or Bus(index)
 
@@ -587,10 +602,16 @@ def create_app(
         # background; the API is up meanwhile. The node installs below have already wrapped the pipeline.
         threading.Thread(target=resume, name="plate-resume", daemon=True).start()
         start_nightly()
+        keeper = lease.Keeper()
+        keeper.start()
         try:
             yield
         finally:
             stop_nightly()
+            keeper.stop()
+            released = lease.release_all()
+            if released:
+                log.info("released %d project lease(s)", released)
 
     app = FastAPI(
         title="PLATE daemon",
@@ -622,6 +643,7 @@ def create_app(
         clock=lambda: app.state.clock(),
         ocr=LazyOcr(pixels),
         depth_fn=LazyDepth(pixels),
+        crash_exits_process=crash_exits_process,  # decision 85: every execution path, not only the dev step
     )
     # Decision 38: every node kind beyond the Edit, wrapped onto this instance before any resume can run.
     nodes.install(pipeline)
@@ -728,6 +750,9 @@ def create_app(
                     pipeline.register_packet(project_id, packet_id)
                 except Exception as e:  # the index has it; packets.json catches up on the next send
                     log.warning("packet %s not registered in %s/packets.json: %s", packet_id, project_id, e)
+                # Decision 84: the router's inputs once, here, before anyone is told the packet is in (so the
+                # first quote, and a carry-over's, decodes nothing for the router). Never raises.
+                pipeline.warm_router(project_id, packet_id)
                 try:
                     announce(project_id, packet_id, row)
                 except Exception as e:  # watchers miss one record; the packet is ingested regardless
@@ -781,6 +806,19 @@ def create_app(
     @app.exception_handler(ProjectError)
     async def _project_error(_request: Request, exc: ProjectError) -> JSONResponse:
         return JSONResponse({"error": "project_unreadable", "detail": str(exc)}, status_code=422)
+
+    @app.exception_handler(ProjectLeased)
+    async def _project_leased(_request: Request, exc: ProjectLeased) -> JSONResponse:
+        # Decision 83: another daemon's live lease covers the project; nothing was written.
+        body = {
+            "error": "project_leased",
+            "host": exc.host,
+            "pid": exc.pid,
+            "daemon_id": exc.daemon_id,
+            "heartbeat_utc": exc.heartbeat_utc,
+            "detail": str(exc),
+        }
+        return JSONResponse(body, status_code=409)
 
     @app.exception_handler(UnknownProject)
     async def _unknown_project(_request: Request, exc: UnknownProject) -> JSONResponse:
@@ -851,6 +889,7 @@ def create_app(
             "pixels": pixels.status(),
             "plugin": plugin_health(),
             "alerts_recent": recent_alerts.count(),
+            "leases": len(lease.held()),
         }
 
     include_all(app)

@@ -36,6 +36,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from ..export import claim
 from ..fsutil import write_bytes_atomic
 from .guard import DeliveryError, DeliveryRefused, Provenance, authorize, read_sidecar, write_sidecar
 from .tools import to_fraction
@@ -383,9 +384,14 @@ def write(
     fps = to_fraction(timeline.get("fps"))
     if check_media_sidecars:
         check_media(_referenced(_clips(timeline, _Clock(fps))))
-    if dest.exists():
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not claim(dest):  # the claim is the check: of any number of deliveries to one name, one wins
         raise FileExistsError(f"{dest} already exists; delivery never overwrites")
-    write_bytes_atomic(dest, text.encode("utf-8"))
+    try:
+        write_bytes_atomic(dest, text.encode("utf-8"))
+    except BaseException:
+        dest.unlink(missing_ok=True)  # our empty claim: the name is free again
+        raise
     if provenance is not None:
         try:
             write_sidecar(

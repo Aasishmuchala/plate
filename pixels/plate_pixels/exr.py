@@ -11,6 +11,9 @@ empty layer) uses the bare channel (``R``); a channel that already contains a do
 
 Cryptomatte: each EXR layer ``CryptoObjectNN`` holds two ranks as R/G = (id, coverage) and B/A = (id, coverage);
 the ids are the murmur3 hash bit pattern stored in a float32, so they are read back through a ``uint32`` view.
+
+Every reader opens (and so decodes) the whole file once per call. ``read_z_and_cryptomatte`` gives the depth and a
+Cryptomatte from one open, for the render-it router's inputs (router plan T152), which otherwise cost two.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ __all__ = [
     "present_ids",
     "read_cryptomatte",
     "read_elements",
+    "read_z_and_cryptomatte",
     "write_multilayer",
 ]
 
@@ -131,10 +135,29 @@ def read_cryptomatte(
     Levels are interleaved the way the format stores them: layer 00 R/G is rank 0, B/A is rank 1, layer 01
     R/G is rank 2, and so on, so rank 0 is always the dominant id. Unused ranks are id 0, coverage 0.
     """
+    element = _crypto_element(which)
+    return _ranks_coverage(element, read_elements(path, manifest, [element])[element])
+
+
+def read_z_and_cryptomatte(
+    path: str | Path, manifest: Mapping[str, Any], which: str = "object"
+) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
+    """``(z, (ranks, coverage))`` from one open of the file: the ``zdepth`` element as float32 (H, W, 1) and the
+    ``which`` Cryptomatte exactly as :func:`read_cryptomatte` decodes it. Raises :class:`MissingChannel` like
+    the readers it stands for."""
+    element = _crypto_element(which)
+    got = read_elements(path, manifest, ["zdepth", element])
+    return got["zdepth"], _ranks_coverage(element, got[element])
+
+
+def _crypto_element(which: str) -> str:
     if which not in CRYPTO_ELEMENTS:
         raise ValueError(f"which must be 'object' or 'material', not {which!r}")
-    element = CRYPTO_ELEMENTS[which]
-    planes = read_elements(path, manifest, [element])[element]  # (H, W, 4 * layers)
+    return CRYPTO_ELEMENTS[which]
+
+
+def _ranks_coverage(element: str, planes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(H, W, 4 * layers) Cryptomatte planes as (uint32 ranks, float32 coverage), rank 0 first."""
     if planes.shape[2] % 4:
         raise MissingChannel(element, "<channel count is not a multiple of 4 (R,G,B,A per layer)>")
     ids = np.ascontiguousarray(planes[..., 0::2]).view(np.uint32)  # R, B of each layer

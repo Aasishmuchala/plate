@@ -4,7 +4,10 @@ A CameraRecipe is the dock's recipe editor in data: the engine and preset the sh
 deliverable safe frame, the engine aspect to overscan to, the classes AI may edit in this shot and the
 opt-in render elements. Recipes live in <scene>.plate.json next to the .max file (MaxGaffer's
 <scene>.maxgaffer.json pattern: human-readable, diff-able, survives a Max crash, never bloats the
-scene), UTF-8 JSON written temp-then-os.replace (fsutil). An unsaved scene has no sidecar.
+scene), UTF-8 JSON written temp-then-os.replace (fsutil). An unsaved scene has no sidecar. A scene whose
+name leaves no room for ".plate.json" next to it (a file name past 255 bytes, or a path past Windows'
+259 characters) keeps its sidecar under <app data>/sidecars/<hash of the scene path>.plate.json
+instead (sidecar_note says so for the dock's log): long names bind and send like any other.
 
 Doctrine (locked by default): editable_classes can only narrow what the policy rules already make
 editable; a class no AI edit may touch (architecture, glazing, signage, other) is refused here.
@@ -14,13 +17,15 @@ Stdlib only.
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import policy
+from . import config, policy
 from .bridge.elements import OPTIN_CLASSES
 from .fsutil import atomic_write_json
 
@@ -30,6 +35,47 @@ PROJECT_KEY = "project_id"  # the key the scene's project binding is kept under 
 DEFAULT_ENGINE_ID = "nano-banana-2.1"
 ASPECT_RE = re.compile(r"^([1-9][0-9]{0,4}):([1-9][0-9]{0,4})$")
 NAME_SHOWN = 80  # a sidecar file name longer than this is elided in a message
+NAME_MAX_BYTES = 255  # one file name, UTF-8 bytes (NTFS counts 255 UTF-16 units; bytes is the stricter)
+WINDOWS_MAX_PATH = 259  # MAX_PATH less the terminating NUL; the plugin does not rely on long-path opt-in
+
+
+def platform_is_windows() -> bool:
+    """os.name == "nt", behind a hook so a test can pretend without breaking pathlib."""
+    return os.name == "nt"
+
+
+def __getattr__(name: str) -> Any:
+    """SIDECAR_FALLBACK_DIR (<app data>/sidecars) is resolved on each use, not at import: PLATE_HOME
+    may change after the module loads (tests, the installer)."""
+    if name == "SIDECAR_FALLBACK_DIR":
+        return config.app_data_dir() / "sidecars"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def sidecar_fallback_dir() -> Path:
+    """Where sidecars of scenes with too long a name live (a test may set SIDECAR_FALLBACK_DIR)."""
+    override = globals().get("SIDECAR_FALLBACK_DIR")
+    return Path(override) if override is not None else config.app_data_dir() / "sidecars"
+
+
+def fits_filesystem(path: Path) -> bool:
+    """Whether path can be created here: its file name within 255 UTF-8 bytes and, on Windows, the
+    whole path within WINDOWS_MAX_PATH characters."""
+    path = Path(path)
+    if len(path.name.encode("utf-8")) > NAME_MAX_BYTES:
+        return False
+    return not platform_is_windows() or len(str(path)) <= WINDOWS_MAX_PATH
+
+
+def scene_key(scene: str | Path) -> str:
+    """16 hex characters naming a scene by its resolved path: the fallback sidecar's file name and the
+    fallback backup's (so the two can be matched by eye)."""
+    path = Path(str(scene))
+    try:
+        path = path.resolve()
+    except (OSError, RuntimeError):
+        path = path.absolute()
+    return hashlib.blake2b(str(path).encode("utf-8"), digest_size=8).hexdigest()
 
 
 class RecipeError(ValueError):
@@ -187,8 +233,9 @@ class CameraRecipe:
 # --------------------------------------------------------------------------- the sidecar
 
 
-def sidecar_path(scene: str | Path | None) -> Path | None:
-    """foo.max -> foo.plate.json next to it (None for an unsaved scene)."""
+def natural_sidecar_path(scene: str | Path | None) -> Path | None:
+    """foo.max -> foo.plate.json next to it, whether or not the file system would take that name
+    (None for an unsaved scene)."""
     if not scene:
         return None
     path = Path(str(scene))
@@ -196,6 +243,25 @@ def sidecar_path(scene: str | Path | None) -> Path | None:
         return None
     stem = path.with_suffix("") if path.suffix.lower() == ".max" else path
     return stem.with_name(stem.name + SIDECAR_SUFFIX)
+
+
+def sidecar_path(scene: str | Path | None) -> Path | None:
+    """foo.max -> foo.plate.json next to it (None for an unsaved scene). When that name does not fit
+    the file system (fits_filesystem) the sidecar is <app data>/sidecars/<scene_key>.plate.json, so
+    load_recipes, save_recipes and the project binding work for any scene name."""
+    natural = natural_sidecar_path(scene)
+    if natural is None or fits_filesystem(natural):
+        return natural
+    return sidecar_fallback_dir() / f"{scene_key(str(scene))}{SIDECAR_SUFFIX}"
+
+
+def sidecar_note(scene: str | Path | None) -> str | None:
+    """A line for the dock's log when the scene's sidecar is not beside it (None when it is, or the
+    scene is unsaved)."""
+    natural = natural_sidecar_path(scene)
+    if natural is None or fits_filesystem(natural):
+        return None
+    return f"sidecar stored under {sidecar_fallback_dir()} (the scene name is too long for one beside it)"
 
 
 def _current_scene() -> str:

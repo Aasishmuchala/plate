@@ -536,6 +536,10 @@ def camera_lock(
     `width` wide, so the numbers are in pixels of that width. median_flow_px / p95 are the maxima over pairs
     of the per-pair median / 95th percentile of the flow magnitude. status comes from thresholds.yaml with the
     backend applied (raft: hard, dis: advisory).
+
+    A clip with fewer than two frames from t0 on has no second frame to compare (BUILD_PLAN decision 90): the
+    result carries status "unscored", median_flow_px / p95 None and no per_pair rows, and no second frame is
+    decoded. It is never a 0.0 that a gate could read as "perfectly locked".
     """
     if backend is None:
         backend = _default_flow_backend()
@@ -547,6 +551,24 @@ def camera_lock(
     work_w = min(int(width), int(info["width"]))
     work_h = max(int(round(info["height"] * work_w / info["width"])), 1)
     j0 = min(max(int(round(t0 * fps)), 0), max(n_video - 1, 0))
+    if n_video - j0 < 2:
+        thr = thresholds.load().get(LOCK_METRIC_ID)
+        return {
+            "metric_id": LOCK_METRIC_ID,
+            "median_flow_px": None,
+            "p95": None,
+            "backend": name,
+            "backend_info": backend.info() if hasattr(backend, "info") else {"impl": name},
+            "status": "unscored",
+            "threshold": float(thr.bound()),
+            "threshold_status": thr.effective_status(name),
+            "per_pair": [],
+            "width": int(work_w),
+            "height": int(work_h),
+            "samples": 0,
+            "video_frames": n_video,
+            "note": "camera lock not scored: fewer than 2 frames",
+        }
     picks = [j0 + j for j in _sample_frames(n_video - j0, max(int(samples), 2))]
 
     def grab(j: int) -> np.ndarray:
